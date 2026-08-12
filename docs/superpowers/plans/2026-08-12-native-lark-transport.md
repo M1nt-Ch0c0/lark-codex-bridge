@@ -307,7 +307,7 @@ Commit `feat: add Lark protobuf frame codec and bounded reassembly`.
 - Consumes: `LarkHttp`, `LarkCredentials`, `Frame`, `Reassembler`, supervisor backoff helper.
 - Produces: `LarkTransport`, `TransportHandle`, `TransportEvent`, `TransportState`, `InboundFrameHandler`.
 
-- [ ] **Step 1: Implement endpoint bootstrap with classified failures**
+- [x] **Step 1: Implement endpoint bootstrap with classified failures**
 
 ```rust
 pub struct WsEndpoint {
@@ -326,7 +326,7 @@ impl LarkTransport {
 
 `POST {open_base}/callback/ws/endpoint` with JSON body `{AppID, AppSecret}` and a `locale: zh` header, 15 s timeout. Response `{code, msg, data: {URL, ClientConfig: {PingInterval, ReconnectCount, ReconnectInterval, ReconnectNonce}}}`; ClientConfig values are seconds. `device_id`/`service_id` are parsed from the returned `URL` query string (the reference extracts them exactly this way). Code classification: `0` ok; `1` (system busy), `1000040343` (internal error), transport errors, timeouts, and HTTP 5xx → `Retryable`; `403` (forbidden), `514` (auth failed), and `1000040350` (exceed connection limit) → `PermanentAuth`/`Exhausted` (non-retryable, surfaces `Degraded`). Note: the reference treats every code except `1000040343` as non-retryable; the design's classification above is a deliberate deviation toward retrying transient server errors — record it in the module docs.
 
-- [ ] **Step 2: Implement the WebSocket actor with ping/pong and liveness**
+- [x] **Step 2: Implement the WebSocket actor with ping/pong and liveness**
 
 ```rust
 pub enum TransportState {
@@ -346,15 +346,15 @@ pub enum TransportEvent {
 
 One actor task owns the `tokio-tungstenite` binary WebSocket. On open it starts a ping loop sending a control frame (`service = service_id`, `method = control`, headers `[{type: ping}]`, SeqID/LogID 0) every server-supplied `PingInterval`; any inbound frame cancels the liveness watchdog, and a ping unanswered within `LARK_PONG_TIMEOUT` terminates the socket to trigger reconnect. Inbound control frames with `type: pong` parse the JSON payload `{PingInterval, ReconnectCount, ReconnectInterval, ReconnectNonce}` and update the live config, exactly like the reference. Data frames route through the `Reassembler`; completed `event`/`card` payloads go to the handler; anomalies surface as `TransportEvent::Anomaly` and are never fatal to the connection.
 
-- [ ] **Step 3: Implement receipt-after-handling and reconnect policy**
+- [x] **Step 3: Implement receipt-after-handling and reconnect policy**
 
 The handler is `Arc<dyn Fn(FrameHeaders, Bytes) -> Future<Output = Result<Option<Value>, LarkError>> + Send + Sync>`. Only after the handler returns `Ok` does the actor encode and send the receipt frame: the original frame's headers plus `biz_rt`, with payload JSON `{code: 200}` and optional `data` = base64(JSON of the handler's return value); handler failure sends `{code: 500}`. A receipt send failure on a closing socket is logged, not retried. Reconnect: on socket close/error or a retryable bootstrap failure, wait using the supervisor's jittered exponential backoff (0.5–30 s) seeded by attempt, honoring the server-supplied `ReconnectNonce` as the initial delay and `ReconnectCount >= 0` as an attempt cap; `PermanentAuth`/`Exhausted` from bootstrap or a `handshake-autherrcode` header enters `Degraded` without further retries. Shutdown closes the socket and joins the actor with a bounded grace.
 
-- [ ] **Step 4: Test against an in-process WebSocket server**
+- [x] **Step 4: Test against an in-process WebSocket server**
 
 Use `tokio_tungstenite::accept_async` on a `tokio::net::TcpListener` pair (no new dev-dependencies) plus the HTTP stub for bootstrap. Cover bootstrap parsing including query extraction, classified permanent vs retryable bootstrap codes, ping frame bytes on the wire, pong-driven config update, liveness timeout triggering reconnect, control/data dispatch, single- and multi-fragment events delivered in order, receipt `{code:200}` only after handler success and `{code:500}` on failure, receipt `data` base64 round-trip, anomaly surfacing without disconnect, backoff delay sequence, attempt cap, `Degraded` on 403/514 with no retry, and clean shutdown without orphan tasks.
 
-- [ ] **Step 5: Verify and publish the task**
+- [x] **Step 5: Verify and publish the task**
 
 Run:
 

@@ -58,8 +58,32 @@ impl LarkHttp {
         P: Serialize + Sync,
         R: DeserializeOwned,
     {
+        self.post_json_with_headers(path, body, &[]).await
+    }
+
+    /// POSTs a JSON body with extra headers (e.g. the `locale` header the
+    /// WebSocket endpoint bootstrap requires). Used by the transport; the
+    /// caller classifies the response body itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified error on transport failure, non-success status,
+    /// oversize body, or malformed JSON.
+    pub(crate) async fn post_json_with_headers<P, R>(
+        &self,
+        path: &str,
+        body: &P,
+        headers: &[(&str, &str)],
+    ) -> Result<R, LarkError>
+    where
+        P: Serialize + Sync,
+        R: DeserializeOwned,
+    {
         let url = self.endpoints.open_url(path)?;
-        let request = self.client.post(url).json(body);
+        let mut request = self.client.post(url).json(body);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
         let (status, bytes) = self
             .execute(request, "POSTing an OpenAPI JSON request")
             .await?;
