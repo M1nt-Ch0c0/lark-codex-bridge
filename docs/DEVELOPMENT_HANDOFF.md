@@ -45,7 +45,7 @@ codex --version
 4. 使用 Rust 原生实现飞书/Lark WebSocket 与 OpenAPI，不依赖 Node sidecar。
 5. 所有长期队列、缓存、pending map、mailbox、附件和 outbox 都必须同时有数量和字节上限。
 6. 不确定的非幂等写入必须显式 `uncertain` 或 fail-closed，不得盲目重试并声称成功。
-7. 以高效切片开发为主：每个阶段一次集中实现、一次集中门禁、一次高风险复审；不要为了形式过度 TDD/SDD。
+7. 以高效切片开发为主：每个阶段一次集中实现、一次集中门禁、一次高风险复审，避免把工作拆得过碎。
 8. 经常做可运行的小提交并推送公开 `main`，让用户能看到进展。
 9. 低负载和更高效率最终必须由同机基准证明，不能只凭实现语言或主观判断宣称达成。
 
@@ -53,6 +53,9 @@ codex --version
 
 - `docs/superpowers/specs/2026-08-12-lark-codex-bridge-design.md`
 - `docs/superpowers/plans/2026-08-12-foundation-app-server.md`
+
+上面目录名中的 `superpowers` 只是早期开发时留下的文件路径；两个文件都是普通 Markdown。
+接管者直接读取即可，不需要安装 Superpowers 或任何其他插件，也不需要遵循其中与具体 Agent 工具相关的流程。
 
 参考仓库本地路径：
 
@@ -165,10 +168,10 @@ Task 6 的目标是 supervisor、`codex probe` 和真实 Codex smoke。计划中
 tests/supervisor.rs
 ```
 
-它有约 292 行，是上一个 Terra High 实现 Agent 在被中断前写出的 fake-factory 测试草稿。
+它有约 292 行，是上一轮开发被中断前写出的 fake-factory 测试草稿。
 不要删除；先读、校正，再以实现驱动它编译。
 
-交接时没有仍在运行、可继续发送消息的旧 subagent。新主 Agent 应从文件系统状态重新派发实现者，
+交接时没有仍在运行、可继续发送消息的旧 Agent。Kimi 应直接从文件系统和 Git 状态继续，
 不要等待或尝试恢复先前的 Agent 会话。
 
 草稿预期了以下接口，可作为设计输入而非不可修改的 API：
@@ -239,7 +242,7 @@ process::spawn_app_server
 4. 替换当前 `src/cli.rs` 中无界的 `TokioCommand::output()` probe；复用 supervisor/handshake。
 5. 增加 `tests/codex_smoke.rs`，先验证 skip 行为，再在本机执行真实 smoke。
 6. 更新 README 和 Task 6 checklist。
-7. 集中跑完整门禁，做一次 Sol Extra High 的 supervisor 并发/所有权审查。
+7. 集中跑完整门禁，再做一次专门针对 supervisor 并发、所有权和资源释放的严格审查。
 8. 修复 P0/P1 后提交、推送并观察跨平台 CI。
 
 ## 6. Task 6 之后仍未完成的工作
@@ -335,132 +338,75 @@ gh run view <run-id> --job <job-id> --log-failed
 GitHub stable 可能比本机 stable 更新。`a9b41be` 曾因 Clippy 1.97 的 `question_mark` lint 失败，
 随后由 `fe04651` 做语义等价修复并获得全绿。不要把本机 lint 通过当作远端全绿的替代。
 
-## 8. 子 Agent 的配置和派发方式
+## 8. Kimi 接管与协作方式
 
-用户要求的角色配置：
+本项目不要求 Kimi 安装任何特定 Agent 插件或扩展。只要 Kimi 能读取工作目录、
+执行 shell、编辑文件和使用 Git，就可以继续开发。若某个工具名在 Kimi 环境中不存在，直接使用其已有的
+等价能力；仓库事实和验收要求不依赖某个 Agent 产品。
 
-- 主 Agent：使用当前任务选择的模型、思考等级和 Fast 设置；
-- 实现 Agent：`gpt-5.6-terra`，`high`；
-- 关键并发/安全审查：`gpt-5.6-sol`，`xhigh`（界面名称 Extra High）；
-- 不重要但想做的独立事项：新建 `gpt-5.6-luna`、`xhigh` 对话，并在任务间传递简短结果。
+### 8.1 启动 Kimi 主会话
 
-### 8.1 重要调度规则
+1. 让 Kimi 使用当前本地目录，而不是只读取 GitHub 网页：
+   `/home/wcy/.lark-channel-workspaces/codex/default/lark-codex-bridge`。
+2. 直接粘贴第 9 节的接管提示词。
+3. 要求第一轮只读核对 Git、文档、CI 和 `tests/supervisor.rs`，不要立即批量改代码。
+4. 核对完成后从 Task 6 继续，不需要恢复或知道此前聊天记录。
 
-1. 同一 dirty worktree 同时只能有一个写代码的 Agent。
-2. reviewer 默认只读；若与实现并行，必须先生成不可变 diff snapshot 并只审该 snapshot。
-3. 为保证模型 override 生效，spawn 时使用 `fork_turns: "none"` 或有限最近轮次，并在 prompt 中提供完整路径和上下文。
-4. 不要使用 `fork_turns: "all"` 再指定模型；完整历史 fork 会继承主 Agent配置。
-5. 实现 Agent 可以 commit，但不要 push；主 Agent查看 diff、复跑必要门禁、审查后统一 push。
-6. reviewer 只报 P0/P1 和具体复现路径；普通样式建议不要拖长修复轮次。
-7. 一轮实现后集中测试，一轮 scoped re-review；不要每个私有函数都跑完整 suite。
-8. 最多并行 2–3 个真正独立的 read-heavy 工作，避免 token 和上下文浪费。
+`tests/supervisor.rs` 尚未提交，因此只从 `origin/main` 新克隆的 Kimi 看不到它。要保留这一半成品，必须让
+Kimi 进入上述当前工作目录，或单独把该文件提供给 Kimi。若文件确实无法取得，应以本文第 5 节和计划中的
+Task 6 为准重新写测试，不能假装草稿已存在。
 
-模型、思考等级或 Fast 在界面中途改变时，只影响此后新开始的主任务 turn；已经运行中的 turn 和已经创建的
-subagent 不会热切换。`spawn_agent` 可显式覆盖 `model` 和 `reasoning_effort`，但没有独立的 Fast 参数；
-不要声称能为某个 subagent 单独保证 Fast。用户可见新任务支持显式 `model` 和 `thinking`，Fast 若要改变，
-应在对应任务界面中设置。
+### 8.2 如果 Kimi 支持子 Agent
 
-派 Task 6 writer 时，等价参数如下；字段名以当前 Codex collaboration tool 为准：
+子 Agent 不是必需条件。支持时按以下边界使用；不支持时由主会话顺序执行同样工作。
 
-```text
-spawn_agent(
-  task_name = "task6_supervisor_impl",
-  fork_turns = "none",
-  model = "gpt-5.6-terra",
-  reasoning_effort = "high",
-  message = <8.2 的完整提示词>
-)
-```
+1. 同一个工作目录同时只允许一个 Agent 写代码。
+2. 实现 Agent 负责一个明确切片，可以修改和提交，但不 push。
+3. 审查 Agent 默认只读，只检查固定 commit 或 diff，不和实现 Agent 同时改文件。
+4. 主 Agent 复核 diff、运行门禁、处理审查意见，然后统一 push 并观察 CI。
+5. 调研类 Agent 不修改代码，只返回来源、结论和对主线的具体建议。
+6. 每个子任务都必须写清工作目录、允许修改的范围、禁止事项、验收命令和预期输出。
+7. 不要同时派多个实现 Agent 修改 supervisor、RPC、client 等共享模块。
 
-writer 完成并停止写入后，再派只读 reviewer：
+### 8.3 Task 6 实现子任务提示词
 
 ```text
-spawn_agent(
-  task_name = "task6_supervisor_review",
-  fork_turns = "none",
-  model = "gpt-5.6-sol",
-  reasoning_effort = "xhigh",
-  message = <8.3 的完整提示词 + 固定 commit/diff 路径>
-)
+在下面仓库继续 Task 6：
+/home/wcy/.lark-channel-workspaces/codex/default/lark-codex-bridge
+
+先完整阅读 docs/DEVELOPMENT_HANDOFF.md，以及
+docs/superpowers/plans/2026-08-12-foundation-app-server.md 中的 Task 6。
+
+保留并检查未跟踪的 tests/supervisor.rs。它是可修改的测试草稿，不是最终 API 规范。
+实现 supervisor、结构化 codex probe、fake process/factory tests 和真实 ignored smoke；同步 README
+与计划。必须复用现有 process/transport/rpc/client，不另造协议栈。
+
+不要删除或覆盖无关 dirty 文件。先跑 focused tests，再集中运行文档第 7 节门禁；真实执行
+CODEX_E2E smoke 和 probe，并检查没有遗留 app-server 子进程。完成后提交但不要 push，返回 commit、
+完整测试结果、尚存风险和需要主 Agent 决定的问题。
 ```
 
-主 Agent 在 writer 运行时用 `list_agents` 看状态，用 `send_message` 补充非阻塞上下文，用 `wait_agent`
-等待结果；只有需要立即停止错误写入时才用 `interrupt_agent`。reviewer 返回后若有 P0/P1，用
-`followup_task` 把精确 findings 发回原 writer 触发修复轮，而不是再开多个 writer 抢同一工作区。
-
-### 8.2 Task 6 实现 Agent 提示词模板
+### 8.4 并发与资源审查子任务提示词
 
 ```text
-你是 Task 6 实现 Agent，模型 gpt-5.6-terra，reasoning high。
-工作目录：/home/wcy/.lark-channel-workspaces/codex/default/lark-codex-bridge。
-先读 docs/DEVELOPMENT_HANDOFF.md 和
-docs/superpowers/plans/2026-08-12-foundation-app-server.md 的 Task 6。
+只读审查 lark-codex-bridge 的 Task 6 固定 commit/diff，不修改、不提交。
+先读 docs/DEVELOPMENT_HANDOFF.md 第 4、5、7 节。
 
-已验证代码基线=fe04651，对应公开 CI 全绿；实际 HEAD 还包含交接文档提交。保留未跟踪
-tests/supervisor.rs；它是草稿，
-需要校正，不是不可修改规范。实现 supervisor、结构化 codex probe、fake factory tests、
-真实 ignored smoke、README/计划同步。复用现有 process/transport/rpc/client，不重造协议栈。
+重点检查：child/transport/RPC/client 单一所有权、epoch 失效、重启状态顺序、退避和永久错误分类、
+shutdown/kill/wait、调用方取消、watch/client race、有界 queue/byte、敏感信息脱敏、probe 输出、
+真实 smoke 是否遗留 orphan。只报告会影响正确性、资源安全、机密性或可恢复性的具体问题。
 
-只使用 apply_patch 修改文件。不要删除或覆盖无关 dirty 文件。集中运行 Task 6 门禁，
-真实执行 CODEX_E2E smoke 和 probe，检查无 orphan。完成后做小步 commit，不 push，
-返回提交、测试结果和明确 concerns。
+每项问题给出 file:line、复现场景、影响和最小修复建议；若没有阻塞问题，明确写出审查过的边界和
+未覆盖风险。把结果返回主 Agent，由主 Agent 决定修复和发布。
 ```
 
-### 8.3 Sol Extra High 审查 Agent 提示词模板
+### 8.5 Kimi 没有子 Agent 时
 
-```text
-你是只读关键并发/资源审查 Agent，模型 gpt-5.6-sol，reasoning xhigh。
-工作目录：/home/wcy/.lark-channel-workspaces/codex/default/lark-codex-bridge。
-读取 docs/DEVELOPMENT_HANDOFF.md、Task 6 brief 和主 Agent提供的 immutable diff package。
+由同一会话按顺序完成：只读核对 → 实现 → focused tests → 全量门禁 → 重新阅读 diff 做审查 → 修复 →
+提交 → push → 检查 CI。审查阶段应暂时停止写代码，以固定的 `git diff` 或 commit 为对象逐项核对第 8.4 节，
+避免一边修改一边宣布审查通过。
 
-只检查 P0/P1：child/transport/RPC/client 单一所有权、epoch 失效、重启状态顺序、
-退避和永久错误分类、shutdown/kill/wait、调用方取消、watch/client race、bounded queue/byte、
-secret redaction、probe输出、真实 smoke orphan。每项必须给 file:line、复现场景和最小修复。
-只读，不修改、不提交、不重复跑全量 tests。将完整报告写到主 Agent指定路径。
-```
-
-### 8.4 Luna xhigh 独立对话模板
-
-只对不阻塞当前主线、可完全独立交付的事项使用，例如依赖调研、命令帮助文案草案或基准方案。
-
-```text
-这是一个低优先级独立调研任务，使用 gpt-5.6-luna，reasoning xhigh。
-不要修改主工作区代码。读取 docs/DEVELOPMENT_HANDOFF.md，只完成：<具体单一事项>。
-输出简短结论、证据路径和给主任务的建议，不创建未经授权的外部状态。
-```
-
-当前 Codex App 提供用户可见 thread 工具。先用 `list_projects` 找到此仓库的 `projectId`，再创建
-`gpt-5.6-luna`、`thinking=xhigh` 的项目任务；若新任务必须带上尚未提交的 `tests/supervisor.rs`，选择
-当前 saved project 的 local checkout，或创建 worktree 时明确从 `working-tree` 状态开始，不能只从公开
-`main` 开始。创建是异步的，用返回的 `threadId/hostId` 调用 `wait_threads`，用
-`send_message_to_thread` 追加上下文。不要为了“显得并行”创建没有清晰边界的对话。
-
-Luna 新任务的等价参数示例：
-
-```text
-create_thread(
-  model = "gpt-5.6-luna",
-  thinking = "xhigh",
-  title = "lark-codex-bridge 独立调研",
-  prompt = <上面的独立调研提示词>,
-  target = <本仓库 project；需要草稿时选择 local 或 working-tree>
-)
-```
-
-如果当前运行环境没有 thread 工具或没有 Luna 可选模型，不要伪造 Luna subagent；直接让用户在 Codex App
-新建该任务，或者先把事项留在 pending 清单。
-
-### 8.5 让新的主 Agent 完整接管
-
-最稳妥的用户操作是：在 Codex App 中为本仓库新建任务，选择所需主模型、思考等级和 Fast，确保任务使用
-包含 `tests/supervisor.rs` 的当前 checkout/working-tree，然后粘贴第 9 节提示词。若新任务从纯
-`origin/main` worktree 开始，它能读到已发布的交接文档，但读不到未提交的 supervisor 测试草稿；此时应先
-让它确认草稿是否已被带入，缺失时回到当前 checkout 接管，不要凭文档重新臆造草稿。
-
-新的主 Agent 不需要继承本对话历史：第 9 节提示词负责建立方向，本文、权威设计、计划、Git 历史和
-GitHub Actions 共同构成接管事实源。接管后第一轮只做核对，第二轮即可按 Task 6 派 writer。
-
-## 9. 可直接复制给新主 Agent 的接管提示词
+## 9. 可直接复制给 Kimi 的接管提示词
 
 ```text
 请接管并持续完成 lark-codex-bridge 的持久开发目标。
@@ -479,12 +425,12 @@ supervisor 测试草稿，supervisor/probe/smoke 尚未实现。
 设计依次完成原生飞书/Lark transport、SQLite/scope/outbox/reply/attachments、命令/审批/权限/服务管理、
 故障注入、parity 和性能基准。不要支持 Claude、Web UI 或会议功能。
 
-工程配置：主 Agent 使用当前设置；写代码的实现 Agent使用 gpt-5.6-terra high；关键并发/安全审查
-使用 gpt-5.6-sol xhigh；低优先级独立事项新建 gpt-5.6-luna xhigh 对话。共享工作区同一时间只允许
-一个 writer。高效切片开发，集中测试和审查，不要过度 TDD/SDD。
+不需要安装任何特定 Agent 插件。若使用子 Agent，共享工作区同一时间只允许一个 writer，
+审查 Agent 只读；若不支持子 Agent，就在当前会话中按实现、测试、审查的顺序完成。采用高效切片开发，
+集中测试和审查，避免把任务拆得过碎。
 
 用户已批准在独立 public 仓库 main 上小步提交并经常 push。每次 push 后必须观察 CI。只有设计规格
-第18节所有验收项都有直接证据时才可把 goal 标记 complete；否则持续推进并保持 goal active。
+第 18 节所有验收项都有直接证据时才可宣称整个项目完成；否则继续推进并明确剩余工作。
 ```
 
 ## 10. 接管完成前的自检
@@ -496,7 +442,7 @@ supervisor 测试草稿，supervisor/probe/smoke 尚未实现。
 - Task 6 的五个步骤各需要什么直接证据？
 - 哪些 Codex 并发/内存不变量已经由 Task 5 建立，不能回退？
 - Task 6 后还剩哪三大里程碑？
-- 哪个 Agent可以写代码，哪个只能审查，模型/effort如何确保生效？
+- 如果使用多个 Agent，如何保证同一时间只有一个 writer、审查者只读？
 - 什么情况下可以 push，什么情况下可以宣称完整目标完成？
 
 若这些问题还不能从当前状态得到确定答案，应继续只读核对，不要开始大规模改动。
