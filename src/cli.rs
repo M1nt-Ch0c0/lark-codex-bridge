@@ -2,7 +2,16 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use tokio::process::Command as TokioCommand;
+use serde::Serialize;
+use tokio::time::timeout;
+
+use crate::{
+    codex::{
+        process::CodexProcessConfig,
+        supervisor::{AppServerSupervisor, SupervisorHandle, SupervisorState},
+    },
+    limits::PROBE_TIMEOUT,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "lark-codex-bridge", version, about)]
@@ -22,7 +31,8 @@ pub enum Command {
 
 #[derive(Debug, Subcommand)]
 pub enum CodexCommand {
-    /// Check that the configured Codex binary can be executed.
+    /// Spawn the app-server, run the initialize handshake, and print a
+    /// sanitized JSON summary of the supported installation.
     Probe {
         #[arg(long, default_value = "codex")]
         binary: PathBuf,
@@ -51,18 +61,66 @@ pub async fn run_with(cli: Cli) -> Result<()> {
     }
 }
 
+/// The only fields `codex probe` may ever print: no Codex home, account
+/// identity, tokens, environment, or raw responses.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProbeReport {
+    supported_version: String,
+    initialize_user_agent: String,
+    platform_family: String,
+    platform_os: String,
+    epoch: u64,
+}
+
 async fn probe_codex(binary: PathBuf) -> Result<()> {
-    let output = TokioCommand::new(&binary)
-        .arg("--version")
-        .output()
+    let config = CodexProcessConfig {
+        binary,
+        codex_home: None,
+    };
+    let mut handle = AppServerSupervisor::start(config)
         .await
-        .with_context(|| format!("unable to run Codex binary {}", binary.display()))?;
+        .context("unable to start the Codex supervisor")?;
 
-    if !output.status.success() {
-        bail!("Codex version probe failed with status {}", output.status);
+    let probe = timeout(PROBE_TIMEOUT, wait_for_probe(&mut handle)).await;
+    // Always stop the supervisor first so no app-server child outlives the probe.
+    handle
+        .shutdown()
+        .await
+        .context("unable to stop the Codex supervisor")?;
+    let state = probe.context("Codex probe timed out waiting for the app-server handshake")??;
+
+    match state {
+        SupervisorState::Ready {
+            epoch,
+            version,
+            peer,
+        } => {
+            let report = ProbeReport {
+                supported_version: version.to_string(),
+                initialize_user_agent: peer.user_agent,
+                platform_family: peer.platform_family,
+                platform_os: peer.platform_os,
+                epoch,
+            };
+            let line = serde_json::to_string(&report).context("unable to encode probe report")?;
+            println!("{line}");
+            Ok(())
+        }
+        SupervisorState::Degraded { reason } => bail!("{reason}"),
+        _ => bail!("Codex app-server stopped before completing the probe"),
     }
+}
 
-    let version = String::from_utf8(output.stdout).context("Codex version output is not UTF-8")?;
-    println!("{}", version.trim());
-    Ok(())
+async fn wait_for_probe(handle: &mut SupervisorHandle) -> Result<SupervisorState> {
+    loop {
+        let state = handle
+            .changed()
+            .await
+            .context("Codex supervisor stopped during the probe")?;
+        match state {
+            SupervisorState::Ready { .. } | SupervisorState::Degraded { .. } => return Ok(state),
+            _ => {}
+        }
+    }
 }
