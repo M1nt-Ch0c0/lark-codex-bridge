@@ -446,12 +446,21 @@ async fn run_supervisor(
                 let graceful = tokio::select! {
                     biased;
                     () = shutdown.cancelled() => true,
-                    _ = running.process.wait() => false,
+                    result = running.process.wait() => {
+                        if result.is_err() {
+                            // The OS wait failed while the child may still be
+                            // alive; kill it before a replacement can spawn.
+                            let _ = running.process.terminate(Duration::ZERO).await;
+                        }
+                        false
+                    }
                 };
                 *client_slot.lock().unwrap_or_else(PoisonError::into_inner) = None;
                 // Fail the old epoch immediately: cancel client/transport so the
-                // writer closes app-server stdin before termination.
-                let _ = running.client.shutdown().await;
+                // writer closes app-server stdin before termination. Bound the
+                // wait so a stuck shutdown chain cannot postpone termination.
+                let shutdown_bound = settings.shutdown_grace().saturating_mul(2);
+                let _ = tokio::time::timeout(shutdown_bound, running.client.shutdown()).await;
                 if graceful {
                     let _ = running.process.terminate(settings.shutdown_grace()).await;
                     break;
