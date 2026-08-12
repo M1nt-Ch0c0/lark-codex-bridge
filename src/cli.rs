@@ -66,10 +66,12 @@ pub enum LarkAuthCommand {
     /// Register a new `PersonalAgent` app via the QR device flow, or validate
     /// and store existing app credentials.
     Register {
-        /// Existing app ID; requires --app-secret and --tenant.
+        /// Existing app ID; requires --tenant, plus --app-secret or the
+        /// `LARK_APP_SECRET` environment variable.
         #[arg(long)]
         app_id: Option<String>,
-        /// Existing app secret; requires --app-id and --tenant.
+        /// Existing app secret; visible in the process list and shell history,
+        /// so prefer the `LARK_APP_SECRET` environment variable instead.
         #[arg(long)]
         app_secret: Option<String>,
         /// Tenant of the existing app; requires --app-id and --app-secret.
@@ -220,8 +222,20 @@ async fn lark_auth_register(
         (Some(app_id), Some(app_secret), Some(tenant)) => {
             LarkCredentials::new(app_id, SecretString::from(app_secret), tenant.into())
         }
+        (Some(app_id), None, Some(tenant)) => {
+            // Avoid putting the secret on the command line: read it from the
+            // environment when only --app-id/--tenant are given.
+            let secret = std::env::var("LARK_APP_SECRET").ok().and_then(|value| {
+                (!value.is_empty()).then_some(value)
+            }).ok_or_else(|| {
+                anyhow!("--app-id/--tenant given without --app-secret; set LARK_APP_SECRET to supply the secret without exposing it in the process list")
+            })?;
+            LarkCredentials::new(app_id, SecretString::from(secret), tenant.into())
+        }
         (None, None, None) => run_device_flow().await?,
-        _ => bail!("--app-id, --app-secret, and --tenant must be given together, or not at all"),
+        _ => bail!(
+            "--app-id and --tenant must be given together, optionally with --app-secret, or none at all"
+        ),
     };
     let info = validate_new_credentials(&creds).await?;
     let store = FileCredentialStore::at_default()

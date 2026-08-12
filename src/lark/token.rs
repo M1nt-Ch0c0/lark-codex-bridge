@@ -154,7 +154,9 @@ impl TenantTokenProvider {
             .map_err(|_| LarkError::protocol("token response has a negative expire"))?;
         // A validity shorter than the skew leaves the token immediately
         // stale, so the next call refetches instead of serving an expired one.
-        let refresh_after = Instant::now() + validity.saturating_sub(TOKEN_REFRESH_SKEW);
+        let refresh_after = Instant::now()
+            .checked_add(validity.saturating_sub(TOKEN_REFRESH_SKEW))
+            .ok_or_else(|| LarkError::protocol("token expire out of range"))?;
         Ok(CachedToken {
             token: SecretString::from(token),
             refresh_after,

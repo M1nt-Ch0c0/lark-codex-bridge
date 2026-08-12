@@ -220,7 +220,7 @@ impl CredentialStore for FileCredentialStore {
 
 #[cfg(unix)]
 fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), LarkError> {
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     let mut file = fs::OpenOptions::new()
         .write(true)
@@ -231,7 +231,11 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), LarkError> {
         .map_err(|_| LarkError::retryable("writing the credentials file"))?;
     file.write_all(bytes)
         .and_then(|()| file.sync_all())
-        .map_err(|_| LarkError::retryable("writing the credentials file"))
+        .map_err(|_| LarkError::retryable("writing the credentials file"))?;
+    // `mode` only applies when the file is created; a pre-existing loose temp
+    // file must be tightened explicitly.
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|_| LarkError::retryable("securing the credentials file"))
 }
 
 #[cfg(not(unix))]

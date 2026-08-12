@@ -26,6 +26,10 @@ use crate::limits::LARK_REGISTER_TIMEOUT;
 const REGISTRATION_PATH: &str = "/oauth/v1/app/registration";
 const DEFAULT_EXPIRES_IN_SECS: u64 = 600;
 const DEFAULT_INTERVAL_SECS: u64 = 5;
+/// Server-directed poll intervals are clamped into this range so a hostile or
+/// broken accounts host cannot turn polling into a busy loop or a stall.
+const MIN_INTERVAL_SECS: u64 = 1;
+const MAX_INTERVAL_SECS: u64 = 60;
 const SLOW_DOWN_STEP: Duration = Duration::from_secs(5);
 
 /// QR challenge returned by [`RegistrationFlow::begin`].
@@ -151,10 +155,13 @@ impl RegistrationFlow {
             .get("expires_in")
             .and_then(Value::as_u64)
             .unwrap_or(DEFAULT_EXPIRES_IN_SECS);
+        // Clamp the server-directed poll interval: a zero or tiny interval
+        // would busy-poll the accounts host until the deadline.
         let interval = response
             .get("interval")
             .and_then(Value::as_u64)
-            .unwrap_or(DEFAULT_INTERVAL_SECS);
+            .unwrap_or(DEFAULT_INTERVAL_SECS)
+            .clamp(MIN_INTERVAL_SECS, MAX_INTERVAL_SECS);
 
         let url = self.qr_url(verification_uri_complete)?;
         self.device_code = Some(device_code.to_owned());

@@ -33,6 +33,9 @@ impl LarkHttp {
         let client = Client::builder()
             .timeout(LARK_HTTP_TIMEOUT)
             .user_agent(concat!("lark-codex-bridge/", env!("CARGO_PKG_VERSION")))
+            // Never follow redirects: a 307/308 would re-post credential-bearing
+            // bodies to the redirect target, and these endpoints never redirect.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| LarkError::retryable("initializing the HTTP client"))?;
         Ok(Self { client, endpoints })
@@ -93,8 +96,8 @@ impl LarkHttp {
 
     /// POSTs a form to `{accounts_base}{path}` for the registration device
     /// flow, which returns protocol errors as 4xx responses with a JSON body
-    /// (RFC 8628). Any status below 500 therefore still parses as JSON; 5xx is
-    /// classified retryable.
+    /// (RFC 8628). Other 4xx statuses still parse as JSON, while 401/403 are
+    /// classified permanent and 429/5xx retryable.
     ///
     /// # Errors
     ///
@@ -119,11 +122,12 @@ impl LarkHttp {
         let request = self.client.post(url).form(form);
         let context = "POSTing an accounts form request";
         let (status, bytes) = self.execute(request, context).await?;
-        if status.is_server_error() {
-            return Err(LarkError::Retryable {
-                context,
-                code: Some(i64::from(status.as_u16())),
-            });
+        let code = Some(i64::from(status.as_u16()));
+        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            return Err(LarkError::PermanentAuth { context, code });
+        }
+        if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+            return Err(LarkError::Retryable { context, code });
         }
         parse_json(&bytes, "parsing an accounts form response")
     }
