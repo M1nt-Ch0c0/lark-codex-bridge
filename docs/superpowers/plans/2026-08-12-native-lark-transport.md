@@ -164,7 +164,7 @@ Commit `feat: add Lark tenant config, credentials, and token cache`.
 - Consumes: `LarkHttp`, `LarkCredentials`, `CredentialStore`, `TenantTokenProvider`.
 - Produces: `RegistrationFlow`, `RegistrationOutcome`, and CLI `lark auth check` / `lark auth register`.
 
-- [ ] **Step 1: Implement the registration device flow**
+- [x] **Step 1: Implement the registration device flow**
 
 ```rust
 pub struct RegistrationFlow { /* endpoints, state */ }
@@ -189,15 +189,15 @@ impl RegistrationFlow {
 
 Protocol (from the reference SDK's `registerApp` in the bundled node-sdk): `POST {accounts_base}/oauth/v1/app/registration`, form-encoded, `action=begin&archetype=PersonalAgent&auth_method=client_secret&request_user_info=open_id`; the response carries `device_code`, `verification_uri_complete`, `expires_in`, `interval`. The QR URL appends `from=sdk`, `source=lark-codex-bridge`, `tp=sdk`, and optionally `addons` (JSON → gzip → base64url, `+`→`-`, `/`→`_`, strip `=`). Polling posts `action=poll&device_code=…`; `authorization_pending` → `Pending`, `slow_down` → increase interval by 5 s, `access_denied`/`expired_token` → terminal error, success returns `client_id`/`client_secret` plus `user_info.tenant_brand`. When `tenant_brand == "lark"`, switch the accounts base URL to `accounts.larksuite.com` exactly once, mirroring the reference. Enforce a registration deadline (`LARK_REGISTER_TIMEOUT`, default 20 minutes — matches the reference QR session TTL).
 
-- [ ] **Step 2: Add CLI onboarding for both paths**
+- [x] **Step 2: Add CLI onboarding for both paths**
 
 `lark auth register` runs the device flow: prints the QR URL (and, when a terminal renderer is trivially available later, the QR itself — plain URL output is sufficient in this milestone), polls with server-directed intervals, validates the returned credentials through `TenantTokenProvider` + `GET /open-apis/bot/v3/info`, then saves them through `CredentialStore`. `lark auth register --app-id <id> --app-secret <secret> --tenant <feishu|lark>` validates and saves existing credentials instead. `lark auth check` loads stored credentials, exchanges a tenant token, fetches bot info, and prints one sanitized JSON object (tenant, bot name, bot open_id) — never the secret or token.
 
-- [ ] **Step 3: Test the flow against the stub server**
+- [x] **Step 3: Test the flow against the stub server**
 
 Extend the Task 1 stub to serve `/oauth/v1/app/registration`. Cover begin response parsing, QR URL query assembly including gzip+base64url `addons`, pending → slow_down(interval grows) → success sequencing, `access_denied` terminal failure, one-time Lark domain switch on `tenant_brand: "lark"`, deadline expiry, and existing-app validation rejecting bad credentials with an actionable error.
 
-- [ ] **Step 4: Verify and publish the task**
+- [x] **Step 4: Verify and publish the task**
 
 Run:
 

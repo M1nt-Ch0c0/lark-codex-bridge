@@ -106,6 +106,16 @@ impl LarkHttp {
         form: &[(&str, &str)],
     ) -> Result<serde_json::Value, LarkError> {
         let url = self.endpoints.accounts_url(path)?;
+        self.post_form_at(url, form).await
+    }
+
+    /// Same as [`LarkHttp::post_accounts_form`] but against an explicit base
+    /// URL, so the registration flow can switch accounts domains mid-flight.
+    pub(crate) async fn post_form_at(
+        &self,
+        url: url::Url,
+        form: &[(&str, &str)],
+    ) -> Result<serde_json::Value, LarkError> {
         let request = self.client.post(url).form(form);
         let context = "POSTing an accounts form request";
         let (status, bytes) = self.execute(request, context).await?;

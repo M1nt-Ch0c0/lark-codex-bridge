@@ -54,3 +54,6 @@ pub const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Shared timeout for every Lark HTTP request (matches the reference
 /// bootstrap request timeout).
 pub const LARK_HTTP_TIMEOUT: Duration = Duration::from_secs(15);
+/// Overall deadline for one QR registration session (matches the reference
+/// QR session TTL).
+pub const LARK_REGISTER_TIMEOUT: Duration = Duration::from_secs(20 * 60);

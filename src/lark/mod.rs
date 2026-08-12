@@ -10,4 +10,5 @@ pub mod config;
 pub mod credentials;
 pub mod error;
 pub mod http;
+pub mod register;
 pub mod token;
