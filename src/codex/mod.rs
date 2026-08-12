@@ -4,5 +4,6 @@ pub mod client;
 pub mod process;
 pub mod protocol;
 pub mod rpc;
+pub mod supervisor;
 pub mod transport;
 pub mod types;

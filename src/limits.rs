@@ -39,6 +39,8 @@ pub const RPC_HIGH_BYTE_BUDGET: usize = RPC_BYTE_BUDGET;
 pub const RPC_RELIABLE_EVENT_BYTE_BUDGET: usize = RPC_BYTE_BUDGET;
 
 pub const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
+pub const SUPERVISOR_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 pub const CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 pub const INTERRUPT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
