@@ -338,7 +338,7 @@ Commit `feat: add app-server RPC broker` and push `main`.
 - Consumes: initialized `RpcHandle` and stable DTOs.
 - Produces: `AppServerClient`, `ThreadId`, `TurnId`, `ThreadSubscription`, `AppServerEvent`, and `TurnOutcome`.
 
-- [ ] **Step 1: Implement thread-scoped event routing**
+- [x] **Step 1: Implement thread-scoped event routing**
 
 ```rust
 impl AppServerClient {
@@ -352,15 +352,15 @@ impl AppServerClient {
 
 Create a bounded mailbox per subscribed thread. Route global warnings separately. Coalesce agent and command deltas by item when a mailbox nears capacity; never drop responses, server requests, `item/completed`, or `turn/completed`. Merge `turn/start` response and `turn/started` idempotently by turn ID.
 
-- [ ] **Step 2: Implement authoritative turn projection**
+- [x] **Step 2: Implement authoritative turn projection**
 
 `ThreadSubscription` yields raw typed events and maintains last completed item state. `TurnOutcome` contains status, optional error, completed items, and token usage; it becomes available only after `turn/completed`. An interrupted turn is a successful terminal outcome with status `Interrupted`, not a transport error.
 
-- [ ] **Step 3: Test full fake-server flows**
+- [x] **Step 3: Test full fake-server flows**
 
 Cover new thread, resumed thread, delta before item start, duplicate item terminal, turn response/notification inversion, final agent message, failed turn, interrupt acknowledgement followed by interrupted terminal, unknown notification, and mailbox pressure preserving terminal events.
 
-- [ ] **Step 4: Verify and publish the task**
+- [x] **Step 4: Verify and publish the task**
 
 Run:
 
