@@ -390,7 +390,7 @@ Commit `feat: drive Codex threads and turns` and push `main`.
 - Consumes: process adapter, transport, RPC handshake, typed client.
 - Produces: `AppServerSupervisor`, `SupervisorHandle`, `SupervisorState`, and a functional `codex probe` command.
 
-- [ ] **Step 1: Implement supervisor state and restart policy**
+- [x] **Step 1: Implement supervisor state and restart policy**
 
 ```rust
 pub enum SupervisorState {
@@ -408,15 +408,15 @@ impl AppServerSupervisor {
 
 The supervisor owns the child and cancellation token. Unexpected exit fails the epoch, increments it, then retries with jittered delays based on 0.5, 1, 2, 4, 8, 16, and 30 seconds. Version/auth/config permanent errors enter `Degraded`. Shutdown cancels tasks, closes stdin, waits 5 seconds, then kills the child and waits for exit.
 
-- [ ] **Step 2: Implement `codex probe`**
+- [x] **Step 2: Implement `codex probe`**
 
 The command prints one JSON object containing supported version, initialize user agent, platform family/OS, and epoch. It must not print Codex home, account identity, tokens, environment, or raw responses. It exits non-zero for missing binary, unsupported version, handshake timeout, or early child exit.
 
-- [ ] **Step 3: Add fake-factory supervisor tests**
+- [x] **Step 3: Add fake-factory supervisor tests**
 
 Inject a `ProcessFactory` trait so tests deterministically verify state ordering, exponential cap, epoch increments, pending request failure, permanent version failure without retry, graceful shutdown, and force kill after timeout.
 
-- [ ] **Step 4: Add the opt-in real smoke test**
+- [x] **Step 4: Add the opt-in real smoke test**
 
 Mark `tests/codex_smoke.rs` with `#[ignore = "requires an authenticated Codex account"]`. The test requires `CODEX_E2E=1`; otherwise it exits successfully after printing a skip reason. When enabled, it starts the installed `codex`, initializes, creates an ephemeral read-only thread in a temporary cwd, starts a turn with `Reply with exactly: pong`, waits up to 180 seconds, asserts a completed agent message contains `pong`, and shuts down without an orphan child. Authentication failures fail with an actionable login diagnostic so the milestone cannot claim a false positive.
 

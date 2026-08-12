@@ -5,9 +5,26 @@
 
 ## 项目状态
 
-当前处于早期开发阶段。已完成架构设计与第一阶段的 Codex app-server
-基础客户端（初始化、线程/回合、事件路由、打断和审批响应），正在继续实现
-飞书侧的业务能力。
+当前处于早期开发阶段。已完成架构设计与 Codex app-server 基础层：有界 stdio
+transport、RPC 握手与并发、typed thread/turn client、supervisor（重启退避、
+永久错误 Degraded、优雅关闭）、结构化 `codex probe`，以及门控的真实 Codex
+smoke 测试。正在继续实现飞书侧的业务能力。
+
+## Codex 环境检查
+
+```bash
+cargo run -- codex probe
+```
+
+`codex probe` 会真实启动 `codex app-server --listen stdio://` 并完成 initialize
+握手，输出单个 JSON 对象，只包含 supported version、initialize user agent、
+platform family/OS 和 epoch；不包含 Codex home、账户身份、token 或环境变量。
+
+真实端到端 smoke 需要已认证的 Codex 账户，并按环境变量门控：
+
+```bash
+CODEX_E2E=1 cargo test --test codex_smoke --locked -- --ignored --nocapture
+```
 
 设计规格见
 [docs/superpowers/specs/2026-08-12-lark-codex-bridge-design.md](docs/superpowers/specs/2026-08-12-lark-codex-bridge-design.md)。
