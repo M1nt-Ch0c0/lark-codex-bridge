@@ -118,6 +118,138 @@ impl LarkHttp {
         parse_json(&bytes, "parsing an OpenAPI JSON response")
     }
 
+    /// POSTs a JSON body with a tenant-token bearer header and parses the
+    /// JSON response. The token is attached as a header and never logged.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified error on transport failure, non-success status,
+    /// oversize body, or malformed JSON.
+    pub(crate) async fn post_json_bearer<P, R>(
+        &self,
+        path: &str,
+        body: &P,
+        bearer: &SecretString,
+    ) -> Result<R, LarkError>
+    where
+        P: Serialize + Sync,
+        R: DeserializeOwned,
+    {
+        let url = self.endpoints.open_url(path)?;
+        let request = self
+            .client
+            .post(url)
+            .json(body)
+            .bearer_auth(bearer.expose_secret());
+        let (status, bytes) = self
+            .execute(request, "POSTing an OpenAPI JSON request")
+            .await?;
+        ensure_success(status, "POSTing an OpenAPI JSON request")?;
+        parse_json(&bytes, "parsing an OpenAPI JSON response")
+    }
+
+    /// Sends a `PATCH` JSON body with a tenant-token bearer header and parses
+    /// the JSON response. Used by card updates.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified error on transport failure, non-success status,
+    /// oversize body, or malformed JSON.
+    pub(crate) async fn patch_json_bearer<P, R>(
+        &self,
+        path: &str,
+        body: &P,
+        bearer: &SecretString,
+    ) -> Result<R, LarkError>
+    where
+        P: Serialize + Sync,
+        R: DeserializeOwned,
+    {
+        let url = self.endpoints.open_url(path)?;
+        let request = self
+            .client
+            .patch(url)
+            .json(body)
+            .bearer_auth(bearer.expose_secret());
+        let (status, bytes) = self
+            .execute(request, "PATCHing an OpenAPI JSON request")
+            .await?;
+        ensure_success(status, "PATCHing an OpenAPI JSON request")?;
+        parse_json(&bytes, "parsing an OpenAPI JSON response")
+    }
+
+    /// POSTs a multipart form with a tenant-token bearer header and parses
+    /// the JSON response. Used by image/file uploads.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified error on transport failure, non-success status,
+    /// oversize body, or malformed JSON.
+    pub(crate) async fn post_multipart_bearer<R>(
+        &self,
+        path: &str,
+        form: reqwest::multipart::Form,
+        bearer: &SecretString,
+    ) -> Result<R, LarkError>
+    where
+        R: DeserializeOwned,
+    {
+        let url = self.endpoints.open_url(path)?;
+        let request = self
+            .client
+            .post(url)
+            .multipart(form)
+            .bearer_auth(bearer.expose_secret());
+        let (status, bytes) = self
+            .execute(request, "POSTing an OpenAPI multipart request")
+            .await?;
+        ensure_success(status, "POSTing an OpenAPI multipart request")?;
+        parse_json(&bytes, "parsing an OpenAPI JSON response")
+    }
+
+    /// GETs `{open_base}{path}` with a tenant-token bearer header, streaming
+    /// the body into memory with a hard `limit` byte cap. The stream is
+    /// aborted mid-body once the cap is exceeded rather than buffering an
+    /// unbounded response.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified error on transport failure, non-success status,
+    /// or an oversize body.
+    pub(crate) async fn get_bytes_bearer(
+        &self,
+        path: &str,
+        bearer: &SecretString,
+        limit: usize,
+    ) -> Result<Bytes, LarkError> {
+        let url = self.endpoints.open_url(path)?;
+        let request = self.client.get(url).bearer_auth(bearer.expose_secret());
+        let context = "GETting an OpenAPI binary resource";
+        let mut response = request
+            .send()
+            .await
+            .map_err(|_| LarkError::retryable(context))?;
+        let status = response.status();
+        ensure_success(status, context)?;
+        if let Some(length) = response.content_length() {
+            if length > limit as u64 {
+                return Err(LarkError::exhausted(context, limit as u64));
+            }
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| LarkError::retryable(context))?
+        {
+            if body.len() + chunk.len() > limit {
+                return Err(LarkError::exhausted(context, limit as u64));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(Bytes::from(body))
+    }
+
     /// POSTs a form to `{accounts_base}{path}` for the registration device
     /// flow, which returns protocol errors as 4xx responses with a JSON body
     /// (RFC 8628). Other 4xx statuses still parse as JSON, while 401/403 are

@@ -6,6 +6,7 @@
 //! via [`error::LarkError`] so callers can distinguish permanent
 //! authentication failures from retryable ones.
 
+pub mod api;
 pub mod config;
 pub mod credentials;
 pub mod error;

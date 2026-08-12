@@ -45,6 +45,18 @@ pub const LARK_MAX_HTTP_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// expiry (matches the reference SDK's early-expiry margin).
 pub const TOKEN_REFRESH_SKEW: Duration = Duration::from_secs(3 * 60);
 
+/// Hard cap on one outbound Lark message/card request body (serialized JSON,
+/// envelope included). Oversize sends are refused before any request I/O.
+pub const LARK_MAX_SEND_BODY_BYTES: usize = 256 * 1024;
+/// Hard cap on one downloaded Lark message resource (image/file). The
+/// download stream is aborted mid-body once the cap is exceeded instead of
+/// buffering an unbounded response.
+pub const LARK_MAX_RESOURCE_BYTES: usize = 20 * 1024 * 1024;
+/// Hard cap on one uploaded Lark image/file. Oversize inputs are refused
+/// before any upload I/O (the reference uploader relies on server-side
+/// rejection only; the design deliberately tightens this).
+pub const LARK_MAX_UPLOAD_BYTES: usize = 20 * 1024 * 1024;
+
 pub const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const SUPERVISOR_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(60);

@@ -16,11 +16,12 @@ use secrecy::SecretString;
 use serde_json::Value;
 use url::Url;
 
+use super::api::{BotInfo, LarkApi};
 use super::config::{LarkEndpoints, TenantBrand};
 use super::credentials::LarkCredentials;
 use super::error::LarkError;
 use super::http::LarkHttp;
-use super::token::{BotInfo, TenantTokenProvider};
+use super::token::TenantTokenProvider;
 use crate::limits::LARK_REGISTER_TIMEOUT;
 
 const REGISTRATION_PATH: &str = "/oauth/v1/app/registration";
@@ -316,5 +317,6 @@ pub async fn validate_credentials(
     http: LarkHttp,
     creds: LarkCredentials,
 ) -> Result<BotInfo, LarkError> {
-    TenantTokenProvider::new(http, creds).bot_info().await
+    let tokens = TenantTokenProvider::new(http.clone(), creds);
+    LarkApi::new(http, tokens).bot_info().await
 }

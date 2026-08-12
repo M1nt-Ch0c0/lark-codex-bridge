@@ -129,3 +129,24 @@ impl fmt::Debug for LarkError {
 }
 
 impl std::error::Error for LarkError {}
+
+/// Lark `code` range covering invalid app credentials, app tickets, and
+/// tokens; these can never succeed on retry.
+pub(crate) const PERMANENT_AUTH_CODES: std::ops::RangeInclusive<i64> = 99_991_661..=99_991_672;
+
+/// Classifies a Lark envelope `code`: `0` is success, the permanent-auth
+/// range is [`LarkError::PermanentAuth`], everything else is
+/// [`LarkError::Retryable`]. Server-provided messages are discarded.
+pub(crate) fn check_code(code: i64, context: &'static str) -> Result<(), LarkError> {
+    match code {
+        0 => Ok(()),
+        code if PERMANENT_AUTH_CODES.contains(&code) => Err(LarkError::PermanentAuth {
+            context,
+            code: Some(code),
+        }),
+        code => Err(LarkError::Retryable {
+            context,
+            code: Some(code),
+        }),
+    }
+}

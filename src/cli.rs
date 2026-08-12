@@ -12,11 +12,11 @@ use crate::{
         supervisor::{AppServerSupervisor, SupervisorHandle, SupervisorState},
     },
     lark::{
+        api::BotInfo,
         config::{LarkEndpoints, TenantBrand},
         credentials::{CredentialStore, FileCredentialStore, LarkCredentials, load_credentials},
         http::LarkHttp,
         register::{RegistrationFlow, RegistrationOutcome, validate_credentials},
-        token::BotInfo,
     },
     limits::PROBE_TIMEOUT,
 };

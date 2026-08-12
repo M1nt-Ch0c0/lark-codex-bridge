@@ -1,0 +1,24 @@
+{
+  "code": 0,
+  "msg": "success",
+  "data": {
+    "chat_id": "oc_a0553eda9014c201e6969b4788953000",
+    "avatar": "https://internal-api-space.example.invalid/avatar/scrubbed",
+    "name": "scrubbed-topic-group",
+    "description": "scrubbed",
+    "owner_id": "ou_155184d1e73cb1458973df8d9e3000a",
+    "owner_id_type": "open_id",
+    "external": false,
+    "tenant_key": "0a1b2c3d4e5f6070",
+    "chat_status": "normal",
+    "message_tab_permission": "all_members",
+    "chat_mode": "topic",
+    "chat_type": "group",
+    "join_message_visibility": "all",
+    "leave_message_visibility": "all",
+    "membership_approval": "no_approval_required",
+    "moderation_permission": "all_members",
+    "user_count": "3",
+    "bot_count": "1"
+  }
+}

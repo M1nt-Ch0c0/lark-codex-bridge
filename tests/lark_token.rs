@@ -247,36 +247,6 @@ async fn debug_output_never_contains_secret_material() {
     );
 }
 
-#[tokio::test]
-async fn bot_info_returns_a_sanitized_identity() {
-    let server = StubServer::start(Arc::new(|request: &RecordedRequest| {
-        match request.path.as_str() {
-            "/open-apis/auth/v3/tenant_access_token/internal" => StubResponse::json(
-                200,
-                r#"{"code":0,"tenant_access_token":"token-0","expire":7200}"#,
-            ),
-            "/open-apis/bot/v3/info" => StubResponse::json(
-                200,
-                r#"{"code":0,"bot":{"app_name":"Bridge Bot","open_id":"ou_bot"}}"#,
-            ),
-            _ => StubResponse::json(404, r#"{"code":1}"#),
-        }
-    }))
-    .await;
-    let provider = provider_for(&server);
-
-    let info = provider.bot_info().await.expect("bot info should succeed");
-
-    assert_eq!(info.app_name.as_deref(), Some("Bridge Bot"));
-    assert_eq!(info.open_id.as_deref(), Some("ou_bot"));
-    let info_request = server
-        .requests()
-        .into_iter()
-        .find(|request| request.path == "/open-apis/bot/v3/info")
-        .expect("bot info request should be recorded");
-    assert_eq!(info_request.header("authorization"), Some("Bearer token-0"));
-}
-
 #[test]
 fn credential_file_roundtrip_preserves_fields_and_permissions() {
     let dir = tempfile::tempdir().expect("tempdir should be created");

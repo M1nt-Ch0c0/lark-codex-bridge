@@ -385,7 +385,7 @@ Commit `feat: add Lark WebSocket transport with reconnect and receipts`.
 - Consumes: `LarkHttp`, `TenantTokenProvider`.
 - Produces: `LarkApi`, `MessageRef`, `ChatMode`, `ResourceData`, and typed request/response DTOs.
 
-- [ ] **Step 1: Implement message and card sending**
+- [x] **Step 1: Implement message and card sending**
 
 ```rust
 impl LarkApi {
@@ -400,7 +400,7 @@ impl LarkApi {
 
 Wire paths (from the bundled node-sdk codegen): `POST /open-apis/im/v1/messages?receive_id_type=chat_id` for sends, `POST /open-apis/im/v1/messages/{message_id}/reply` for replies (`reply_in_thread: true` for topic replies), `PATCH /open-apis/im/v1/messages/{message_id}` for card updates. Every call attaches `Authorization: Bearer <tenant token>` from `TenantTokenProvider`, classifies `code != 0` into `PermanentAuth` (99991663-class token errors trigger exactly one forced token refresh retry) vs `Retryable`, and caps outbound text/card bodies at `LARK_MAX_SEND_BODY_BYTES`. Message content is never logged.
 
-- [ ] **Step 2: Implement message get, chat info, and bounded resource download**
+- [x] **Step 2: Implement message get, chat info, and bounded resource download**
 
 ```rust
 pub enum ChatMode { P2p, Group, Topic }
@@ -418,11 +418,11 @@ impl LarkApi {
 
 Paths: `GET /open-apis/im/v1/messages/{message_id}`, `GET /open-apis/im/v1/chats/{chat_id}` (`chat_mode` field maps `p2p`/`group`/`topic`), `GET /open-apis/im/v1/messages/{message_id}/resources/{file_key}?type=image|file`, `POST /open-apis/im/v1/images` and `POST /open-apis/im/v1/files` (multipart), `GET /open-apis/bot/v3/info`. Downloads stream through a `LARK_MAX_RESOURCE_BYTES` (e.g. 20 MiB) hard cap that aborts mid-body rather than buffering unbounded data; uploads likewise refuse oversize inputs before sending.
 
-- [ ] **Step 3: Test request shapes, auth, and bounds against the stub**
+- [x] **Step 3: Test request shapes, auth, and bounds against the stub**
 
 Assert exact method/path/query/header/body for every call, including `receive_id_type`, `reply_in_thread`, multipart field names, and the bearer header. Cover token-error → single forced refresh → retry once, `PermanentAuth` propagation, body cap abort on an oversize download stream, oversize upload rejection before I/O, and `code != 0` classification fixtures.
 
-- [ ] **Step 4: Verify and publish the task**
+- [x] **Step 4: Verify and publish the task**
 
 Run:
 

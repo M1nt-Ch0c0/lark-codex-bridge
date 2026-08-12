@@ -9,25 +9,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use super::credentials::LarkCredentials;
-use super::error::LarkError;
+use super::error::{LarkError, check_code};
 use super::http::LarkHttp;
 use crate::limits::TOKEN_REFRESH_SKEW;
 
 const TOKEN_PATH: &str = "/open-apis/auth/v3/tenant_access_token/internal";
-const BOT_INFO_PATH: &str = "/open-apis/bot/v3/info";
-
-/// Lark `code` range covering invalid app credentials, app tickets, and
-/// tokens; these can never succeed on retry.
-const PERMANENT_AUTH_CODES: std::ops::RangeInclusive<i64> = 99_991_661..=99_991_672;
-
-/// Sanitized bot identity returned by `GET /open-apis/bot/v3/info`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BotInfo {
-    /// Bot display name (`app_name` on the wire).
-    pub app_name: Option<String>,
-    /// Bot `open_id`.
-    pub open_id: Option<String>,
-}
 
 /// Caches the tenant access token for one app.
 ///
@@ -90,37 +76,23 @@ impl TenantTokenProvider {
         Ok(token)
     }
 
-    /// Fetches the sanitized bot identity using a cached tenant token.
+    /// Returns a freshly exchanged tenant access token, ignoring and
+    /// replacing the cached entry.
+    ///
+    /// Used by the `OpenAPI` client when a call fails with a token-invalid
+    /// error: the cached token is provably stale, so exactly one forced
+    /// refresh is followed by exactly one retry of the failed call.
     ///
     /// # Errors
     ///
-    /// Returns a classified error on token exchange or bot-info failure.
-    pub async fn bot_info(&self) -> Result<BotInfo, LarkError> {
-        #[derive(Deserialize)]
-        struct BotInfoResponse {
-            code: i64,
-            bot: Option<BotInfoDto>,
-        }
-        #[derive(Deserialize)]
-        struct BotInfoDto {
-            app_name: Option<String>,
-            open_id: Option<String>,
-        }
-
-        let token = self.token().await?;
-        let response: BotInfoResponse = self
-            .inner
-            .http
-            .get_json(BOT_INFO_PATH, Some(&token))
-            .await?;
-        check_code(response.code, "fetching bot info")?;
-        let bot = response
-            .bot
-            .ok_or_else(|| LarkError::protocol("bot info response missing the bot object"))?;
-        Ok(BotInfo {
-            app_name: bot.app_name,
-            open_id: bot.open_id,
-        })
+    /// Returns `PermanentAuth` for rejected credentials, `Retryable` for
+    /// transient failures, and `ProtocolViolation` for malformed responses.
+    pub async fn force_refresh(&self) -> Result<SecretString, LarkError> {
+        let mut state = self.inner.state.lock().await;
+        let fresh = self.fetch_token().await?;
+        let token = fresh.token.clone();
+        state.cached = Some(fresh);
+        Ok(token)
     }
 
     async fn fetch_token(&self) -> Result<CachedToken, LarkError> {
@@ -171,19 +143,5 @@ impl fmt::Debug for TenantTokenProvider {
             .field("app_id", &self.inner.creds.app_id)
             .field("tenant", &self.inner.creds.tenant)
             .finish_non_exhaustive()
-    }
-}
-
-fn check_code(code: i64, context: &'static str) -> Result<(), LarkError> {
-    match code {
-        0 => Ok(()),
-        code if PERMANENT_AUTH_CODES.contains(&code) => Err(LarkError::PermanentAuth {
-            context,
-            code: Some(code),
-        }),
-        code => Err(LarkError::Retryable {
-            context,
-            code: Some(code),
-        }),
     }
 }

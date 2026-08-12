@@ -1,0 +1,30 @@
+{
+  "code": 0,
+  "msg": "success",
+  "data": {
+    "items": [
+      {
+        "message_id": "om_x100b5496d4b93cc0c73c1df0dc0000a",
+        "root_id": "om_x100b5496d4b93cc0c73c1df0dc00001",
+        "parent_id": "om_x100b5496d4b93cc0c73c1df0dc00002",
+        "msg_type": "text",
+        "create_time": "1755000000000",
+        "update_time": "1755000000000",
+        "deleted": false,
+        "updated": false,
+        "chat_id": "oc_a0553eda9014c201e6969b4788953000",
+        "chat_type": "group",
+        "sender": {
+          "id": "ou_155184d1e73cb1458973df8d9e3000a",
+          "id_type": "open_id",
+          "sender_type": "user"
+        },
+        "body": {
+          "content": "{\"text\":\"scrubbed content\"}"
+        },
+        "mentions": [],
+        "thread_id": "omt_1a9c1d74fd104000"
+      }
+    ]
+  }
+}
