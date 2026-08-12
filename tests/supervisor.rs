@@ -211,7 +211,7 @@ async fn initialize_fake(stdout: &mut DuplexStream, stdin: DuplexStream) {
         json!({
             "id": request["id"],
             "result": {
-                "codexHome": "/scrubbed",
+                "codexHome": absolute_codex_home(),
                 "platformFamily": "unix",
                 "platformOs": "linux",
                 "userAgent": "codex-cli/0.146.0"
@@ -221,6 +221,16 @@ async fn initialize_fake(stdout: &mut DuplexStream, stdin: DuplexStream) {
     .await;
     let initialized = read_line(&mut stdin).await;
     assert_eq!(initialized["method"], "initialized");
+}
+
+// The handshake rejects a non-absolute `codexHome`; Windows requires a
+// drive-prefixed path, so mirror the helper used by the other test suites.
+fn absolute_codex_home() -> &'static str {
+    if cfg!(windows) {
+        r"C:\scrubbed-codex-home"
+    } else {
+        "/tmp/scrubbed-codex-home"
+    }
 }
 
 async fn read_line(reader: &mut BufReader<DuplexStream>) -> Value {
