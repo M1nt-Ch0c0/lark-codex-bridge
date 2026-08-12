@@ -228,7 +228,7 @@ Commit `feat: add PersonalAgent QR registration and app onboarding`.
 - Produces: `Frame`, `Header`, `FrameMethod`, `MessageType`, `FrameHeaders`, `Reassembler`, `Reassembly`, `ReassemblyError`.
 - Consumes: `prost`, `bytes`, `LarkError`.
 
-- [ ] **Step 1: Implement the pbbp2 wire messages with pure prost derives**
+- [x] **Step 1: Implement the pbbp2 wire messages with pure prost derives**
 
 No `build.rs` and no `protoc` requirement; derive directly in Rust source with explicit field numbers extracted from the reference SDK's generated encoder:
 
@@ -255,7 +255,7 @@ pub struct Frame {
 
 Custom `Debug` for `Frame` redacts `payload` (logs length only). Provide `FrameHeaders` helpers for `type`, `message_id`, `sum`, `seq`, `trace_id`, `biz_rt`, `handshake-status`, `handshake-msg`, `handshake-autherrcode`, and the `MessageType` enum (`event`, `card`, `ping`, `pong`).
 
-- [ ] **Step 2: Implement bounded fragment reassembly**
+- [x] **Step 2: Implement bounded fragment reassembly**
 
 ```rust
 pub struct Reassembly {
@@ -274,11 +274,11 @@ impl Reassembler {
 
 Semantics from the reference `DataCache` plus the design's hardening: single-fragment frames (`sum == 1`) pass through directly; multi-fragment frames allocate a per-message slot vector keyed by `message_id`, indexed by `seq`, completing when all `sum` slots are filled. Enforce simultaneously: `LARK_FRAGMENT_TOTAL_BYTES` (e.g. 8 MiB), `LARK_FRAGMENT_MESSAGE_BYTES` (e.g. 1 MiB), `LARK_FRAGMENT_MAX_COUNT` per message and in flight, and a 5-second TTL per message swept on ingest (not by a background timer). Duplicate `seq`, `seq >= sum`, `sum == 0`, and conflicting `sum` for an in-flight `message_id` are rejected and recorded as protocol anomalies with IDs only.
 
-- [ ] **Step 3: Add codec goldens and reassembly boundary tests**
+- [x] **Step 3: Add codec goldens and reassembly boundary tests**
 
 Goldens: hand-computed byte vectors for a ping frame (control, `service=<id>`, `type=ping`, SeqID/LogID 0) and a single-fragment event frame, plus round-trips preserving unknown/optional fields. Reassembly: out-of-order arrival, duplicate fragment, `seq` out of range, sum mismatch, per-message byte overflow, total byte overflow, fragment count overflow, TTL expiry mid-sequence, and `Debug` redaction of payload bytes.
 
-- [ ] **Step 4: Verify and publish the task**
+- [x] **Step 4: Verify and publish the task**
 
 Run:
 

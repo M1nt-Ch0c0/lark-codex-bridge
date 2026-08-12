@@ -57,3 +57,33 @@ pub const LARK_HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 /// Overall deadline for one QR registration session (matches the reference
 /// QR session TTL).
 pub const LARK_REGISTER_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+
+/// Total bytes buffered across all in-flight fragmented Lark messages.
+pub const LARK_FRAGMENT_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum reassembled payload size of a single Lark message; also the WebSocket
+/// binary message cap, since one fragment can never legally exceed it.
+pub const LARK_FRAGMENT_MESSAGE_BYTES: usize = 1024 * 1024;
+/// Maximum fragment count of one Lark message; `sum` headers above this are
+/// rejected instead of allocating a huge slot vector.
+pub const LARK_FRAGMENT_MESSAGE_MAX_FRAGMENTS: usize = 64;
+/// Maximum distinct fragmented Lark messages buffered concurrently.
+pub const LARK_FRAGMENT_MAX_IN_FLIGHT: usize = 64;
+/// Time-to-live of a partially reassembled Lark message, swept on ingest
+/// (deliberately tighter than the reference SDK's 10 s interval sweep).
+pub const LARK_FRAGMENT_TTL: Duration = Duration::from_secs(5);
+
+/// After the transport sends a ping, any inbound frame within this window
+/// proves liveness; otherwise the socket is dropped to trigger a reconnect.
+pub const LARK_PONG_TIMEOUT: Duration = Duration::from_secs(10);
+/// Fallback ping interval when the server bootstrap does not provide a
+/// positive `PingInterval`.
+pub const LARK_DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(30);
+/// Timeout for one WebSocket connect/handshake attempt.
+pub const LARK_WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Bounded grace for the Lark WebSocket actor to close the socket on shutdown.
+pub const LARK_TRANSPORT_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+/// Count bound of the transport observation channel (state/messages/anomalies).
+pub const LARK_TRANSPORT_EVENT_CAPACITY: usize = 64;
+/// Byte budget for message payloads parked in the transport observation
+/// channel; permits are held until the receiver dequeues.
+pub const LARK_TRANSPORT_EVENT_BYTE_BUDGET: usize = 8 * 1024 * 1024;

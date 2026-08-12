@@ -9,6 +9,8 @@
 pub mod config;
 pub mod credentials;
 pub mod error;
+pub mod fragments;
+pub mod frame;
 pub mod http;
 pub mod register;
 pub mod token;

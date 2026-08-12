@@ -1,0 +1,44 @@
+{
+  "description": "Scrubbed pbbp2 frame shapes for the Lark frame codec tests. Field numbers: SeqID=1, LogID=2 (uint64); service=3, method=4 (int32, 0=control, 1=data); headers=5 (repeated {key=1, value=2}); payloadEncoding=6, payloadType=7 (optional string); payload=8 (optional bytes); LogIDNew=9 (optional string). proto3: zero scalars are not emitted on the wire.",
+  "ping_frame": {
+    "comment": "control liveness frame sent by the client every PingInterval; SeqID/LogID are 0",
+    "service": 7,
+    "method": 0,
+    "headers": [{ "key": "type", "value": "ping" }]
+  },
+  "single_fragment_event_frame": {
+    "comment": "data frame whose sum header is 1 (or absent) passes through the reassembler directly; payload is UTF-8 JSON",
+    "seq_id": 0,
+    "log_id": 0,
+    "service": 7,
+    "method": 1,
+    "headers": [
+      { "key": "type", "value": "event" },
+      { "key": "message_id", "value": "m-1" },
+      { "key": "sum", "value": "1" },
+      { "key": "seq", "value": "0" },
+      { "key": "trace_id", "value": "tr-1" }
+    ],
+    "payload_utf8": "{}"
+  },
+  "multi_fragment_event_frame": {
+    "comment": "data frame of a fragmented message: fragments share message_id, sum is the total count, seq is the zero-based index; reassembled payload is UTF-8 JSON",
+    "seq_id": 0,
+    "log_id": 0,
+    "service": 7,
+    "method": 1,
+    "headers": [
+      { "key": "type", "value": "event" },
+      { "key": "message_id", "value": "m-multi" },
+      { "key": "sum", "value": "3" },
+      { "key": "seq", "value": "0" },
+      { "key": "trace_id", "value": "tr-multi" }
+    ],
+    "payload_utf8": "{\"part\":0"
+  },
+  "receipt_frame": {
+    "comment": "data frame sent back after the handler completes: the inbound frame's headers plus biz_rt (handler wall time in ms); payload is JSON {code:200,data?} or {code:500}; data is base64(JSON of the handler return value)",
+    "headers_extra": [{ "key": "biz_rt", "value": "3" }],
+    "payload_utf8": "{\"code\":200}"
+  }
+}
