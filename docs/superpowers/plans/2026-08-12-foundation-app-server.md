@@ -311,7 +311,7 @@ Generate IDs as `c:<epoch>:<monotonic-u64>`. Maintain one pending map with metho
 
 Verify notification-before-response, concurrent out-of-order responses, timeout cleanup, error responses, opaque server integer IDs, response priority, EOF failure fanout, old-epoch late response isolation, and initialize/initialized order.
 
-- [ ] **Step 4: Verify and publish the task**
+- [x] **Step 4: Verify and publish the task**
 
 Run:
 
