@@ -400,6 +400,7 @@ async fn liveness_timeout_drops_the_socket_and_reconnects() {
     let (handler, _seen) = ok_handler();
     let config = TransportConfig {
         pong_timeout: Duration::from_millis(200),
+        ..TransportConfig::default()
     };
     let (stub, mut ws_server, handle) =
         start_transport(DEFAULT_CLIENT_CONFIG, handler, config).await;
@@ -768,4 +769,101 @@ async fn shutdown_closes_the_socket_and_joins_without_orphans() {
     })
     .await;
     assert!(closed.is_ok(), "socket closed");
+}
+
+// ---------------------------------------------------------------------------
+// Handler bounding regressions
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn slow_handler_times_out_with_500_receipt() {
+    let config = TransportConfig {
+        handler_timeout: Duration::from_millis(200),
+        ..TransportConfig::default()
+    };
+    let handler: InboundFrameHandler = Arc::new(|_headers, _payload| {
+        Box::pin(std::future::pending::<Result<Option<Value>, LarkError>>())
+    });
+    let (_stub, mut ws_server, handle) =
+        start_transport(DEFAULT_CLIENT_CONFIG, handler, config).await;
+
+    let mut conn = ws_server.accept().await;
+    let _ping = conn.recv_frame().await;
+    conn.send_event("m-slow", 1, 0, b"{}").await;
+
+    // The stuck handler is cut off at the timeout and reported as a failure.
+    let receipt = conn.recv_receipt().await;
+    assert_eq!(receipt.frame_headers().message_id(), Some("m-slow"));
+    let body: Value = serde_json::from_slice(receipt.payload.as_ref().expect("payload"))
+        .expect("receipt payload is json");
+    assert_eq!(body["code"], 500);
+    assert!(body.get("data").is_none());
+
+    // The connection is still healthy afterwards: the next event is handled
+    // (and also times out, proving the loop kept running).
+    conn.send_event("m-after", 1, 0, b"{}").await;
+    let receipt = conn.recv_receipt().await;
+    assert_eq!(receipt.frame_headers().message_id(), Some("m-after"));
+
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn shutdown_is_bounded_even_with_a_stuck_handler() {
+    // Default handler timeout (60 s) far exceeds the shutdown grace (5 s):
+    // the bounded join must abort the actor instead of hanging.
+    let (entered_tx, mut entered_rx) = mpsc::channel::<()>(1);
+    let handler: InboundFrameHandler = Arc::new(move |_headers, _payload| {
+        let entered_tx = entered_tx.clone();
+        Box::pin(async move {
+            let _ = entered_tx.send(()).await;
+            std::future::pending::<Result<Option<Value>, LarkError>>().await
+        })
+    });
+    let (_stub, mut ws_server, handle) =
+        start_transport(DEFAULT_CLIENT_CONFIG, handler, TransportConfig::default()).await;
+
+    let mut conn = ws_server.accept().await;
+    let _ping = conn.recv_frame().await;
+    conn.send_event("m-stuck", 1, 0, b"{}").await;
+    timeout(TEST_TIMEOUT, entered_rx.recv())
+        .await
+        .expect("the handler is entered")
+        .expect("entry signal");
+
+    let started = Instant::now();
+    handle.shutdown().await;
+    assert!(
+        started.elapsed() < TEST_TIMEOUT,
+        "shutdown stays bounded by grace + abort"
+    );
+}
+
+#[tokio::test]
+async fn malformed_bootstrap_response_degrades_without_retry() {
+    // A malformed endpoint response is a protocol violation; retrying the
+    // same unparseable body cannot succeed, so the transport fails closed.
+    let stub = StubServer::start(Arc::new(|_| {
+        StubResponse::json(200, r#"{"code":0,"msg":"ok"}"#)
+    }))
+    .await;
+    let http = LarkHttp::new(endpoints_for(&stub)).expect("http client");
+    let (handler, _seen) = ok_handler();
+    let mut handle = LarkTransport::start(http, test_credentials(), handler);
+
+    loop {
+        match next_state(&mut handle).await {
+            TransportState::Degraded { reason } => {
+                assert!(reason.contains("protocol violation"), "reason: {reason}");
+                break;
+            }
+            TransportState::Stopped => panic!("stopped before degraded"),
+            _ => {}
+        }
+    }
+    assert_eq!(stub.request_count(), 1, "no retry on protocol violation");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(stub.request_count(), 1);
+
+    handle.shutdown().await;
 }

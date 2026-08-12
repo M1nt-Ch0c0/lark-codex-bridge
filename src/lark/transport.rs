@@ -21,13 +21,21 @@
 //!   by consecutive failure count, honoring the server `ReconnectNonce` as the
 //!   first delay and `ReconnectCount >= 0` as the attempt cap.
 //!   `ReconnectInterval` is parsed but intentionally unused for scheduling.
+//!   Note the cap semantics deliberately differ from the reference: the
+//!   reference counts only attempts inside one reconnect loop after a
+//!   successful connection, while this client counts consecutive failed
+//!   attempts since the last successful session (including the very first
+//!   connect), resetting the counter on every successful connect.
 //!
 //! Receipts: `{code: 200}` is sent only after the inbound handler completes
 //! successfully (with `data` = base64(JSON of the handler's return value)
-//! when it returns one); handler failure sends `{code: 500}`. A receipt send
-//! failure on a closing socket is logged, never retried. `PermanentAuth`/
-//! `Exhausted` from bootstrap or a `handshake-autherrcode` header enters
-//! [`TransportState::Degraded`] without further retries.
+//! when it returns one); handler failure — including exceeding
+//! [`LARK_HANDLER_TIMEOUT`] — sends `{code: 500}`. A receipt send failure on a
+//! closing socket is logged, never retried. `PermanentAuth`/`Exhausted` from
+//! bootstrap or a `handshake-autherrcode` header enters
+//! [`TransportState::Degraded`] without further retries; a `ProtocolViolation`
+//! from bootstrap (a malformed endpoint response) also fails closed into
+//! `Degraded`, since retrying an unparseable response cannot succeed.
 
 use std::fmt;
 use std::sync::Arc;
@@ -58,9 +66,9 @@ use super::frame::{Frame, FrameHeaders, FrameMethod, Header, MessageType, header
 use super::http::LarkHttp;
 use crate::codex::supervisor::AppServerSupervisor;
 use crate::limits::{
-    LARK_DEFAULT_PING_INTERVAL, LARK_FRAGMENT_MESSAGE_BYTES, LARK_PONG_TIMEOUT,
-    LARK_TRANSPORT_EVENT_BYTE_BUDGET, LARK_TRANSPORT_EVENT_CAPACITY, LARK_TRANSPORT_SHUTDOWN_GRACE,
-    LARK_WS_CONNECT_TIMEOUT,
+    LARK_DEFAULT_PING_INTERVAL, LARK_FRAGMENT_MESSAGE_BYTES, LARK_HANDLER_TIMEOUT,
+    LARK_PONG_TIMEOUT, LARK_TRANSPORT_EVENT_BYTE_BUDGET, LARK_TRANSPORT_EVENT_CAPACITY,
+    LARK_TRANSPORT_SHUTDOWN_GRACE, LARK_WS_CONNECT_TIMEOUT,
 };
 
 /// One pulled WebSocket endpoint plus its server-supplied client config.
@@ -198,12 +206,17 @@ pub struct TransportConfig {
     /// After a ping is sent, any inbound frame within this window proves
     /// liveness; otherwise the socket is dropped to trigger a reconnect.
     pub pong_timeout: Duration,
+    /// Upper bound for one handler invocation; on expiry the handler is
+    /// treated as failed and a `{code: 500}` receipt is sent, so a stuck
+    /// handler cannot stall the ping loop, liveness, or shutdown.
+    pub handler_timeout: Duration,
 }
 
 impl Default for TransportConfig {
     fn default() -> Self {
         Self {
             pong_timeout: LARK_PONG_TIMEOUT,
+            handler_timeout: LARK_HANDLER_TIMEOUT,
         }
     }
 }
@@ -546,7 +559,7 @@ impl Actor {
                 attempt: failures.saturating_add(1),
             });
             match self.connect_once().await {
-                Err(error) if is_permanent(&error) => {
+                Err(error) if is_fatal(&error) => {
                     tracing::warn!(error = %error, "lark transport degraded");
                     self.publish_state(TransportState::Degraded {
                         reason: error.to_string(),
@@ -636,6 +649,9 @@ impl Actor {
         loop {
             tokio::select! {
                 biased;
+                // Branch order matters under a sustained inbound flood:
+                // shutdown first, then the timers, so a busy stream can never
+                // starve the ping loop or the liveness watchdog.
                 () = self.shutdown.cancelled() => {
                     let close = async {
                         let _ = sink.send(Message::Close(None)).await;
@@ -643,6 +659,27 @@ impl Actor {
                     };
                     let _ = timeout(LARK_TRANSPORT_SHUTDOWN_GRACE, close).await;
                     return SessionEnd::Stopped;
+                }
+                () = &mut next_ping => {
+                    if send_ping(&mut sink, self.live.service_id).await.is_err() {
+                        return SessionEnd::Reconnect;
+                    }
+                    liveness = Some(Box::pin(tokio::time::sleep(self.config.pong_timeout)));
+                    next_ping
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + self.live.ping_interval);
+                }
+                () = async {
+                    if let Some(deadline) = liveness.as_mut() {
+                        deadline.await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    tracing::warn!(
+                        "no inbound frame within the pong timeout; dropping the socket"
+                    );
+                    return SessionEnd::Reconnect;
                 }
                 message = stream.next() => {
                     let Some(message) = message else {
@@ -672,27 +709,6 @@ impl Actor {
                             // tungstenite; text frames are not part of pbbp2.
                         }
                     }
-                }
-                () = async {
-                    if let Some(deadline) = liveness.as_mut() {
-                        deadline.await;
-                    } else {
-                        std::future::pending::<()>().await;
-                    }
-                } => {
-                    tracing::warn!(
-                        "no inbound frame within the pong timeout; dropping the socket"
-                    );
-                    return SessionEnd::Reconnect;
-                }
-                () = &mut next_ping => {
-                    if send_ping(&mut sink, self.live.service_id).await.is_err() {
-                        return SessionEnd::Reconnect;
-                    }
-                    liveness = Some(Box::pin(tokio::time::sleep(self.config.pong_timeout)));
-                    next_ping
-                        .as_mut()
-                        .reset(tokio::time::Instant::now() + self.live.ping_interval);
                 }
             }
         }
@@ -762,7 +778,21 @@ impl Actor {
         };
         self.publish_message(headers.clone(), &done);
         let started = Instant::now();
-        let result = (self.handler)(headers.clone(), done.payload.clone()).await;
+        // The handler await is bounded: a stuck handler must not stall the
+        // ping loop, the liveness watchdog, or shutdown. On timeout the
+        // handler is treated as failed and a `{code: 500}` receipt is sent.
+        let result = timeout(
+            self.config.handler_timeout,
+            (self.handler)(headers.clone(), done.payload.clone()),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            tracing::warn!(
+                message_id = done.message_id,
+                "lark inbound handler timed out"
+            );
+            Err(LarkError::retryable("the inbound frame handler timed out"))
+        });
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let receipt = build_receipt(frame, result, elapsed_ms);
         let encoded = receipt.encode_to_vec();
@@ -815,10 +845,14 @@ impl Actor {
     }
 }
 
-fn is_permanent(error: &LarkError) -> bool {
+/// Fail-closed classification for the connect phase: permanent auth and
+/// exhausted bounds cannot succeed on retry, and a protocol violation from
+/// bootstrap means the endpoint response is unparseable — retrying the same
+/// parse cannot help either. All three degrade without further attempts.
+fn is_fatal(error: &LarkError) -> bool {
     matches!(
         error.kind(),
-        LarkErrorKind::PermanentAuth | LarkErrorKind::Exhausted
+        LarkErrorKind::PermanentAuth | LarkErrorKind::Exhausted | LarkErrorKind::ProtocolViolation
     )
 }
 

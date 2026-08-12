@@ -5,9 +5,11 @@
 //! generated pbbp2 encoder: `SeqID`=1/`LogID`=2 (`uint64`), `service`=3 and
 //! `method`=4 (`int32`), `headers`=5 (repeated `Header`), `payloadEncoding`=6
 //! and `payloadType`=7 (optional strings), `payload`=8 (optional bytes), and
-//! `LogIDNew`=9 (optional string). proto3 semantics mean zero-valued scalars
-//! are not emitted; the gateway accepts both forms because decoding defaults
-//! missing fields to zero.
+//! `LogIDNew`=9 (optional string). The reference's proto2-style encoder writes
+//! fields 1–4 unconditionally, so the wire structs below model them as
+//! `optional` and the encoder always fills `Some(...)` (even when zero),
+//! keeping our outbound bytes identical to the reference's; decoding defaults
+//! a missing field to zero.
 //!
 //! Redaction: `Frame`'s `Debug` never prints payload bytes (length only) and
 //! `FrameHeaders`'s `Debug` redacts `handshake-msg`, which is free-form server
@@ -21,7 +23,9 @@ use super::error::LarkError;
 
 /// Private prost-derived wire types. Kept private because prost 0.14 derives
 /// its own `Debug` (which would print payload bytes); the public types below
-/// own the redacted `Debug` implementations.
+/// own the redacted `Debug` implementations. Fields 1–4 are `optional` so the
+/// encoder always emits them exactly like the reference encoder (see the
+/// module docs).
 mod wire {
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct Header {
@@ -33,14 +37,14 @@ mod wire {
 
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct Frame {
-        #[prost(uint64, tag = "1")]
-        pub seq_id: u64,
-        #[prost(uint64, tag = "2")]
-        pub log_id: u64,
-        #[prost(int32, tag = "3")]
-        pub service: i32,
-        #[prost(int32, tag = "4")]
-        pub method: i32,
+        #[prost(uint64, optional, tag = "1")]
+        pub seq_id: Option<u64>,
+        #[prost(uint64, optional, tag = "2")]
+        pub log_id: Option<u64>,
+        #[prost(int32, optional, tag = "3")]
+        pub service: Option<i32>,
+        #[prost(int32, optional, tag = "4")]
+        pub method: Option<i32>,
         #[prost(message, repeated, tag = "5")]
         pub headers: Vec<Header>,
         #[prost(string, optional, tag = "6")]
@@ -75,10 +79,12 @@ impl From<wire::Header> for Header {
 impl From<&Frame> for wire::Frame {
     fn from(frame: &Frame) -> Self {
         Self {
-            seq_id: frame.seq_id,
-            log_id: frame.log_id,
-            service: frame.service,
-            method: frame.method,
+            // Fields 1–4 are always written, even when zero, to match the
+            // reference encoder byte for byte.
+            seq_id: Some(frame.seq_id),
+            log_id: Some(frame.log_id),
+            service: Some(frame.service),
+            method: Some(frame.method),
             headers: frame.headers.iter().map(wire::Header::from).collect(),
             payload_encoding: frame.payload_encoding.clone(),
             payload_type: frame.payload_type.clone(),
@@ -91,10 +97,10 @@ impl From<&Frame> for wire::Frame {
 impl From<wire::Frame> for Frame {
     fn from(frame: wire::Frame) -> Self {
         Self {
-            seq_id: frame.seq_id,
-            log_id: frame.log_id,
-            service: frame.service,
-            method: frame.method,
+            seq_id: frame.seq_id.unwrap_or_default(),
+            log_id: frame.log_id.unwrap_or_default(),
+            service: frame.service.unwrap_or_default(),
+            method: frame.method.unwrap_or_default(),
             headers: frame.headers.into_iter().map(Header::from).collect(),
             payload_encoding: frame.payload_encoding,
             payload_type: frame.payload_type,

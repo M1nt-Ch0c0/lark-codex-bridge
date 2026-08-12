@@ -39,10 +39,14 @@ fn event_headers(message_id: &str, sum: u32, seq: u32) -> FrameHeaders {
 
 #[test]
 fn ping_frame_matches_hand_computed_golden() {
-    // service=7 (field 3 varint), one header {type: ping}; proto3 omits the
-    // zero-valued SeqID/LogID/method fields.
+    // The reference's proto2-style encoder writes fields 1–4 unconditionally,
+    // so the real ping frame bytes start with the zero-valued SeqID/LogID and
+    // method fields; our encoder must be byte-identical.
     let expected: Vec<u8> = vec![
+        0x08, 0x00, // field 1: SeqID = 0
+        0x10, 0x00, // field 2: LogID = 0
         0x18, 0x07, // field 3: service = 7
+        0x20, 0x00, // field 4: method = 0 (control)
         0x2A, 0x0C, // field 5: headers, 12 bytes
         0x0A, 0x04, b't', b'y', b'p', b'e', // header key
         0x12, 0x04, b'p', b'i', b'n', b'g', // header value
@@ -70,6 +74,8 @@ fn single_fragment_event_frame_matches_hand_computed_golden() {
     frame.payload = Some(Bytes::from_static(b"{}"));
 
     let expected: Vec<u8> = vec![
+        0x08, 0x00, // SeqID = 0
+        0x10, 0x00, // LogID = 0
         0x18, 0x07, // service = 7
         0x20, 0x01, // method = 1 (data)
         0x2A, 0x0D, // header {type, event}: 13 bytes
@@ -439,6 +445,48 @@ fn ingest_sweeps_other_expired_messages() {
         .expect("new message triggers the sweep");
     assert_eq!(reassembler.in_flight(), 1);
     assert_eq!(reassembler.buffered_bytes(), 1);
+}
+
+#[test]
+fn unparsable_sum_header_is_rejected_instead_of_passing_through() {
+    let mut reassembler = Reassembler::new();
+    let now = Instant::now();
+    let unparsable = headers(&[
+        (header_key::TYPE, "event"),
+        (header_key::MESSAGE_ID, "m"),
+        (header_key::SUM, "not-a-number"),
+        (header_key::SEQ, "0"),
+    ]);
+    assert_eq!(
+        reassembler
+            .ingest(&unparsable, Bytes::from_static(b"a"), now)
+            .expect_err("unparsable sum is a protocol anomaly"),
+        ReassemblyError::OutOfRange
+    );
+}
+
+#[test]
+fn sweep_runs_even_when_the_fragment_is_rejected() {
+    let mut reassembler = Reassembler::new();
+    let now = Instant::now();
+    reassembler
+        .ingest(&event_headers("old", 2, 0), Bytes::from_static(b"a"), now)
+        .expect("old message");
+    assert_eq!(reassembler.in_flight(), 1);
+    let later = now + LARK_FRAGMENT_TTL + Duration::from_millis(1);
+    // A malformed fragment is rejected, but the sweep must still run first.
+    assert_eq!(
+        reassembler
+            .ingest(
+                &event_headers("junk", 0, 0),
+                Bytes::from_static(b"x"),
+                later
+            )
+            .expect_err("sum 0 rejected"),
+        ReassemblyError::OutOfRange
+    );
+    assert_eq!(reassembler.in_flight(), 0, "stale entry swept on ingest");
+    assert_eq!(reassembler.buffered_bytes(), 0);
 }
 
 #[test]

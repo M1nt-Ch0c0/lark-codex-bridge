@@ -1,5 +1,5 @@
 {
-  "description": "Scrubbed pbbp2 frame shapes for the Lark frame codec tests. Field numbers: SeqID=1, LogID=2 (uint64); service=3, method=4 (int32, 0=control, 1=data); headers=5 (repeated {key=1, value=2}); payloadEncoding=6, payloadType=7 (optional string); payload=8 (optional bytes); LogIDNew=9 (optional string). proto3: zero scalars are not emitted on the wire.",
+  "description": "Scrubbed pbbp2 frame shapes for the Lark frame codec tests. Field numbers: SeqID=1, LogID=2 (uint64); service=3, method=4 (int32, 0=control, 1=data); headers=5 (repeated {key=1, value=2}); payloadEncoding=6, payloadType=7 (optional string); payload=8 (optional bytes); LogIDNew=9 (optional string). The reference encoder is proto2-style: fields 1-4 are written unconditionally, even when zero.",
   "ping_frame": {
     "comment": "control liveness frame sent by the client every PingInterval; SeqID/LogID are 0",
     "service": 7,

@@ -75,6 +75,12 @@ pub const LARK_FRAGMENT_TTL: Duration = Duration::from_secs(5);
 /// After the transport sends a ping, any inbound frame within this window
 /// proves liveness; otherwise the socket is dropped to trigger a reconnect.
 pub const LARK_PONG_TIMEOUT: Duration = Duration::from_secs(10);
+/// Upper bound for one inbound frame handler invocation. A handler that
+/// exceeds it is treated as failed (`{code: 500}` receipt) so a stuck handler
+/// cannot stall the ping loop, the liveness watchdog, or shutdown. 60 s is
+/// generous for in-memory normalization plus a bounded channel push, while
+/// staying well below any plausible server-side receipt deadline.
+pub const LARK_HANDLER_TIMEOUT: Duration = Duration::from_secs(60);
 /// Fallback ping interval when the server bootstrap does not provide a
 /// positive `PingInterval`.
 pub const LARK_DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(30);

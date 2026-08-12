@@ -24,7 +24,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 
-use super::frame::FrameHeaders;
+use super::frame::{FrameHeaders, header_key};
 use crate::limits::{
     LARK_FRAGMENT_MAX_IN_FLIGHT, LARK_FRAGMENT_MESSAGE_BYTES, LARK_FRAGMENT_MESSAGE_MAX_FRAGMENTS,
     LARK_FRAGMENT_TOTAL_BYTES, LARK_FRAGMENT_TTL,
@@ -91,6 +91,15 @@ impl fmt::Display for ReassemblyError {
 }
 
 impl std::error::Error for ReassemblyError {}
+
+/// Parses the `sum` header: absent means a single-fragment message; present
+/// but unparsable is a protocol anomaly.
+fn parse_sum(headers: &FrameHeaders) -> Result<u32, ReassemblyError> {
+    match headers.get(header_key::SUM) {
+        None => Ok(1),
+        Some(raw) => raw.parse::<u32>().map_err(|_| ReassemblyError::OutOfRange),
+    }
+}
 
 struct Entry {
     sum: u32,
@@ -164,7 +173,6 @@ impl Reassembler {
     ) -> Result<Option<Reassembly>, ReassemblyError> {
         let message_id = headers.message_id().unwrap_or_default();
         let trace_id = headers.trace_id().map(str::to_owned);
-        let sum = headers.sum().unwrap_or(1);
         let reject = |error: ReassemblyError| {
             tracing::warn!(
                 message_id,
@@ -173,6 +181,23 @@ impl Reassembler {
                 "lark fragment rejected"
             );
             error
+        };
+
+        // Sweep expired entries before any validation or early return so the
+        // TTL is enforced on every ingest, not only on well-formed fragments.
+        // Remember whether this message's own entry expired so a late
+        // continuation reports `Expired` instead of starting over mid-sequence.
+        let entry_expired = self
+            .entries
+            .get(message_id)
+            .is_some_and(|entry| now.duration_since(entry.created) > LARK_FRAGMENT_TTL);
+        self.sweep(now);
+
+        // A missing `sum` header means a single fragment; a present but
+        // unparsable one is a protocol anomaly, not a passthrough.
+        let sum = match parse_sum(headers) {
+            Ok(sum) => sum,
+            Err(error) => return Err(reject(error)),
         };
 
         if payload.len() > LARK_FRAGMENT_MESSAGE_BYTES {
@@ -202,16 +227,9 @@ impl Reassembler {
         if seq >= sum {
             return Err(reject(ReassemblyError::OutOfRange));
         }
-
-        // Expire this message's entry first so a late continuation reports
-        // `Expired` instead of silently starting over mid-sequence.
-        if let Some(entry) = self.entries.get(message_id) {
-            if now.duration_since(entry.created) > LARK_FRAGMENT_TTL {
-                self.remove_entry(message_id);
-                return Err(reject(ReassemblyError::Expired));
-            }
+        if entry_expired {
+            return Err(reject(ReassemblyError::Expired));
         }
-        self.sweep(now);
 
         let len = payload.len();
         if self.total_bytes + len > LARK_FRAGMENT_TOTAL_BYTES {
