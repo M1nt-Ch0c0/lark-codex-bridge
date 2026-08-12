@@ -420,7 +420,7 @@ Inject a `ProcessFactory` trait so tests deterministically verify state ordering
 
 Mark `tests/codex_smoke.rs` with `#[ignore = "requires an authenticated Codex account"]`. The test requires `CODEX_E2E=1`; otherwise it exits successfully after printing a skip reason. When enabled, it starts the installed `codex`, initializes, creates an ephemeral read-only thread in a temporary cwd, starts a turn with `Reply with exactly: pong`, waits up to 180 seconds, asserts a completed agent message contains `pong`, and shuts down without an orphan child. Authentication failures fail with an actionable login diagnostic so the milestone cannot claim a false positive.
 
-- [ ] **Step 5: Verify and publish the milestone**
+- [x] **Step 5: Verify and publish the milestone**
 
 Run:
 
