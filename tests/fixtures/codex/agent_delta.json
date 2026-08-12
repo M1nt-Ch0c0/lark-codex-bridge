@@ -1,0 +1,9 @@
+{
+  "method": "item/agentMessage/delta",
+  "params": {
+    "threadId": "0198f100-0000-7000-8000-000000000001",
+    "turnId": "0198f101-0000-7000-8000-000000000002",
+    "itemId": "item-agent-1",
+    "delta": "Working"
+  }
+}

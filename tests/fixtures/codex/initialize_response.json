@@ -1,0 +1,9 @@
+{
+  "id": "initialize-1",
+  "result": {
+    "userAgent": "codex_cli_rs/0.146.0",
+    "platformFamily": "unix",
+    "platformOs": "linux",
+    "codexHome": "/home/test/.codex"
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "id": 7,
+  "result": {
+    "thread": {
+      "id": "0198f100-0000-7000-8000-000000000001",
+      "sessionId": "0198f100-0000-7000-8000-000000000001",
+      "preview": "",
+      "modelProvider": "openai",
+      "createdAt": 1786478400,
+      "updatedAt": 1786478400,
+      "status": {
+        "type": "idle"
+      },
+      "ephemeral": false,
+      "turns": [],
+      "source": "appServer",
+      "cliVersion": "0.146.0",
+      "cwd": "/workspace"
+    },
+    "model": "gpt-5.6",
+    "modelProvider": "openai",
+    "cwd": "/workspace",
+    "approvalPolicy": "on-request",
+    "approvalsReviewer": "user",
+    "sandbox": {
+      "type": "workspaceWrite",
+      "writableRoots": [
+        "/workspace"
+      ],
+      "networkAccess": false,
+      "excludeTmpdirEnvVar": false,
+      "excludeSlashTmp": false
+    }
+  }
+}

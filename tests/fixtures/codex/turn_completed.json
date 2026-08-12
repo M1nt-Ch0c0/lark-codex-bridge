@@ -1,0 +1,23 @@
+{
+  "method": "turn/completed",
+  "params": {
+    "threadId": "0198f100-0000-7000-8000-000000000001",
+    "turn": {
+      "id": "0198f101-0000-7000-8000-000000000002",
+      "items": [
+        {
+          "id": "item-agent-1",
+          "type": "agentMessage",
+          "text": "Hello from Codex.",
+          "phase": "final_answer",
+          "memoryCitation": null
+        }
+      ],
+      "status": "completed",
+      "startedAt": 1786478401,
+      "completedAt": 1786478402,
+      "durationMs": 1500,
+      "error": null
+    }
+  }
+}

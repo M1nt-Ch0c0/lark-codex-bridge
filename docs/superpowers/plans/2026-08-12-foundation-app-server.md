@@ -154,7 +154,7 @@ Commit `chore: bootstrap Rust project` and push `main`.
 - Produces: `RequestId`, `InboundMessage`, `OutboundMessage`, `decode_line`, and `encode_line`.
 - Produces: `InitializeParams`, `ThreadStartParams`, `ThreadResumeParams`, `TurnStartParams`, `TurnInterruptParams`, their result types, `UserInput`, `ThreadItem`, and `TurnStatus`.
 
-- [ ] **Step 1: Implement open wire envelopes**
+- [x] **Step 1: Implement open wire envelopes**
 
 Use an untagged opaque ID and explicit classification so interleaved notifications cannot be mistaken for the next response:
 
@@ -176,15 +176,15 @@ pub fn encode_line(message: &OutboundMessage) -> Result<Vec<u8>, ProtocolError>;
 
 Reject missing/ambiguous envelope fields and lines over the global limit. Accept additive unknown fields. Encoding appends exactly one newline and omits the `jsonrpc` member.
 
-- [ ] **Step 2: Implement only the stable typed DTO subset**
+- [x] **Step 2: Implement only the stable typed DTO subset**
 
 Represent changing item payloads as a tagged `ThreadItem` with known variants plus `Unknown { item_type, raw }`. Use exact wire names through Serde. `SandboxMode` serializes `read-only`, `workspace-write`, or `danger-full-access`; turn sandbox policy uses `readOnly`, `workspaceWrite`, or `dangerFullAccess`.
 
-- [ ] **Step 3: Add scrubbed 0.146.0 fixtures and focused tests**
+- [x] **Step 3: Add scrubbed 0.146.0 fixtures and focused tests**
 
 Cover string/integer IDs, interleaved notification/response classification, unknown item preservation, error response decoding, newline encoding, oversized line rejection, kebab/camel sandbox serialization, and authoritative terminal DTOs.
 
-- [ ] **Step 4: Verify and publish the task**
+- [x] **Step 4: Verify and publish the task**
 
 Run:
 
