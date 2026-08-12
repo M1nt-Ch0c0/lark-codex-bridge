@@ -90,7 +90,7 @@ impl InitializeParams {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InitializeResult {
     pub codex_home: PathBuf,
@@ -136,7 +136,7 @@ pub enum Personality {
     Pragmatic,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Default, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadStartParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -171,7 +171,7 @@ pub struct ThreadStartParams {
     pub model_provider: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadResumeParams {
     pub thread_id: String,
@@ -189,7 +189,7 @@ impl ThreadResumeParams {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Default, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadResumeOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -216,7 +216,7 @@ pub struct ThreadResumeOverrides {
     pub service_tier: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadStartResult {
     pub thread: Thread,
@@ -274,7 +274,7 @@ pub enum ExternalNetworkAccess {
     Enabled,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnStartParams {
     pub thread_id: String,
@@ -324,7 +324,7 @@ impl TurnStartParams {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
 pub struct TurnStartResult {
     pub turn: Turn,
 }
@@ -362,7 +362,7 @@ pub enum ImageDetail {
     Original,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type")]
 pub enum UserInput {
     #[serde(rename = "text")]
@@ -419,7 +419,7 @@ open_string_enum! {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnError {
     pub message: String,
@@ -431,7 +431,7 @@ pub struct TurnError {
     pub extra: Map<String, Value>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Turn {
     pub id: String,
@@ -451,7 +451,7 @@ pub struct Turn {
     pub extra: Map<String, Value>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Thread {
     pub id: String,
@@ -878,20 +878,20 @@ fn opaque_item(item_type: &str, raw: Value) -> Result<ThreadItem, &'static str> 
     })
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadStartedNotification {
     pub thread: Thread,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnStartedNotification {
     pub thread_id: String,
     pub turn: Turn,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentMessageDeltaNotification {
     pub thread_id: String,
@@ -900,7 +900,7 @@ pub struct AgentMessageDeltaNotification {
     pub delta: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ItemCompletedNotification {
     pub thread_id: String,
@@ -909,7 +909,7 @@ pub struct ItemCompletedNotification {
     pub item: ThreadItem,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnCompletedNotification {
     pub thread_id: String,

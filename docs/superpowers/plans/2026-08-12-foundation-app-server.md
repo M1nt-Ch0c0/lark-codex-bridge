@@ -212,7 +212,7 @@ Commit `feat: model Codex app-server protocol` and push `main`.
 - Consumes: `protocol::{InboundMessage, OutboundMessage, decode_line, encode_line}`.
 - Produces: `CodexProcessConfig`, `CodexProcess`, `ProcessExit`, `TransportHandle`, `TransportEvent`, and `spawn_stream_transport`.
 
-- [ ] **Step 1: Implement version probing and owned child startup**
+- [x] **Step 1: Implement version probing and owned child startup**
 
 ```rust
 pub struct CodexProcessConfig {
@@ -233,7 +233,7 @@ impl CodexProcess {
 
 Parse only output matching `codex-cli X.Y.Z`, enforce `>=0.146.0,<0.147.0`, start arguments `app-server --listen stdio://`, pipe all stdio, set `kill_on_drop(true)`, and never interpolate the binary through a shell. Log only binary path, PID, version, and exit status.
 
-- [ ] **Step 2: Implement generic bounded reader/writer tasks**
+- [x] **Step 2: Implement generic bounded reader/writer tasks**
 
 ```rust
 pub fn spawn_stream_transport<R, W, E>(
@@ -250,11 +250,11 @@ where
 
 The reader uses `LinesCodec::new_with_max_length`; the writer owns stdin and flushes each message. Stderr is line-limited and emits redacted metadata rather than protocol events. `TransportHandle` exposes separate bounded high/normal senders and one event receiver. High-priority messages always drain before normal messages without starving normal traffic indefinitely.
 
-- [ ] **Step 3: Test framing, pressure, cancellation, and EOF**
+- [x] **Step 3: Test framing, pressure, cancellation, and EOF**
 
 Use `tokio::io::duplex` to verify partial reads, several messages in one read, line overflow, malformed JSON isolation, high priority ordering, closed stdin, cancellation, stdout EOF, and stderr not entering the protocol channel.
 
-- [ ] **Step 4: Verify and publish the task**
+- [x] **Step 4: Verify and publish the task**
 
 Run:
 
