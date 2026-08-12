@@ -110,10 +110,11 @@ async fn stdout_waits_for_a_complete_line_across_partial_reads() {
     let event = next_event(&mut transport.handle.events).await;
     assert!(matches!(
         event,
-        TransportEvent::Message(InboundMessage::Response {
+        TransportEvent::Message(message)
+            if matches!(message.message(), InboundMessage::Response {
             id: RequestId::String(id),
             result,
-        }) if id == "request-1" && result == json!({"thread": {"id": "thread-1"}})
+        } if id == "request-1" && result == &json!({"thread": {"id": "thread-1"}}))
     ));
 }
 
@@ -133,15 +134,16 @@ async fn stdout_decodes_several_records_from_one_read_in_wire_order() {
     let second = next_event(&mut transport.handle.events).await;
     assert!(matches!(
         first,
-        TransportEvent::Message(InboundMessage::Notification { method, .. })
-            if method == "turn/started"
+        TransportEvent::Message(message)
+            if matches!(message.message(), InboundMessage::Notification { method, .. }
+                if method == "turn/started")
     ));
     assert!(matches!(
         second,
-        TransportEvent::Message(InboundMessage::Response {
-            id: RequestId::Integer(7),
-            result,
-        }) if result == json!({"ok": true})
+        TransportEvent::Message(message)
+            if matches!(message.message(), InboundMessage::Response {
+                id: RequestId::Integer(7), result,
+            } if result == &json!({"ok": true}))
     ));
 }
 
@@ -160,8 +162,9 @@ async fn malformed_stdout_record_is_reported_without_losing_the_next_record() {
     ));
     assert!(matches!(
         next_event(&mut transport.handle.events).await,
-        TransportEvent::Message(InboundMessage::Notification { method, .. })
-            if method == "thread/started"
+        TransportEvent::Message(message)
+            if matches!(message.message(), InboundMessage::Notification { method, .. }
+                if method == "thread/started")
     ));
 }
 
@@ -415,8 +418,9 @@ async fn unterminated_final_record_is_delivered_before_stdout_eof() {
 
     assert!(matches!(
         next_event(&mut transport.handle.events).await,
-        TransportEvent::Message(InboundMessage::Notification { method, .. })
-            if method == "thread/started"
+        TransportEvent::Message(message)
+            if matches!(message.message(), InboundMessage::Notification { method, .. }
+                if method == "thread/started")
     ));
     assert!(matches!(
         next_event(&mut transport.handle.events).await,
@@ -485,8 +489,9 @@ async fn oversized_unterminated_stderr_is_drained_without_blocking_stdout() {
 
     assert!(matches!(
         next_event(&mut transport.handle.events).await,
-        TransportEvent::Message(InboundMessage::Notification { method, .. })
-            if method == "turn/started"
+        TransportEvent::Message(message)
+            if matches!(message.message(), InboundMessage::Notification { method, .. }
+                if method == "turn/started")
     ));
     timeout(EVENT_TIMEOUT, stderr_writer)
         .await

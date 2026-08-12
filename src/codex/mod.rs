@@ -1,5 +1,6 @@
 //! Stable, version-gated integration with the Codex app-server protocol.
 
+pub mod client;
 pub mod process;
 pub mod protocol;
 pub mod rpc;

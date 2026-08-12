@@ -272,17 +272,17 @@ async fn integer_server_request_ids_are_preserved_in_success_and_error_responses
     )
     .await;
     let event = recv_event(&mut harness.connection).await;
-    let request = match event {
+    let mut request = match event {
         RpcEvent::ServerRequest(request) => request,
         other => panic!("expected a server request, got {other:?}"),
     };
-    assert_eq!(request.id, RequestId::Integer(42));
+    assert_eq!(request.id(), &RequestId::Integer(42));
     assert_eq!(request.method, "item/commandExecution/requestApproval");
     assert_eq!(request.params, Some(json!({"command": "redacted"})));
     harness
         .connection
         .handle
-        .respond_request(&request, &json!({"decision": "accept"}))
+        .respond_request(&mut request, &json!({"decision": "accept"}))
         .await
         .expect("server request response should queue");
     assert_eq!(
@@ -296,14 +296,14 @@ async fn integer_server_request_ids_are_preserved_in_success_and_error_responses
     )
     .await;
     let event = recv_event(&mut harness.connection).await;
-    let request = match event {
+    let mut request = match event {
         RpcEvent::ServerRequest(request) => request,
         other => panic!("expected a server request, got {other:?}"),
     };
     harness
         .connection
         .handle
-        .respond_request_error(&request, -32601, "unsupported")
+        .respond_request_error(&mut request, -32601, "unsupported")
         .await
         .expect("server request error should queue");
     assert_eq!(
@@ -322,7 +322,7 @@ async fn stale_server_request_tokens_cannot_answer_a_reused_id_on_a_new_epoch() 
         &json!({"id": 7, "method": "approval/request", "params": {}}),
     )
     .await;
-    let stale = match recv_event(&mut old.connection).await {
+    let mut stale = match recv_event(&mut old.connection).await {
         RpcEvent::ServerRequest(request) => request,
         other => panic!("expected a server request, got {other:?}"),
     };
@@ -334,15 +334,15 @@ async fn stale_server_request_tokens_cannot_answer_a_reused_id_on_a_new_epoch() 
         &json!({"id": 7, "method": "approval/request", "params": {}}),
     )
     .await;
-    assert!(matches!(
-        recv_event(&mut current.connection).await,
-        RpcEvent::ServerRequest(_)
-    ));
+    let mut current_request = match recv_event(&mut current.connection).await {
+        RpcEvent::ServerRequest(request) => request,
+        other => panic!("expected a server request, got {other:?}"),
+    };
 
     let error = current
         .connection
         .handle
-        .respond_request(&stale, &json!({"decision": "accept"}))
+        .respond_request(&mut stale, &json!({"decision": "accept"}))
         .await
         .expect_err("an old-epoch token must not approve a new request with the same ID");
     assert!(matches!(error, RpcError::UnknownServerRequest));
@@ -358,6 +358,13 @@ async fn stale_server_request_tokens_cannot_answer_a_reused_id_on_a_new_epoch() 
         "a stale request token must not write a response"
     );
 
+    current
+        .connection
+        .handle
+        .respond_request_error(&mut current_request, -32000, "declined")
+        .await
+        .expect("the current-epoch request should remain answerable");
+
     old.connection.shutdown().await;
     current.connection.shutdown().await;
 }
@@ -370,7 +377,7 @@ async fn rejected_oversized_response_keeps_the_server_request_token_retryable() 
         &json!({"id": 8, "method": "approval/request", "params": {}}),
     )
     .await;
-    let request = match recv_event(&mut harness.connection).await {
+    let mut request = match recv_event(&mut harness.connection).await {
         RpcEvent::ServerRequest(request) => request,
         other => panic!("expected a server request, got {other:?}"),
     };
@@ -379,7 +386,7 @@ async fn rejected_oversized_response_keeps_the_server_request_token_retryable() 
     let error = harness
         .connection
         .handle
-        .respond_request(&request, &oversized)
+        .respond_request(&mut request, &oversized)
         .await
         .expect_err("an oversized response should fail before consuming the token");
     assert!(matches!(error, RpcError::PayloadTooLarge { .. }));
@@ -387,7 +394,7 @@ async fn rejected_oversized_response_keeps_the_server_request_token_retryable() 
     harness
         .connection
         .handle
-        .respond_request_error(&request, -32000, "response too large")
+        .respond_request_error(&mut request, -32000, "response too large")
         .await
         .expect("the same token should allow a bounded fallback response");
     assert_eq!(
@@ -411,7 +418,7 @@ async fn server_responses_overtake_a_backpressured_normal_queue() {
         &json!({"id": 91, "method": "approval/request", "params": {}}),
     )
     .await;
-    let approval = match recv_event(&mut harness.connection).await {
+    let mut approval = match recv_event(&mut harness.connection).await {
         RpcEvent::ServerRequest(request) => request,
         other => panic!("expected a server request, got {other:?}"),
     };
@@ -431,7 +438,7 @@ async fn server_responses_overtake_a_backpressured_normal_queue() {
     harness
         .connection
         .handle
-        .respond_request(&approval, &json!({"decision": "accept"}))
+        .respond_request(&mut approval, &json!({"decision": "accept"}))
         .await
         .expect("high-priority response should enter the bounded queue");
 
@@ -451,6 +458,76 @@ async fn server_responses_overtake_a_backpressured_normal_queue() {
     );
 
     harness.connection.shutdown().await;
+}
+
+#[tokio::test]
+async fn cancelled_server_response_still_reaches_the_wire_and_consumes_the_token() {
+    let mut harness = rpc_harness(64, 34);
+    write_wire(
+        &mut harness.app_stdout,
+        &json!({"id": "approval-cancel", "method": "approval/request", "params": {}}),
+    )
+    .await;
+    let mut approval = match recv_event(&mut harness.connection).await {
+        RpcEvent::ServerRequest(request) => request,
+        other => panic!("expected a server request, got {other:?}"),
+    };
+
+    let handle = harness.connection.handle.clone();
+    let responder = tokio::spawn(async move {
+        handle
+            .respond_request(&mut approval, &json!({"decision": "decline"}))
+            .await
+    });
+    tokio::task::yield_now().await;
+    responder.abort();
+    let _ = responder.await;
+
+    let response = read_wire(&mut harness.app_stdin).await;
+    assert_eq!(response["id"], "approval-cancel");
+    assert_eq!(response["result"]["decision"], "decline");
+
+    harness.connection.shutdown().await;
+}
+
+#[tokio::test]
+async fn abandoned_server_request_fails_the_epoch_closed() {
+    let mut harness = rpc_harness(64 * 1024, 35);
+    write_wire(
+        &mut harness.app_stdout,
+        &json!({"id": "approval-abandon", "method": "approval/request", "params": {}}),
+    )
+    .await;
+    let mut request = match recv_event(&mut harness.connection).await {
+        RpcEvent::ServerRequest(request) => request,
+        other => panic!("expected a server request, got {other:?}"),
+    };
+    harness
+        .connection
+        .handle
+        .abandon_request(&mut request)
+        .expect("request token should fail the epoch closed");
+
+    let exit = harness.connection.shutdown().await;
+    assert_eq!(exit, TransportExit::Cancelled);
+}
+
+#[tokio::test]
+async fn dropping_an_unanswered_server_request_fails_the_epoch_closed() {
+    let mut harness = rpc_harness(64 * 1024, 36);
+    write_wire(
+        &mut harness.app_stdout,
+        &json!({"id": "approval-drop", "method": "approval/request", "params": {}}),
+    )
+    .await;
+    let request = match recv_event(&mut harness.connection).await {
+        RpcEvent::ServerRequest(request) => request,
+        other => panic!("expected a server request, got {other:?}"),
+    };
+    drop(request);
+
+    let exit = harness.connection.shutdown().await;
+    assert_eq!(exit, TransportExit::Cancelled);
 }
 
 #[tokio::test]

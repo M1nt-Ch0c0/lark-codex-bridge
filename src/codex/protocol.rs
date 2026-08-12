@@ -7,7 +7,7 @@ use serde::{
 use serde_json::{Map, Value};
 use thiserror::Error;
 
-use crate::limits::MAX_JSONL_LINE_BYTES;
+use crate::limits::{MAX_JSON_NESTING, MAX_JSON_STRUCTURAL_TOKENS, MAX_JSONL_LINE_BYTES};
 
 /// An opaque request identifier accepted by Codex app-server.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -57,6 +57,54 @@ pub enum InboundMessage {
         method: String,
         params: Option<Value>,
     },
+}
+
+impl InboundMessage {
+    #[must_use]
+    pub fn retained_memory_weight(&self) -> usize {
+        const FIXED: usize = 192;
+        match self {
+            Self::Response { id, result } => FIXED
+                .saturating_add(request_id_memory_weight(id))
+                .saturating_add(value_memory_weight(result)),
+            Self::ErrorResponse { id, error } => FIXED
+                .saturating_add(request_id_memory_weight(id))
+                .saturating_add(error.message.len())
+                .saturating_add(error.data.as_ref().map_or(0, value_memory_weight)),
+            Self::Request { id, method, params } => FIXED
+                .saturating_add(request_id_memory_weight(id))
+                .saturating_add(method.len())
+                .saturating_add(params.as_ref().map_or(0, value_memory_weight)),
+            Self::Notification { method, params } => FIXED
+                .saturating_add(method.len())
+                .saturating_add(params.as_ref().map_or(0, value_memory_weight)),
+        }
+    }
+}
+
+#[must_use]
+pub fn request_id_memory_weight(id: &RequestId) -> usize {
+    match id {
+        RequestId::String(value) => value.len().saturating_add(32),
+        RequestId::Integer(_) => 24,
+    }
+}
+
+#[must_use]
+pub fn value_memory_weight(value: &Value) -> usize {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => 24,
+        Value::String(value) => value.len().saturating_add(32),
+        Value::Array(values) => values.iter().fold(32, |total, value| {
+            total.saturating_add(value_memory_weight(value).saturating_add(24))
+        }),
+        Value::Object(values) => values.iter().fold(48, |total, (key, value)| {
+            total
+                .saturating_add(key.len())
+                .saturating_add(value_memory_weight(value))
+                .saturating_add(56)
+        }),
+    }
 }
 
 impl fmt::Debug for InboundMessage {
@@ -150,6 +198,10 @@ pub enum ProtocolError {
     InvalidEnvelope(&'static str),
     #[error("protocol message could not be encoded")]
     Encode(#[source] serde_json::Error),
+    #[error("decoded protocol message exceeds the {maximum}-byte retained-memory limit")]
+    RetainedMessageTooLarge { maximum: usize },
+    #[error("protocol JSON exceeds the conservative {kind} limit of {maximum}")]
+    StructuralLimit { kind: &'static str, maximum: usize },
 }
 
 /// Decodes and classifies one app-server JSONL record.
@@ -179,8 +231,56 @@ pub fn decode_line(line: &[u8]) -> Result<InboundMessage, ProtocolError> {
         return Err(ProtocolError::ExpectedObject);
     }
 
+    preflight_json_structure(line)?;
+
     let envelope: RawEnvelope = serde_json::from_slice(line).map_err(ProtocolError::InvalidJson)?;
     classify(envelope)
+}
+
+/// Rejects shapes which would expand disproportionately when decoded into
+/// `serde_json::Value`.  This is a linear byte scan with constant state; JSON
+/// syntax remains authoritative in serde, so malformed input is still reported
+/// by the normal parser.
+fn preflight_json_structure(line: &[u8]) -> Result<(), ProtocolError> {
+    let mut nesting = 0_usize;
+    let mut structural = 0_usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for &byte in line {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                nesting = nesting.saturating_add(1);
+                structural = structural.saturating_add(1);
+                if nesting > MAX_JSON_NESTING {
+                    return Err(ProtocolError::StructuralLimit {
+                        kind: "nesting",
+                        maximum: MAX_JSON_NESTING,
+                    });
+                }
+            }
+            b'}' | b']' => nesting = nesting.saturating_sub(1),
+            b',' | b':' => structural = structural.saturating_add(1),
+            _ => {}
+        }
+        if structural > MAX_JSON_STRUCTURAL_TOKENS {
+            return Err(ProtocolError::StructuralLimit {
+                kind: "structural-token",
+                maximum: MAX_JSON_STRUCTURAL_TOKENS,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn classify(envelope: RawEnvelope) -> Result<InboundMessage, ProtocolError> {

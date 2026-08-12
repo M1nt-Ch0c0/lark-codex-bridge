@@ -902,6 +902,24 @@ pub struct AgentMessageDeltaNotification {
 
 #[derive(Clone, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ItemStartedNotification {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub started_at_ms: i64,
+    pub item: ThreadItem,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandExecutionOutputDeltaNotification {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub delta: String,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ItemCompletedNotification {
     pub thread_id: String,
     pub turn_id: String,
@@ -914,4 +932,42 @@ pub struct ItemCompletedNotification {
 pub struct TurnCompletedNotification {
     pub thread_id: String,
     pub turn: Turn,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ErrorNotification {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub error: TurnError,
+    pub will_retry: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUsageBreakdown {
+    pub input_tokens: i64,
+    pub cached_input_tokens: i64,
+    #[serde(default)]
+    pub cache_write_input_tokens: i64,
+    pub output_tokens: i64,
+    pub reasoning_output_tokens: i64,
+    pub total_tokens: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadTokenUsage {
+    pub total: TokenUsageBreakdown,
+    pub last: TokenUsageBreakdown,
+    #[serde(default)]
+    pub model_context_window: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadTokenUsageUpdatedNotification {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub token_usage: ThreadTokenUsage,
 }

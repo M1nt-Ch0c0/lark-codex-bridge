@@ -6,7 +6,9 @@ use lark_codex_bridge::codex::types::{
     SandboxMode, ThreadItem, ThreadStartResult, TurnCompletedNotification, TurnSandboxPolicy,
     TurnStartedNotification, TurnStatus, UserInput,
 };
-use lark_codex_bridge::limits::MAX_JSONL_LINE_BYTES;
+use lark_codex_bridge::limits::{
+    MAX_JSON_NESTING, MAX_JSON_STRUCTURAL_TOKENS, MAX_JSONL_LINE_BYTES,
+};
 use serde_json::{Value, json};
 
 const INITIALIZE_RESPONSE: &[u8] = include_bytes!("fixtures/codex/initialize_response.json");
@@ -230,6 +232,43 @@ fn oversized_lines_are_rejected_before_parsing() {
     assert_protocol_error(
         encode_line(&oversized_outbound).expect_err("oversized output must be rejected"),
     );
+}
+
+#[test]
+fn dense_arrays_are_rejected_before_value_allocation() {
+    let mut line = Vec::with_capacity(MAX_JSON_STRUCTURAL_TOKENS.saturating_mul(2));
+    line.extend_from_slice(br#"{"id":1,"result":["#);
+    for index in 0..=MAX_JSON_STRUCTURAL_TOKENS {
+        if index != 0 {
+            line.push(b',');
+        }
+        line.push(b'0');
+    }
+    line.extend_from_slice(b"]}");
+    assert!(matches!(
+        decode_line(&line),
+        Err(ProtocolError::StructuralLimit {
+            kind: "structural-token",
+            maximum: MAX_JSON_STRUCTURAL_TOKENS,
+        })
+    ));
+}
+
+#[test]
+fn deep_json_is_rejected_before_value_allocation() {
+    let mut line = Vec::with_capacity(MAX_JSON_NESTING.saturating_mul(2).saturating_add(32));
+    line.extend_from_slice(br#"{"id":1,"result":"#);
+    line.extend(vec![b'['; MAX_JSON_NESTING + 1]);
+    line.push(b'0');
+    line.extend(vec![b']'; MAX_JSON_NESTING + 1]);
+    line.push(b'}');
+    assert!(matches!(
+        decode_line(&line),
+        Err(ProtocolError::StructuralLimit {
+            kind: "nesting",
+            maximum: MAX_JSON_NESTING,
+        })
+    ));
 }
 
 #[test]

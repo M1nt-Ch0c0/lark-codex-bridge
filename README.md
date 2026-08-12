@@ -5,7 +5,9 @@
 
 ## 项目状态
 
-当前处于早期开发阶段。已完成架构设计，正在实现第一阶段可用版本。
+当前处于早期开发阶段。已完成架构设计与第一阶段的 Codex app-server
+基础客户端（初始化、线程/回合、事件路由、打断和审批响应），正在继续实现
+飞书侧的业务能力。
 
 设计规格见
 [docs/superpowers/specs/2026-08-12-lark-codex-bridge-design.md](docs/superpowers/specs/2026-08-12-lark-codex-bridge-design.md)。

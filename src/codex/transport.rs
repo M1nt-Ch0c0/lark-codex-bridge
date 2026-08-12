@@ -17,7 +17,7 @@ use crate::{
     codex::protocol::{InboundMessage, OutboundMessage, ProtocolError, decode_line, encode_line},
     limits::{
         EVENT_CAPACITY, HIGH_PRIORITY_BURST, MAX_JSONL_LINE_BYTES, MAX_STDERR_LINE_BYTES,
-        RPC_HIGH_CAPACITY, RPC_NORMAL_CAPACITY, TRANSPORT_BYTE_BUDGET,
+        RPC_HIGH_CAPACITY, RPC_NORMAL_CAPACITY, TRANSPORT_BYTE_BUDGET, TRANSPORT_HIGH_BYTE_BUDGET,
     },
 };
 
@@ -44,13 +44,35 @@ impl From<io::Error> for TransportIoError {
 
 #[derive(Debug)]
 pub enum TransportEvent {
-    Message(InboundMessage),
+    Message(BudgetedInboundMessage),
     ProtocolError(ProtocolError),
     ReadError(TransportIoError),
     WriteError(TransportIoError),
     StdoutEof,
     StderrLine { byte_len: usize },
     Cancelled,
+}
+
+pub struct BudgetedInboundMessage {
+    message: InboundMessage,
+    budget: OwnedSemaphorePermit,
+}
+
+impl BudgetedInboundMessage {
+    #[must_use]
+    pub fn message(&self) -> &InboundMessage {
+        &self.message
+    }
+
+    pub fn into_parts(self) -> (InboundMessage, OwnedSemaphorePermit) {
+        (self.message, self.budget)
+    }
+}
+
+impl fmt::Debug for BudgetedInboundMessage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.message.fmt(formatter)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -123,7 +145,6 @@ impl TransportSender {
 
 struct InternalEvent {
     event: TransportEvent,
-    _budget: Option<OwnedSemaphorePermit>,
 }
 
 pub struct TransportEventReceiver {
@@ -231,7 +252,8 @@ where
 {
     let cancellation = parent_cancellation.child_token();
     drop(parent_cancellation);
-    let outbound_budget = Arc::new(Semaphore::new(TRANSPORT_BYTE_BUDGET));
+    let outbound_high_budget = Arc::new(Semaphore::new(TRANSPORT_HIGH_BYTE_BUDGET));
+    let outbound_normal_budget = Arc::new(Semaphore::new(TRANSPORT_BYTE_BUDGET));
     let inbound_budget = Arc::new(Semaphore::new(TRANSPORT_BYTE_BUDGET));
     let (high_tx, high_rx) = mpsc::channel(RPC_HIGH_CAPACITY);
     let (normal_tx, normal_rx) = mpsc::channel(RPC_NORMAL_CAPACITY);
@@ -254,12 +276,12 @@ where
     TransportHandle {
         high_tx: TransportSender {
             tx: high_tx,
-            budget: Arc::clone(&outbound_budget),
+            budget: outbound_high_budget,
             cancellation: cancellation.clone(),
         },
         normal_tx: TransportSender {
             tx: normal_tx,
-            budget: outbound_budget,
+            budget: outbound_normal_budget,
             cancellation: cancellation.clone(),
         },
         events: TransportEventReceiver {
@@ -293,39 +315,43 @@ where
             frame = framed.next() => frame,
         };
         match frame {
-            Some(Ok(line)) => {
-                let permit = tokio::select! {
-                    biased;
-                    () = cancellation.cancelled() => return ReaderExit::Cancelled,
-                    permit = Arc::clone(&budget).acquire_many_owned(byte_permits(line.len())) => {
-                        match permit {
-                            Ok(permit) => permit,
-                            Err(_) => return ReaderExit::Cancelled,
-                        }
+            Some(Ok(line)) => match decode_line(line.as_bytes()) {
+                Ok(message) => {
+                    let weight = line.len().max(message.retained_memory_weight());
+                    if weight > TRANSPORT_BYTE_BUDGET {
+                        return ReaderExit::Protocol(ProtocolError::RetainedMessageTooLarge {
+                            maximum: TRANSPORT_BYTE_BUDGET,
+                        });
                     }
-                };
-                match decode_line(line.as_bytes()) {
-                    Ok(message) => {
-                        let event = InternalEvent {
-                            event: TransportEvent::Message(message),
-                            _budget: Some(permit),
-                        };
-                        if !send_event(&event_tx, event, &cancellation).await {
-                            return ReaderExit::Cancelled;
+                    let permit = tokio::select! {
+                        biased;
+                        () = cancellation.cancelled() => return ReaderExit::Cancelled,
+                        permit = Arc::clone(&budget).acquire_many_owned(byte_permits(weight)) => {
+                            match permit {
+                                Ok(permit) => permit,
+                                Err(_) => return ReaderExit::Cancelled,
+                            }
                         }
-                    }
-                    Err(error) => {
-                        drop(permit);
-                        let event = InternalEvent {
-                            event: TransportEvent::ProtocolError(error),
-                            _budget: None,
-                        };
-                        if !send_event(&event_tx, event, &cancellation).await {
-                            return ReaderExit::Cancelled;
-                        }
+                    };
+                    let event = InternalEvent {
+                        event: TransportEvent::Message(BudgetedInboundMessage {
+                            message,
+                            budget: permit,
+                        }),
+                    };
+                    if !send_event(&event_tx, event, &cancellation).await {
+                        return ReaderExit::Cancelled;
                     }
                 }
-            }
+                Err(error) => {
+                    let event = InternalEvent {
+                        event: TransportEvent::ProtocolError(error),
+                    };
+                    if !send_event(&event_tx, event, &cancellation).await {
+                        return ReaderExit::Cancelled;
+                    }
+                }
+            },
             Some(Err(LinesCodecError::MaxLineLengthExceeded)) => {
                 return ReaderExit::Protocol(ProtocolError::LineTooLong {
                     length: MAX_JSONL_LINE_BYTES.saturating_add(1),
@@ -422,7 +448,6 @@ async fn drain_stderr<E>(
                         event: TransportEvent::StderrLine {
                             byte_len: visible_len,
                         },
-                        _budget: None,
                     });
                     next_report = Instant::now() + STDERR_REPORT_INTERVAL;
                 }
