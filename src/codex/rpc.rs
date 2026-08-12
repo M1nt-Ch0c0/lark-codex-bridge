@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt, io,
     sync::{
         Arc,
@@ -31,7 +31,8 @@ use crate::{
     limits::{
         CONTROL_RPC_TIMEOUT, EVENT_CAPACITY, HIGH_PRIORITY_BURST, INITIALIZE_TIMEOUT,
         MAX_JSONL_LINE_BYTES, MAX_OUTBOUND_VALUE_WIRE_BYTES, RPC_BYTE_BUDGET, RPC_HIGH_BYTE_BUDGET,
-        RPC_HIGH_CAPACITY, RPC_INFLIGHT_CAPACITY, RPC_NORMAL_CAPACITY, RPC_SERVER_REQUEST_CAPACITY,
+        RPC_HIGH_CAPACITY, RPC_INFLIGHT_CAPACITY, RPC_NORMAL_CAPACITY,
+        RPC_RELIABLE_EVENT_BYTE_BUDGET, RPC_RELIABLE_EVENT_CAPACITY, RPC_SERVER_REQUEST_CAPACITY,
     },
 };
 
@@ -121,6 +122,30 @@ impl ServerRequestLease {
             Ordering::AcqRel,
             Ordering::Acquire,
         );
+    }
+
+    fn resolve_actor_owned(&self) {
+        let _ = self.state.compare_exchange(
+            SERVER_REQUEST_ACTOR_OWNED,
+            SERVER_REQUEST_RESOLVED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn fail_actor_owned(&self) {
+        if self
+            .state
+            .compare_exchange(
+                SERVER_REQUEST_ACTOR_OWNED,
+                SERVER_REQUEST_RESOLVED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.abandonment.cancel();
+        }
     }
 
     fn abandon_if_armed(&self) {
@@ -259,7 +284,8 @@ pub struct RpcHandle {
     state: Arc<AtomicU8>,
     initialize_state: Arc<AtomicU8>,
     next_id: Arc<AtomicU64>,
-    inflight: Arc<Semaphore>,
+    high_inflight: Arc<Semaphore>,
+    normal_inflight: Arc<Semaphore>,
     high_command_budget: Arc<Semaphore>,
     normal_command_budget: Arc<Semaphore>,
     pending_count: Arc<AtomicUsize>,
@@ -345,7 +371,16 @@ impl RpcHandle {
         self.ensure_open()?;
         let deadline = deadline_after(timeout);
         let inflight = self
-            .acquire_until(Arc::clone(&self.inflight), 1, method, deadline)
+            .acquire_until(
+                Arc::clone(if high {
+                    &self.high_inflight
+                } else {
+                    &self.normal_inflight
+                }),
+                1,
+                method,
+                deadline,
+            )
             .await?;
         let command_budget = if high {
             &self.high_command_budget
@@ -614,6 +649,12 @@ impl RpcHandle {
         let server_lease = server_request
             .as_ref()
             .map(|response| Arc::clone(&response.lease));
+        if let Some(lease) = &server_lease {
+            // Arm actor ownership before publishing the command.  The command's
+            // lease then fail-closes on every queue/actor/pump drop path, while
+            // serialization failures above remain retryable.
+            lease.handoff_to_actor();
+        }
         let command = RpcCommand::Fire {
             method,
             message,
@@ -623,12 +664,6 @@ impl RpcHandle {
             _budget: budget,
         };
         self.enqueue(high, command, method, deadline).await?;
-        // From this point the actor owns a durable queue entry.  A caller that
-        // cancels while waiting for transport acknowledgement must not tear
-        // down an otherwise healthy epoch by dropping its retained token.
-        if let Some(lease) = server_lease {
-            lease.handoff_to_actor();
-        }
         tokio::select! {
             biased;
             () = self.cancellation.cancelled() => Err(RpcError::ConnectionLost(self.epoch)),
@@ -764,20 +799,40 @@ impl Drop for RequestCancelGuard {
 }
 
 pub struct RpcEventReceiver {
-    rx: mpsc::Receiver<InternalRpcEvent>,
+    normal_rx: mpsc::Receiver<InternalRpcEvent>,
+    reliable_rx: mpsc::Receiver<InternalRpcEvent>,
     terminal_rx: Option<oneshot::Receiver<RpcEvent>>,
     normal_closed: bool,
+    reliable_closed: bool,
+    next_sequence: u64,
+    buffered: BTreeMap<u64, InternalRpcEvent>,
 }
 
 impl RpcEventReceiver {
     pub async fn recv(&mut self) -> Option<RpcEvent> {
-        if !self.normal_closed {
-            if let Some(event) = self.rx.recv().await {
+        loop {
+            if let Some(event) = self.buffered.remove(&self.next_sequence) {
+                self.next_sequence = self.next_sequence.saturating_add(1);
                 return Some(event.event);
             }
-            self.normal_closed = true;
+            if self.normal_closed && self.reliable_closed {
+                return self.terminal_rx.take()?.await.ok();
+            }
+            tokio::select! {
+                event = self.normal_rx.recv(), if !self.normal_closed => match event {
+                    Some(event) => {
+                        self.buffered.insert(event.sequence, event);
+                    }
+                    None => self.normal_closed = true,
+                },
+                event = self.reliable_rx.recv(), if !self.reliable_closed => match event {
+                    Some(event) => {
+                        self.buffered.insert(event.sequence, event);
+                    }
+                    None => self.reliable_closed = true,
+                },
+            }
         }
-        self.terminal_rx.take()?.await.ok()
     }
 }
 
@@ -823,12 +878,14 @@ pub fn spawn_rpc(
     let (normal_tx, normal_rx) = mpsc::channel(RPC_NORMAL_CAPACITY);
     let (cancel_tx, cancel_rx) = mpsc::channel(RPC_INFLIGHT_CAPACITY);
     let (event_tx, event_rx) = mpsc::channel(EVENT_CAPACITY);
+    let (reliable_event_tx, reliable_event_rx) = mpsc::channel(RPC_RELIABLE_EVENT_CAPACITY);
     let (terminal_tx, terminal_rx) = oneshot::channel();
     let state = Arc::new(AtomicU8::new(STATE_OPEN));
     let pending_count = Arc::new(AtomicUsize::new(0));
     let protocol_drift_count = Arc::new(AtomicU64::new(0));
     let dropped_notification_count = Arc::new(AtomicU64::new(0));
     let event_budget = Arc::new(Semaphore::new(RPC_BYTE_BUDGET));
+    let reliable_event_budget = Arc::new(Semaphore::new(RPC_RELIABLE_EVENT_BYTE_BUDGET));
 
     let handle = RpcHandle {
         high_tx,
@@ -838,7 +895,8 @@ pub fn spawn_rpc(
         state: Arc::clone(&state),
         initialize_state: Arc::new(AtomicU8::new(INIT_NEW)),
         next_id: Arc::new(AtomicU64::new(0)),
-        inflight: Arc::new(Semaphore::new(RPC_INFLIGHT_CAPACITY)),
+        high_inflight: Arc::new(Semaphore::new(RPC_HIGH_CAPACITY)),
+        normal_inflight: Arc::new(Semaphore::new(RPC_INFLIGHT_CAPACITY)),
         high_command_budget: Arc::new(Semaphore::new(RPC_HIGH_BYTE_BUDGET)),
         normal_command_budget: Arc::new(Semaphore::new(RPC_BYTE_BUDGET)),
         pending_count: Arc::clone(&pending_count),
@@ -854,8 +912,10 @@ pub fn spawn_rpc(
             normal_rx,
             cancel_rx,
             event_tx,
+            reliable_event_tx,
             terminal_tx,
             event_budget,
+            reliable_event_budget,
             epoch,
             state,
             pending_count,
@@ -869,9 +929,13 @@ pub fn spawn_rpc(
     RpcConnection {
         handle,
         events: RpcEventReceiver {
-            rx: event_rx,
+            normal_rx: event_rx,
+            reliable_rx: reliable_event_rx,
             terminal_rx: Some(terminal_rx),
             normal_closed: false,
+            reliable_closed: false,
+            next_sequence: 0,
+            buffered: BTreeMap::new(),
         },
         cancellation,
         actor: Some(actor),
@@ -887,8 +951,10 @@ async fn run_actor(
     mut normal_rx: mpsc::Receiver<RpcCommand>,
     mut cancel_rx: mpsc::Receiver<RequestId>,
     event_tx: mpsc::Sender<InternalRpcEvent>,
+    reliable_event_tx: mpsc::Sender<InternalRpcEvent>,
     terminal_tx: oneshot::Sender<RpcEvent>,
     event_budget: Arc<Semaphore>,
+    reliable_event_budget: Arc<Semaphore>,
     epoch: ConnectionEpoch,
     state: Arc<AtomicU8>,
     pending_count: Arc<AtomicUsize>,
@@ -916,6 +982,7 @@ async fn run_actor(
     let mut pending = HashMap::<RequestId, PendingRequest>::new();
     let mut server_pending = HashSet::<RequestId>::new();
     let mut high_burst = 0_usize;
+    let mut event_sequence = 0_u64;
     let exit = loop {
         let allow_high = pump_high_tx.capacity() > 0;
         let allow_normal = pump_normal_tx.capacity() > 0;
@@ -934,18 +1001,30 @@ async fn run_actor(
                             &mut server_pending,
                             &event_tx,
                             &event_budget,
+                            &reliable_event_tx,
+                            &reliable_event_budget,
                             &cancellation,
                             epoch,
+                            &mut event_sequence,
                             &pending_count,
                             &protocol_drift_count,
                             &dropped_notification_count,
-                        ) {
-                            break TransportExit::TaskFailed;
+                        ).await {
+                            break if cancellation.is_cancelled() {
+                                TransportExit::Cancelled
+                            } else {
+                                TransportExit::TaskFailed
+                            };
                         }
                     }
                     Some(TransportEvent::ProtocolError(_)) => {
                         increment_saturating(&protocol_drift_count);
-                        if !try_emit_small_event(RpcEvent::ProtocolDrift, &event_tx, &event_budget) {
+                        if !try_emit_small_event(
+                            RpcEvent::ProtocolDrift,
+                            &event_tx,
+                            &event_budget,
+                            &mut event_sequence,
+                        ) {
                             break TransportExit::TaskFailed;
                         }
                     }
@@ -997,6 +1076,8 @@ async fn run_actor(
 
     state.store(STATE_LOST, Ordering::Release);
     cancellation.cancel();
+    completion_rx.close();
+    drop(completion_rx);
     fail_all_pending(&mut pending, epoch, &pending_count);
     high_rx.close();
     normal_rx.close();
@@ -1018,15 +1099,18 @@ async fn run_actor(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn handle_inbound(
+async fn handle_inbound(
     message: InboundMessage,
     transport_budget: OwnedSemaphorePermit,
     pending: &mut HashMap<RequestId, PendingRequest>,
     server_pending: &mut HashSet<RequestId>,
     event_tx: &mpsc::Sender<InternalRpcEvent>,
     event_budget: &Arc<Semaphore>,
+    reliable_event_tx: &mpsc::Sender<InternalRpcEvent>,
+    reliable_event_budget: &Arc<Semaphore>,
     cancellation: &CancellationToken,
     epoch: ConnectionEpoch,
+    event_sequence: &mut u64,
     pending_count: &AtomicUsize,
     protocol_drift_count: &AtomicU64,
     dropped_notification_count: &AtomicU64,
@@ -1041,7 +1125,12 @@ fn handle_inbound(
             } else {
                 drop(transport_budget);
                 increment_saturating(protocol_drift_count);
-                return try_emit_small_event(RpcEvent::ProtocolDrift, event_tx, event_budget);
+                return try_emit_small_event(
+                    RpcEvent::ProtocolDrift,
+                    event_tx,
+                    event_budget,
+                    event_sequence,
+                );
             }
         }
         InboundMessage::ErrorResponse { id, error } => {
@@ -1053,7 +1142,12 @@ fn handle_inbound(
                 }));
             } else {
                 increment_saturating(protocol_drift_count);
-                return try_emit_small_event(RpcEvent::ProtocolDrift, event_tx, event_budget);
+                return try_emit_small_event(
+                    RpcEvent::ProtocolDrift,
+                    event_tx,
+                    event_budget,
+                    event_sequence,
+                );
             }
         }
         InboundMessage::Request { id, method, params } => {
@@ -1062,7 +1156,7 @@ fn handle_inbound(
             {
                 return false;
             }
-            return try_emit_event(
+            return emit_reliable_event(
                 RpcEvent::ServerRequest(ServerRequest {
                     id,
                     method,
@@ -1073,18 +1167,35 @@ fn handle_inbound(
                     lease: Arc::new(ServerRequestLease::new(cancellation.clone())),
                 }),
                 None,
-                Arc::clone(event_budget),
-                event_tx,
-            );
+                Arc::clone(reliable_event_budget),
+                reliable_event_tx,
+                event_sequence,
+                cancellation,
+            )
+            .await;
         }
         InboundMessage::Notification { method, params } => {
             let authoritative = is_authoritative_notification(&method);
-            let emitted = try_emit_event(
-                RpcEvent::Notification { method, params },
-                Some(transport_budget),
-                Arc::clone(event_budget),
-                event_tx,
-            );
+            let event = RpcEvent::Notification { method, params };
+            let emitted = if authoritative {
+                emit_reliable_event(
+                    event,
+                    Some(transport_budget),
+                    Arc::clone(reliable_event_budget),
+                    reliable_event_tx,
+                    event_sequence,
+                    cancellation,
+                )
+                .await
+            } else {
+                try_emit_event(
+                    event,
+                    Some(transport_budget),
+                    Arc::clone(event_budget),
+                    event_tx,
+                    event_sequence,
+                )
+            };
             if emitted {
                 return true;
             }
@@ -1142,6 +1253,7 @@ fn dispatch_command(
                 },
                 deadline,
                 completion: JobCompletion::Request(id.clone()),
+                server_response: None,
                 _budget: budget_permit,
             };
             if let Err(error) = pump_tx.try_send(job) {
@@ -1175,6 +1287,7 @@ fn dispatch_command(
                 message,
                 deadline,
                 completion: JobCompletion::Fire(ack),
+                server_response: server_request,
                 _budget: budget_permit,
             };
             if let Err(error) = pump_tx.try_send(job) {
@@ -1213,21 +1326,38 @@ async fn run_sender_pump(
             message,
             deadline,
             completion,
+            server_response,
             _budget,
         } = job;
         let result = tokio::select! {
             biased;
             () = cancellation.cancelled() => Err(RpcError::ConnectionLost(epoch)),
             () = tokio::time::sleep_until(deadline) => Err(RpcError::Timeout { method }),
-            result = sender.send(message) => result.map_err(|error| map_send_error(&error, method, epoch)),
+            result = async {
+                if server_response.is_some() {
+                    sender.send_confirmed(message).await
+                } else {
+                    sender.send(message).await
+                }
+            } => result.map_err(|error| map_send_error(&error, method, epoch)),
         };
+        if let Some(response) = &server_response {
+            if result.is_ok() {
+                response.resolve();
+            } else {
+                response.fail_closed();
+            }
+        }
         match completion {
             JobCompletion::Request(id) => {
-                if completion_tx
-                    .send(OutboundCompletion { id, result })
-                    .await
-                    .is_err()
-                {
+                let sent = tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => false,
+                    result = completion_tx.send(OutboundCompletion { id, result }) => {
+                        result.is_ok()
+                    }
+                };
+                if !sent {
                     return;
                 }
             }
@@ -1245,7 +1375,7 @@ fn map_send_error(
 ) -> RpcError {
     match error {
         TransportSendError::Protocol(_) => RpcError::PayloadTooLarge { method },
-        TransportSendError::Closed | TransportSendError::Cancelled => {
+        TransportSendError::Closed | TransportSendError::Cancelled | TransportSendError::Io(_) => {
             RpcError::ConnectionLost(epoch)
         }
     }
@@ -1362,6 +1492,7 @@ fn try_emit_event(
     transport_budget: Option<OwnedSemaphorePermit>,
     event_budget: Arc<Semaphore>,
     event_tx: &mpsc::Sender<InternalRpcEvent>,
+    event_sequence: &mut u64,
 ) -> bool {
     let weight = rpc_event_weight(&event);
     if weight > RPC_BYTE_BUDGET {
@@ -1371,32 +1502,91 @@ fn try_emit_event(
     let Ok(budget) = event_budget.try_acquire_many_owned(permits) else {
         return false;
     };
-    event_tx
-        .try_send(InternalRpcEvent {
-            event,
-            _budget: budget,
-            _transport_budget: transport_budget,
-        })
-        .is_ok()
+    let Ok(slot) = event_tx.try_reserve() else {
+        return false;
+    };
+    let Some(sequence) = take_event_sequence(event_sequence) else {
+        return false;
+    };
+    slot.send(InternalRpcEvent {
+        sequence,
+        event,
+        _budget: budget,
+        _transport_budget: transport_budget,
+    });
+    true
+}
+
+async fn emit_reliable_event(
+    event: RpcEvent,
+    transport_budget: Option<OwnedSemaphorePermit>,
+    event_budget: Arc<Semaphore>,
+    event_tx: &mpsc::Sender<InternalRpcEvent>,
+    event_sequence: &mut u64,
+    cancellation: &CancellationToken,
+) -> bool {
+    let weight = rpc_event_weight(&event);
+    if weight > RPC_RELIABLE_EVENT_BYTE_BUDGET {
+        return false;
+    }
+    let budget = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => return false,
+        permit = event_budget.acquire_many_owned(bounded_reliable_permits(weight)) => {
+            let Ok(permit) = permit else { return false; };
+            permit
+        }
+    };
+    let slot = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => return false,
+        permit = event_tx.reserve() => {
+            let Ok(permit) = permit else { return false; };
+            permit
+        }
+    };
+    let Some(sequence) = take_event_sequence(event_sequence) else {
+        return false;
+    };
+    slot.send(InternalRpcEvent {
+        sequence,
+        event,
+        _budget: budget,
+        _transport_budget: transport_budget,
+    });
+    true
 }
 
 fn try_emit_small_event(
     event: RpcEvent,
     event_tx: &mpsc::Sender<InternalRpcEvent>,
     event_budget: &Arc<Semaphore>,
+    event_sequence: &mut u64,
 ) -> bool {
     let weight = rpc_event_weight(&event);
     let Ok(budget) = Arc::clone(event_budget).try_acquire_many_owned(bounded_permits(weight))
     else {
         return false;
     };
-    event_tx
-        .try_send(InternalRpcEvent {
-            event,
-            _budget: budget,
-            _transport_budget: None,
-        })
-        .is_ok()
+    let Ok(slot) = event_tx.try_reserve() else {
+        return false;
+    };
+    let Some(sequence) = take_event_sequence(event_sequence) else {
+        return false;
+    };
+    slot.send(InternalRpcEvent {
+        sequence,
+        event,
+        _budget: budget,
+        _transport_budget: None,
+    });
+    true
+}
+
+fn take_event_sequence(next: &mut u64) -> Option<u64> {
+    let sequence = *next;
+    *next = next.checked_add(1)?;
+    Some(sequence)
 }
 
 fn rpc_event_weight(event: &RpcEvent) -> usize {
@@ -1418,6 +1608,11 @@ fn rpc_event_weight(event: &RpcEvent) -> usize {
 fn bounded_permits(bytes: usize) -> u32 {
     u32::try_from(bytes.clamp(1, RPC_BYTE_BUDGET))
         .expect("RPC byte budget is bounded below u32::MAX")
+}
+
+fn bounded_reliable_permits(bytes: usize) -> u32 {
+    u32::try_from(bytes.clamp(1, RPC_RELIABLE_EVENT_BYTE_BUDGET))
+        .expect("reliable RPC event budget is bounded below u32::MAX")
 }
 
 fn count_serialized<T>(method: &'static str, value: &T) -> Result<usize, RpcError>
@@ -1556,10 +1751,25 @@ enum RpcCommand {
     },
 }
 
-#[derive(Clone)]
 struct ServerResponseLease {
     id: RequestId,
     lease: Arc<ServerRequestLease>,
+}
+
+impl ServerResponseLease {
+    fn resolve(&self) {
+        self.lease.resolve_actor_owned();
+    }
+
+    fn fail_closed(&self) {
+        self.lease.fail_actor_owned();
+    }
+}
+
+impl Drop for ServerResponseLease {
+    fn drop(&mut self) {
+        self.fail_closed();
+    }
 }
 
 struct PendingRequest {
@@ -1574,6 +1784,7 @@ struct OutboundJob {
     message: OutboundMessage,
     deadline: Instant,
     completion: JobCompletion,
+    server_response: Option<ServerResponseLease>,
     _budget: OwnedSemaphorePermit,
 }
 
@@ -1588,6 +1799,7 @@ struct OutboundCompletion {
 }
 
 struct InternalRpcEvent {
+    sequence: u64,
     event: RpcEvent,
     _budget: OwnedSemaphorePermit,
     _transport_budget: Option<OwnedSemaphorePermit>,

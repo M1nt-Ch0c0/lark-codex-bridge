@@ -93,11 +93,14 @@ pub enum TransportSendError {
     Closed,
     #[error("app-server transport was cancelled")]
     Cancelled,
+    #[error("app-server transport write failed")]
+    Io(#[source] TransportIoError),
 }
 
 struct QueuedFrame {
     bytes: Vec<u8>,
     _budget: OwnedSemaphorePermit,
+    written: Option<oneshot::Sender<Result<(), TransportIoError>>>,
 }
 
 #[derive(Clone)]
@@ -115,6 +118,32 @@ impl TransportSender {
     /// Returns an error if encoding fails or the connection closes while waiting
     /// for bounded queue capacity.
     pub async fn send(&self, message: OutboundMessage) -> Result<(), TransportSendError> {
+        self.enqueue(message, None).await
+    }
+
+    /// Queues a frame and waits until the writer has flushed it to app-server stdin.
+    pub(crate) async fn send_confirmed(
+        &self,
+        message: OutboundMessage,
+    ) -> Result<(), TransportSendError> {
+        let (written_tx, written_rx) = oneshot::channel();
+        self.enqueue(message, Some(written_tx)).await?;
+        tokio::select! {
+            biased;
+            result = written_rx => match result {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => Err(TransportSendError::Io(error)),
+                Err(_) => Err(TransportSendError::Closed),
+            },
+            () = self.cancellation.cancelled() => Err(TransportSendError::Cancelled),
+        }
+    }
+
+    async fn enqueue(
+        &self,
+        message: OutboundMessage,
+        written: Option<oneshot::Sender<Result<(), TransportIoError>>>,
+    ) -> Result<(), TransportSendError> {
         let maximum_frame_permits = byte_permits(MAX_JSONL_LINE_BYTES.saturating_add(1));
         let mut budget = tokio::select! {
             biased;
@@ -129,6 +158,7 @@ impl TransportSender {
         let frame = QueuedFrame {
             bytes,
             _budget: budget,
+            written,
         };
         tokio::select! {
             biased;
@@ -411,10 +441,21 @@ where
             return WriterExit::Cancelled;
         };
         if let Err(error) = stdin.write_all(&frame.bytes).await {
-            return WriterExit::Write(error.into());
+            let error = TransportIoError::from(error);
+            if let Some(written) = frame.written {
+                let _ = written.send(Err(error));
+            }
+            return WriterExit::Write(error);
         }
         if let Err(error) = stdin.flush().await {
-            return WriterExit::Write(error.into());
+            let error = TransportIoError::from(error);
+            if let Some(written) = frame.written {
+                let _ = written.send(Err(error));
+            }
+            return WriterExit::Write(error);
+        }
+        if let Some(written) = frame.written {
+            let _ = written.send(Ok(()));
         }
     }
 }

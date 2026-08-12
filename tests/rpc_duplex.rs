@@ -5,7 +5,10 @@ use lark_codex_bridge::codex::{
     rpc::{ConnectionEpoch, RpcConnection, RpcError, RpcEvent, initialize_connection, spawn_rpc},
     transport::{TransportExit, spawn_stream_transport},
 };
-use lark_codex_bridge::limits::{EVENT_CAPACITY, MAX_JSONL_LINE_BYTES};
+use lark_codex_bridge::limits::{
+    EVENT_CAPACITY, MAX_JSONL_LINE_BYTES, RPC_HIGH_CAPACITY, RPC_INFLIGHT_CAPACITY,
+    RPC_RELIABLE_EVENT_CAPACITY,
+};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, duplex};
 use tokio::time::timeout;
@@ -196,6 +199,129 @@ async fn concurrent_requests_complete_from_out_of_order_responses() {
         json!({"completed": "high"})
     );
     assert_eq!(harness.connection.handle.pending_count(), 0);
+
+    harness.connection.shutdown().await;
+}
+
+#[tokio::test]
+async fn high_request_reaches_wire_when_normal_inflight_is_saturated() {
+    let mut harness = rpc_harness(64 * 1024, 39);
+    let mut normal = Vec::with_capacity(RPC_INFLIGHT_CAPACITY);
+    for sequence in 0..RPC_INFLIGHT_CAPACITY {
+        let handle = harness.connection.handle.clone();
+        normal.push(tokio::spawn(async move {
+            handle
+                .request::<_, Value>(
+                    "example/normal-saturation",
+                    &json!({"sequence": sequence}),
+                    IO_TIMEOUT,
+                )
+                .await
+        }));
+    }
+    for _ in 0..RPC_INFLIGHT_CAPACITY {
+        let request = read_wire(&mut harness.app_stdin).await;
+        assert_eq!(request["method"], "example/normal-saturation");
+    }
+
+    let handle = harness.connection.handle.clone();
+    let high = tokio::spawn(async move {
+        handle
+            .request_high::<_, Value>(
+                "turn/interrupt",
+                &json!({"threadId": "thread-priority", "turnId": "turn-priority"}),
+                IO_TIMEOUT,
+            )
+            .await
+    });
+    let request = timeout(
+        Duration::from_millis(250),
+        read_wire(&mut harness.app_stdin),
+    )
+    .await
+    .expect("reserved high-priority inflight admission must make bounded progress");
+    assert_eq!(request["method"], "turn/interrupt");
+
+    high.abort();
+    for task in normal {
+        task.abort();
+    }
+    harness.connection.shutdown().await;
+}
+
+#[tokio::test]
+async fn reliable_events_survive_a_full_normal_event_backlog_in_wire_order() {
+    let mut harness = rpc_harness(256 * 1024, 40);
+    let handle = harness.connection.handle.clone();
+    let barrier = tokio::spawn(async move {
+        handle
+            .request::<_, Value>("example/reliable-barrier", &json!({}), IO_TIMEOUT)
+            .await
+    });
+    let barrier_request = read_wire(&mut harness.app_stdin).await;
+    for sequence in 0..EVENT_CAPACITY {
+        write_wire(
+            &mut harness.app_stdout,
+            &json!({"method": "example/progress", "params": {"sequence": sequence}}),
+        )
+        .await;
+    }
+    write_wire(
+        &mut harness.app_stdout,
+        &json!({"id": "approval-reliable", "method": "approval/request", "params": {}}),
+    )
+    .await;
+    write_wire(
+        &mut harness.app_stdout,
+        &json!({
+            "method": "turn/completed",
+            "params": {"threadId": "thread-reliable", "turn": {"id": "turn-reliable"}}
+        }),
+    )
+    .await;
+    write_wire(
+        &mut harness.app_stdout,
+        &json!({"id": wire_id(&barrier_request), "result": {"observed": true}}),
+    )
+    .await;
+    assert_eq!(
+        barrier
+            .await
+            .expect("barrier request should not panic")
+            .expect("actor must process reliable events before the later response"),
+        json!({"observed": true})
+    );
+
+    for sequence in 0..EVENT_CAPACITY {
+        assert!(matches!(
+            recv_event(&mut harness.connection).await,
+            RpcEvent::Notification { method, params }
+                if method == "example/progress"
+                    && params == Some(json!({"sequence": sequence}))
+        ));
+    }
+    let mut request = match recv_event(&mut harness.connection).await {
+        RpcEvent::ServerRequest(request) => request,
+        other => panic!("expected reliable server request, got {other:?}"),
+    };
+    assert_eq!(
+        request.id(),
+        &RequestId::String("approval-reliable".to_owned())
+    );
+    assert!(matches!(
+        recv_event(&mut harness.connection).await,
+        RpcEvent::Notification { method, .. } if method == "turn/completed"
+    ));
+    harness
+        .connection
+        .handle
+        .respond_request(&mut request, &json!({"decision": "accept"}))
+        .await
+        .expect("reliably delivered request should remain answerable");
+    assert_eq!(
+        read_wire(&mut harness.app_stdin).await["id"],
+        "approval-reliable"
+    );
 
     harness.connection.shutdown().await;
 }
@@ -435,12 +561,12 @@ async fn server_responses_overtake_a_backpressured_normal_queue() {
             .await
             .expect("normal notification should enter the bounded queue");
     }
-    harness
-        .connection
-        .handle
-        .respond_request(&mut approval, &json!({"decision": "accept"}))
-        .await
-        .expect("high-priority response should enter the bounded queue");
+    let handle = harness.connection.handle.clone();
+    let response = tokio::spawn(async move {
+        handle
+            .respond_request(&mut approval, &json!({"decision": "accept"}))
+            .await
+    });
 
     let mut normal_before_response = 0;
     loop {
@@ -456,6 +582,10 @@ async fn server_responses_overtake_a_backpressured_normal_queue() {
         normal_before_response < NORMAL_BACKLOG,
         "a high-priority server response must overtake queued normal traffic"
     );
+    response
+        .await
+        .expect("response task should not panic")
+        .expect("high-priority response should be flushed to the wire");
 
     harness.connection.shutdown().await;
 }
@@ -487,7 +617,99 @@ async fn cancelled_server_response_still_reaches_the_wire_and_consumes_the_token
     assert_eq!(response["id"], "approval-cancel");
     assert_eq!(response["result"]["decision"], "decline");
 
+    let handle = harness.connection.handle.clone();
+    let health = tokio::spawn(async move {
+        handle
+            .request::<_, Value>("example/after-cancelled-response", &json!({}), IO_TIMEOUT)
+            .await
+    });
+    let request = read_wire(&mut harness.app_stdin).await;
+    assert_eq!(request["method"], "example/after-cancelled-response");
+    write_wire(
+        &mut harness.app_stdout,
+        &json!({"id": wire_id(&request), "result": {"healthy": true}}),
+    )
+    .await;
+    assert_eq!(
+        health
+            .await
+            .expect("health request should not panic")
+            .expect("caller cancellation must not poison a successful background response"),
+        json!({"healthy": true})
+    );
+
     harness.connection.shutdown().await;
+}
+
+#[tokio::test]
+async fn completion_pressure_cannot_deadlock_shutdown_or_terminal_delivery() {
+    let mut harness = rpc_harness(1, 41);
+    let mut requests = Vec::with_capacity(RPC_INFLIGHT_CAPACITY + RPC_HIGH_CAPACITY);
+    for sequence in 0..RPC_INFLIGHT_CAPACITY {
+        let handle = harness.connection.handle.clone();
+        requests.push(tokio::spawn(async move {
+            handle
+                .request::<_, Value>(
+                    "example/completion-pressure-normal",
+                    &json!({"sequence": sequence}),
+                    IO_TIMEOUT,
+                )
+                .await
+        }));
+    }
+    for sequence in 0..RPC_HIGH_CAPACITY {
+        let handle = harness.connection.handle.clone();
+        requests.push(tokio::spawn(async move {
+            handle
+                .request_high::<_, Value>(
+                    "example/completion-pressure-high",
+                    &json!({"sequence": sequence}),
+                    IO_TIMEOUT,
+                )
+                .await
+        }));
+    }
+    let expected_pending = RPC_INFLIGHT_CAPACITY + RPC_HIGH_CAPACITY;
+    timeout(IO_TIMEOUT, async {
+        while harness.connection.handle.pending_count() != expected_pending {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all pressure requests should enter the actor before it is blocked");
+
+    for sequence in 0..=RPC_RELIABLE_EVENT_CAPACITY {
+        write_wire(
+            &mut harness.app_stdout,
+            &json!({
+                "method": "turn/completed",
+                "params": {"threadId": "thread-pressure", "sequence": sequence}
+            }),
+        )
+        .await;
+    }
+
+    for _ in 0..expected_pending {
+        let _ = read_wire(&mut harness.app_stdin).await;
+    }
+    let exit = timeout(Duration::from_millis(500), harness.connection.shutdown())
+        .await
+        .expect("completion pressure must not make shutdown wait on its own pumps");
+    assert_eq!(exit, TransportExit::Cancelled);
+
+    for _ in 0..RPC_RELIABLE_EVENT_CAPACITY {
+        assert!(matches!(
+            recv_event(&mut harness.connection).await,
+            RpcEvent::Notification { method, .. } if method == "turn/completed"
+        ));
+    }
+    assert!(matches!(
+        recv_event(&mut harness.connection).await,
+        RpcEvent::TransportClosed(TransportExit::Cancelled)
+    ));
+    for request in requests {
+        request.abort();
+    }
 }
 
 #[tokio::test]

@@ -13,6 +13,7 @@ pub const RPC_NORMAL_CAPACITY: usize = 256;
 pub const RPC_INFLIGHT_CAPACITY: usize = RPC_HIGH_CAPACITY + RPC_NORMAL_CAPACITY;
 pub const RPC_SERVER_REQUEST_CAPACITY: usize = RPC_HIGH_CAPACITY;
 pub const EVENT_CAPACITY: usize = 1024;
+pub const RPC_RELIABLE_EVENT_CAPACITY: usize = RPC_SERVER_REQUEST_CAPACITY * 2;
 pub const THREAD_EVENT_CAPACITY: usize = 256;
 pub const THREAD_TERMINAL_CAPACITY: usize = 64;
 pub const CLIENT_COMMAND_CAPACITY: usize = 256;
@@ -34,6 +35,7 @@ pub const TRANSPORT_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 pub const TRANSPORT_HIGH_BYTE_BUDGET: usize = TRANSPORT_BYTE_BUDGET;
 pub const RPC_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 pub const RPC_HIGH_BYTE_BUDGET: usize = RPC_BYTE_BUDGET;
+pub const RPC_RELIABLE_EVENT_BYTE_BUDGET: usize = RPC_BYTE_BUDGET;
 
 pub const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(30);
