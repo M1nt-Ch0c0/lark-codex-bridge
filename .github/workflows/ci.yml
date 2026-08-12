@@ -9,6 +9,17 @@ permissions:
   contents: read
 
 jobs:
+  msrv:
+    name: MSRV (Rust 1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - run: cargo check --all-targets
+
   quality:
     name: Quality (Linux)
     runs-on: ubuntu-latest

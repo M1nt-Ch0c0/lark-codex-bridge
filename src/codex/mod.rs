@@ -2,5 +2,6 @@
 
 pub mod process;
 pub mod protocol;
+pub mod rpc;
 pub mod transport;
 pub mod types;

@@ -281,33 +281,33 @@ Commit `feat: add bounded app-server transport` and push `main`.
 - Consumes: `TransportHandle`, wire envelopes, timeout constants.
 - Produces: `RpcHandle`, `RpcEvent`, `ServerRequest`, `ConnectionEpoch`, and `initialize_connection`.
 
-- [ ] **Step 1: Implement one RPC owner task**
+- [x] **Step 1: Implement one RPC owner task**
 
 ```rust
 pub struct RpcHandle {
     high_tx: mpsc::Sender<RpcCommand>,
     normal_tx: mpsc::Sender<RpcCommand>,
     epoch: ConnectionEpoch,
-    initialized: Arc<AtomicBool>,
+    initialized: Arc<AtomicU8>,
 }
 
 impl RpcHandle {
     pub async fn request<P, R>(&self, method: &'static str, params: &P, timeout: Duration) -> Result<R, RpcError>
     where P: Serialize + ?Sized, R: DeserializeOwned;
     pub async fn notify<P: Serialize + ?Sized>(&self, method: &'static str, params: &P) -> Result<(), RpcError>;
-    pub async fn respond<R: Serialize + ?Sized>(&self, id: RequestId, result: &R) -> Result<(), RpcError>;
-    pub async fn respond_error(&self, id: RequestId, code: i64, message: &str) -> Result<(), RpcError>;
+    pub async fn respond_request<R: Serialize + ?Sized>(&self, request: &ServerRequest, result: &R) -> Result<(), RpcError>;
+    pub async fn respond_request_error(&self, request: &ServerRequest, code: i64, message: &str) -> Result<(), RpcError>;
     pub fn epoch(&self) -> ConnectionEpoch;
 }
 ```
 
 Generate IDs as `c:<epoch>:<monotonic-u64>`. Maintain one pending map with method/deadline/oneshot. On EOF fail every pending call with `ConnectionLost(epoch)`. Route notifications and server requests through an event channel. Late/unknown IDs increment drift and are ignored.
 
-- [ ] **Step 2: Implement the exact handshake**
+- [x] **Step 2: Implement the exact handshake**
 
-`initialize_connection` sends one `initialize` request with client name `lark_codex_bridge`, title `Lark Codex Bridge`, package version, and no experimental capability. Only after a successful response does it send `initialized {}`. A second call on the same connection returns `AlreadyInitialized` locally.
+`initialize_connection` sends one `initialize` request with client name `lark_codex_bridge`, title `Lark Codex Bridge`, package version, and no experimental capability. Only after a successful response does it send `initialized` with an empty parameter object, matching the official app-server example. A second call on the same connection returns `AlreadyInitialized` locally.
 
-- [ ] **Step 3: Add deterministic duplex RPC tests**
+- [x] **Step 3: Add deterministic duplex RPC tests**
 
 Verify notification-before-response, concurrent out-of-order responses, timeout cleanup, error responses, opaque server integer IDs, response priority, EOF failure fanout, old-epoch late response isolation, and initialize/initialized order.
 
