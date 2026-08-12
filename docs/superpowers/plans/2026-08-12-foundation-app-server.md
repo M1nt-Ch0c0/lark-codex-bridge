@@ -67,7 +67,7 @@
 - Produces: `cli::run() -> anyhow::Result<()>` and `cli::Cli` for the binary.
 - Produces: `limits::{MAX_JSONL_LINE_BYTES, RPC_HIGH_CAPACITY, RPC_NORMAL_CAPACITY, EVENT_CAPACITY}`.
 
-- [ ] **Step 1: Create package metadata and exact dependency set**
+- [x] **Step 1: Create package metadata and exact dependency set**
 
 Use package name `lark-codex-bridge`, version `0.1.0-alpha.1`, edition `2024`, and MSRV `1.85`. Pin compatible dependency families to these current versions:
 
@@ -93,7 +93,7 @@ predicates = "3.1.4"
 tempfile = "3.27.0"
 ```
 
-- [ ] **Step 2: Add the CLI shell and bounded constants**
+- [x] **Step 2: Add the CLI shell and bounded constants**
 
 Define these initial commands; `codex probe` is implemented in Task 6:
 
@@ -117,11 +117,11 @@ pub enum CodexCommand {
 
 Set `MAX_JSONL_LINE_BYTES = 32 * 1024 * 1024`, high/normal RPC capacities to `64/256`, event capacity to `1024`, initialize timeout to 10 seconds, control RPC timeout to 30 seconds, and interrupt timeout to 10 seconds.
 
-- [ ] **Step 3: Add CI and CLI contract tests**
+- [x] **Step 3: Add CI and CLI contract tests**
 
 CI runs `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-targets`, and `cargo build --release` on Linux; macOS and Windows run `cargo test --all-targets` and `cargo build`. `tests/cli.rs` verifies `--help`, `--version`, and a missing `codex` binary returns a non-zero code without a panic backtrace.
 
-- [ ] **Step 4: Verify and publish the task**
+- [x] **Step 4: Verify and publish the task**
 
 Run:
 

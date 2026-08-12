@@ -1,0 +1,12 @@
+/target/
+/.env
+/.env.*
+/.lark-codex-bridge/
+/logs/
+/state/
+/schemas/generated/
+*.log
+*.profraw
+.DS_Store
+.idea/
+.vscode/
