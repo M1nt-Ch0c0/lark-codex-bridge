@@ -73,7 +73,7 @@
 - Produces: `TenantBrand`, `LarkEndpoints`, `LarkError`, `LarkCredentials`, `CredentialStore`, `LarkHttp`, `TenantTokenProvider`.
 - Consumes: nothing outside `limits` and the new dependencies.
 
-- [ ] **Step 1: Add the milestone dependency set**
+- [x] **Step 1: Add the milestone dependency set**
 
 Append to `[dependencies]` with exact pins (verify the lockfile resolves each):
 
@@ -89,7 +89,7 @@ secrecy = { version = "0.10.3", features = ["serde"] }
 
 No `native-tls`/OpenSSL anywhere; TLS is rustls only (design §15).
 
-- [ ] **Step 2: Implement tenant configuration and credential storage**
+- [x] **Step 2: Implement tenant configuration and credential storage**
 
 ```rust
 pub enum TenantBrand { Feishu, Lark }
@@ -113,7 +113,7 @@ pub trait CredentialStore {
 
 The file store writes atomically (temp file + rename) with `0600` permissions and redacts the secret in every `Debug`/`Display` path. Environment variables `LARK_APP_ID`, `LARK_APP_SECRET`, `LARK_TENANT` override the file so tests and the smoke gate never touch real state. `LarkError` classifies into `PermanentAuth` (bad credentials, forbidden), `Retryable` (network, timeout, 5xx, rate limit), `ProtocolViolation` (malformed frame/event), and `Exhausted` (bounds hit).
 
-- [ ] **Step 3: Implement the shared HTTP core and tenant token cache**
+- [x] **Step 3: Implement the shared HTTP core and tenant token cache**
 
 ```rust
 impl LarkHttp {
@@ -130,11 +130,11 @@ impl TenantTokenProvider {
 
 `TenantTokenProvider` calls `POST /open-apis/auth/v3/tenant_access_token/internal` with `{app_id, app_secret}`, caches `{token, expire_at}` behind a mutex with a single-flight refresh, and refreshes `TOKEN_REFRESH_SKEW` (3 minutes, matching the reference's early-expiry margin) before `expire_at`. A `code != 0` response classifies 403/auth failures as `PermanentAuth` and everything else as `Retryable`; the cached token is never logged. Response bodies are capped at `LARK_MAX_HTTP_BODY_BYTES` (e.g. 4 MiB) before JSON parsing. Add `LARK_HTTP_TIMEOUT = 15 s` (the reference bootstrap uses a 15 s request timeout) and token/cache constants to `src/limits.rs`.
 
-- [ ] **Step 4: Test token cache and error classification against a stub server**
+- [x] **Step 4: Test token cache and error classification against a stub server**
 
 Hand-roll a minimal HTTP/1.1 stub on `tokio::net::TcpListener` (no new dev-dependencies): canned status/JSON per request path, request capture for assertion. Cover first fetch, cache hit without a second request, refresh inside the skew window, single-flight under concurrent callers, `PermanentAuth` on invalid credentials, `Retryable` on 500 and on connect failure, body cap rejection, and `Debug` output containing no secret material.
 
-- [ ] **Step 5: Verify and publish the task**
+- [x] **Step 5: Verify and publish the task**
 
 Run:
 

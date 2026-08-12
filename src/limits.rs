@@ -38,9 +38,19 @@ pub const RPC_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 pub const RPC_HIGH_BYTE_BUDGET: usize = RPC_BYTE_BUDGET;
 pub const RPC_RELIABLE_EVENT_BYTE_BUDGET: usize = RPC_BYTE_BUDGET;
 
+/// Hard cap on a single Lark HTTP response body, enforced before JSON
+/// parsing and mid-stream for close-delimited bodies.
+pub const LARK_MAX_HTTP_BODY_BYTES: usize = 4 * 1024 * 1024;
+/// Refresh the tenant access token this long before its server-declared
+/// expiry (matches the reference SDK's early-expiry margin).
+pub const TOKEN_REFRESH_SKEW: Duration = Duration::from_secs(3 * 60);
+
 pub const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const SUPERVISOR_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 pub const CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 pub const INTERRUPT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Shared timeout for every Lark HTTP request (matches the reference
+/// bootstrap request timeout).
+pub const LARK_HTTP_TIMEOUT: Duration = Duration::from_secs(15);
