@@ -1342,11 +1342,8 @@ fn route_for_update<'a>(
                 && projection.outcomes.is_empty();
             idle.then(|| candidate_id.clone())
         });
-        if let Some(evictable) = evictable {
-            routes.remove(&evictable);
-        } else {
-            return None;
-        }
+        let evictable = evictable?;
+        routes.remove(&evictable);
     }
     Some(routes.entry(thread_id.clone()).or_default())
 }
