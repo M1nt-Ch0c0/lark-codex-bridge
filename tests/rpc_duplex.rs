@@ -7,7 +7,7 @@ use lark_codex_bridge::codex::{
 };
 use lark_codex_bridge::limits::{
     EVENT_CAPACITY, MAX_JSONL_LINE_BYTES, RPC_HIGH_CAPACITY, RPC_INFLIGHT_CAPACITY,
-    RPC_RELIABLE_EVENT_CAPACITY,
+    RPC_RELIABLE_EVENT_CAPACITY, RPC_TOTAL_PENDING_CAPACITY,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, duplex};
@@ -644,7 +644,7 @@ async fn cancelled_server_response_still_reaches_the_wire_and_consumes_the_token
 #[tokio::test]
 async fn completion_pressure_cannot_deadlock_shutdown_or_terminal_delivery() {
     let mut harness = rpc_harness(1, 41);
-    let mut requests = Vec::with_capacity(RPC_INFLIGHT_CAPACITY + RPC_HIGH_CAPACITY);
+    let mut requests = Vec::with_capacity(RPC_TOTAL_PENDING_CAPACITY);
     for sequence in 0..RPC_INFLIGHT_CAPACITY {
         let handle = harness.connection.handle.clone();
         requests.push(tokio::spawn(async move {
@@ -669,7 +669,7 @@ async fn completion_pressure_cannot_deadlock_shutdown_or_terminal_delivery() {
                 .await
         }));
     }
-    let expected_pending = RPC_INFLIGHT_CAPACITY + RPC_HIGH_CAPACITY;
+    let expected_pending = RPC_TOTAL_PENDING_CAPACITY;
     timeout(IO_TIMEOUT, async {
         while harness.connection.handle.pending_count() != expected_pending {
             tokio::task::yield_now().await;
@@ -710,6 +710,93 @@ async fn completion_pressure_cannot_deadlock_shutdown_or_terminal_delivery() {
     for request in requests {
         request.abort();
     }
+}
+
+#[tokio::test]
+async fn high_cancellations_survive_a_full_normal_cancellation_backlog() {
+    let mut harness = rpc_harness(256 * 1024, 42);
+    let total_pending = RPC_TOTAL_PENDING_CAPACITY;
+    let mut normal = Vec::with_capacity(RPC_INFLIGHT_CAPACITY);
+    for sequence in 0..RPC_INFLIGHT_CAPACITY {
+        let handle = harness.connection.handle.clone();
+        normal.push(tokio::spawn(async move {
+            handle
+                .request::<_, Value>(
+                    "example/cancel-normal",
+                    &json!({"sequence": sequence}),
+                    IO_TIMEOUT,
+                )
+                .await
+        }));
+    }
+    let mut high = Vec::with_capacity(RPC_HIGH_CAPACITY);
+    for sequence in 0..RPC_HIGH_CAPACITY {
+        let handle = harness.connection.handle.clone();
+        high.push(tokio::spawn(async move {
+            handle
+                .request_high::<_, Value>(
+                    "example/cancel-high",
+                    &json!({"sequence": sequence}),
+                    IO_TIMEOUT,
+                )
+                .await
+        }));
+    }
+    for _ in 0..total_pending {
+        let _ = read_wire(&mut harness.app_stdin).await;
+    }
+    assert_eq!(harness.connection.handle.pending_count(), total_pending);
+
+    for sequence in 0..=RPC_RELIABLE_EVENT_CAPACITY {
+        write_wire(
+            &mut harness.app_stdout,
+            &json!({
+                "method": "turn/completed",
+                "params": {"threadId": "thread-cancel-pressure", "sequence": sequence}
+            }),
+        )
+        .await;
+    }
+    tokio::time::sleep(Duration::from_millis(25)).await;
+
+    for request in normal {
+        request.abort();
+        let _ = request.await;
+    }
+    for request in high {
+        request.abort();
+        let _ = request.await;
+    }
+    for _ in 0..=RPC_RELIABLE_EVENT_CAPACITY {
+        assert!(matches!(
+            recv_event(&mut harness.connection).await,
+            RpcEvent::Notification { method, .. } if method == "turn/completed"
+        ));
+    }
+    timeout(Duration::from_millis(250), async {
+        while harness.connection.handle.pending_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all normal and high cancellation IDs must fit the cancellation lane");
+
+    let handle = harness.connection.handle.clone();
+    let replacement = tokio::spawn(async move {
+        handle
+            .request_high::<_, Value>("turn/interrupt", &json!({}), IO_TIMEOUT)
+            .await
+    });
+    let request = timeout(
+        Duration::from_millis(250),
+        read_wire(&mut harness.app_stdin),
+    )
+    .await
+    .expect("cancelled high requests must release admission for a new interrupt");
+    assert_eq!(request["method"], "turn/interrupt");
+    replacement.abort();
+
+    harness.connection.shutdown().await;
 }
 
 #[tokio::test]

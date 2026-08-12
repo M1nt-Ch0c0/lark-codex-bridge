@@ -33,6 +33,7 @@ use crate::{
         MAX_JSONL_LINE_BYTES, MAX_OUTBOUND_VALUE_WIRE_BYTES, RPC_BYTE_BUDGET, RPC_HIGH_BYTE_BUDGET,
         RPC_HIGH_CAPACITY, RPC_INFLIGHT_CAPACITY, RPC_NORMAL_CAPACITY,
         RPC_RELIABLE_EVENT_BYTE_BUDGET, RPC_RELIABLE_EVENT_CAPACITY, RPC_SERVER_REQUEST_CAPACITY,
+        RPC_TOTAL_PENDING_CAPACITY,
     },
 };
 
@@ -876,7 +877,7 @@ pub fn spawn_rpc(
     drop(parent_cancellation);
     let (high_tx, high_rx) = mpsc::channel(RPC_HIGH_CAPACITY);
     let (normal_tx, normal_rx) = mpsc::channel(RPC_NORMAL_CAPACITY);
-    let (cancel_tx, cancel_rx) = mpsc::channel(RPC_INFLIGHT_CAPACITY);
+    let (cancel_tx, cancel_rx) = mpsc::channel(RPC_TOTAL_PENDING_CAPACITY);
     let (event_tx, event_rx) = mpsc::channel(EVENT_CAPACITY);
     let (reliable_event_tx, reliable_event_rx) = mpsc::channel(RPC_RELIABLE_EVENT_CAPACITY);
     let (terminal_tx, terminal_rx) = oneshot::channel();
