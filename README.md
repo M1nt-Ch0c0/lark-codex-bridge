@@ -12,6 +12,9 @@
 设计规格见
 [docs/superpowers/specs/2026-08-12-lark-codex-bridge-design.md](docs/superpowers/specs/2026-08-12-lark-codex-bridge-design.md)。
 
+当前开发状态、未完成工作和 Agent 接管方式见
+[docs/DEVELOPMENT_HANDOFF.md](docs/DEVELOPMENT_HANDOFF.md)。
+
 ## 目标
 
 - 长期托管一个 `codex app-server`，避免每轮启动 `codex exec`。
