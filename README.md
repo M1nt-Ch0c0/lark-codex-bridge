@@ -5,10 +5,19 @@
 
 ## 项目状态
 
-当前处于早期开发阶段。已完成架构设计与 Codex app-server 基础层：有界 stdio
-transport、RPC 握手与并发、typed thread/turn client、supervisor（重启退避、
-永久错误 Degraded、优雅关闭）、结构化 `codex probe`，以及门控的真实 Codex
-smoke 测试。正在继续实现飞书侧的业务能力。
+当前版本是早期 alpha，尚未提供完整的常驻 `run` 运行时，不应视为可投入生产的
+飞书机器人。已经实现的基础能力包括：
+
+- Codex app-server 的有界 stdio transport、RPC broker、typed thread/turn client、
+  supervisor、`codex probe` 和门控的真实 Codex smoke；
+- Rust 原生飞书/Lark 凭证登记、OpenAPI、WebSocket transport、事件归一化、
+  `lark probe` 和门控的真实 Lark smoke；
+- SQLite WAL 单写者 store、持久入站收件箱、去重、访问策略，以及初步的
+  scope router/actor 和连续 turn 排队。
+
+仍在实现的 alpha 能力包括命令、回复投影与持久 outbox、附件缓存、完整应用装配、
+崩溃恢复和端到端运行时验证。真实 Lark smoke 是显式门控的验收项；未提供凭证、
+未运行或仅观察到 skip 都不算通过。
 
 ## Codex 环境检查
 
@@ -55,8 +64,8 @@ LARK_E2E=1 LARK_E2E_APP_ID=… LARK_E2E_APP_SECRET=… LARK_E2E_TENANT=feishu LA
 设计规格见
 [docs/superpowers/specs/2026-08-12-lark-codex-bridge-design.md](docs/superpowers/specs/2026-08-12-lark-codex-bridge-design.md)。
 
-当前开发状态、未完成工作和 Agent 接管方式见
-[docs/DEVELOPMENT_HANDOFF.md](docs/DEVELOPMENT_HANDOFF.md)。
+仓库只跟踪稳定的产品说明和架构规格。实施计划、实时进度、Agent 接管记录和临时
+测试证据属于本地开发材料，不发布到 Git。
 
 ## 目标
 

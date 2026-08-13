@@ -11,5 +11,7 @@
 .idea/
 .vscode/
 
-# Local-only development handoff (not for publication)
+# Local-only development material (not for publication)
 docs/DEVELOPMENT_HANDOFF.md
+docs/local/
+docs/superpowers/plans/
