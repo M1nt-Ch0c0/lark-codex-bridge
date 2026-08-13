@@ -25,8 +25,9 @@ pub mod schema;
 mod sessions;
 mod writer;
 
-use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -65,6 +66,9 @@ pub enum StoreError {
     /// The writer task has stopped (shutdown completed or it panicked).
     #[error("store is closed")]
     Closed,
+    /// Another live writer already owns this file-backed database in-process.
+    #[error("store is already open in this process")]
+    AlreadyOpen,
     /// A `user_version` migration failed to apply.
     #[error("store migration {version} ({name}) failed")]
     Migration {
@@ -97,6 +101,12 @@ pub enum StoreError {
     #[error("store capacity is exhausted while {context}")]
     CapacityExceeded {
         /// Static description of the bounded collection.
+        context: &'static str,
+    },
+    /// A path cannot be represented losslessly by this schema.
+    #[error("store path is invalid while {context}")]
+    InvalidPath {
+        /// Static description of the rejected path operation.
         context: &'static str,
     },
 }
@@ -135,8 +145,13 @@ impl StoreHandle {
     ///
     /// Returns an error when the database cannot be opened or migrated.
     pub async fn open(path: &Path) -> Result<Self, StoreError> {
+        let reservation = FileReservation::reserve(path)?;
         Ok(Self::from_parts(
-            writer::spawn(writer::StoreLocation::File(path.to_path_buf())).await?,
+            writer::spawn(
+                writer::StoreLocation::File(path.to_path_buf()),
+                Some(reservation),
+            )
+            .await?,
         ))
     }
 
@@ -147,7 +162,7 @@ impl StoreHandle {
     /// Returns an error when the database cannot be initialized.
     pub async fn open_in_memory() -> Result<Self, StoreError> {
         Ok(Self::from_parts(
-            writer::spawn(writer::StoreLocation::InMemory).await?,
+            writer::spawn(writer::StoreLocation::InMemory, None).await?,
         ))
     }
 
@@ -261,6 +276,59 @@ impl StoreHandle {
         })
         .await
     }
+}
+
+static LIVE_FILE_STORES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+/// Process-local reservation held by the writer thread for its full lifetime.
+pub(crate) struct FileReservation {
+    key: PathBuf,
+}
+
+impl FileReservation {
+    fn reserve(path: &Path) -> Result<Self, StoreError> {
+        let key = normalized_file_key(path)?;
+        let stores = LIVE_FILE_STORES.get_or_init(|| Mutex::new(HashSet::new()));
+        let mut stores = stores.lock().map_err(|_| StoreError::Closed)?;
+        if !stores.insert(key.clone()) {
+            return Err(StoreError::AlreadyOpen);
+        }
+        Ok(Self { key })
+    }
+}
+
+impl Drop for FileReservation {
+    fn drop(&mut self) {
+        if let Some(stores) = LIVE_FILE_STORES.get() {
+            if let Ok(mut stores) = stores.lock() {
+                stores.remove(&self.key);
+            }
+        }
+    }
+}
+
+fn normalized_file_key(path: &Path) -> Result<PathBuf, StoreError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|_| StoreError::Io {
+                context: "resolving the database path",
+            })?
+            .join(path)
+    };
+    let parent = absolute.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|_| StoreError::Io {
+        context: "creating the database directory",
+    })?;
+    let canonical_parent = std::fs::canonicalize(parent).map_err(|_| StoreError::Io {
+        context: "resolving the database path",
+    })?;
+    Ok(
+        canonical_parent.join(absolute.file_name().ok_or(StoreError::Io {
+            context: "resolving the database path",
+        })?),
+    )
 }
 
 /// Adds captured strings' UTF-8 byte lengths without overflowing.

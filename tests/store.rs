@@ -4,7 +4,8 @@ use lark_codex_bridge::lark::api::ChatMode;
 use lark_codex_bridge::lark::normalize::{InboundEvent, ScopeKey};
 use lark_codex_bridge::limits::{
     STORE_OUTBOX_CLAIM_MAX_BYTES, STORE_OUTBOX_MAX_QUEUED_BYTES, STORE_OUTBOX_PAYLOAD_MAX_BYTES,
-    STORE_REQUEST_MAX_BYTES, STORE_WRITER_CAPACITY,
+    STORE_RECOVERY_TURN_MAX_BYTES, STORE_RECOVERY_TURN_MAX_ROWS, STORE_REQUEST_MAX_BYTES,
+    STORE_WRITER_BYTE_BUDGET, STORE_WRITER_CAPACITY,
 };
 use lark_codex_bridge::store::{
     DedupOutcome, InboundEventState, NewOutboxRow, NewTurnRow, OutboxEnqueue, OutboxState,
@@ -158,6 +159,26 @@ async fn rejects_future_schema_versions_without_mutating_the_database() {
 }
 
 #[tokio::test]
+async fn file_store_rejects_a_second_live_open_until_the_writer_exits() {
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("store.sqlite");
+    let first = StoreHandle::open(&path).await.expect("first open");
+    let clone = first.clone();
+    drop(clone);
+    assert!(matches!(
+        StoreHandle::open(&path).await,
+        Err(StoreError::AlreadyOpen)
+    ));
+    first.shutdown().await.expect("shutdown");
+    StoreHandle::open(&path)
+        .await
+        .expect("reservation releases with writer lifecycle")
+        .shutdown()
+        .await
+        .expect("shutdown");
+}
+
+#[tokio::test]
 async fn dedup_transitions_and_ttl_are_fail_closed() {
     let store = StoreHandle::open_in_memory().await.expect("open");
     let first = event("event-1", "message-1");
@@ -237,6 +258,36 @@ async fn only_starting_turns_can_be_created_and_turn_transitions_are_checked() {
 }
 
 #[tokio::test]
+async fn live_turn_recovery_has_transactional_count_and_byte_bounds() {
+    let store = StoreHandle::open_in_memory().await.expect("open");
+    for number in 0..STORE_RECOVERY_TURN_MAX_ROWS {
+        store
+            .record_turn(turn(&format!("turn-{number}"), TurnState::Starting))
+            .await
+            .expect("fits count cap");
+    }
+    assert!(matches!(
+        store
+            .record_turn(turn("overflow", TurnState::Starting))
+            .await,
+        Err(StoreError::CapacityExceeded { .. })
+    ));
+    let recovery = store.uncertain_turns().await.expect("bounded recovery");
+    assert_eq!(recovery.len(), STORE_RECOVERY_TURN_MAX_ROWS);
+    let recovery_bytes: usize = recovery
+        .iter()
+        .map(|row| {
+            row.scope_key.len()
+                + row.client_message_id.len()
+                + row.codex_thread_id.as_deref().unwrap_or_default().len()
+                + row.codex_turn_id.as_deref().unwrap_or_default().len()
+        })
+        .sum();
+    assert!(recovery_bytes <= STORE_RECOVERY_TURN_MAX_BYTES);
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
 async fn outbox_is_idempotent_claimed_once_and_has_explicit_crash_recovery() {
     let store = StoreHandle::open_in_memory().await.expect("open");
     let original = match store
@@ -300,7 +351,10 @@ async fn outbox_attempts_never_decrease_and_receipts_require_sending() {
         Err(StoreError::InvalidTransition { .. })
     ));
     store.claim_outbox_batch(i64::MAX, 1).await.expect("claim");
-    store.fail_outbox(row.id, 1, 0, false).await.expect("fail");
+    store
+        .fail_outbox(row.id, 1, 0, false)
+        .await
+        .expect("first failure");
     assert_eq!(
         store
             .outbox_row(row.id)
@@ -312,24 +366,137 @@ async fn outbox_attempts_never_decrease_and_receipts_require_sending() {
     );
     store.claim_outbox_batch(i64::MAX, 1).await.expect("claim");
     assert!(matches!(
+        store.fail_outbox(row.id, 1, 0, false).await,
+        Err(StoreError::InvalidTransition { .. })
+    ));
+    assert!(matches!(
         store.fail_outbox(row.id, 0, 0, false).await,
         Err(StoreError::InvalidTransition { .. })
     ));
-    store
-        .complete_outbox(row.id, "receipt")
+    assert!(matches!(
+        store.complete_outbox(row.id, "receipt").await,
+        Ok(())
+    ));
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn attachment_lease_foreign_key_cascades_follow_both_parents() {
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("store.sqlite");
+    let store = StoreHandle::open(&path).await.expect("open");
+    let first_turn = store
+        .record_turn(turn("first", TurnState::Starting))
         .await
-        .expect("receipt");
+        .expect("turn");
+    let second_turn = store
+        .record_turn(turn("second", TurnState::Starting))
+        .await
+        .expect("turn");
+    store
+        .put_attachment("attachment-parent", 1, "file")
+        .await
+        .expect("attachment");
+    store
+        .put_attachment("turn-parent", 1, "file")
+        .await
+        .expect("attachment");
+    store
+        .add_attachment_lease("attachment-parent", first_turn)
+        .await
+        .expect("lease");
+    store
+        .add_attachment_lease("turn-parent", second_turn)
+        .await
+        .expect("lease");
+    store.shutdown().await.expect("shutdown");
+    let connection = rusqlite::Connection::open(&path).expect("connection");
+    connection
+        .execute_batch("PRAGMA foreign_keys = ON")
+        .expect("foreign keys");
+    connection
+        .execute(
+            "DELETE FROM attachments WHERE sha256 = ?1",
+            ["attachment-parent"],
+        )
+        .expect("attachment cascade");
+    connection
+        .execute("DELETE FROM turns WHERE id = ?1", [second_turn])
+        .expect("turn cascade");
+    drop(connection);
+    let store = StoreHandle::open(&path).await.expect("reopen");
+    assert!(
+        store
+            .attachment_leases("attachment-parent")
+            .await
+            .expect("leases")
+            .is_empty()
+    );
+    assert!(
+        store
+            .attachment_leases("turn-parent")
+            .await
+            .expect("leases")
+            .is_empty()
+    );
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn file_backed_sending_rows_become_uncertain_after_reopen_recovery() {
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("store.sqlite");
+    let store = StoreHandle::open(&path).await.expect("open");
+    let row = match store
+        .enqueue_outbox(outbox("key", "body"))
+        .await
+        .expect("enqueue")
+    {
+        OutboxEnqueue::New(row) => row,
+        OutboxEnqueue::Duplicate(_) => panic!("new"),
+    };
+    store.claim_outbox_batch(i64::MAX, 1).await.expect("claim");
+    store.shutdown().await.expect("shutdown");
+    let store = StoreHandle::open(&path).await.expect("reopen");
+    assert_eq!(store.recover_sending_outbox().await.expect("recover"), 1);
     assert_eq!(
         store
             .outbox_row(row.id)
             .await
             .expect("row")
             .expect("row")
-            .receipt_message_id
-            .as_deref(),
-        Some("receipt")
+            .state,
+        OutboxState::UncertainDelivery
     );
     store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn failed_migration_rolls_back_and_remains_reopenable() {
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("migration.sqlite");
+    let connection = rusqlite::Connection::open(&path).expect("seed");
+    connection
+        .execute_batch("CREATE TABLE inbound_events (bad INTEGER); PRAGMA user_version = 0;")
+        .expect("conflict");
+    drop(connection);
+    assert!(matches!(
+        StoreHandle::open(&path).await,
+        Err(StoreError::Migration { version: 1, .. })
+    ));
+    let connection = rusqlite::Connection::open(&path).expect("inspect");
+    let version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .expect("version");
+    assert_eq!(version, 0);
+    let scopes: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'scopes'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("schema");
+    assert_eq!(scopes, 0);
 }
 
 #[tokio::test]
@@ -414,19 +581,20 @@ async fn writer_channel_rejects_overflow_and_oversized_typed_inputs() {
     let lock = rusqlite::Connection::open(&path).expect("lock connection");
     lock.execute_batch("PRAGMA busy_timeout = 5000; BEGIN IMMEDIATE")
         .expect("write lock");
-    let blocked_store = store.clone();
-    let blocked =
-        tokio::spawn(async move { blocked_store.enqueue_outbox(outbox("blocked", "x")).await });
-    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    let task_count = STORE_WRITER_CAPACITY * 4;
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(task_count + 1));
     let mut joins = Vec::new();
-    for number in 0..=STORE_WRITER_CAPACITY {
+    for number in 0..task_count {
         let store = store.clone();
+        let barrier = barrier.clone();
         joins.push(tokio::spawn(async move {
+            barrier.wait().await;
             store
                 .enqueue_outbox(outbox(&format!("queued-{number}"), "x"))
                 .await
         }));
     }
+    barrier.wait().await;
     lock.execute_batch("ROLLBACK").expect("release lock");
     let mut queue_full = false;
     for join in joins {
@@ -434,11 +602,53 @@ async fn writer_channel_rejects_overflow_and_oversized_typed_inputs() {
             queue_full = true;
         }
     }
-    blocked.await.expect("blocked join").expect("blocked write");
     assert!(
         queue_full,
         "typed callers observe the bounded writer channel"
     );
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn writer_byte_budget_and_cancelled_callers_release_permits_after_dequeue() {
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("store.sqlite");
+    let store = StoreHandle::open(&path).await.expect("open");
+    let lock = rusqlite::Connection::open(&path).expect("lock connection");
+    lock.execute_batch("PRAGMA busy_timeout = 5000; BEGIN IMMEDIATE")
+        .expect("write lock");
+    let key_bytes = 256 * 1024;
+    let key = "k".repeat(key_bytes);
+    let sends = STORE_WRITER_BYTE_BUDGET / key_bytes + 2;
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(sends + 1));
+    let mut joins = Vec::new();
+    for number in 0..sends {
+        let store = store.clone();
+        let barrier = barrier.clone();
+        let key = format!("{key}-{number}");
+        joins.push(tokio::spawn(async move {
+            barrier.wait().await;
+            store.enqueue_outbox(outbox(&key, "x")).await
+        }));
+    }
+    barrier.wait().await;
+    let cancelled = joins.pop().expect("queued caller");
+    cancelled.abort();
+    lock.execute_batch("ROLLBACK").expect("release lock");
+    let mut queue_full = false;
+    for join in joins {
+        if matches!(join.await.expect("join"), Err(StoreError::QueueFull)) {
+            queue_full = true;
+        }
+    }
+    assert!(
+        queue_full,
+        "byte permits reject callers before count capacity"
+    );
+    store
+        .enqueue_outbox(outbox("after-cancel", "x"))
+        .await
+        .expect("dequeued cancelled work released its permit");
     store.shutdown().await.expect("shutdown");
 }
 
@@ -472,6 +682,36 @@ async fn archive_returns_the_thread_changed_by_this_call() {
             .codex_thread_id,
         "second"
     );
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn scope_paths_are_redacted_and_non_utf8_paths_are_refused() {
+    let store = StoreHandle::open_in_memory().await.expect("open");
+    let scope = ScopeKey::Chat("oc_scope".to_owned());
+    store
+        .upsert_scope(
+            &scope,
+            std::path::Path::new("/workspace/secret-project"),
+            "fp",
+        )
+        .await
+        .expect("scope");
+    let debug = format!(
+        "{:?}",
+        store.scope_row(&scope).await.expect("row").expect("row")
+    );
+    assert!(!debug.contains("secret-project"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+
+        let invalid = std::path::PathBuf::from(std::ffi::OsString::from_vec(vec![0xff]));
+        assert!(matches!(
+            store.upsert_scope(&scope, &invalid, "fp").await,
+            Err(StoreError::InvalidPath { .. })
+        ));
+    }
     store.shutdown().await.expect("shutdown");
 }
 

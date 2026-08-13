@@ -14,7 +14,7 @@ use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
 
 use super::schema::MIGRATIONS;
-use super::{StoreError, sqlite_error};
+use super::{FileReservation, StoreError, sqlite_error};
 use crate::limits::{STORE_BUSY_TIMEOUT, STORE_WRITER_CAPACITY};
 
 /// One request toward the writer task.
@@ -51,10 +51,13 @@ pub(crate) enum StoreLocation {
 ///
 /// Returns an error when the database cannot be opened or a migration fails.
 #[allow(clippy::needless_pass_by_value)]
-pub(crate) async fn spawn(location: StoreLocation) -> Result<WriterParts, StoreError> {
+pub(crate) async fn spawn(
+    location: StoreLocation,
+    reservation: Option<FileReservation>,
+) -> Result<WriterParts, StoreError> {
     let (sender, receiver) = mpsc::channel(STORE_WRITER_CAPACITY);
     let (init, initialized) = oneshot::channel();
-    let join = std::thread::spawn(move || writer_main(location, receiver, init));
+    let join = std::thread::spawn(move || writer_main(location, receiver, init, reservation));
     initialized.await.map_err(|_| StoreError::Closed)??;
     Ok(WriterParts { sender, join })
 }
@@ -64,6 +67,7 @@ fn writer_main(
     location: StoreLocation,
     mut receiver: mpsc::Receiver<StoreRequest>,
     init: oneshot::Sender<Result<(), StoreError>>,
+    _reservation: Option<FileReservation>,
 ) {
     let mut connection = match open_and_migrate(&location) {
         Ok(connection) => {

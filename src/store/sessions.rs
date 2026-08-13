@@ -14,6 +14,7 @@ use rusqlite::params;
 
 use super::{StoreError, StoreHandle, now_ms, query_optional, request_bytes, sqlite_error};
 use crate::lark::normalize::ScopeKey;
+use crate::limits::{STORE_RECOVERY_TURN_MAX_BYTES, STORE_RECOVERY_TURN_MAX_ROWS};
 
 /// Lifecycle status of a scope→thread mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,7 +90,7 @@ impl TurnState {
 }
 
 /// One row of the `scopes` table.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ScopeRow {
     /// Scope key (`im:<chat_id>` / `im:<chat_id>:thread:<thread_id>`).
     pub scope_key: String,
@@ -99,6 +100,18 @@ pub struct ScopeRow {
     pub policy_fingerprint: String,
     /// Last update, milliseconds since the Unix epoch.
     pub updated_ms: i64,
+}
+
+impl std::fmt::Debug for ScopeRow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ScopeRow")
+            .field("scope_key", &self.scope_key)
+            .field("cwd_len", &self.cwd.to_string_lossy().len())
+            .field("policy_fingerprint", &self.policy_fingerprint)
+            .field("updated_ms", &self.updated_ms)
+            .finish_non_exhaustive()
+    }
 }
 
 /// One row of the `threads` table.
@@ -165,7 +178,12 @@ impl StoreHandle {
         fingerprint: &str,
     ) -> Result<(), StoreError> {
         let scope_key = scope.to_string();
-        let cwd = cwd.to_string_lossy().into_owned();
+        let cwd = cwd
+            .to_str()
+            .ok_or(StoreError::InvalidPath {
+                context: "persisting a non-UTF-8 workspace path",
+            })?
+            .to_owned();
         let fingerprint = fingerprint.to_owned();
         let request_size = request_bytes(&[&scope_key, &cwd, &fingerprint]);
         self.run_sized(request_size, move |connection| {
@@ -315,7 +333,18 @@ impl StoreHandle {
         ]);
         self.run_sized(request_size, move |connection| {
             let now = now_ms();
-            connection
+            let transaction = connection
+                .transaction()
+                .map_err(|error| sqlite_error("starting a turn transaction", &error))?;
+            let (count, bytes) = recovery_usage(&transaction, None)?;
+            let row_bytes = turn_bytes(
+                &row.scope_key,
+                &row.client_message_id,
+                row.codex_thread_id.as_deref(),
+                None,
+            );
+            ensure_recovery_capacity(count, bytes, row_bytes, "recording a live turn")?;
+            transaction
                 .execute(
                     "INSERT INTO turns
                      (scope_key, client_message_id, codex_thread_id, state, uncertain, created_ms, updated_ms)
@@ -330,7 +359,11 @@ impl StoreHandle {
                     ],
                 )
                 .map_err(|error| sqlite_error("recording a turn", &error))?;
-            Ok(connection.last_insert_rowid())
+            let id = transaction.last_insert_rowid();
+            transaction
+                .commit()
+                .map_err(|error| sqlite_error("committing a turn transaction", &error))?;
+            Ok(id)
         })
         .await
     }
@@ -356,11 +389,26 @@ impl StoreHandle {
         let codex_turn_id = codex_turn_id.map(str::to_owned);
         let request_size = request_bytes(&[codex_turn_id.as_deref().unwrap_or_default()]);
         self.run_sized(request_size, move |connection| {
-            let current: String = connection
+            let (current, scope_key, client_message_id, current_thread_id, current_turn_id): (
+                String,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+            ) = connection
                 .query_row(
-                    "SELECT state FROM turns WHERE id = ?1",
+                    "SELECT state, scope_key, client_message_id, codex_thread_id, codex_turn_id
+                     FROM turns WHERE id = ?1",
                     params![id],
-                    |row| row.get(0),
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
                 )
                 .map_err(|error| match error {
                     rusqlite::Error::QueryReturnedNoRows => StoreError::NotFound {
@@ -377,7 +425,21 @@ impl StoreHandle {
                     context: "transitioning a turn",
                 });
             }
-            connection
+            let transaction = connection
+                .transaction()
+                .map_err(|error| sqlite_error("starting a turn transition", &error))?;
+            if matches!(state, TurnState::Running | TurnState::Uncertain) {
+                let (count, bytes) = recovery_usage(&transaction, Some(id))?;
+                let resulting_turn_id = codex_turn_id.as_deref().or(current_turn_id.as_deref());
+                let row_bytes = turn_bytes(
+                    &scope_key,
+                    &client_message_id,
+                    current_thread_id.as_deref(),
+                    resulting_turn_id,
+                );
+                ensure_recovery_capacity(count, bytes, row_bytes, "transitioning a live turn")?;
+            }
+            transaction
                 .execute(
                     "UPDATE turns SET state = ?2, uncertain = ?3, updated_ms = ?4,
                          codex_turn_id = COALESCE(?5, codex_turn_id)
@@ -391,28 +453,44 @@ impl StoreHandle {
                     ],
                 )
                 .map_err(|error| sqlite_error("transitioning a turn", &error))?;
+            transaction
+                .commit()
+                .map_err(|error| sqlite_error("committing a turn transition", &error))?;
             Ok(())
         })
         .await
     }
 
-    /// Lists all turns whose `turn/start` outcome is unknown and that still
-    /// need recovery.
+    /// Lists all bounded live turns (`starting`, `running`, and `uncertain`)
+    /// requiring crash recovery. The stored live-turn invariant caps both
+    /// returned row count and identifier bytes; corrupt legacy data that
+    /// exceeds either cap fails closed with [`StoreError::CapacityExceeded`].
     ///
     /// # Errors
     ///
     /// Returns an error when the writer task or SQLite fails.
     pub async fn uncertain_turns(&self) -> Result<Vec<TurnRow>, StoreError> {
         self.run(|connection| {
+            let (count, bytes) = recovery_usage(connection, None)?;
+            if count > STORE_RECOVERY_TURN_MAX_ROWS || bytes > STORE_RECOVERY_TURN_MAX_BYTES {
+                return Err(StoreError::CapacityExceeded {
+                    context: "reading live turn recovery rows",
+                });
+            }
             let mut statement = connection
                 .prepare(
                     "SELECT id, scope_key, client_message_id, codex_thread_id, codex_turn_id,
                             state, uncertain, created_ms, updated_ms
-                     FROM turns WHERE uncertain != 0 ORDER BY id",
+                     FROM turns
+                     WHERE state IN ('starting', 'running', 'uncertain')
+                     ORDER BY id LIMIT ?1",
                 )
                 .map_err(|error| sqlite_error("listing uncertain turns", &error))?;
             let rows = statement
-                .query_map([], read_turn_row)
+                .query_map(
+                    params![i64::try_from(STORE_RECOVERY_TURN_MAX_ROWS).unwrap_or(i64::MAX)],
+                    read_turn_row,
+                )
                 .map_err(|error| sqlite_error("listing uncertain turns", &error))?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| sqlite_error("listing uncertain turns", &error))?;
@@ -439,6 +517,58 @@ impl StoreHandle {
         })
         .await
     }
+}
+
+fn recovery_usage(
+    connection: &rusqlite::Connection,
+    exclude_id: Option<i64>,
+) -> Result<(usize, usize), StoreError> {
+    let (count, bytes): (i64, i64) = connection
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(
+                 LENGTH(CAST(scope_key AS BLOB)) + LENGTH(CAST(client_message_id AS BLOB)) +
+                 COALESCE(LENGTH(CAST(codex_thread_id AS BLOB)), 0) +
+                 COALESCE(LENGTH(CAST(codex_turn_id AS BLOB)), 0)
+             ), 0)
+             FROM turns
+             WHERE state IN ('starting', 'running', 'uncertain')
+               AND (?1 IS NULL OR id != ?1)",
+            params![exclude_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| sqlite_error("reading live turn recovery usage", &error))?;
+    Ok((
+        usize::try_from(count).unwrap_or(usize::MAX),
+        usize::try_from(bytes).unwrap_or(usize::MAX),
+    ))
+}
+
+fn turn_bytes(
+    scope_key: &str,
+    client_message_id: &str,
+    codex_thread_id: Option<&str>,
+    codex_turn_id: Option<&str>,
+) -> usize {
+    request_bytes(&[
+        scope_key,
+        client_message_id,
+        codex_thread_id.unwrap_or_default(),
+        codex_turn_id.unwrap_or_default(),
+    ])
+}
+
+fn ensure_recovery_capacity(
+    count: usize,
+    bytes: usize,
+    additional_bytes: usize,
+    context: &'static str,
+) -> Result<(), StoreError> {
+    if count >= STORE_RECOVERY_TURN_MAX_ROWS
+        || bytes.saturating_add(additional_bytes) > STORE_RECOVERY_TURN_MAX_BYTES
+    {
+        return Err(StoreError::CapacityExceeded { context });
+    }
+    Ok(())
 }
 
 fn read_thread_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadRow> {

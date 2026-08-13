@@ -162,6 +162,11 @@ pub const STORE_INBOUND_MAX_BYTES: u64 = 4 * 1024 * 1024;
 pub const STORE_ATTACHMENT_MAX_ROWS: u64 = 4096;
 /// Maximum durable attachment bytes tracked by the store.
 pub const STORE_ATTACHMENT_MAX_BYTES: u64 = 256 * 1024 * 1024;
+/// Maximum live (`starting`/`running`/`uncertain`) turns retained for crash
+/// recovery. Terminal turns are historical rows and do not occupy this set.
+pub const STORE_RECOVERY_TURN_MAX_ROWS: usize = 32;
+/// Maximum identifier bytes materialized by one crash-recovery turn scan.
+pub const STORE_RECOVERY_TURN_MAX_BYTES: usize = 1024 * 1024;
 /// Send attempts after which an outbox row is marked terminally `failed`.
 pub const STORE_OUTBOX_MAX_ATTEMPTS: u32 = 8;
 /// Maximum length of a stored inbound-event rejection reason; reasons are
