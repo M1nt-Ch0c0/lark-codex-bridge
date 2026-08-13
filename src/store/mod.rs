@@ -145,10 +145,11 @@ impl StoreHandle {
     ///
     /// Returns an error when the database cannot be opened or migrated.
     pub async fn open(path: &Path) -> Result<Self, StoreError> {
-        let reservation = FileReservation::reserve(path)?;
+        let database_path = prepare_database_file(path)?;
+        let reservation = FileReservation::reserve(&database_path)?;
         Ok(Self::from_parts(
             writer::spawn(
-                writer::StoreLocation::File(path.to_path_buf()),
+                writer::StoreLocation::File(database_path),
                 Some(reservation),
             )
             .await?,
@@ -280,14 +281,10 @@ impl StoreHandle {
 
 static LIVE_FILE_STORES: OnceLock<Mutex<HashSet<FileIdentity>>> = OnceLock::new();
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Hash, PartialEq, Eq)]
 enum FileIdentity {
-    Provisional(PathBuf),
     #[cfg(unix)]
-    Unix {
-        device: u64,
-        inode: u64,
-    },
+    Unix { device: u64, inode: u64 },
     #[cfg(not(unix))]
     Canonical(PathBuf),
 }
@@ -306,23 +303,6 @@ impl FileReservation {
             return Err(StoreError::AlreadyOpen);
         }
         Ok(Self { key })
-    }
-
-    pub(crate) fn promote(&mut self, path: &Path) -> Result<(), StoreError> {
-        let actual = file_identity(path)?;
-        if actual == self.key {
-            return Ok(());
-        }
-        let stores = LIVE_FILE_STORES.get_or_init(|| Mutex::new(HashSet::new()));
-        let mut stores = stores.lock().map_err(|_| StoreError::Closed)?;
-        if stores.contains(&actual) {
-            return Err(StoreError::AlreadyOpen);
-        }
-        let removed = stores.remove(&self.key);
-        debug_assert!(removed);
-        stores.insert(actual.clone());
-        self.key = actual;
-        Ok(())
     }
 }
 
@@ -346,39 +326,52 @@ fn file_identity(path: &Path) -> Result<FileIdentity, StoreError> {
             })?
             .join(path)
     };
-    if absolute.exists() {
-        let canonical = std::fs::canonicalize(&absolute).map_err(|_| StoreError::Io {
+    let canonical = std::fs::canonicalize(&absolute).map_err(|_| StoreError::Io {
+        context: "resolving the database path",
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = std::fs::metadata(canonical).map_err(|_| StoreError::Io {
             context: "resolving the database path",
         })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-
-            let metadata = std::fs::metadata(canonical).map_err(|_| StoreError::Io {
-                context: "resolving the database path",
-            })?;
-            return Ok(FileIdentity::Unix {
-                device: metadata.dev(),
-                inode: metadata.ino(),
-            });
-        }
-        #[cfg(not(unix))]
-        {
-            return Ok(FileIdentity::Canonical(canonical));
-        }
+        Ok(FileIdentity::Unix {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
     }
+    #[cfg(not(unix))]
+    {
+        Ok(FileIdentity::Canonical(canonical))
+    }
+}
+
+fn prepare_database_file(path: &Path) -> Result<PathBuf, StoreError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|_| StoreError::Io {
+                context: "resolving the database path",
+            })?
+            .join(path)
+    };
     let parent = absolute.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent).map_err(|_| StoreError::Io {
         context: "creating the database directory",
     })?;
-    let canonical_parent = std::fs::canonicalize(parent).map_err(|_| StoreError::Io {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&absolute)
+        .map_err(|_| StoreError::Io {
+            context: "creating the database file",
+        })?;
+    std::fs::canonicalize(absolute).map_err(|_| StoreError::Io {
         context: "resolving the database path",
-    })?;
-    Ok(FileIdentity::Provisional(canonical_parent.join(
-        absolute.file_name().ok_or(StoreError::Io {
-            context: "resolving the database path",
-        })?,
-    )))
+    })
 }
 
 /// Adds captured strings' UTF-8 byte lengths without overflowing.

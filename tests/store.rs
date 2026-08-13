@@ -201,6 +201,28 @@ async fn file_store_rejects_symlink_and_hard_link_aliases() {
     first.shutdown().await.expect("shutdown");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn concurrent_dangling_symlink_and_target_allow_one_open() {
+    let temp = tempdir().expect("tempdir");
+    let target = temp.path().join("target.sqlite");
+    let alias = temp.path().join("alias.sqlite");
+    std::os::unix::fs::symlink(&target, &alias).expect("dangling symlink");
+    let (left, right) = tokio::join!(StoreHandle::open(&target), StoreHandle::open(&alias));
+    let successful = [left, right]
+        .into_iter()
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    assert_eq!(successful.len(), 1);
+    successful
+        .into_iter()
+        .next()
+        .expect("one")
+        .shutdown()
+        .await
+        .expect("shutdown");
+}
+
 #[tokio::test]
 async fn dedup_transitions_and_ttl_are_fail_closed() {
     let store = StoreHandle::open_in_memory().await.expect("open");
