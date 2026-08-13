@@ -232,7 +232,14 @@ impl StoreHandle {
         let incoming = event.clone();
         let event_id = event.event_id.clone();
         let message_id = event.message_id.clone();
-        let request_size = request_bytes(&[&tenant, &event_id, &message_id]);
+        // The queued closure owns a full normalized event and later materializes
+        // a JSON payload while the same permit is held. Count both string-backed
+        // representations plus a conservative structural allowance without
+        // performing logical validation before duplicate lookup.
+        let captured_event_bytes = inbound_event_variable_bytes(event);
+        let request_size = request_bytes(&[&tenant, &event_id, &message_id])
+            .saturating_add(captured_event_bytes.saturating_mul(2))
+            .saturating_add(2 * 1024);
         self.run_sized(request_size, move |connection| {
             let transaction = connection
                 .transaction()
@@ -474,11 +481,12 @@ impl StoreHandle {
             let transaction = connection
                 .transaction()
                 .map_err(|error| sqlite_error("starting inbound turn resolution", &error))?;
-            let (current, uncertain, inbound_count): (String, i64, i64) = transaction
+            let (current, uncertain, inbound_count, turn_scope): (String, i64, i64, String) =
+                transaction
                 .query_row(
-                    "SELECT state, uncertain, inbound_count FROM turns WHERE id = ?1",
+                    "SELECT state, uncertain, inbound_count, scope_key FROM turns WHERE id = ?1",
                     params![turn_row_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .map_err(|error| match error {
                     rusqlite::Error::QueryReturnedNoRows => StoreError::NotFound {
@@ -510,6 +518,35 @@ impl StoreHandle {
                     inbound_rows: inbound_count,
                 });
             }
+            if current == "uncertain" && uncertain == 0 {
+                if !matches!(turn, TurnResolution::Failed | TurnResolution::Interrupted) {
+                    return Err(StoreError::InvalidTransition {
+                        context: "refining a resolved uncertain turn",
+                    });
+                }
+                validate_resolved_markers(&transaction, turn_row_id, inbound_count, "rejected")?;
+                let now = now_ms();
+                transaction
+                    .execute(
+                        "UPDATE turns SET state = ?2, uncertain = 0, updated_ms = ?3
+                         WHERE id = ?1",
+                        params![turn_row_id, target_turn, now],
+                    )
+                    .map_err(|error| sqlite_error("refining an uncertain turn", &error))?;
+                transaction
+                    .execute(
+                        "UPDATE inbound_events SET rejection_reason = ?2, updated_ms = ?3
+                         WHERE turn_row_id = ?1 AND state = 'rejected'",
+                        params![turn_row_id, reason, now],
+                    )
+                    .map_err(|error| sqlite_error("refining uncertain inbound markers", &error))?;
+                transaction.commit().map_err(|error| {
+                    sqlite_error("committing uncertain turn refinement", &error)
+                })?;
+                return Ok(ResolveTurnOutcome::Resolved {
+                    inbound_rows: inbound_count,
+                });
+            }
             if matches!(current.as_str(), "completed" | "failed" | "interrupted") {
                 return Err(StoreError::InvalidTransition {
                     context: "resolving a terminal turn differently",
@@ -531,19 +568,7 @@ impl StoreHandle {
                     context: "resolving an inbound turn",
                 });
             }
-            let accepted: i64 = transaction
-                .query_row(
-                    "SELECT COUNT(*) FROM inbound_events
-                     WHERE turn_row_id = ?1 AND state = 'accepted'",
-                    params![turn_row_id],
-                    |row| row.get(0),
-                )
-                .map_err(|error| sqlite_error("counting accepted inbound rows", &error))?;
-            if usize::try_from(accepted).ok() != Some(inbound_count) {
-                return Err(StoreError::CorruptData {
-                    context: "validating accepted inbound claim count",
-                });
-            }
+            validate_unresolved_markers(&transaction, turn_row_id, &turn_scope, inbound_count)?;
             let now = now_ms();
             transaction
                 .execute(
@@ -792,6 +817,32 @@ enum ScopeKindWire {
 fn validate_incoming_key(event: &InboundEvent) -> Result<(), StoreError> {
     validate_id(&event.event_id, "validating an inbound event ID")?;
     validate_id(&event.message_id, "validating an inbound message ID")
+}
+
+fn inbound_event_variable_bytes(event: &InboundEvent) -> usize {
+    let scope_bytes = match &event.scope {
+        ScopeKey::Chat(chat_id) => chat_id.len(),
+        ScopeKey::Thread(chat_id, thread_id) => chat_id.len().saturating_add(thread_id.len()),
+    };
+    [
+        event.event_id.len(),
+        event.message_id.len(),
+        event.chat_id.len(),
+        event.sender_id.len(),
+        event.thread_id.as_deref().map_or(0, str::len),
+        event.root_id.as_deref().map_or(0, str::len),
+        event.reply_to_message_id.as_deref().map_or(0, str::len),
+        event.text.len(),
+        event.message_type.len(),
+        scope_bytes,
+        event
+            .resources
+            .iter()
+            .map(|resource| resource.key.len())
+            .sum(),
+    ]
+    .into_iter()
+    .fold(0_usize, usize::saturating_add)
 }
 
 fn validate_id(value: &str, context: &'static str) -> Result<(), StoreError> {
@@ -1414,6 +1465,33 @@ fn validate_resolved_markers(
     if accepted != 0 || total > inbound_count || matching != total {
         return Err(StoreError::CorruptData {
             context: "validating resolved inbound markers",
+        });
+    }
+    Ok(())
+}
+
+fn validate_unresolved_markers(
+    connection: &rusqlite::Connection,
+    turn_row_id: i64,
+    turn_scope: &str,
+    inbound_count: usize,
+) -> Result<(), StoreError> {
+    let (total, accepted, mismatched_scope): (i64, i64, i64) = connection
+        .query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(CASE WHEN state = 'accepted' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN scope_key != ?2 THEN 1 ELSE 0 END), 0)
+             FROM inbound_events WHERE turn_row_id = ?1",
+            params![turn_row_id, turn_scope],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|error| sqlite_error("validating unresolved inbound markers", &error))?;
+    if usize::try_from(total).ok() != Some(inbound_count)
+        || usize::try_from(accepted).ok() != Some(inbound_count)
+        || mismatched_scope != 0
+    {
+        return Err(StoreError::CorruptData {
+            context: "validating unresolved inbound markers",
         });
     }
     Ok(())

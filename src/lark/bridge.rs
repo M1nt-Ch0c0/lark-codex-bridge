@@ -102,7 +102,10 @@ impl fmt::Debug for QueuedInboundEvent {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("QueuedInboundEvent")
-            .field("event", &self.event)
+            .field("event_id", &self.event.event_id)
+            .field("message_id", &self.event.message_id)
+            .field("text_len", &self.event.text.len())
+            .field("resource_count", &self.event.resources.len())
             .finish_non_exhaustive()
     }
 }

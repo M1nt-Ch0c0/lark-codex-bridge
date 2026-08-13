@@ -54,7 +54,7 @@ impl fmt::Debug for LarkCredentials {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("LarkCredentials")
-            .field("app_id", &self.app_id)
+            .field("app_id_len", &self.app_id.len())
             .field("app_secret", &"<redacted>")
             .field("tenant", &self.tenant)
             .finish()

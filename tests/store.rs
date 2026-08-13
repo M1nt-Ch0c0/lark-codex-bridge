@@ -114,7 +114,7 @@ async fn registration_replays_canonical_payload_and_atomic_turn_resolution() {
     assert!(matches!(first, DedupOutcome::New(_)));
 
     let mut redelivery = event("event-alias", "message-canonical");
-    redelivery.text = "untrusted redelivery body".to_owned();
+    redelivery.text = "untrusted-redelivery-body".repeat(48_000);
     let replay = store
         .register_inbound(&tenant, &redelivery)
         .await
@@ -1118,5 +1118,241 @@ async fn file_store_tightens_existing_database_permissions() {
         std::fs::metadata(&path).expect("metadata").mode() & 0o777,
         0o600
     );
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn migration_two_triggers_reject_null_payload_shape_on_insert_and_update() {
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("trigger.sqlite");
+    StoreHandle::open(&path)
+        .await
+        .expect("migrate")
+        .shutdown()
+        .await
+        .expect("shutdown");
+    let connection = rusqlite::Connection::open(&path).expect("open raw");
+    connection
+        .execute_batch("PRAGMA foreign_keys = ON")
+        .expect("foreign keys");
+    assert!(
+        connection
+            .execute(
+                "INSERT INTO inbound_events
+                 (tenant,event_id,message_id,scope_key,state,first_seen_ms,updated_ms,
+                  payload_version,payload_blob,payload_bytes,turn_row_id)
+                 VALUES ('tenant','null-insert','message','im:chat','received',1,1,
+                         NULL,X'78',1,NULL)",
+                [],
+            )
+            .is_err(),
+        "received insert with SQL NULL payload columns must be rejected"
+    );
+
+    let tenant = tenant_namespace("cli_trigger_test");
+    drop(connection);
+    let store = StoreHandle::open(&path).await.expect("typed reopen");
+    store
+        .register_inbound(&tenant, &event("valid-trigger", "valid-message"))
+        .await
+        .expect("valid row");
+    store.shutdown().await.expect("shutdown");
+    let connection = rusqlite::Connection::open(&path).expect("raw reopen");
+    assert!(
+        connection
+            .execute(
+                "UPDATE inbound_events
+                 SET payload_version = NULL
+                 WHERE event_id = 'valid-trigger'",
+                [],
+            )
+            .is_err(),
+        "received update with SQL NULL payload columns must be rejected"
+    );
+}
+
+#[tokio::test]
+async fn resolved_uncertain_runtime_turn_is_not_live_and_can_be_refined() {
+    let store = StoreHandle::open_in_memory().await.expect("open");
+    let tenant = tenant_namespace("cli_uncertain_test");
+    let inbound = event("event-uncertain", "message-uncertain");
+    store
+        .register_inbound(&tenant, &inbound)
+        .await
+        .expect("register");
+    let begun = store
+        .begin_turn_and_claim_inbound(
+            turn("uncertain-runtime", TurnState::Starting),
+            &[InboundKey::new(tenant, inbound.event_id)],
+        )
+        .await
+        .expect("begin");
+    let BeginTurnOutcome::Started { turn_row_id, .. } = begun else {
+        panic!("started")
+    };
+    store
+        .set_turn_state(turn_row_id, TurnState::Running, Some("codex-uncertain"))
+        .await
+        .expect("running");
+    store
+        .resolve_turn_and_finish_inbound_batch(
+            turn_row_id,
+            TurnResolution::Uncertain,
+            InboundTerminal::Rejected,
+        )
+        .await
+        .expect("resolve uncertain");
+    assert!(
+        store
+            .uncertain_turns()
+            .await
+            .expect("live recovery")
+            .is_empty(),
+        "resolved uncertainty must not consume live recovery capacity"
+    );
+    assert_eq!(
+        store
+            .resolve_turn_and_finish_inbound_batch(
+                turn_row_id,
+                TurnResolution::Failed,
+                InboundTerminal::Rejected,
+            )
+            .await
+            .expect("manual refinement"),
+        ResolveTurnOutcome::Resolved { inbound_rows: 1 }
+    );
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn debug_redacts_inbound_sender_resource_keys_and_content() {
+    use lark_codex_bridge::lark::api::ResourceKind;
+    use lark_codex_bridge::lark::bridge::QueuedInboundEvent;
+    use lark_codex_bridge::lark::normalize::ResourceDesc;
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+
+    let mut sensitive = event("event-debug", "message-debug");
+    sensitive.sender_id = "sender-sentinel".to_owned();
+    sensitive.text = "text-sentinel".to_owned();
+    sensitive.resources.push(ResourceDesc {
+        kind: ResourceKind::File,
+        key: "resource-key-sentinel".to_owned(),
+    });
+    let permit = Arc::new(Semaphore::new(1))
+        .try_acquire_owned()
+        .expect("permit");
+    let queued = QueuedInboundEvent {
+        event: sensitive.clone(),
+        permit,
+    };
+    for debug in [format!("{sensitive:?}"), format!("{queued:?}")] {
+        assert!(!debug.contains("sender-sentinel"));
+        assert!(!debug.contains("text-sentinel"));
+        assert!(!debug.contains("resource-key-sentinel"));
+    }
+}
+
+#[tokio::test]
+async fn combined_resolve_rejects_extra_linked_markers_and_scope_mismatch() {
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("resolve-integrity.sqlite");
+    let tenant = tenant_namespace("cli_resolve_integrity");
+    let store = StoreHandle::open(&path).await.expect("open");
+    store
+        .register_inbound(&tenant, &event("event-claimed", "message-claimed"))
+        .await
+        .expect("claimed row");
+    store
+        .register_inbound(&tenant, &event("event-extra", "message-extra"))
+        .await
+        .expect("extra row");
+    let begun = store
+        .begin_turn_and_claim_inbound(
+            turn("integrity-turn", TurnState::Starting),
+            &[InboundKey::new(tenant.clone(), "event-claimed".to_owned())],
+        )
+        .await
+        .expect("begin");
+    let BeginTurnOutcome::Started { turn_row_id, .. } = begun else {
+        panic!("started")
+    };
+    store.shutdown().await.expect("shutdown");
+
+    let connection = rusqlite::Connection::open(&path).expect("corrupt raw");
+    connection
+        .execute_batch(
+            "DROP TRIGGER inbound_events_v2_shape_update;
+             PRAGMA foreign_keys = ON;",
+        )
+        .expect("disable shape trigger");
+    connection
+        .execute(
+            "UPDATE inbound_events
+             SET state = 'completed', turn_row_id = ?1,
+                 payload_version = NULL, payload_blob = NULL, payload_bytes = 0
+             WHERE event_id = 'event-extra'",
+            [turn_row_id],
+        )
+        .expect("forge extra terminal marker");
+    connection
+        .execute(
+            "UPDATE turns SET scope_key = 'im:different-scope' WHERE id = ?1",
+            [turn_row_id],
+        )
+        .expect("forge scope mismatch");
+    drop(connection);
+
+    let store = StoreHandle::open(&path).await.expect("reopen");
+    store
+        .set_turn_state(turn_row_id, TurnState::Running, Some("codex-integrity"))
+        .await
+        .expect("running");
+    assert!(matches!(
+        store
+            .resolve_turn_and_finish_inbound_batch(
+                turn_row_id,
+                TurnResolution::Completed,
+                InboundTerminal::Completed,
+            )
+            .await,
+        Err(StoreError::CorruptData { .. })
+    ));
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn inbound_writer_permits_account_for_the_captured_event_and_payload() {
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("inbound-writer-budget.sqlite");
+    let store = StoreHandle::open(&path).await.expect("open");
+    let tenant = tenant_namespace("cli_inbound_writer_budget");
+    let mut large = event("event-large", "message-large");
+    large.text = "x".repeat(256 * 1024);
+
+    let lock = rusqlite::Connection::open(&path).expect("lock connection");
+    lock.execute_batch("PRAGMA busy_timeout = 5000; BEGIN IMMEDIATE")
+        .expect("write lock");
+    let waker = Waker::noop();
+    let mut context = Context::from_waker(waker);
+    let mut pending = Vec::new();
+    let mut byte_budget_full = false;
+    for _ in 0..64 {
+        let mut future = Box::pin(store.register_inbound(&tenant, &large));
+        match future.as_mut().poll(&mut context) {
+            Poll::Pending => pending.push(future),
+            Poll::Ready(Err(StoreError::QueueFull)) => {
+                byte_budget_full = true;
+                break;
+            }
+            Poll::Ready(other) => panic!("unexpected inbound budget result: {other:?}"),
+        }
+    }
+    assert!(
+        byte_budget_full,
+        "captured normalized events and their serialized payloads consume writer permits"
+    );
+    lock.execute_batch("ROLLBACK").expect("release lock");
+    drop(pending);
     store.shutdown().await.expect("shutdown");
 }

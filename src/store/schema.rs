@@ -120,28 +120,28 @@ CREATE INDEX inbound_events_terminal_sweep
 CREATE TRIGGER inbound_events_v2_shape_insert
 BEFORE INSERT ON inbound_events
 WHEN
-    (NEW.state = 'received' AND NOT (
-        NEW.turn_row_id IS NULL AND NEW.payload_version = 1 AND
-        NEW.payload_blob IS NOT NULL AND
-        NEW.payload_bytes = length(NEW.payload_blob)
+    (NEW.state = 'received' AND (
+        NEW.turn_row_id IS NOT NULL OR NEW.payload_version IS NOT 1 OR
+        NEW.payload_blob IS NULL OR
+        NEW.payload_bytes IS NOT length(NEW.payload_blob)
     ))
- OR (NEW.state = 'accepted' AND NOT (
-        NEW.turn_row_id IS NOT NULL AND NEW.payload_version = 1 AND
-        NEW.payload_blob IS NOT NULL AND
-        NEW.payload_bytes = length(NEW.payload_blob) AND
+ OR (NEW.state = 'accepted' AND (
+        NEW.turn_row_id IS NULL OR NEW.payload_version IS NOT 1 OR
+        NEW.payload_blob IS NULL OR
+        NEW.payload_bytes IS NOT length(NEW.payload_blob) OR NOT
         EXISTS (
             SELECT 1 FROM turns
             WHERE id = NEW.turn_row_id AND scope_key = NEW.scope_key
         )
     ))
- OR (NEW.state IN ('completed', 'rejected') AND NOT (
-        NEW.payload_version IS NULL AND NEW.payload_blob IS NULL AND
-        NEW.payload_bytes = 0 AND (
-            NEW.turn_row_id IS NULL OR EXISTS (
-                SELECT 1 FROM turns
-                WHERE id = NEW.turn_row_id AND scope_key = NEW.scope_key
-                  AND (state IN ('completed', 'failed', 'interrupted')
-                       OR (state = 'uncertain' AND uncertain = 0))
+ OR (NEW.state IN ('completed', 'rejected') AND (
+        NEW.payload_version IS NOT NULL OR NEW.payload_blob IS NOT NULL OR
+        NEW.payload_bytes IS NOT 0 OR (
+            NEW.turn_row_id IS NOT NULL AND NOT EXISTS (
+              SELECT 1 FROM turns
+              WHERE id = NEW.turn_row_id AND scope_key = NEW.scope_key
+                AND (state IN ('completed', 'failed', 'interrupted')
+                     OR (state = 'uncertain' AND uncertain = 0))
             )
         )
     ))
@@ -152,28 +152,28 @@ END;
 CREATE TRIGGER inbound_events_v2_shape_update
 BEFORE UPDATE ON inbound_events
 WHEN
-    (NEW.state = 'received' AND NOT (
-        NEW.turn_row_id IS NULL AND NEW.payload_version = 1 AND
-        NEW.payload_blob IS NOT NULL AND
-        NEW.payload_bytes = length(NEW.payload_blob)
+    (NEW.state = 'received' AND (
+        NEW.turn_row_id IS NOT NULL OR NEW.payload_version IS NOT 1 OR
+        NEW.payload_blob IS NULL OR
+        NEW.payload_bytes IS NOT length(NEW.payload_blob)
     ))
- OR (NEW.state = 'accepted' AND NOT (
-        NEW.turn_row_id IS NOT NULL AND NEW.payload_version = 1 AND
-        NEW.payload_blob IS NOT NULL AND
-        NEW.payload_bytes = length(NEW.payload_blob) AND
+ OR (NEW.state = 'accepted' AND (
+        NEW.turn_row_id IS NULL OR NEW.payload_version IS NOT 1 OR
+        NEW.payload_blob IS NULL OR
+        NEW.payload_bytes IS NOT length(NEW.payload_blob) OR NOT
         EXISTS (
             SELECT 1 FROM turns
             WHERE id = NEW.turn_row_id AND scope_key = NEW.scope_key
         )
     ))
- OR (NEW.state IN ('completed', 'rejected') AND NOT (
-        NEW.payload_version IS NULL AND NEW.payload_blob IS NULL AND
-        NEW.payload_bytes = 0 AND (
-            NEW.turn_row_id IS NULL OR EXISTS (
-                SELECT 1 FROM turns
-                WHERE id = NEW.turn_row_id AND scope_key = NEW.scope_key
-                  AND (state IN ('completed', 'failed', 'interrupted')
-                       OR (state = 'uncertain' AND uncertain = 0))
+ OR (NEW.state IN ('completed', 'rejected') AND (
+        NEW.payload_version IS NOT NULL OR NEW.payload_blob IS NOT NULL OR
+        NEW.payload_bytes IS NOT 0 OR (
+            NEW.turn_row_id IS NOT NULL AND NOT EXISTS (
+              SELECT 1 FROM turns
+              WHERE id = NEW.turn_row_id AND scope_key = NEW.scope_key
+                AND (state IN ('completed', 'failed', 'interrupted')
+                     OR (state = 'uncertain' AND uncertain = 0))
             )
         )
     ))

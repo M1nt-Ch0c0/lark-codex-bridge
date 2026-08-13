@@ -85,7 +85,6 @@ impl fmt::Debug for InboundEvent {
             .field("event_id", &self.event_id)
             .field("message_id", &self.message_id)
             .field("chat_id", &self.chat_id)
-            .field("sender_id", &self.sender_id)
             .field("chat_type", &self.chat_type)
             .field("thread_id", &self.thread_id)
             .field("root_id", &self.root_id)
@@ -93,7 +92,15 @@ impl fmt::Debug for InboundEvent {
             .field("text_len", &self.text.len())
             .field("mentions_bot", &self.mentions_bot)
             .field("mention_all", &self.mention_all)
-            .field("resources", &self.resources)
+            .field("resource_count", &self.resources.len())
+            .field(
+                "resource_key_bytes",
+                &self
+                    .resources
+                    .iter()
+                    .map(|resource| resource.key.len())
+                    .sum::<usize>(),
+            )
             .field("message_type", &self.message_type)
             .field("create_time_ms", &self.create_time_ms)
             .field("scope", &self.scope)
@@ -123,12 +130,22 @@ impl fmt::Display for ScopeKey {
 
 /// Descriptor of a message resource (image/file): key and kind, never the
 /// bytes and never the user-chosen file name.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ResourceDesc {
     /// Resource kind (`image`/`file`).
     pub kind: ResourceKind,
     /// Server-side resource key (`image_key`/`file_key`).
     pub key: String,
+}
+
+impl fmt::Debug for ResourceDesc {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResourceDesc")
+            .field("kind", &self.kind)
+            .field("key_len", &self.key.len())
+            .finish()
+    }
 }
 
 /// Conservative degradation applied while normalizing one event. Recorded as
@@ -451,7 +468,7 @@ impl fmt::Debug for Normalizer {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Normalizer")
-            .field("bot_open_id", &self.bot_open_id)
+            .field("bot_open_id_len", &self.bot_open_id.len())
             .field("cached_chat_modes", &self.cached_chat_mode_count())
             .finish_non_exhaustive()
     }
