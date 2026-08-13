@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_util::future::BoxFuture;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
@@ -339,11 +340,26 @@ async fn process_batch(
         .acquire_owned()
         .await
         .map_err(|_| ScopeFailureKind::Capacity)?;
-    for item in &batch {
-        if policy.decide(&item.queued.event) != crate::runtime::policy::AccessDecision::Allow {
-            return Err(ScopeFailureKind::Policy);
+    let mut eligible = Vec::with_capacity(batch.len());
+    for item in batch {
+        let reason = if is_stale(&item.queued.event, settings.message_max_age) {
+            Some(InboundRejectionKind::Stale)
+        } else if policy.decide(&item.queued.event) != crate::runtime::policy::AccessDecision::Allow
+        {
+            Some(InboundRejectionKind::Policy)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            reject_item(store, sink.as_ref(), &item, reason).await?;
+        } else {
+            eligible.push(item);
         }
     }
+    if eligible.is_empty() {
+        return Ok(());
+    }
+    let batch = eligible;
     let (cwd, fingerprint) = prepare_workspace(scope, store, policy, settings).await?;
     let client = wait_for_client(&mut supervisor).await?;
     set_state(state, ScopeState::StartingTurn);
@@ -462,6 +478,34 @@ fn deduplicate_batch(batch: Vec<ActorInbound>) -> Result<Vec<ActorInbound>, Scop
         retained.push(item);
     }
     Ok(retained)
+}
+
+fn is_stale(event: &InboundEvent, max_age: std::time::Duration) -> bool {
+    let now = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX);
+    let max_age = i64::try_from(max_age.as_millis()).unwrap_or(i64::MAX);
+    now.saturating_sub(event.create_time_ms) > max_age
+}
+
+async fn reject_item(
+    store: &StoreHandle,
+    sink: &dyn DurableReplySink,
+    item: &ActorInbound,
+    reason: InboundRejectionKind,
+) -> Result<(), ScopeFailureKind> {
+    let notice = sink
+        .rejection_notice(&item.queued.event, reason)
+        .map_err(|_| ScopeFailureKind::Projection)?;
+    store
+        .reject_received_and_enqueue_notice(&item.key, reason, notice)
+        .await
+        .map_err(|_| ScopeFailureKind::Store)?;
+    Ok(())
 }
 
 async fn prepare_workspace(

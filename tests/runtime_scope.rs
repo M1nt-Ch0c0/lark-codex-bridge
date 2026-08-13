@@ -30,7 +30,7 @@ use fakecodex::{FakeFactory, FakeOutcome, test_settings};
 #[derive(Default)]
 struct RecordingSink {
     rejections: Mutex<Vec<InboundRejectionKind>>,
-    finalizations: Mutex<Vec<(i64, lark_codex_bridge::store::TurnResolution)>>,
+    finalizations: Mutex<Vec<(i64, lark_codex_bridge::store::TurnResolution, usize)>>,
 }
 
 impl DurableReplySink for RecordingSink {
@@ -50,10 +50,11 @@ impl DurableReplySink for RecordingSink {
     }
 
     fn finalize(&self, turn: TurnFinalization) -> BoxFuture<'static, Result<(), ReplySinkError>> {
-        self.finalizations
-            .lock()
-            .expect("finalization lock")
-            .push((turn.turn_row_id, turn.resolution));
+        self.finalizations.lock().expect("finalization lock").push((
+            turn.turn_row_id,
+            turn.resolution,
+            turn.sources.len(),
+        ));
         async { Ok(()) }.boxed()
     }
 }
@@ -197,8 +198,10 @@ async fn queued_registered(
         .await
         .expect("register")
     {
-        DedupOutcome::New(retained) => retained,
-        other => panic!("expected new retained event, got {other:?}"),
+        DedupOutcome::New(retained) | DedupOutcome::ReplayReceived(retained) => retained,
+        duplicate @ DedupOutcome::Duplicate { .. } => {
+            panic!("expected retained event, got {duplicate:?}")
+        }
     };
     let bytes = retained.retained_bytes();
     let permit = Arc::new(Semaphore::new(bytes))
@@ -209,6 +212,32 @@ async fn queued_registered(
         event: *retained.into_event(),
         permit,
     }
+}
+
+async fn wait_for_inbound_states(
+    store: &StoreHandle,
+    namespace: &TenantNamespace,
+    event_ids: &[&str],
+    expected: InboundEventState,
+) {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let mut ready = true;
+            for event_id in event_ids {
+                ready &= store
+                    .inbound_state(namespace, event_id)
+                    .await
+                    .expect("inbound state")
+                    == Some(expected);
+            }
+            if ready {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("inbound events reach the expected state");
 }
 
 #[tokio::test]
@@ -254,7 +283,7 @@ async fn router_rejects_non_owner_with_one_atomic_durable_notice() {
 }
 
 #[tokio::test]
-async fn allowed_event_claims_one_turn_and_uses_the_exact_client_message_id() {
+async fn debounce_batch_claims_one_turn_and_uses_the_exact_client_message_id() {
     let config = validated_config();
     let workspace = config
         .default_workspace
@@ -279,9 +308,18 @@ async fn allowed_event_claims_one_turn_and_uses_the_exact_client_message_id() {
     .expect("router");
     let inbound = event("event-allowed", "owner-runtime-scope");
     router
-        .route(queued_registered(&store, &namespace, inbound).await)
+        .route(queued_registered(&store, &namespace, inbound.clone()).await)
         .await
         .expect("route to actor");
+    router
+        .route(queued_registered(&store, &namespace, inbound).await)
+        .await
+        .expect("route exact replay to actor");
+    let second = event("event-allowed-second", "owner-runtime-scope");
+    router
+        .route(queued_registered(&store, &namespace, second).await)
+        .await
+        .expect("route second debounce item");
 
     let start_thread = control.next_request().await;
     assert_eq!(start_thread["method"], "thread/start");
@@ -293,6 +331,13 @@ async fn allowed_event_claims_one_turn_and_uses_the_exact_client_message_id() {
     let start_turn = control.next_request().await;
     assert_eq!(start_turn["method"], "turn/start");
     assert_eq!(start_turn["params"]["threadId"], "thread-runtime");
+    assert_eq!(
+        start_turn["params"]["input"]
+            .as_array()
+            .expect("input array")
+            .len(),
+        2
+    );
     assert_eq!(start_turn["params"]["input"][0]["text"], "hello");
     let client_message_id = start_turn["params"]["clientUserMessageId"]
         .as_str()
@@ -314,21 +359,13 @@ async fn allowed_event_claims_one_turn_and_uses_the_exact_client_message_id() {
         }))
         .await;
 
-    timeout(Duration::from_secs(2), async {
-        loop {
-            if store
-                .inbound_state(&namespace, "event-allowed")
-                .await
-                .expect("inbound state")
-                == Some(InboundEventState::Completed)
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("actor completes the turn");
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-allowed", "event-allowed-second"],
+        InboundEventState::Completed,
+    )
+    .await;
     assert!(
         store
             .uncertain_turns()
@@ -336,7 +373,61 @@ async fn allowed_event_claims_one_turn_and_uses_the_exact_client_message_id() {
             .expect("live turns")
             .is_empty()
     );
-    assert_eq!(sink.finalizations.lock().expect("finalizations").len(), 1);
+    let turn_row_id = {
+        let finalizations = sink.finalizations.lock().expect("finalizations");
+        assert_eq!(finalizations.len(), 1);
+        assert_eq!(finalizations[0].2, 2);
+        finalizations[0].0
+    };
+    let row = store
+        .turn_row(turn_row_id)
+        .await
+        .expect("turn row")
+        .expect("persisted turn");
+    assert_eq!(row.client_message_id, client_message_id);
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn permit_recheck_atomically_rejects_a_stale_event_before_any_rpc() {
+    let config = validated_config();
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RecordingSink::default());
+    let supervisor = degraded_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink.clone(),
+    )
+    .await
+    .expect("router");
+    let mut inbound = event("event-stale", "owner-runtime-scope");
+    inbound.create_time_ms =
+        now_ms() - i64::try_from(Duration::from_secs(16 * 60).as_millis()).expect("age fits");
+    router
+        .route(queued_registered(&store, &namespace, inbound).await)
+        .await
+        .expect("route stale event");
+
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-stale"],
+        InboundEventState::Rejected,
+    )
+    .await;
+    assert_eq!(store.outbox_depth().await.expect("outbox").pending, 1);
+    assert_eq!(
+        *sink.rejections.lock().expect("rejections"),
+        vec![InboundRejectionKind::Stale]
+    );
     router.shutdown().await.expect("shutdown");
     store.shutdown().await.expect("store shutdown");
 }
