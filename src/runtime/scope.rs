@@ -281,25 +281,46 @@ async fn run_scope_actor(
     state: Arc<RwLock<ScopeState>>,
     shutdown: CancellationToken,
 ) {
+    let mut deferred = None;
     'actor: loop {
-        let command = tokio::select! {
-            biased;
-            () = shutdown.cancelled() => break,
-            command = receiver.recv() => command,
+        let command = if let Some(deferred) = deferred.take() {
+            Some(ScopeCommand::Inbound(deferred))
+        } else {
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => break,
+                command = receiver.recv() => command,
+            }
         };
         let Some(command) = command else { break };
         match command {
             ScopeCommand::Inbound(first) => {
                 let mut batch = vec![*first];
+                let mut text_bytes = batch[0].queued.event.text.len();
                 set_state(&state, ScopeState::Debouncing);
                 let deadline = Instant::now() + settings.debounce;
                 loop {
+                    if batch.len() >= TURN_BATCH_MAX_MESSAGES
+                        || text_bytes >= TURN_BATCH_TEXT_BYTE_BUDGET
+                    {
+                        break;
+                    }
                     tokio::select! {
                         biased;
                         () = shutdown.cancelled() => break 'actor,
                         () = sleep_until(deadline) => break,
                         command = receiver.recv() => match command {
-                            Some(ScopeCommand::Inbound(next)) => batch.push(*next),
+                            Some(ScopeCommand::Inbound(next)) => {
+                                let next_bytes = next.queued.event.text.len();
+                                if text_bytes.saturating_add(next_bytes)
+                                    > TURN_BATCH_TEXT_BYTE_BUDGET
+                                {
+                                    deferred = Some(next);
+                                    break;
+                                }
+                                text_bytes = text_bytes.saturating_add(next_bytes);
+                                batch.push(*next);
+                            }
                             None => return,
                         }
                     }
@@ -344,7 +365,7 @@ async fn process_batch(
     state: &Arc<RwLock<ScopeState>>,
     shutdown: &CancellationToken,
 ) -> Result<(), ScopeFailureKind> {
-    let batch = deduplicate_batch(batch)?;
+    let batch = deduplicate_batch(batch);
     let _active_permit = tokio::select! {
         biased;
         () = shutdown.cancelled() => return Err(ScopeFailureKind::Supervisor),
@@ -354,7 +375,9 @@ async fn process_batch(
     };
     let mut eligible = Vec::with_capacity(batch.len());
     for item in batch {
-        let reason = if is_stale(&item.queued.event, settings.message_max_age) {
+        let reason = if item.queued.event.text.len() > TURN_BATCH_TEXT_BYTE_BUDGET {
+            Some(InboundRejectionKind::Overloaded)
+        } else if is_stale(&item.queued.event, settings.message_max_age) {
             Some(InboundRejectionKind::Stale)
         } else if policy.decide(&item.queued.event) != crate::runtime::policy::AccessDecision::Allow
         {
@@ -530,21 +553,16 @@ async fn process_batch(
     Ok(())
 }
 
-fn deduplicate_batch(batch: Vec<ActorInbound>) -> Result<Vec<ActorInbound>, ScopeFailureKind> {
+fn deduplicate_batch(batch: Vec<ActorInbound>) -> Vec<ActorInbound> {
     let mut unique = HashSet::new();
     let mut retained = Vec::new();
-    let mut text_bytes = 0_usize;
     for item in batch {
         if !unique.insert(item.key.clone()) {
             continue;
         }
-        text_bytes = text_bytes.saturating_add(item.queued.event.text.len());
-        if retained.len() >= TURN_BATCH_MAX_MESSAGES || text_bytes > TURN_BATCH_TEXT_BYTE_BUDGET {
-            return Err(ScopeFailureKind::Capacity);
-        }
         retained.push(item);
     }
-    Ok(retained)
+    retained
 }
 
 fn is_stale(event: &InboundEvent, max_age: std::time::Duration) -> bool {

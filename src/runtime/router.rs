@@ -167,12 +167,15 @@ impl Router {
         let (sender, receiver) = mpsc::channel(ROUTER_COMMAND_CAPACITY);
         let snapshot = Arc::new(RwLock::new(RouterSnapshot::default()));
         let task_snapshot = Arc::clone(&snapshot);
+        let active_turn_capacity = settings.active_turn_permits;
+        let active_turns = Arc::new(Semaphore::new(active_turn_capacity));
         let task = tokio::spawn(run_router(
             receiver,
             store,
             tenant,
             policy,
             settings,
+            Arc::clone(&active_turns),
             supervisor,
             sink,
             task_snapshot,
@@ -181,6 +184,8 @@ impl Router {
             sender,
             byte_budget: Arc::new(Semaphore::new(ROUTER_COMMAND_BYTE_BUDGET)),
             snapshot,
+            active_turns,
+            active_turn_capacity,
             task: Some(task),
         })
     }
@@ -191,6 +196,8 @@ pub struct RouterHandle {
     sender: mpsc::Sender<RouterCommand>,
     byte_budget: Arc<Semaphore>,
     snapshot: Arc<RwLock<RouterSnapshot>>,
+    active_turns: Arc<Semaphore>,
+    active_turn_capacity: usize,
     task: Option<JoinHandle<Result<(), RouteError>>>,
 }
 
@@ -223,9 +230,14 @@ impl RouterHandle {
     /// Returns the latest bounded structural snapshot.
     #[must_use]
     pub fn snapshot(&self) -> RouterSnapshot {
-        self.snapshot
+        let mut snapshot = self
+            .snapshot
             .read()
-            .map_or_else(|_| RouterSnapshot::default(), |snapshot| *snapshot)
+            .map_or_else(|_| RouterSnapshot::default(), |snapshot| *snapshot);
+        snapshot.active_turns = self
+            .active_turn_capacity
+            .saturating_sub(self.active_turns.available_permits());
+        snapshot
     }
 
     /// Stops the router, its actors, and finally the owned supervisor.
@@ -265,11 +277,11 @@ async fn run_router(
     tenant: TenantNamespace,
     policy: AccessPolicy,
     settings: RouterSettings,
+    active_turns: Arc<Semaphore>,
     mut supervisor: SupervisorHandle,
     sink: Arc<dyn DurableReplySink>,
     snapshot: Arc<RwLock<RouterSnapshot>>,
 ) -> Result<(), RouteError> {
-    let active_turns = Arc::new(Semaphore::new(settings.active_turn_permits));
     let (supervisor_tx, supervisor_rx) = watch::channel(supervisor_access(&supervisor));
     let mut actors = HashMap::<String, ScopeActorHandle>::new();
     let mut supervisor_open = true;
