@@ -240,3 +240,24 @@ pub const SCOPE_MAILBOX_BYTE_BUDGET: usize = 8 * 1024 * 1024;
 pub const TURN_BATCH_MAX_MESSAGES: usize = 64;
 /// Maximum normalized text bytes assembled into one Codex turn request.
 pub const TURN_BATCH_TEXT_BYTE_BUDGET: usize = 768 * 1024;
+
+/// Maximum characters (Unicode scalar values) in one projected reply message
+/// before deterministic splitting. A part never exceeds this bound.
+pub const REPLY_MESSAGE_MAX_CHARS: usize = 4000;
+/// Maximum split parts for one projected reply; any remainder is truncated
+/// with an explicit marker instead of producing an unbounded part count.
+pub const REPLY_MAX_SPLITS: usize = 8;
+/// Deterministic truncation marker appended to the final split part.
+pub const REPLY_TRUNCATION_MARKER: &str = "…[truncated]";
+/// Minimum interval between two progress upserts of the same turn.
+pub const REPLY_UPDATE_MIN_INTERVAL: Duration = Duration::from_millis(1500);
+/// Minimum newly accumulated characters before the next progress upsert.
+pub const REPLY_UPDATE_MIN_CHARS: usize = 200;
+
+/// Base delay of the outbox pump's deterministic exponential backoff.
+pub const OUTBOX_RETRY_BASE: Duration = Duration::from_millis(500);
+/// Upper bound of one outbox pump retry delay.
+pub const OUTBOX_RETRY_MAX: Duration = Duration::from_secs(30);
+/// Poll cadence for discovering newly enqueued rows while the transport is
+/// connected and no rows are due yet.
+pub const OUTBOX_POLL_INTERVAL: Duration = Duration::from_millis(250);

@@ -389,6 +389,58 @@ impl StoreHandle {
         .await
     }
 
+    /// Marks a claimed row terminally `failed` without further attempts.
+    ///
+    /// Used for definitive failures — permanent authentication rejection, an
+    /// oversize body, or a corrupt payload — where a bounded retry can never
+    /// succeed. The row is kept (with its attempts and payload) for
+    /// diagnostics.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::NotFound`] for an unknown row and
+    /// [`StoreError::InvalidTransition`] when the row is not `sending`.
+    pub async fn fail_outbox_terminal(&self, id: i64) -> Result<(), StoreError> {
+        self.run(move |connection| {
+            require_sending(connection, id, "terminally failing an outbox row")?;
+            connection
+                .execute(
+                    "UPDATE outbox SET state = 'failed', updated_ms = ?2 WHERE id = ?1",
+                    params![id, now_ms()],
+                )
+                .map_err(|error| sqlite_error("terminally failing an outbox row", &error))?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Returns a claimed `sending` row to `pending` without counting a send
+    /// attempt.
+    ///
+    /// The pump uses this to re-park rows when the Lark transport disconnects
+    /// after a claim but before any send, so a disconnect churn can never
+    /// exhaust the retry budget without a single real send attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::NotFound`] for an unknown row and
+    /// [`StoreError::InvalidTransition`] when the row is not `sending`.
+    pub async fn release_outbox_claim(&self, id: i64) -> Result<(), StoreError> {
+        self.run(move |connection| {
+            require_sending(connection, id, "releasing an outbox claim")?;
+            let now = now_ms();
+            connection
+                .execute(
+                    "UPDATE outbox SET state = 'pending', next_retry_ms = ?2, updated_ms = ?2
+                     WHERE id = ?1",
+                    params![id, now],
+                )
+                .map_err(|error| sqlite_error("releasing an outbox claim", &error))?;
+            Ok(())
+        })
+        .await
+    }
+
     /// Marks rows stranded in `sending` by a prior process as explicitly
     /// uncertain. They are not silently replayed because delivery may have
     /// reached Lark before the process died.
