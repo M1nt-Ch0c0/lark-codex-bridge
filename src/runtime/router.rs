@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use futures_util::future::join_all;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
@@ -427,9 +428,7 @@ fn supervisor_access(supervisor: &SupervisorHandle) -> SupervisorAccess {
 }
 
 async fn shutdown_actors(actors: HashMap<String, ScopeActorHandle>) {
-    for actor in actors.into_values() {
-        actor.shutdown().await;
-    }
+    join_all(actors.into_values().map(ScopeActorHandle::shutdown)).await;
 }
 
 fn update_snapshot(

@@ -18,12 +18,13 @@ use lark_codex_bridge::runtime::router::{Router, RouterSettings};
 use lark_codex_bridge::runtime::scope::{DurableReplySink, ReplySinkError, TurnFinalization};
 use lark_codex_bridge::store::{
     DedupOutcome, InboundEventState, InboundRejectionKind, NewOutboxRow, StoreHandle,
+    TurnResolution,
 };
 use secrecy::SecretString;
 use semver::Version;
 use serde_json::{Value, json};
 use tokio::sync::Semaphore;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 use fakecodex::{FakeFactory, FakeOutcome, test_settings};
 
@@ -429,5 +430,122 @@ async fn permit_recheck_atomically_rejects_a_stale_event_before_any_rpc() {
         vec![InboundRejectionKind::Stale]
     );
     router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn shutdown_cancels_an_actor_waiting_for_a_supervisor_client() {
+    let config = validated_config();
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let supervisor = degraded_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        Arc::new(RecordingSink::default()),
+    )
+    .await
+    .expect("router");
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("event-shutdown", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("route to waiting actor");
+    sleep(Duration::from_millis(700)).await;
+
+    timeout(Duration::from_millis(500), router.shutdown())
+        .await
+        .expect("router shutdown deadline")
+        .expect("router shutdown");
+    assert_eq!(
+        store
+            .inbound_state(&namespace, "event-shutdown")
+            .await
+            .expect("inbound state"),
+        Some(InboundEventState::Received)
+    );
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn shutdown_durably_resolves_a_running_turn_as_uncertain() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RecordingSink::default());
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink.clone(),
+    )
+    .await
+    .expect("router");
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("event-running-shutdown", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("route event");
+    let start_thread = control.next_request().await;
+    control
+        .respond(
+            &start_thread,
+            thread_result("thread-running-shutdown", &workspace),
+        )
+        .await;
+    let start_turn = control.next_request().await;
+    control
+        .respond(
+            &start_turn,
+            json!({"turn": turn("turn-running-shutdown", "inProgress")}),
+        )
+        .await;
+
+    timeout(Duration::from_millis(500), router.shutdown())
+        .await
+        .expect("router shutdown deadline")
+        .expect("router shutdown");
+    assert_eq!(
+        store
+            .inbound_state(&namespace, "event-running-shutdown")
+            .await
+            .expect("inbound state"),
+        Some(InboundEventState::Rejected)
+    );
+    {
+        let finalizations = sink.finalizations.lock().expect("finalizations");
+        assert_eq!(finalizations.len(), 1);
+        assert_eq!(finalizations[0].1, TurnResolution::Uncertain);
+    }
+    assert!(
+        store
+            .uncertain_turns()
+            .await
+            .expect("live turns")
+            .is_empty()
+    );
     store.shutdown().await.expect("store shutdown");
 }

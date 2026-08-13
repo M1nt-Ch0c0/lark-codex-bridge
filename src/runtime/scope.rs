@@ -7,12 +7,13 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_util::future::BoxFuture;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, sleep_until};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::codex::client::{AppServerClient, AppServerEvent, TurnOutcome};
+use crate::codex::client::{AppServerClient, AppServerEvent, ThreadId, TurnOutcome};
 use crate::codex::types::{
     SandboxMode, ThreadResumeParams, ThreadStartParams, TurnSandboxPolicy, TurnStartParams,
     TurnStatus, UserInput,
@@ -164,13 +165,16 @@ pub(crate) struct ActorInbound {
 
 enum ScopeCommand {
     Inbound(Box<ActorInbound>),
-    Shutdown(oneshot::Sender<()>),
 }
 
 pub(crate) struct ScopeActorHandle {
+    scope: ScopeKey,
     sender: mpsc::Sender<ScopeCommand>,
     budget: Arc<Semaphore>,
     state: Arc<RwLock<ScopeState>>,
+    store: StoreHandle,
+    supervisor: watch::Receiver<SupervisorAccess>,
+    shutdown: CancellationToken,
     join: Option<JoinHandle<()>>,
 }
 
@@ -187,21 +191,27 @@ impl ScopeActorHandle {
         let (sender, receiver) = mpsc::channel(SCOPE_MAILBOX_CAPACITY);
         let state = Arc::new(RwLock::new(ScopeState::Idle));
         let task_state = Arc::clone(&state);
+        let shutdown = CancellationToken::new();
         let join = tokio::spawn(run_scope_actor(
-            scope,
+            scope.clone(),
             receiver,
-            store,
+            store.clone(),
             policy,
             settings,
-            supervisor,
+            supervisor.clone(),
             active_turns,
             sink,
             task_state,
+            shutdown.clone(),
         ));
         Self {
+            scope,
             sender,
             budget: Arc::new(Semaphore::new(SCOPE_MAILBOX_BYTE_BUDGET)),
             state,
+            store,
+            supervisor,
+            shutdown,
             join: Some(join),
         }
     }
@@ -244,18 +254,11 @@ impl ScopeActorHandle {
     }
 
     pub(crate) async fn shutdown(mut self) {
-        let (respond, wait) = oneshot::channel();
-        if self
-            .sender
-            .send(ScopeCommand::Shutdown(respond))
-            .await
-            .is_ok()
-        {
-            let _ = wait.await;
-        }
+        self.shutdown.cancel();
         if let Some(join) = self.join.take() {
             let _ = join.await;
         }
+        release_thread_route(&self.scope, &self.store, &self.supervisor).await;
     }
 }
 
@@ -276,8 +279,15 @@ async fn run_scope_actor(
     active_turns: Arc<Semaphore>,
     sink: Arc<dyn DurableReplySink>,
     state: Arc<RwLock<ScopeState>>,
+    shutdown: CancellationToken,
 ) {
-    while let Some(command) = receiver.recv().await {
+    'actor: loop {
+        let command = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => break,
+            command = receiver.recv() => command,
+        };
+        let Some(command) = command else { break };
         match command {
             ScopeCommand::Inbound(first) => {
                 let mut batch = vec![*first];
@@ -285,13 +295,11 @@ async fn run_scope_actor(
                 let deadline = Instant::now() + settings.debounce;
                 loop {
                     tokio::select! {
+                        biased;
+                        () = shutdown.cancelled() => break 'actor,
                         () = sleep_until(deadline) => break,
                         command = receiver.recv() => match command {
                             Some(ScopeCommand::Inbound(next)) => batch.push(*next),
-                            Some(ScopeCommand::Shutdown(respond)) => {
-                                let _ = respond.send(());
-                                return;
-                            }
                             None => return,
                         }
                     }
@@ -307,17 +315,17 @@ async fn run_scope_actor(
                     Arc::clone(&active_turns),
                     Arc::clone(&sink),
                     &state,
+                    &shutdown,
                 )
                 .await;
+                if shutdown.is_cancelled() {
+                    break;
+                }
                 if let Err(kind) = result {
                     set_state(&state, ScopeState::Failed { kind });
                 } else {
                     set_state(&state, ScopeState::Idle);
                 }
-            }
-            ScopeCommand::Shutdown(respond) => {
-                let _ = respond.send(());
-                return;
             }
         }
     }
@@ -334,12 +342,16 @@ async fn process_batch(
     active_turns: Arc<Semaphore>,
     sink: Arc<dyn DurableReplySink>,
     state: &Arc<RwLock<ScopeState>>,
+    shutdown: &CancellationToken,
 ) -> Result<(), ScopeFailureKind> {
     let batch = deduplicate_batch(batch)?;
-    let _active_permit = active_turns
-        .acquire_owned()
-        .await
-        .map_err(|_| ScopeFailureKind::Capacity)?;
+    let _active_permit = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => return Err(ScopeFailureKind::Supervisor),
+        permit = active_turns.acquire_owned() => {
+            permit.map_err(|_| ScopeFailureKind::Capacity)?
+        }
+    };
     let mut eligible = Vec::with_capacity(batch.len());
     for item in batch {
         let reason = if is_stale(&item.queued.event, settings.message_max_age) {
@@ -361,14 +373,22 @@ async fn process_batch(
     }
     let batch = eligible;
     let (cwd, fingerprint) = prepare_workspace(scope, store, policy, settings).await?;
-    let client = wait_for_client(&mut supervisor).await?;
+    let client = wait_for_client(&mut supervisor, shutdown).await?;
     set_state(state, ScopeState::StartingTurn);
-    let thread_id =
-        ensure_thread(scope, store, policy, settings, &client, &cwd, &fingerprint).await?;
-    let mut subscription = client
-        .subscribe(thread_id.as_str().into())
-        .await
-        .map_err(|_| ScopeFailureKind::Client)?;
+    let thread_id = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => return Err(ScopeFailureKind::Supervisor),
+        result = ensure_thread(scope, store, policy, settings, &client, &cwd, &fingerprint) => {
+            result?
+        }
+    };
+    let mut subscription = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => return Err(ScopeFailureKind::Supervisor),
+        result = client.subscribe(thread_id.as_str().into()) => {
+            result.map_err(|_| ScopeFailureKind::Client)?
+        }
+    };
     let client_message_id = Uuid::new_v4().to_string();
     let keys = batch
         .iter()
@@ -414,7 +434,12 @@ async fn process_batch(
     params.approval_policy = Some(settings.approval_policy.clone());
     params.model.clone_from(&settings.model);
     params.sandbox_policy = Some(turn_sandbox(settings, rpc_cwd));
-    let Ok(started) = client.start_turn(params).await else {
+    let started = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => None,
+        result = client.start_turn(params) => result.ok(),
+    };
+    let Some(started) = started else {
         finalize_uncertain(store, sink.as_ref(), settings, turn_row_id, scope, sources).await?;
         return Ok(());
     };
@@ -428,7 +453,12 @@ async fn process_batch(
     }
     set_state(state, ScopeState::Running { turn_row_id });
     let outcome = loop {
-        match subscription.recv().await {
+        let event = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => None,
+            event = subscription.recv() => event,
+        };
+        match event {
             Some(AppServerEvent::TurnCompleted(outcome))
                 if outcome.turn_id.as_str() == started.id =>
             {
@@ -559,15 +589,35 @@ async fn prepare_workspace(
 
 async fn wait_for_client(
     supervisor: &mut watch::Receiver<SupervisorAccess>,
+    shutdown: &CancellationToken,
 ) -> Result<Arc<AppServerClient>, ScopeFailureKind> {
     loop {
         if let Some(client) = supervisor.borrow().client.clone() {
             return Ok(client);
         }
-        supervisor
-            .changed()
-            .await
-            .map_err(|_| ScopeFailureKind::Supervisor)?;
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return Err(ScopeFailureKind::Supervisor),
+            changed = supervisor.changed() => {
+                changed.map_err(|_| ScopeFailureKind::Supervisor)?;
+            }
+        }
+    }
+}
+
+async fn release_thread_route(
+    scope: &ScopeKey,
+    store: &StoreHandle,
+    supervisor: &watch::Receiver<SupervisorAccess>,
+) {
+    let Ok(Some(active)) = store.active_thread(scope).await else {
+        return;
+    };
+    let client = supervisor.borrow().client.clone();
+    if let Some(client) = client {
+        let _ = client
+            .release_thread(&ThreadId::from(active.codex_thread_id))
+            .await;
     }
 }
 
@@ -696,7 +746,7 @@ async fn finalize_uncertain(
 async fn persist_finalization(
     sink: &dyn DurableReplySink,
     settings: &RouterSettings,
-    mut finalization: TurnFinalization,
+    finalization: TurnFinalization,
 ) -> Result<(), ScopeFailureKind> {
     loop {
         let attempt = TurnFinalization {
@@ -713,7 +763,6 @@ async fn persist_finalization(
                 sleep(settings.finalization_retry).await;
             }
         }
-        finalization.outcome = finalization.outcome.take();
     }
 }
 
