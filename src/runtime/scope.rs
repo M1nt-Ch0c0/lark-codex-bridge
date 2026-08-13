@@ -449,7 +449,16 @@ async fn process_batch(
         result = client.start_turn(params) => result.ok(),
     };
     let Some(started) = started else {
-        finalize_uncertain(store, sink.as_ref(), settings, turn_row_id, scope, sources).await?;
+        finalize_uncertain(
+            store,
+            sink.as_ref(),
+            settings,
+            turn_row_id,
+            scope,
+            sources,
+            shutdown,
+        )
+        .await?;
         return Ok(());
     };
     if store
@@ -457,7 +466,16 @@ async fn process_batch(
         .await
         .is_err()
     {
-        finalize_uncertain(store, sink.as_ref(), settings, turn_row_id, scope, sources).await?;
+        finalize_uncertain(
+            store,
+            sink.as_ref(),
+            settings,
+            turn_row_id,
+            scope,
+            sources,
+            shutdown,
+        )
+        .await?;
         return Ok(());
     }
     set_state(state, ScopeState::Running { turn_row_id });
@@ -479,7 +497,16 @@ async fn process_batch(
     };
     set_state(state, ScopeState::Finalizing { turn_row_id });
     let Some(outcome) = outcome else {
-        finalize_uncertain(store, sink.as_ref(), settings, turn_row_id, scope, sources).await?;
+        finalize_uncertain(
+            store,
+            sink.as_ref(),
+            settings,
+            turn_row_id,
+            scope,
+            sources,
+            shutdown,
+        )
+        .await?;
         return Ok(());
     };
     let (resolution, inbound) = resolution_for(&outcome.status);
@@ -493,6 +520,7 @@ async fn process_batch(
             resolution,
             outcome: Some(outcome),
         },
+        shutdown,
     )
     .await?;
     store
@@ -728,6 +756,7 @@ async fn finalize_uncertain(
     turn_row_id: i64,
     scope: &ScopeKey,
     sources: Vec<TurnSource>,
+    shutdown: &CancellationToken,
 ) -> Result<(), ScopeFailureKind> {
     persist_finalization(
         sink,
@@ -739,6 +768,7 @@ async fn finalize_uncertain(
             resolution: TurnResolution::Uncertain,
             outcome: None,
         },
+        shutdown,
     )
     .await?;
     store
@@ -756,6 +786,7 @@ async fn persist_finalization(
     sink: &dyn DurableReplySink,
     settings: &RouterSettings,
     finalization: TurnFinalization,
+    shutdown: &CancellationToken,
 ) -> Result<(), ScopeFailureKind> {
     loop {
         let attempt = TurnFinalization {
@@ -765,11 +796,20 @@ async fn persist_finalization(
             resolution: finalization.resolution,
             outcome: finalization.outcome.clone(),
         };
-        match sink.finalize(attempt).await {
+        let result = tokio::select! {
+            biased;
+            result = sink.finalize(attempt) => result,
+            () = shutdown.cancelled() => return Err(ScopeFailureKind::Supervisor),
+        };
+        match result {
             Ok(()) => return Ok(()),
             Err(ReplySinkError::Invariant) => return Err(ScopeFailureKind::Projection),
             Err(ReplySinkError::Unavailable | ReplySinkError::Capacity) => {
-                sleep(settings.finalization_retry).await;
+                tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => return Err(ScopeFailureKind::Supervisor),
+                    () = sleep(settings.finalization_retry) => {}
+                }
             }
         }
     }

@@ -1,6 +1,9 @@
 mod fakecodex;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{FutureExt, future::BoxFuture};
@@ -24,7 +27,7 @@ use lark_codex_bridge::store::{
 use secrecy::SecretString;
 use semver::Version;
 use serde_json::{Value, json};
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use tokio::time::{sleep, timeout};
 
 use fakecodex::{FakeFactory, FakeOutcome, test_settings};
@@ -58,6 +61,46 @@ impl DurableReplySink for RecordingSink {
             turn.sources.len(),
         ));
         async { Ok(()) }.boxed()
+    }
+}
+
+#[derive(Default)]
+struct UnavailableSink {
+    attempts: AtomicUsize,
+    attempted: Notify,
+}
+
+impl UnavailableSink {
+    async fn wait_for_attempt(&self) {
+        timeout(Duration::from_secs(2), async {
+            while self.attempts.load(Ordering::SeqCst) == 0 {
+                self.attempted.notified().await;
+            }
+        })
+        .await
+        .expect("finalization attempt");
+    }
+}
+
+impl DurableReplySink for UnavailableSink {
+    fn rejection_notice(
+        &self,
+        event: &InboundEvent,
+        _reason: InboundRejectionKind,
+    ) -> Result<NewOutboxRow, ReplySinkError> {
+        Ok(NewOutboxRow {
+            idempotency_key: format!("{}:rejection", event.event_id),
+            scope_key: event.scope.to_string(),
+            kind: "notice".to_owned(),
+            payload_json: "{\"text\":\"rejected\"}".to_owned(),
+            next_retry_ms: 0,
+        })
+    }
+
+    fn finalize(&self, _turn: TurnFinalization) -> BoxFuture<'static, Result<(), ReplySinkError>> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        self.attempted.notify_waiters();
+        async { Err(ReplySinkError::Unavailable) }.boxed()
     }
 }
 
@@ -738,5 +781,81 @@ async fn message_while_running_waits_then_resumes_the_same_thread() {
     .await;
     assert_eq!(sink.finalizations.lock().expect("finalizations").len(), 2);
     router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn shutdown_cancels_unavailable_finalization_without_clearing_accepted_payload() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(UnavailableSink::default());
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink.clone(),
+    )
+    .await
+    .expect("router");
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("event-finalization-unavailable", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("route event");
+    let start_thread = control.next_request().await;
+    control
+        .respond(
+            &start_thread,
+            thread_result("thread-finalization-unavailable", &workspace),
+        )
+        .await;
+    let start_turn = control.next_request().await;
+    control
+        .respond(
+            &start_turn,
+            json!({"turn": turn("turn-finalization-unavailable", "inProgress")}),
+        )
+        .await;
+    control
+        .send_json(json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-finalization-unavailable",
+                "turn": turn("turn-finalization-unavailable", "completed")
+            }
+        }))
+        .await;
+    sink.wait_for_attempt().await;
+
+    timeout(Duration::from_millis(500), router.shutdown())
+        .await
+        .expect("shutdown cancels the finalization retry")
+        .expect("router shutdown");
+    assert_eq!(
+        store
+            .inbound_state(&namespace, "event-finalization-unavailable")
+            .await
+            .expect("inbound state"),
+        Some(InboundEventState::Accepted)
+    );
+    let live_turns = store.uncertain_turns().await.expect("live turns");
+    assert_eq!(live_turns.len(), 1);
+    assert_eq!(
+        live_turns[0].state,
+        lark_codex_bridge::store::TurnState::Running
+    );
     store.shutdown().await.expect("store shutdown");
 }
