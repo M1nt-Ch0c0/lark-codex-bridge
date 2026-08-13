@@ -43,6 +43,7 @@
 - `src/lark/transport.rs`: endpoint bootstrap, WebSocket actor, ping/pong, receipt, reconnect state machine.
 - `src/lark/api.rs`: tenant-token-aware OpenAPI client (messages, cards, images, files, bot info, chat info, message get).
 - `src/lark/normalize.rs`: raw `im.message.receive_v1` → stable `InboundEvent`, scope keys, mention/topic/quote handling, bounded backfill.
+- `src/lark/bridge.rs`: transport → normalizer wiring behind a bounded inbound event channel.
 - `src/cli.rs`: `lark auth check|register`, `lark probe` subcommands.
 - `tests/lark_token.rs`: token cache and bot-info flows against a local stub HTTP server.
 - `tests/lark_register.rs`: registration begin/poll flows against a local stub (no real scan).
@@ -50,6 +51,7 @@
 - `tests/lark_transport.rs`: in-process WebSocket server driving bootstrap/ping/receipt/reconnect/degraded flows.
 - `tests/lark_api.rs`: OpenAPI request shapes, auth headers, and bounded downloads against a local stub.
 - `tests/lark_normalize.rs`: normalization fixtures for p2p, group @, topic, quote, and backfill degradation.
+- `tests/lark_bridge.rs`: bridge wiring (event → normalize → bounded channel, full-channel 500 receipts, card-action ack, degradation delivery) and `lark probe` round trip against an in-process WS server.
 - `tests/lark_smoke.rs`: ignored, opt-in real Lark end-to-end test (`LARK_E2E=1`).
 - `tests/fixtures/lark/*.json`: scrubbed event/message/chat/token samples.
 
@@ -508,9 +510,13 @@ Commit `feat: normalize Lark events into stable inbound model`.
 
 **Files:**
 
+- Create: `src/lark/bridge.rs`
+- Create: `tests/lark_bridge.rs`
 - Create: `tests/lark_smoke.rs`
 - Modify: `src/cli.rs`
 - Modify: `src/lark/mod.rs`
+- Modify: `src/lark/transport.rs`
+- Modify: `src/limits.rs`
 - Modify: `README.md`
 
 **Interfaces:**
@@ -518,15 +524,15 @@ Commit `feat: normalize Lark events into stable inbound model`.
 - Consumes: every `lark` module above.
 - Produces: `lark probe` command and a gated real end-to-end smoke test.
 
-- [ ] **Step 1: Wire the transport to the normalizer behind a bounded event channel**
+- [x] **Step 1: Wire the transport to the normalizer behind a bounded event channel**
 
 `LarkBridge::start(creds) -> (TransportHandle, mpsc::Receiver<InboundEvent>)`: the transport handler normalizes each completed event payload and pushes `InboundEvent` into a channel bounded by `LARK_INBOUND_EVENT_CAPACITY` count and `LARK_INBOUND_EVENT_BYTE_BUDGET` bytes (permits held until dequeue, matching the existing transport/RPC permit pattern). A full channel fails the handler so the receipt honestly reports `{code: 500}` instead of silently dropping. Card-action payloads are acknowledged with `{code: 200, data}` and logged as unsupported for this milestone rather than routed.
 
-- [ ] **Step 2: Implement `lark probe`**
+- [x] **Step 2: Implement `lark probe`**
 
 Loads credentials, exchanges a tenant token, fetches bot info, pulls a WS endpoint, opens the socket, waits for the first ping/pong round trip (bounded by `PROBE_TIMEOUT`), then closes. Prints one sanitized JSON object: tenant, bot name, bot open_id, endpoint reachability, negotiated `PingInterval`, and elapsed milliseconds. Never prints secrets, tokens, or the full endpoint URL (log only host). Exits non-zero with an actionable diagnostic for missing credentials, `PermanentAuth`, and timeout.
 
-- [ ] **Step 3: Add the opt-in real Lark smoke test**
+- [x] **Step 3: Add the opt-in real Lark smoke test**
 
 `tests/lark_smoke.rs` is `#[ignore = "requires real Feishu/Lark app credentials"]` and additionally requires `LARK_E2E=1`; without it the test prints the skip reason and exits successfully — a skipped run is explicitly not evidence. When enabled it requires `LARK_E2E_APP_ID`, `LARK_E2E_APP_SECRET`, `LARK_E2E_TENANT` (`feishu|lark`), and `LARK_E2E_CHAT_ID` (a chat where the app bot is a member), then: exchanges a tenant token, sends `bridge-smoke <unix-ts>` via `LarkApi::send_text`, starts the transport, waits up to 180 s for its own message event to round-trip through `InboundEvent`, asserts scope/chat/text metadata, replies `pong` to that message via `reply_text`, and shuts down with no orphan tasks. A skip, an assertion failure, or missing credentials can never be reported as a pass in milestone evidence.
 

@@ -26,6 +26,32 @@ platform family/OS 和 epoch；不包含 Codex home、账户身份、token 或�
 CODEX_E2E=1 cargo test --test codex_smoke --locked -- --ignored --nocapture
 ```
 
+## 飞书 / Lark 接入与检查
+
+登记应用凭证（扫码注册新 PersonalAgent 应用，或登记已有 App ID/Secret）：
+
+```bash
+cargo run -- lark auth register
+cargo run -- lark auth register --app-id <id> --tenant <feishu|lark>   # secret 从 LARK_APP_SECRET 读取
+cargo run -- lark auth check
+```
+
+凭证也可用环境变量提供（优先级高于凭证文件）：`LARK_APP_ID`、`LARK_APP_SECRET`、
+`LARK_TENANT`（`feishu|lark`）。`lark auth check` 只输出 tenant、bot 名称和 bot open_id。
+
+`lark probe` 用已存凭证换取 tenant token、查询 bot 信息、拉取 WebSocket endpoint
+并完成一次真实 ping/pong 往返，输出单个脱敏 JSON 对象（tenant、botName、botOpenId、
+endpointHost、pingIntervalSecs、elapsedMs）；绝不输出 secret、token 或完整 endpoint URL。
+缺凭证、永久认证失败或超时均以非零退出并给出可操作的诊断。
+
+真实飞书/Lark 端到端 smoke 需要应用凭证和一个机器人已加入的会话，并按环境变量门控
+（未设置时测试打印 skip 原因并成功退出，skip 不算证据）：
+
+```bash
+LARK_E2E=1 LARK_E2E_APP_ID=… LARK_E2E_APP_SECRET=… LARK_E2E_TENANT=feishu LARK_E2E_CHAT_ID=oc_… \
+  cargo test --test lark_smoke --locked -- --ignored --nocapture
+```
+
 设计规格见
 [docs/superpowers/specs/2026-08-12-lark-codex-bridge-design.md](docs/superpowers/specs/2026-08-12-lark-codex-bridge-design.md)。
 

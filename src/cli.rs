@@ -12,11 +12,14 @@ use crate::{
         supervisor::{AppServerSupervisor, SupervisorHandle, SupervisorState},
     },
     lark::{
-        api::BotInfo,
+        api::{BotInfo, LarkApi},
         config::{LarkEndpoints, TenantBrand},
         credentials::{CredentialStore, FileCredentialStore, LarkCredentials, load_credentials},
+        error::LarkError,
         http::LarkHttp,
         register::{RegistrationFlow, RegistrationOutcome, validate_credentials},
+        token::TenantTokenProvider,
+        transport::LarkTransport,
     },
     limits::PROBE_TIMEOUT,
 };
@@ -59,6 +62,9 @@ pub enum LarkCommand {
         #[command(subcommand)]
         command: LarkAuthCommand,
     },
+    /// Exchange a tenant token, fetch bot info, pull the WebSocket endpoint,
+    /// and verify one ping/pong round trip; prints a sanitized JSON summary.
+    Probe,
 }
 
 #[derive(Debug, Subcommand)]
@@ -136,6 +142,9 @@ pub async fn run_with(cli: Cli) -> Result<()> {
                     command: LarkAuthCommand::Check,
                 },
         } => lark_auth_check().await,
+        Command::Lark {
+            command: LarkCommand::Probe,
+        } => lark_probe().await,
     }
 }
 
@@ -302,6 +311,66 @@ fn print_auth_report(tenant: TenantBrand, info: &BotInfo) -> Result<()> {
         bot_open_id: info.open_id.clone(),
     };
     let line = serde_json::to_string(&report).context("unable to encode auth report")?;
+    println!("{line}");
+    Ok(())
+}
+
+/// The only fields `lark probe` may ever print: no app secret, no tenant
+/// token, and never the full endpoint URL (host only).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LarkProbeReport {
+    tenant: String,
+    bot_name: Option<String>,
+    bot_open_id: Option<String>,
+    endpoint_host: String,
+    endpoint_reachable: bool,
+    ping_interval_secs: u64,
+    elapsed_ms: u64,
+}
+
+async fn lark_probe() -> Result<()> {
+    let creds = load_credentials()
+        .context("unable to load stored credentials")?
+        .ok_or_else(|| {
+            anyhow!(
+                "no Lark credentials found; run `lark auth register` or set LARK_APP_ID, LARK_APP_SECRET, and LARK_TENANT"
+            )
+        })?;
+    let http = LarkHttp::new(LarkEndpoints::for_tenant(creds.tenant))
+        .context("unable to build the Lark HTTP client")?;
+    let tokens = TenantTokenProvider::new(http.clone(), creds.clone());
+    // Exchange the token explicitly first so a permanent auth failure gets an
+    // actionable diagnostic instead of a generic probe error.
+    tokens.token().await.map_err(|error| match error {
+        LarkError::PermanentAuth { .. } => anyhow!(
+            "Lark authentication failed permanently; verify the app ID, app secret, and tenant (or re-run `lark auth register`)"
+        ),
+        other => anyhow!("unable to exchange a Lark tenant token: {other}"),
+    })?;
+    let api = LarkApi::new(http.clone(), tokens);
+    let info = api
+        .bot_info()
+        .await
+        .map_err(|error| anyhow!("unable to fetch the Lark bot info: {error}"))?;
+    let outcome = LarkTransport::probe(&http, &creds).await.map_err(|error| match error {
+        LarkError::PermanentAuth { code, .. } => anyhow!(
+            "Lark WebSocket endpoint rejected the credentials permanently (code {code:?}); verify the app ID, app secret, and tenant"
+        ),
+        other => anyhow!(
+            "unable to complete the Lark WebSocket probe: {other}; check network reachability of the tenant endpoints and retry"
+        ),
+    })?;
+    let report = LarkProbeReport {
+        tenant: creds.tenant.to_string(),
+        bot_name: info.app_name,
+        bot_open_id: info.open_id,
+        endpoint_host: outcome.endpoint_host,
+        endpoint_reachable: true,
+        ping_interval_secs: outcome.ping_interval.as_secs(),
+        elapsed_ms: u64::try_from(outcome.elapsed.as_millis()).unwrap_or(u64::MAX),
+    };
+    let line = serde_json::to_string(&report).context("unable to encode probe report")?;
     println!("{line}");
     Ok(())
 }

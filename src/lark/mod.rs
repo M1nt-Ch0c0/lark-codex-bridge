@@ -7,6 +7,7 @@
 //! authentication failures from retryable ones.
 
 pub mod api;
+pub mod bridge;
 pub mod config;
 pub mod credentials;
 pub mod error;

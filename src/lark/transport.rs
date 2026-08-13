@@ -68,7 +68,7 @@ use crate::codex::supervisor::AppServerSupervisor;
 use crate::limits::{
     LARK_DEFAULT_PING_INTERVAL, LARK_FRAGMENT_MESSAGE_BYTES, LARK_HANDLER_TIMEOUT,
     LARK_PONG_TIMEOUT, LARK_TRANSPORT_EVENT_BYTE_BUDGET, LARK_TRANSPORT_EVENT_CAPACITY,
-    LARK_TRANSPORT_SHUTDOWN_GRACE, LARK_WS_CONNECT_TIMEOUT,
+    LARK_TRANSPORT_SHUTDOWN_GRACE, LARK_WS_CONNECT_TIMEOUT, PROBE_TIMEOUT,
 };
 
 /// One pulled WebSocket endpoint plus its server-supplied client config.
@@ -221,6 +221,21 @@ impl Default for TransportConfig {
     }
 }
 
+/// Outcome of a one-shot endpoint liveness probe (`lark probe`).
+///
+/// Carries only the endpoint host (never the full URL, which can contain
+/// one-time tickets) and the negotiated timing values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeOutcome {
+    /// Host of the pulled WebSocket endpoint.
+    pub endpoint_host: String,
+    /// Ping interval negotiated for the session: the bootstrap value,
+    /// updated by the first pong's `ClientConfig` payload when present.
+    pub ping_interval: Duration,
+    /// Wall time of the whole probe (bootstrap, connect, first round trip).
+    pub elapsed: Duration,
+}
+
 /// Entry points for the Lark WebSocket transport.
 pub struct LarkTransport;
 
@@ -297,6 +312,96 @@ impl LarkTransport {
             shutdown,
             task: Some(task),
         }
+    }
+
+    /// Runs a one-shot liveness probe: pulls the endpoint, opens the socket,
+    /// sends one ping, and waits for the first pong within
+    /// [`PROBE_TIMEOUT`], then closes.
+    ///
+    /// Unlike [`LarkTransport::start`] this performs exactly one bootstrap and
+    /// one connect with no retries — a probe reports reachability, it does not
+    /// hold a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified [`LarkError`]: `PermanentAuth` for bad
+    /// credentials or a handshake auth error, `Retryable` for connect
+    /// failures, a closed socket, or the overall timeout.
+    pub async fn probe(
+        http: &LarkHttp,
+        creds: &LarkCredentials,
+    ) -> Result<ProbeOutcome, LarkError> {
+        let started = Instant::now();
+        let endpoint = Self::pull_endpoint(http, creds).await?;
+        let host = endpoint.url.host_str().unwrap_or("").to_owned();
+        let round_trip = async {
+            let ws_config = WebSocketConfig::default()
+                .max_message_size(Some(LARK_FRAGMENT_MESSAGE_BYTES))
+                .max_frame_size(Some(LARK_FRAGMENT_MESSAGE_BYTES));
+            let (socket, _response) = timeout(
+                LARK_WS_CONNECT_TIMEOUT,
+                connect_async_with_config(endpoint.url.as_str(), Some(ws_config), false),
+            )
+            .await
+            .map_err(|_| LarkError::retryable("lark probe connect timed out"))?
+            .map_err(|_| LarkError::retryable("lark probe connect failed"))?;
+            let (mut sink, mut stream) = socket.split();
+            send_ping(&mut sink, endpoint.service_id)
+                .await
+                .map_err(|()| LarkError::retryable("lark probe failed to send the ping frame"))?;
+            let mut live = LiveConfig::default();
+            live.apply_endpoint(&endpoint);
+            loop {
+                match stream.next().await {
+                    Some(Ok(Message::Binary(bytes))) => {
+                        let Ok(frame) = Frame::decode_bytes(&bytes) else {
+                            continue;
+                        };
+                        let headers = frame.frame_headers();
+                        if let Some(code) = headers.handshake_autherrcode() {
+                            return Err(LarkError::PermanentAuth {
+                                context: "the lark probe handshake",
+                                code: code.parse::<i64>().ok(),
+                            });
+                        }
+                        let is_pong = matches!(
+                            FrameMethod::from_wire(frame.method),
+                            Some(FrameMethod::Control)
+                        ) && matches!(headers.ty(), Some(MessageType::Pong));
+                        if is_pong {
+                            if let Some(payload) = frame.payload.as_deref() {
+                                let _ = live.apply_pong(payload);
+                            }
+                            let close = async {
+                                let _ = sink.send(Message::Close(None)).await;
+                                let _ = sink.flush().await;
+                            };
+                            let _ = timeout(LARK_TRANSPORT_SHUTDOWN_GRACE, close).await;
+                            return Ok(live.ping_interval);
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => {
+                        return Err(LarkError::retryable(
+                            "lark probe socket closed before the first pong",
+                        ));
+                    }
+                    Some(Err(_)) => {
+                        return Err(LarkError::retryable("lark probe socket error"));
+                    }
+                    // Protocol pings are answered by tungstenite; text frames
+                    // are not part of pbbp2.
+                    Some(Ok(_)) => {}
+                }
+            }
+        };
+        let ping_interval = timeout(PROBE_TIMEOUT, round_trip).await.map_err(|_| {
+            LarkError::retryable("lark probe timed out waiting for the first pong")
+        })??;
+        Ok(ProbeOutcome {
+            endpoint_host: host,
+            ping_interval,
+            elapsed: started.elapsed(),
+        })
     }
 }
 

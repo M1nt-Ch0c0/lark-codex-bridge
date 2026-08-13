@@ -120,3 +120,13 @@ pub const LARK_TRANSPORT_EVENT_CAPACITY: usize = 64;
 /// Byte budget for message payloads parked in the transport observation
 /// channel; permits are held until the receiver dequeues.
 pub const LARK_TRANSPORT_EVENT_BYTE_BUDGET: usize = 8 * 1024 * 1024;
+
+/// Count bound of the normalized inbound event channel handed from the Lark
+/// bridge wiring to the scope runtime. A full channel fails the inbound
+/// handler so the frame receipt honestly reports `{code: 500}` instead of
+/// silently dropping the event.
+pub const LARK_INBOUND_EVENT_CAPACITY: usize = 256;
+/// Byte budget (sized by the raw event payloads) for events parked in the
+/// inbound event channel; permits are held until the receiver dequeues,
+/// matching the transport/RPC permit pattern.
+pub const LARK_INBOUND_EVENT_BYTE_BUDGET: usize = 8 * 1024 * 1024;
