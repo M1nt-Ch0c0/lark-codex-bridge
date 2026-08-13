@@ -246,23 +246,25 @@ impl ScopeActorHandle {
         key: InboundKey,
         queued: QueuedInboundEvent,
     ) -> Result<(), ActorRouteError> {
-        let bytes =
-            u32::try_from(queued.permit.num_permits()).map_err(|_| ActorRouteError::Capacity)?;
-        let permit = self
-            .budget
-            .clone()
-            .try_acquire_many_owned(bytes)
-            .map_err(|_| ActorRouteError::Capacity)?;
-        self.sender
-            .try_send(ScopeCommand::Inbound(Box::new(ActorInbound {
-                key,
-                queued,
-                _mailbox_permit: permit,
-            })))
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => ActorRouteError::Capacity,
-                mpsc::error::TrySendError::Closed(_) => ActorRouteError::Closed,
-            })
+        let Ok(bytes) = u32::try_from(queued.permit.num_permits()) else {
+            return Err(ActorRouteError::Capacity(Box::new(queued)));
+        };
+        let Ok(permit) = self.budget.clone().try_acquire_many_owned(bytes) else {
+            return Err(ActorRouteError::Capacity(Box::new(queued)));
+        };
+        let command = ScopeCommand::Inbound(Box::new(ActorInbound {
+            key,
+            queued,
+            _mailbox_permit: permit,
+        }));
+        self.sender.try_send(command).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(ScopeCommand::Inbound(item)) => {
+                ActorRouteError::Capacity(Box::new(item.queued))
+            }
+            mpsc::error::TrySendError::Closed(ScopeCommand::Inbound(item)) => {
+                ActorRouteError::Closed(Box::new(item.queued))
+            }
+        })
     }
 
     pub(crate) fn state(&self) -> ScopeState {
@@ -307,10 +309,9 @@ impl ScopeActorHandle {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ActorRouteError {
-    Capacity,
-    Closed,
+    Capacity(Box<QueuedInboundEvent>),
+    Closed(Box<QueuedInboundEvent>),
 }
 
 #[derive(Clone)]

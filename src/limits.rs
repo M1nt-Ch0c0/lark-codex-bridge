@@ -228,6 +228,10 @@ pub const DEFAULT_MAX_SCOPE_ACTORS: usize = 256;
 pub const ROUTER_COMMAND_CAPACITY: usize = 256;
 /// Aggregate exact persisted inbound bytes waiting in the router command queue.
 pub const ROUTER_COMMAND_BYTE_BUDGET: usize = 8 * 1024 * 1024;
+/// Count bound of transiently failed route decisions waiting for retry.
+pub const ROUTER_RETRY_CAPACITY: usize = 256;
+/// Aggregate exact persisted inbound bytes retained by the router retry lane.
+pub const ROUTER_RETRY_BYTE_BUDGET: usize = 8 * 1024 * 1024;
 /// Count bound of high-priority runtime controls such as turn interruption.
 pub const ROUTER_CONTROL_CAPACITY: usize = 64;
 /// Aggregate serialized scope-key bytes retained by high-priority controls.

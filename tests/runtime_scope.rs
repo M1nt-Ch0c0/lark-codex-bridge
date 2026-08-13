@@ -16,8 +16,8 @@ use lark_codex_bridge::lark::config::TenantBrand;
 use lark_codex_bridge::lark::credentials::LarkCredentials;
 use lark_codex_bridge::lark::normalize::{InboundEvent, ScopeKey};
 use lark_codex_bridge::limits::{
-    ROUTER_ACTIVE_TURN_HARD_LIMIT, ROUTER_COMMAND_BYTE_BUDGET, ROUTER_SCOPE_ACTOR_HARD_LIMIT,
-    SCOPE_MAILBOX_CAPACITY,
+    ROUTER_ACTIVE_TURN_HARD_LIMIT, ROUTER_COMMAND_BYTE_BUDGET, ROUTER_RETRY_CAPACITY,
+    ROUTER_SCOPE_ACTOR_HARD_LIMIT, SCOPE_MAILBOX_CAPACITY,
 };
 use lark_codex_bridge::runtime::intake::TenantNamespace;
 use lark_codex_bridge::runtime::policy::AccessPolicy;
@@ -73,6 +73,51 @@ impl DurableReplySink for RecordingSink {
 struct UnavailableSink {
     attempts: AtomicUsize,
     attempted: Notify,
+}
+
+#[derive(Default)]
+struct RetryOnceRejectionSink {
+    attempts: AtomicUsize,
+}
+
+#[derive(Default)]
+struct UnavailableRejectionSink;
+
+impl DurableReplySink for UnavailableRejectionSink {
+    fn rejection_notice(
+        &self,
+        _event: &InboundEvent,
+        _reason: InboundRejectionKind,
+    ) -> Result<NewOutboxRow, ReplySinkError> {
+        Err(ReplySinkError::Unavailable)
+    }
+
+    fn finalize(&self, _turn: TurnFinalization) -> BoxFuture<'static, Result<(), ReplySinkError>> {
+        async { Ok(()) }.boxed()
+    }
+}
+
+impl DurableReplySink for RetryOnceRejectionSink {
+    fn rejection_notice(
+        &self,
+        event: &InboundEvent,
+        reason: InboundRejectionKind,
+    ) -> Result<NewOutboxRow, ReplySinkError> {
+        if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(ReplySinkError::Unavailable);
+        }
+        Ok(NewOutboxRow {
+            idempotency_key: format!("{}:retry:{reason:?}", event.event_id),
+            scope_key: event.scope.to_string(),
+            kind: "notice".to_owned(),
+            payload_json: "{\"text\":\"rejected after retry\"}".to_owned(),
+            next_retry_ms: 0,
+        })
+    }
+
+    fn finalize(&self, _turn: TurnFinalization) -> BoxFuture<'static, Result<(), ReplySinkError>> {
+        async { Ok(()) }.boxed()
+    }
 }
 
 impl UnavailableSink {
@@ -325,6 +370,14 @@ async fn queued_registered(
     }
 }
 
+async fn queued_synthetic(event: InboundEvent, retained_bytes: usize) -> QueuedInboundEvent {
+    let permit = Arc::new(Semaphore::new(retained_bytes))
+        .acquire_many_owned(u32::try_from(retained_bytes).expect("retained bytes fit"))
+        .await
+        .expect("synthetic retained permit");
+    QueuedInboundEvent { event, permit }
+}
+
 async fn wait_for_inbound_states(
     store: &StoreHandle,
     namespace: &TenantNamespace,
@@ -406,6 +459,155 @@ async fn router_rejects_non_owner_with_one_atomic_durable_notice() {
         *sink.rejections.lock().expect("rejection lock"),
         vec![InboundRejectionKind::Policy]
     );
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn router_retries_a_transient_rejection_projection_without_losing_the_received_row() {
+    let config = validated_config();
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RetryOnceRejectionSink::default());
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        degraded_supervisor().await,
+        sink.clone(),
+    )
+    .await
+    .expect("router");
+
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("event-rejection-retry", "intruder-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("bounded retry lane accepts transient projection failure");
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-rejection-retry"],
+        InboundEventState::Rejected,
+    )
+    .await;
+    assert_eq!(sink.attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(store.outbox_depth().await.expect("outbox").pending, 1);
+
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn router_retry_lane_enforces_its_count_bound() {
+    let config = validated_config();
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        degraded_supervisor().await,
+        Arc::new(UnavailableRejectionSink),
+    )
+    .await
+    .expect("router");
+
+    let retry_event = event("event-retry-capacity", "intruder-runtime-scope");
+    router
+        .route(queued_registered(&store, &namespace, retry_event.clone()).await)
+        .await
+        .expect("first bounded retry slot");
+    for _ in 1..ROUTER_RETRY_CAPACITY {
+        router
+            .route(queued_synthetic(retry_event.clone(), 1).await)
+            .await
+            .expect("bounded retry slot");
+    }
+    assert!(matches!(
+        router
+            .route(queued_synthetic(retry_event.clone(), 1).await)
+            .await,
+        Err(RouteError::ReplySink)
+    ));
+    assert_eq!(router.snapshot().queued_commands, ROUTER_RETRY_CAPACITY);
+    assert_eq!(
+        store
+            .inbound_state(&namespace, &retry_event.event_id)
+            .await
+            .expect("overflow state"),
+        Some(InboundEventState::Received)
+    );
+
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn router_retry_lane_enforces_its_aggregate_byte_bound() {
+    let config = validated_config();
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        degraded_supervisor().await,
+        Arc::new(UnavailableRejectionSink),
+    )
+    .await
+    .expect("router");
+    let retained_bytes = ROUTER_COMMAND_BYTE_BUDGET / 2 + 1;
+    let mut first = queued_registered(
+        &store,
+        &namespace,
+        event("event-retry-bytes-first", "intruder-runtime-scope"),
+    )
+    .await;
+    first.permit = Arc::new(Semaphore::new(retained_bytes))
+        .acquire_many_owned(u32::try_from(retained_bytes).expect("retained bytes fit"))
+        .await
+        .expect("first synthetic retained permit");
+    router.route(first).await.expect("first retry fits");
+
+    let overflow_id = "event-retry-bytes-overflow";
+    let mut overflow = queued_registered(
+        &store,
+        &namespace,
+        event(overflow_id, "intruder-runtime-scope"),
+    )
+    .await;
+    overflow.permit = Arc::new(Semaphore::new(retained_bytes))
+        .acquire_many_owned(u32::try_from(retained_bytes).expect("retained bytes fit"))
+        .await
+        .expect("overflow synthetic retained permit");
+    assert!(matches!(
+        router.route(overflow).await,
+        Err(RouteError::ReplySink)
+    ));
+    assert_eq!(
+        store
+            .inbound_state(&namespace, overflow_id)
+            .await
+            .expect("overflow state"),
+        Some(InboundEventState::Received)
+    );
+
     router.shutdown().await.expect("shutdown");
     store.shutdown().await.expect("store shutdown");
 }
