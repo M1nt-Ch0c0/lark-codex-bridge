@@ -15,7 +15,9 @@ use lark_codex_bridge::lark::bridge::QueuedInboundEvent;
 use lark_codex_bridge::lark::config::TenantBrand;
 use lark_codex_bridge::lark::credentials::LarkCredentials;
 use lark_codex_bridge::lark::normalize::{InboundEvent, ScopeKey};
-use lark_codex_bridge::limits::{ROUTER_ACTIVE_TURN_HARD_LIMIT, ROUTER_SCOPE_ACTOR_HARD_LIMIT};
+use lark_codex_bridge::limits::{
+    ROUTER_ACTIVE_TURN_HARD_LIMIT, ROUTER_SCOPE_ACTOR_HARD_LIMIT, SCOPE_MAILBOX_CAPACITY,
+};
 use lark_codex_bridge::runtime::intake::TenantNamespace;
 use lark_codex_bridge::runtime::policy::AccessPolicy;
 use lark_codex_bridge::runtime::router::{RouteError, Router, RouterSettings};
@@ -23,8 +25,8 @@ use lark_codex_bridge::runtime::scope::{
     DurableReplySink, InterruptOutcome, ReplySinkError, TurnFinalization,
 };
 use lark_codex_bridge::store::{
-    DedupOutcome, InboundEventState, InboundRejectionKind, NewOutboxRow, StoreHandle,
-    TurnResolution,
+    BeginTurnOutcome, DedupOutcome, InboundEventState, InboundKey, InboundRejectionKind,
+    InboundTerminal, NewOutboxRow, NewTurnRow, StoreHandle, TurnResolution, TurnState,
 };
 use secrecy::SecretString;
 use semver::Version;
@@ -190,6 +192,23 @@ async fn ready_supervisor() -> (
     .await
     .expect("ready supervisor");
     (supervisor, control)
+}
+
+async fn restarting_supervisor() -> (
+    lark_codex_bridge::codex::supervisor::SupervisorHandle,
+    fakecodex::FakeControl,
+    fakecodex::FakeControl,
+) {
+    let (first, first_control) = FakeFactory::ready();
+    let (second, second_control) = FakeFactory::ready();
+    let supervisor = AppServerSupervisor::start_with_factory(
+        CodexProcessConfig::default(),
+        Arc::new(FakeFactory::new([first, second])),
+        test_settings(),
+    )
+    .await
+    .expect("restarting supervisor");
+    (supervisor, first_control, second_control)
 }
 
 async fn assert_invalid_router_settings(config: &BridgeConfig) {
@@ -1313,6 +1332,262 @@ async fn interrupt_waits_for_terminal_completion_before_the_next_turn() {
         InboundEventState::Completed,
     )
     .await;
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn supervisor_epoch_loss_finalizes_uncertain_before_queued_work_resumes() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RecordingSink::default());
+    let (supervisor, first_control, second_control) = restarting_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink.clone(),
+    )
+    .await
+    .expect("router");
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("event-epoch-first", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("route first turn");
+    let start_thread = first_control.next_request().await;
+    first_control
+        .respond(&start_thread, thread_result("thread-epoch", &workspace))
+        .await;
+    let first_turn = first_control.next_request().await;
+    respond_turn_started(&first_control, &first_turn, "turn-epoch-first").await;
+    wait_for_running_turn(&store, "turn-epoch-first").await;
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("event-epoch-second", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("queue second turn");
+
+    first_control.unexpected_exit();
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-epoch-first"],
+        InboundEventState::Rejected,
+    )
+    .await;
+    {
+        let finalizations = sink.finalizations.lock().expect("finalizations");
+        assert_eq!(finalizations.len(), 1);
+        assert_eq!(finalizations[0].1, TurnResolution::Uncertain);
+    }
+
+    let resume = second_control.next_request().await;
+    assert_eq!(resume["method"], "thread/resume");
+    second_control
+        .respond(&resume, thread_result("thread-epoch", &workspace))
+        .await;
+    let second_turn = second_control.next_request().await;
+    assert_eq!(second_turn["method"], "turn/start");
+    respond_turn_started(&second_control, &second_turn, "turn-epoch-second").await;
+    send_turn_completed(
+        &second_control,
+        "thread-epoch",
+        "turn-epoch-second",
+        "completed",
+    )
+    .await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-epoch-second"],
+        InboundEventState::Completed,
+    )
+    .await;
+    assert_eq!(sink.finalizations.lock().expect("finalizations").len(), 2);
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn mixed_batch_omits_an_already_claimed_key_without_stranding_its_sibling() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let first = event("event-mixed-claimed", "owner-runtime-scope");
+    let second = event("event-mixed-received", "owner-runtime-scope");
+    let first_queued = queued_registered(&store, &namespace, first.clone()).await;
+    let second_queued = queued_registered(&store, &namespace, second).await;
+    let seeded = store
+        .begin_turn_and_claim_inbound(
+            NewTurnRow {
+                scope_key: first.scope.to_string(),
+                client_message_id: "seeded-mixed-claim".to_owned(),
+                codex_thread_id: Some("thread-seeded-mixed".to_owned()),
+                state: TurnState::Starting,
+            },
+            &[InboundKey::new(
+                namespace.clone(),
+                "event-mixed-claimed".to_owned(),
+            )],
+        )
+        .await
+        .expect("seed one claimed key");
+    let BeginTurnOutcome::Started {
+        turn_row_id: seeded_turn,
+        ..
+    } = seeded
+    else {
+        panic!("seeded claim must create a turn");
+    };
+    let sink = Arc::new(RecordingSink::default());
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink,
+    )
+    .await
+    .expect("router");
+    router.route(first_queued).await.expect("route claimed key");
+    router
+        .route(second_queued)
+        .await
+        .expect("route received sibling");
+
+    let start_thread = control.next_request().await;
+    control
+        .respond(&start_thread, thread_result("thread-mixed", &workspace))
+        .await;
+    let start_turn = control.next_request().await;
+    assert_eq!(
+        start_turn["params"]["input"]
+            .as_array()
+            .expect("input array")
+            .len(),
+        1
+    );
+    respond_turn_started(&control, &start_turn, "turn-mixed").await;
+    send_turn_completed(&control, "thread-mixed", "turn-mixed", "completed").await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-mixed-received"],
+        InboundEventState::Completed,
+    )
+    .await;
+    assert_eq!(
+        store
+            .inbound_state(&namespace, "event-mixed-claimed")
+            .await
+            .expect("claimed state"),
+        Some(InboundEventState::Accepted)
+    );
+    store
+        .resolve_turn_and_finish_inbound_batch(
+            seeded_turn,
+            TurnResolution::Uncertain,
+            InboundTerminal::Rejected,
+        )
+        .await
+        .expect("clean up seeded recovery turn");
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn full_scope_mailbox_atomically_rejects_the_overflow_with_a_busy_notice() {
+    let config = validated_config();
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RecordingSink::default());
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        degraded_supervisor().await,
+        sink.clone(),
+    )
+    .await
+    .expect("router");
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("event-mailbox-blocker", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("route blocker");
+    sleep(Duration::from_millis(700)).await;
+    for index in 0..SCOPE_MAILBOX_CAPACITY {
+        router
+            .route(
+                queued_registered(
+                    &store,
+                    &namespace,
+                    event(
+                        format!("event-mailbox-pending-{index}").as_str(),
+                        "owner-runtime-scope",
+                    ),
+                )
+                .await,
+            )
+            .await
+            .expect("fill bounded mailbox");
+    }
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("event-mailbox-overflow", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("overflow becomes a durable rejection");
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-mailbox-overflow"],
+        InboundEventState::Rejected,
+    )
+    .await;
+    assert_eq!(
+        *sink.rejections.lock().expect("rejections"),
+        vec![InboundRejectionKind::Overloaded]
+    );
+    assert_eq!(store.outbox_depth().await.expect("outbox").pending, 1);
     router.shutdown().await.expect("shutdown");
     store.shutdown().await.expect("store shutdown");
 }
