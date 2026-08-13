@@ -226,4 +226,120 @@ impl StoreHandle {
         })
         .await
     }
+
+    /// Lists every attachment row in deterministic order (`last_used_ms`
+    /// ascending, then `sha256` ascending) so GC victim selection is stable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the writer task or SQLite fails, or when the
+    /// stored row count exceeds the attachment row cap.
+    pub async fn list_attachments(&self) -> Result<Vec<AttachmentRow>, StoreError> {
+        self.run(|connection| {
+            let count: i64 = connection
+                .query_row("SELECT COUNT(*) FROM attachments", [], |row| row.get(0))
+                .map_err(|error| sqlite_error("counting attachments", &error))?;
+            if count > i64::try_from(STORE_ATTACHMENT_MAX_ROWS).unwrap_or(i64::MAX) {
+                return Err(StoreError::CapacityExceeded {
+                    context: "listing attachments",
+                });
+            }
+            let mut statement = connection
+                .prepare(
+                    "SELECT sha256, bytes, kind, created_ms, last_used_ms
+                     FROM attachments ORDER BY last_used_ms, sha256",
+                )
+                .map_err(|error| sqlite_error("listing attachments", &error))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok(AttachmentRow {
+                        sha256: row.get(0)?,
+                        bytes: u64::try_from(row.get::<_, i64>(1)?).unwrap_or(0),
+                        kind: row.get(2)?,
+                        created_ms: row.get(3)?,
+                        last_used_ms: row.get(4)?,
+                    })
+                })
+                .map_err(|error| sqlite_error("listing attachments", &error))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| sqlite_error("listing attachments", &error))?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// Deletes one attachment row regardless of outstanding leases (leases
+    /// cascade away). Used by startup reconciliation when the backing file is
+    /// missing or corrupt, so a dangling store row can never persist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the writer task or SQLite fails.
+    pub async fn delete_attachment_force(&self, sha256: &str) -> Result<bool, StoreError> {
+        let sha256 = sha256.to_owned();
+        let request_size = request_bytes(&[&sha256]);
+        self.run_sized(request_size, move |connection| {
+            let deleted = connection
+                .execute("DELETE FROM attachments WHERE sha256 = ?1", params![sha256])
+                .map_err(|error| sqlite_error("deleting an attachment", &error))?;
+            Ok(deleted == 1)
+        })
+        .await
+    }
+
+    /// Deletes leases whose turn has reached a terminal state or a resolved
+    /// uncertainty, returning how many were removed. A crashed turn that never
+    /// released its leases is therefore cleaned up at startup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the writer task or SQLite fails.
+    pub async fn delete_stale_attachment_leases(&self) -> Result<u64, StoreError> {
+        self.run(|connection| {
+            let removed = connection
+                .execute(
+                    "DELETE FROM attachment_leases WHERE turn_row_id IN (
+                         SELECT id FROM turns
+                         WHERE state IN ('completed', 'failed', 'interrupted')
+                            OR (state = 'uncertain' AND uncertain = 0)
+                     )",
+                    [],
+                )
+                .map_err(|error| sqlite_error("deleting stale attachment leases", &error))?;
+            Ok(u64::try_from(removed).unwrap_or(u64::MAX))
+        })
+        .await
+    }
+
+    /// Sets the `last_used_ms` of one attachment row. GC orders victims by
+    /// `last_used_ms`; this backdating seam keeps GC and reconciliation
+    /// deterministic and testable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::NotFound`] for an unknown row, or an error when
+    /// the writer task or SQLite fails.
+    pub async fn set_attachment_last_used(
+        &self,
+        sha256: &str,
+        last_used_ms: i64,
+    ) -> Result<(), StoreError> {
+        let sha256 = sha256.to_owned();
+        let request_size = request_bytes(&[&sha256]);
+        self.run_sized(request_size, move |connection| {
+            let changed = connection
+                .execute(
+                    "UPDATE attachments SET last_used_ms = ?2 WHERE sha256 = ?1",
+                    params![sha256, last_used_ms],
+                )
+                .map_err(|error| sqlite_error("updating an attachment timestamp", &error))?;
+            if changed == 0 {
+                return Err(StoreError::NotFound {
+                    context: "updating an unknown attachment timestamp",
+                });
+            }
+            Ok(())
+        })
+        .await
+    }
 }

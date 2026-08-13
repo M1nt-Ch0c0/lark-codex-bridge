@@ -194,6 +194,38 @@ pub const INBOUND_REPLAY_INTERVAL: Duration = Duration::from_secs(30);
 pub const STORE_ATTACHMENT_MAX_ROWS: u64 = 4096;
 /// Maximum durable attachment bytes tracked by the store.
 pub const STORE_ATTACHMENT_MAX_BYTES: u64 = 256 * 1024 * 1024;
+/// Hard cap on one downloaded attachment before it is written to disk.
+/// Reuses the Lark resource download cap so an already-bounded download can
+/// never exceed the cache's per-item budget.
+pub const ATTACHMENT_MAX_BYTES: usize = LARK_MAX_RESOURCE_BYTES;
+/// Maximum distinct resource descriptors accepted for one message/turn.
+pub const ATTACHMENT_MAX_PER_MESSAGE: usize = 16;
+/// Aggregate byte cap across all attachments leased by one turn.
+pub const ATTACHMENT_TURN_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum content files retained on disk in the attachment cache (mirrors
+/// [`STORE_ATTACHMENT_MAX_ROWS`]).
+pub const ATTACHMENT_CACHE_MAX_FILES: usize = 4096;
+/// Maximum total content bytes retained on disk in the attachment cache
+/// (mirrors [`STORE_ATTACHMENT_MAX_BYTES`]).
+pub const ATTACHMENT_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+/// Maximum bytes of a display file name retained as metadata only (never a
+/// disk-path component).
+pub const ATTACHMENT_FILE_NAME_MAX_BYTES: usize = 255;
+/// Maximum bytes of one resource MIME type string.
+pub const ATTACHMENT_MIME_MAX_BYTES: usize = 128;
+/// Maximum bytes of one resource key.
+pub const ATTACHMENT_RESOURCE_KEY_MAX_BYTES: usize = 4 * 1024;
+/// Age after which an unleased attachment becomes eligible for GC.
+pub const ATTACHMENT_GC_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+/// Interval between periodic GC sweeps (the periodic runner is out of scope
+/// for the attachment cache core).
+pub const ATTACHMENT_GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// Maximum victims examined and evicted by one GC pass.
+pub const ATTACHMENT_GC_BATCH: usize = 256;
+/// Maximum directory entries scanned by one reconciliation pass.
+pub const ATTACHMENT_RECONCILE_BATCH: usize = 4096;
+/// In-cache temp-file name prefix (never a valid SHA-256 name).
+pub const ATTACHMENT_TEMP_PREFIX: &str = ".tmp-";
 /// Maximum live (`starting`/`running`/`uncertain`) turns retained for crash
 /// recovery. Terminal turns are historical rows and do not occupy this set.
 pub const STORE_RECOVERY_TURN_MAX_ROWS: usize = 32;
