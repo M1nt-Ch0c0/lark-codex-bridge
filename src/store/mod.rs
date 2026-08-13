@@ -251,17 +251,17 @@ impl StoreHandle {
                     Ok(()) => result,
                     Err(error) => Err(error),
                 };
-                if let Ok(mut respond) = execute_respond.lock()
-                    && let Some(respond) = respond.take()
+                if let Some(respond) = execute_respond
+                    .lock()
+                    .ok()
+                    .and_then(|mut respond| respond.take())
                 {
                     let _ = respond.send(final_result);
                 }
             }) as writer::StoreCompletion
         });
         let reject = Box::new(move |error: StoreError| {
-            if let Ok(mut respond) = respond.lock()
-                && let Some(respond) = respond.take()
-            {
+            if let Some(respond) = respond.lock().ok().and_then(|mut respond| respond.take()) {
                 let _ = respond.send(Err(error));
             }
         });

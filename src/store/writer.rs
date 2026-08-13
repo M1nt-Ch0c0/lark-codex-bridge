@@ -88,9 +88,11 @@ fn writer_main(
     while let Some(request) = receiver.blocking_recv() {
         match request {
             StoreRequest::Job { execute, reject } => {
-                if let StoreLocation::File(path) = &location
-                    && let Err(error) = tighten_database_sidecars(path)
-                {
+                let prevalidation = match &location {
+                    StoreLocation::File(path) => tighten_database_sidecars(path),
+                    StoreLocation::InMemory => Ok(()),
+                };
+                if let Err(error) = prevalidation {
                     reject(error);
                     break;
                 }

@@ -6,8 +6,11 @@
 mod bridgews;
 mod larkstub;
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -17,20 +20,23 @@ use lark_codex_bridge::lark::api::ChatMode;
 use lark_codex_bridge::lark::bridge::{BridgeConfig, IntakeHook, IntakeVerdict, LarkBridge};
 use lark_codex_bridge::lark::config::{LarkEndpoints, TenantBrand};
 use lark_codex_bridge::lark::credentials::LarkCredentials;
+use lark_codex_bridge::lark::error::LarkError;
 use lark_codex_bridge::lark::frame::{Frame, Header, header_key};
 use lark_codex_bridge::lark::http::LarkHttp;
-use lark_codex_bridge::lark::normalize::ScopeKey;
-use lark_codex_bridge::lark::transport::{LarkTransport, TransportHandle};
+use lark_codex_bridge::lark::normalize::{InboundEvent, ScopeKey};
+use lark_codex_bridge::lark::transport::{LarkTransport, TransportConfig, TransportHandle};
+use lark_codex_bridge::limits::STORE_INBOUND_RECEIVED_MAX_ROWS;
 use lark_codex_bridge::runtime::intake::{DurableIntake, IntakeRuntime, TenantNamespace};
 use lark_codex_bridge::store::{
-    BeginTurnOutcome, InboundEventState, InboundKey, InboundTerminal, NewTurnRow, StoreHandle,
-    TurnResolution, TurnState,
+    BeginTurnOutcome, DedupOutcome, InboundEventState, InboundKey, InboundTerminal, NewTurnRow,
+    StoreHandle, TurnResolution, TurnState,
 };
 use larkstub::{RecordedRequest, StubResponse, StubServer};
 use secrecy::SecretString;
 use serde_json::Value;
+use tempfile::tempdir;
 use tokio::sync::{Notify, Semaphore, mpsc};
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
 use url::Url;
 
@@ -66,11 +72,47 @@ fn endpoint_body(ws_addr: SocketAddr) -> String {
     )
 }
 
+async fn unused_socket_addr() -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("reserve unused address");
+    listener.local_addr().expect("unused address")
+}
+
 fn p2p_fixture_with_ids(event_id: &str, message_id: &str) -> Vec<u8> {
     let mut payload: Value = serde_json::from_str(P2P_TEXT_FIXTURE).expect("fixture JSON");
     payload["header"]["event_id"] = Value::String(event_id.to_owned());
     payload["event"]["message"]["message_id"] = Value::String(message_id.to_owned());
     serde_json::to_vec(&payload).expect("encode fixture")
+}
+
+fn p2p_fixture_variant(event_id: &str, message_id: &str, text: &str) -> Vec<u8> {
+    let mut payload: Value = serde_json::from_str(P2P_TEXT_FIXTURE).expect("fixture JSON");
+    payload["header"]["event_id"] = Value::String(event_id.to_owned());
+    payload["event"]["message"]["message_id"] = Value::String(message_id.to_owned());
+    payload["event"]["message"]["content"] =
+        Value::String(serde_json::json!({ "text": text }).to_string());
+    serde_json::to_vec(&payload).expect("encode fixture")
+}
+
+fn stored_event(event_id: &str, message_id: &str) -> InboundEvent {
+    InboundEvent {
+        event_id: event_id.to_owned(),
+        message_id: message_id.to_owned(),
+        chat_id: "oc_p2p_chat".to_owned(),
+        sender_id: "ou_alice".to_owned(),
+        chat_type: ChatMode::P2p,
+        thread_id: None,
+        root_id: None,
+        reply_to_message_id: None,
+        text: "hello bridge".to_owned(),
+        mentions_bot: false,
+        mention_all: false,
+        resources: Vec::new(),
+        message_type: "text".to_owned(),
+        create_time_ms: 1_700_000_000_000,
+        scope: ScopeKey::Chat("oc_p2p_chat".to_owned()),
+    }
 }
 
 /// Serves tokens, bot info, and the endpoint bootstrap; chat-mode lookups
@@ -356,7 +398,7 @@ async fn durable_runtime_rejects_binding_mismatch_and_zero_limits() {
         .expect("prepare zero");
     let Err(error) = LarkBridge::start_with_runtime(
         endpoints_for(&stub),
-        original,
+        original.clone(),
         BridgeConfig {
             event_capacity: 0,
             ..BridgeConfig::default()
@@ -372,6 +414,35 @@ async fn durable_runtime_rejects_binding_mismatch_and_zero_limits() {
         lark_codex_bridge::lark::error::LarkErrorKind::ProtocolViolation
     );
     assert!(ws_server.incoming.try_recv().is_err(), "still no WebSocket");
+    for config in [
+        BridgeConfig {
+            event_byte_budget: 0,
+            ..BridgeConfig::default()
+        },
+        BridgeConfig {
+            event_capacity: Semaphore::MAX_PERMITS + 1,
+            ..BridgeConfig::default()
+        },
+        BridgeConfig {
+            event_byte_budget: Semaphore::MAX_PERMITS + 1,
+            ..BridgeConfig::default()
+        },
+    ] {
+        let runtime = DurableIntake::prepare(store.clone(), &original)
+            .await
+            .expect("prepare invalid limit");
+        let Err(error) =
+            LarkBridge::start_with_runtime(endpoints_for(&stub), original.clone(), config, runtime)
+                .await
+        else {
+            panic!("invalid durable bound must fail");
+        };
+        assert_eq!(
+            error.kind(),
+            lark_codex_bridge::lark::error::LarkErrorKind::ProtocolViolation
+        );
+        assert!(ws_server.incoming.try_recv().is_err(), "no WebSocket");
+    }
     store.shutdown().await.expect("shutdown store");
 }
 
@@ -471,7 +542,7 @@ async fn terminal_duplicate_acks_200_even_when_durable_channel_is_full() {
                 state: TurnState::Starting,
             },
             &[InboundKey::new(
-                namespace,
+                namespace.clone(),
                 "evt_p2p_scrubbed_001".to_owned(),
             )],
         )
@@ -480,6 +551,13 @@ async fn terminal_duplicate_acks_200_even_when_durable_channel_is_full() {
     let BeginTurnOutcome::Started { turn_row_id, .. } = begun else {
         panic!("started")
     };
+    conn.send_data("event", "m-accepted-duplicate", P2P_TEXT_FIXTURE.as_bytes())
+        .await;
+    assert_eq!(
+        conn.recv_receipt().await.1["code"],
+        200,
+        "accepted duplicate bypasses the full channel"
+    );
     store
         .set_turn_state(turn_row_id, TurnState::Running, Some("codex-bridge"))
         .await
@@ -551,16 +629,565 @@ async fn committed_row_replays_after_channel_full_500() {
         events.recv().await.expect("drain first").event.event_id,
         "event-capacity-first"
     );
-    conn.send_data("event", "m-capacity-retry", &second).await;
+    let alias = p2p_fixture_variant(
+        "event-capacity-alias",
+        "message-capacity-second",
+        "untrusted redelivery content",
+    );
+    conn.send_data("event", "m-capacity-retry", &alias).await;
     assert_eq!(conn.recv_receipt().await.1["code"], 200);
+    let canonical = events.recv().await.expect("canonical replay").event;
+    assert_eq!(canonical.event_id, "event-capacity-second");
+    assert_eq!(canonical.text, "hello bridge");
+    handle.shutdown().await;
+    store.shutdown().await.expect("shutdown store");
+}
+
+#[tokio::test]
+async fn byte_full_commit_500_replays_before_ws_and_releases_its_permit() {
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("byte-full-restart.sqlite");
+    let credentials = test_credentials();
+    let namespace = TenantNamespace::from_credentials(&credentials);
+    let store = StoreHandle::open(&path).await.expect("store");
+    let runtime = DurableIntake::prepare(store.clone(), &credentials)
+        .await
+        .expect("prepare");
+    let mut ws_server = TestWsServer::start().await;
+    let stub = StubServer::start(bridge_stub(ws_server.addr, |_| {
+        StubResponse::text(500, "unused")
+    }))
+    .await;
+    let (handle, mut events) = LarkBridge::start_with_runtime(
+        endpoints_for(&stub),
+        credentials.clone(),
+        BridgeConfig {
+            event_capacity: 1,
+            event_byte_budget: 1,
+            ..BridgeConfig::default()
+        },
+        runtime,
+    )
+    .await
+    .expect("start");
+    let mut conn = ws_server.accept().await;
+    let _ping = conn.recv_frame().await;
+    conn.send_data("event", "m-byte-full", P2P_TEXT_FIXTURE.as_bytes())
+        .await;
+    assert_eq!(conn.recv_receipt().await.1["code"], 500);
+    assert!(events.try_recv().is_err());
+    let recovered = store
+        .recover_received(&namespace)
+        .await
+        .expect("committed despite the receipt");
+    assert_eq!(recovered.len(), 1);
+    let persisted_bytes = recovered[0].retained_bytes();
+    handle.shutdown().await;
+    store.shutdown().await.expect("shutdown before reopen");
+
+    let store = StoreHandle::open(&path).await.expect("reopen");
+    let restart = DurableIntake::prepare(store.clone(), &credentials)
+        .await
+        .expect("restart prepare");
+    let offline_addr = unused_socket_addr().await;
+    let offline_stub = StubServer::start(bridge_stub(offline_addr, |_| {
+        StubResponse::text(500, "unused")
+    }))
+    .await;
+    let (handle, mut replay) = LarkBridge::start_with_runtime(
+        endpoints_for(&offline_stub),
+        credentials.clone(),
+        BridgeConfig {
+            event_capacity: 1,
+            event_byte_budget: persisted_bytes,
+            ..BridgeConfig::default()
+        },
+        restart,
+    )
+    .await
+    .expect("restart");
+    let replayed = replay
+        .try_recv()
+        .expect("recovery is queued even though no WebSocket can connect");
+    assert_eq!(replayed.event.event_id, "evt_p2p_scrubbed_001");
+    drop(replayed);
+    handle.shutdown().await;
+
+    let restart = DurableIntake::prepare(store.clone(), &credentials)
+        .await
+        .expect("online restart prepare");
+    let (handle, mut replay) = LarkBridge::start_with_runtime(
+        endpoints_for(&stub),
+        credentials,
+        BridgeConfig {
+            event_capacity: 1,
+            event_byte_budget: persisted_bytes,
+            ..BridgeConfig::default()
+        },
+        restart,
+    )
+    .await
+    .expect("online restart");
+    drop(replay.try_recv().expect("online recovery preload"));
+    let mut conn = ws_server.accept().await;
+    let _ping = conn.recv_frame().await;
+    let next = p2p_fixture_with_ids("evt_p2p_scrubbed_002", "om_p2p_002");
+    conn.send_data("event", "m-byte-released", &next).await;
+    assert_eq!(
+        conn.recv_receipt().await.1["code"],
+        200,
+        "dropping replay releases the exact persisted-byte permit"
+    );
+    assert_eq!(
+        replay.recv().await.expect("next event").event.event_id,
+        "evt_p2p_scrubbed_002"
+    );
+    handle.shutdown().await;
+    store.shutdown().await.expect("shutdown store");
+}
+
+#[tokio::test]
+async fn handler_timeout_can_500_before_a_late_file_store_commit() {
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("late-commit.sqlite");
+    let credentials = test_credentials();
+    let namespace = TenantNamespace::from_credentials(&credentials);
+    let store = StoreHandle::open(&path).await.expect("store");
+    let runtime = DurableIntake::prepare(store.clone(), &credentials)
+        .await
+        .expect("prepare");
+    let mut ws_server = TestWsServer::start().await;
+    let stub = StubServer::start(bridge_stub(ws_server.addr, |_| {
+        StubResponse::text(500, "unused")
+    }))
+    .await;
+    let (handle, mut events) = LarkBridge::start_with_runtime(
+        endpoints_for(&stub),
+        credentials,
+        BridgeConfig {
+            transport: TransportConfig {
+                handler_timeout: Duration::from_millis(50),
+                ..TransportConfig::default()
+            },
+            ..BridgeConfig::default()
+        },
+        runtime,
+    )
+    .await
+    .expect("start");
+    let mut conn = ws_server.accept().await;
+    let _ping = conn.recv_frame().await;
+
+    let blocker = rusqlite::Connection::open(&path).expect("open blocker");
+    blocker
+        .execute_batch("PRAGMA busy_timeout = 0; BEGIN IMMEDIATE;")
+        .expect("hold the file writer");
+    let scope = ScopeKey::Chat("oc_writer_barrier".to_owned());
+    let mut writer_blocker = Box::pin(store.upsert_scope(&scope, temp.path(), "writer-barrier"));
+    let waker = Waker::noop();
+    let mut context = Context::from_waker(waker);
+    assert!(
+        matches!(writer_blocker.as_mut().poll(&mut context), Poll::Pending),
+        "the first store job must be queued behind the external write lock"
+    );
+
+    conn.send_data("event", "m-late-commit", P2P_TEXT_FIXTURE.as_bytes())
+        .await;
+    assert_eq!(conn.recv_receipt().await.1["code"], 500);
+    blocker.execute_batch("COMMIT;").expect("release writer");
+    writer_blocker.await.expect("barrier job completes");
+
+    timeout(TEST_TIMEOUT, async {
+        loop {
+            if store
+                .inbound_state(&namespace, "evt_p2p_scrubbed_001")
+                .await
+                .expect("query")
+                == Some(InboundEventState::Received)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the canceled hook's queued store job commits later");
+    assert!(
+        events.try_recv().is_err(),
+        "a canceled hook cannot enqueue after its late commit"
+    );
+    handle.shutdown().await;
+    store.shutdown().await.expect("shutdown store");
+}
+
+#[tokio::test]
+async fn receipt_loss_redelivery_queues_canonical_rows_but_only_one_claim_wins() {
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("receipt-loss.sqlite");
+    let credentials = test_credentials();
+    let namespace = TenantNamespace::from_credentials(&credentials);
+    let store = StoreHandle::open(&path).await.expect("store");
+    let runtime = DurableIntake::prepare(store.clone(), &credentials)
+        .await
+        .expect("prepare");
+    let mut ws_server = TestWsServer::start().await;
+    let stub = StubServer::start(bridge_stub(ws_server.addr, |_| {
+        StubResponse::text(500, "unused")
+    }))
+    .await;
+    let (handle, mut events) = LarkBridge::start_with_runtime(
+        endpoints_for(&stub),
+        credentials,
+        BridgeConfig {
+            event_capacity: 2,
+            ..BridgeConfig::default()
+        },
+        runtime,
+    )
+    .await
+    .expect("start");
+    let mut conn = ws_server.accept().await;
+    let _ping = conn.recv_frame().await;
+    conn.send_data("event", "m-receipt-lost", P2P_TEXT_FIXTURE.as_bytes())
+        .await;
+    drop(conn);
+    timeout(TEST_TIMEOUT, async {
+        loop {
+            if store
+                .inbound_state(&namespace, "evt_p2p_scrubbed_001")
+                .await
+                .expect("query")
+                == Some(InboundEventState::Received)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("first delivery commits even though its receipt is lost");
+
+    let mut conn = ws_server.accept().await;
+    let _ping = conn.recv_frame().await;
+    conn.send_data("event", "m-redelivery", P2P_TEXT_FIXTURE.as_bytes())
+        .await;
+    assert_eq!(conn.recv_receipt().await.1["code"], 200);
+    let first = events.recv().await.expect("first canonical delivery");
+    let second = events.recv().await.expect("canonical redelivery");
+    assert_eq!(first.event, second.event);
+
+    let key = InboundKey::new(namespace, "evt_p2p_scrubbed_001".to_owned());
+    let first_claim = store.begin_turn_and_claim_inbound(
+        NewTurnRow {
+            scope_key: "im:oc_p2p_chat".to_owned(),
+            client_message_id: "claim-race-a".to_owned(),
+            codex_thread_id: None,
+            state: TurnState::Starting,
+        },
+        std::slice::from_ref(&key),
+    );
+    let second_claim = store.begin_turn_and_claim_inbound(
+        NewTurnRow {
+            scope_key: "im:oc_p2p_chat".to_owned(),
+            client_message_id: "claim-race-b".to_owned(),
+            codex_thread_id: None,
+            state: TurnState::Starting,
+        },
+        std::slice::from_ref(&key),
+    );
+    let (first_claim, second_claim) = tokio::join!(first_claim, second_claim);
+    let outcomes = [
+        first_claim.expect("first claim"),
+        second_claim.expect("second claim"),
+    ];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, BeginTurnOutcome::Started { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, BeginTurnOutcome::NoReceived { .. }))
+            .count(),
+        1
+    );
+    handle.shutdown().await;
+    store.shutdown().await.expect("shutdown store");
+}
+
+#[tokio::test]
+async fn durable_store_cap_fails_before_live_insert_or_channel_reservation() {
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let credentials = test_credentials();
+    let namespace = TenantNamespace::from_credentials(&credentials);
+    for index in 0..STORE_INBOUND_RECEIVED_MAX_ROWS {
+        store
+            .register_inbound(
+                &namespace,
+                &stored_event(
+                    &format!("cap-event-{index:03}"),
+                    &format!("cap-message-{index:03}"),
+                ),
+            )
+            .await
+            .expect("seed received capacity");
+    }
+    let runtime = DurableIntake::prepare(store.clone(), &credentials)
+        .await
+        .expect("prepare full store");
+    let mut ws_server = TestWsServer::start().await;
+    let stub = StubServer::start(bridge_stub(ws_server.addr, |_| {
+        StubResponse::text(500, "unused")
+    }))
+    .await;
+    let (handle, events) = LarkBridge::start_with_runtime(
+        endpoints_for(&stub),
+        credentials,
+        BridgeConfig {
+            event_capacity: usize::try_from(STORE_INBOUND_RECEIVED_MAX_ROWS).expect("usize") + 1,
+            ..BridgeConfig::default()
+        },
+        runtime,
+    )
+    .await
+    .expect("start");
+    let mut conn = ws_server.accept().await;
+    let _ping = conn.recv_frame().await;
+    let overflow = p2p_fixture_with_ids("cap-event-new", "cap-message-new");
+    conn.send_data("event", "m-cap-overflow", &overflow).await;
+    assert_eq!(conn.recv_receipt().await.1["code"], 500);
+    assert_eq!(
+        store
+            .inbound_state(&namespace, "cap-event-new")
+            .await
+            .expect("query"),
+        None,
+        "store capacity rejects before inserting a row"
+    );
+    assert_eq!(
+        events.len(),
+        usize::try_from(STORE_INBOUND_RECEIVED_MAX_ROWS).expect("usize"),
+        "the live overflow never reserved a channel slot"
+    );
+    handle.shutdown().await;
+    store.shutdown().await.expect("shutdown store");
+}
+
+#[tokio::test]
+async fn startup_count_and_byte_overflow_fail_without_a_ws_connection() {
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let credentials = test_credentials();
+    let namespace = TenantNamespace::from_credentials(&credentials);
+    for index in 0..2 {
+        store
+            .register_inbound(
+                &namespace,
+                &stored_event(
+                    &format!("startup-event-{index}"),
+                    &format!("startup-message-{index}"),
+                ),
+            )
+            .await
+            .expect("seed recovery");
+    }
+    let mut ws_server = TestWsServer::start().await;
+    let stub = StubServer::start(bridge_stub(ws_server.addr, |_| {
+        StubResponse::text(500, "unused")
+    }))
+    .await;
+
+    for config in [
+        BridgeConfig {
+            event_capacity: 1,
+            ..BridgeConfig::default()
+        },
+        BridgeConfig {
+            event_byte_budget: 1,
+            ..BridgeConfig::default()
+        },
+    ] {
+        let runtime = DurableIntake::prepare(store.clone(), &credentials)
+            .await
+            .expect("prepare");
+        let Err(error) = LarkBridge::start_with_runtime(
+            endpoints_for(&stub),
+            credentials.clone(),
+            config,
+            runtime,
+        )
+        .await
+        else {
+            panic!("startup overflow must fail");
+        };
+        assert_eq!(
+            error.kind(),
+            lark_codex_bridge::lark::error::LarkErrorKind::Exhausted
+        );
+        assert!(ws_server.incoming.try_recv().is_err(), "no WS was opened");
+    }
+    store.shutdown().await.expect("shutdown store");
+}
+
+#[tokio::test]
+async fn durable_ignored_and_card_payloads_bypass_the_intake_hook() {
+    let credentials = test_credentials();
+    let hook_calls = Arc::new(AtomicUsize::new(0));
+    let hook: IntakeHook = {
+        let hook_calls = Arc::clone(&hook_calls);
+        Arc::new(move |_event| {
+            hook_calls.fetch_add(1, Ordering::SeqCst);
+            async move { Ok(IntakeVerdict::DropDuplicate) }.boxed()
+        })
+    };
+    let runtime = IntakeRuntime::try_from_parts(&credentials, Vec::new(), hook).expect("runtime");
+    let mut ws_server = TestWsServer::start().await;
+    let stub = StubServer::start(bridge_stub(ws_server.addr, |_| {
+        StubResponse::text(500, "unused")
+    }))
+    .await;
+    let (handle, mut events) = LarkBridge::start_with_runtime(
+        endpoints_for(&stub),
+        credentials,
+        BridgeConfig::default(),
+        runtime,
+    )
+    .await
+    .expect("start");
+    let mut conn = ws_server.accept().await;
+    let _ping = conn.recv_frame().await;
+    conn.send_data("card", "m-card-bypass", br#"{"action":{"value":{}}}"#)
+        .await;
+    assert_eq!(conn.recv_receipt().await.1["code"], 200);
+    conn.send_data(
+        "event",
+        "m-ignored-bypass",
+        br#"{"schema":"2.0","header":{"event_type":"other.event"}}"#,
+    )
+    .await;
+    assert_eq!(conn.recv_receipt().await.1["code"], 200);
+    assert_eq!(hook_calls.load(Ordering::SeqCst), 0);
+    assert!(events.try_recv().is_err());
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn closed_durable_receiver_returns_500_after_commit_without_leaking_permits() {
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let credentials = test_credentials();
+    let namespace = TenantNamespace::from_credentials(&credentials);
+    let runtime = DurableIntake::prepare(store.clone(), &credentials)
+        .await
+        .expect("prepare");
+    let mut ws_server = TestWsServer::start().await;
+    let stub = StubServer::start(bridge_stub(ws_server.addr, |_| {
+        StubResponse::text(500, "unused")
+    }))
+    .await;
+    let (handle, events) = LarkBridge::start_with_runtime(
+        endpoints_for(&stub),
+        credentials,
+        BridgeConfig::default(),
+        runtime,
+    )
+    .await
+    .expect("start");
+    drop(events);
+    let mut conn = ws_server.accept().await;
+    let _ping = conn.recv_frame().await;
+    conn.send_data("event", "m-closed-receiver", P2P_TEXT_FIXTURE.as_bytes())
+        .await;
+    assert_eq!(conn.recv_receipt().await.1["code"], 500);
+    assert_eq!(
+        store
+            .inbound_state(&namespace, "evt_p2p_scrubbed_001")
+            .await
+            .expect("committed"),
+        Some(InboundEventState::Received)
+    );
+    handle.shutdown().await;
+    store.shutdown().await.expect("shutdown store");
+}
+
+#[tokio::test]
+async fn hook_and_byte_errors_release_count_permits_for_the_next_event() {
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let credentials = test_credentials();
+    let namespace = TenantNamespace::from_credentials(&credentials);
+    let mut large_event = stored_event("permit-large-event", "permit-large-message");
+    large_event.text = "x".repeat(1024);
+    let DedupOutcome::New(large) = store
+        .register_inbound(&namespace, &large_event)
+        .await
+        .expect("seed large retained event")
+    else {
+        panic!("large event is new")
+    };
+    let DedupOutcome::New(small) = store
+        .register_inbound(
+            &namespace,
+            &stored_event("permit-small-event", "permit-small-message"),
+        )
+        .await
+        .expect("seed small retained event")
+    else {
+        panic!("small event is new")
+    };
+    assert!(large.retained_bytes() > small.retained_bytes());
+    let small_bytes = small.retained_bytes();
+    let outcomes = Arc::new(Mutex::new(VecDeque::from([
+        Err(LarkError::retryable("test hook failure")),
+        Ok(IntakeVerdict::Enqueue(large)),
+        Ok(IntakeVerdict::Enqueue(small)),
+    ])));
+    let hook: IntakeHook = Arc::new(move |_event| {
+        let outcome = outcomes
+            .lock()
+            .expect("hook outcomes lock")
+            .pop_front()
+            .expect("one scripted hook outcome per delivery");
+        async move { outcome }.boxed()
+    });
+    let runtime = IntakeRuntime::try_from_parts(&credentials, Vec::new(), hook).expect("runtime");
+    let mut ws_server = TestWsServer::start().await;
+    let stub = StubServer::start(bridge_stub(ws_server.addr, |_| {
+        StubResponse::text(500, "unused")
+    }))
+    .await;
+    let (handle, mut events) = LarkBridge::start_with_runtime(
+        endpoints_for(&stub),
+        credentials,
+        BridgeConfig {
+            event_capacity: 1,
+            event_byte_budget: small_bytes,
+            ..BridgeConfig::default()
+        },
+        runtime,
+    )
+    .await
+    .expect("start");
+    let mut conn = ws_server.accept().await;
+    let _ping = conn.recv_frame().await;
+
+    for (message_id, expected_code) in [
+        ("m-hook-error", 500),
+        ("m-byte-error", 500),
+        ("m-after-errors", 200),
+    ] {
+        conn.send_data("event", message_id, P2P_TEXT_FIXTURE.as_bytes())
+            .await;
+        assert_eq!(conn.recv_receipt().await.1["code"], expected_code);
+    }
     assert_eq!(
         events
             .recv()
             .await
-            .expect("canonical replay")
+            .expect("small retained event")
             .event
             .event_id,
-        "event-capacity-second"
+        "permit-small-event"
     );
     handle.shutdown().await;
     store.shutdown().await.expect("shutdown store");

@@ -1450,11 +1450,23 @@ async fn debug_redacts_inbound_sender_resource_keys_and_content() {
 
     let mut sensitive = event("event-debug", "message-debug");
     sensitive.sender_id = "sender-sentinel".to_owned();
+    sensitive.event_id = "event-id-sentinel".to_owned();
+    sensitive.message_id = "message-id-sentinel".to_owned();
+    sensitive.chat_id = "chat-id-sentinel".to_owned();
+    sensitive.thread_id = Some("thread-id-sentinel".to_owned());
+    sensitive.root_id = Some("root-id-sentinel".to_owned());
+    sensitive.reply_to_message_id = Some("reply-id-sentinel".to_owned());
+    sensitive.chat_type = ChatMode::Topic;
+    sensitive.scope = ScopeKey::Thread(
+        "chat-id-sentinel".to_owned(),
+        "thread-id-sentinel".to_owned(),
+    );
     sensitive.text = "text-sentinel".to_owned();
     sensitive.resources.push(ResourceDesc {
         kind: ResourceKind::File,
         key: "resource-key-sentinel".to_owned(),
     });
+    sensitive.message_type = "message-type-sentinel".to_owned();
     let permit = Arc::new(Semaphore::new(1))
         .try_acquire_owned()
         .expect("permit");
@@ -1462,10 +1474,32 @@ async fn debug_redacts_inbound_sender_resource_keys_and_content() {
         event: sensitive.clone(),
         permit,
     };
-    for debug in [format!("{sensitive:?}"), format!("{queued:?}")] {
-        assert!(!debug.contains("sender-sentinel"));
-        assert!(!debug.contains("text-sentinel"));
-        assert!(!debug.contains("resource-key-sentinel"));
+    let key = InboundKey::new(
+        tenant_namespace("cli_debug_key"),
+        "event-id-sentinel".to_owned(),
+    );
+    for debug in [
+        format!("{sensitive:?}"),
+        format!("{queued:?}"),
+        format!("{key:?}"),
+    ] {
+        for sentinel in [
+            "sender-sentinel",
+            "text-sentinel",
+            "resource-key-sentinel",
+            "message-type-sentinel",
+            "event-id-sentinel",
+            "message-id-sentinel",
+            "chat-id-sentinel",
+            "thread-id-sentinel",
+            "root-id-sentinel",
+            "reply-id-sentinel",
+        ] {
+            assert!(
+                !debug.contains(sentinel),
+                "debug leaked {sentinel}: {debug}"
+            );
+        }
     }
 }
 

@@ -39,10 +39,12 @@ fn event() -> InboundEvent {
 }
 
 fn assert_send<T: Send>() {}
+fn assert_send_sync<T: Send + Sync>() {}
 
 #[tokio::test]
 async fn prepare_captures_only_store_namespace_and_complete_recovery() {
     assert_send::<IntakeRuntime>();
+    assert_send_sync::<IntakeHook>();
     let store = StoreHandle::open_in_memory().await.expect("open");
     let creds = credentials("cli_runtime_prepare", "secret-runtime-sentinel");
     let namespace = lark_codex_bridge::runtime::intake::TenantNamespace::from_credentials(&creds);

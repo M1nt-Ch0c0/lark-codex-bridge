@@ -623,7 +623,7 @@ async fn chat_mode_cache_count_stays_bounded() {
 }
 
 #[tokio::test]
-async fn debug_output_redacts_message_text() {
+async fn debug_output_redacts_message_content_and_routing_ids() {
     let server = StubServer::start(im_stub(failing, failing)).await;
     let normalizer = normalizer_for(&server);
 
@@ -633,8 +633,19 @@ async fn debug_output_redacts_message_text() {
         .expect("p2p fixture should normalize");
     let debug = format!("{outcome:?}");
 
-    assert!(!debug.contains("hello bridge"));
-    assert!(debug.contains("evt_p2p_scrubbed_001"));
+    for sensitive in [
+        "hello bridge",
+        "evt_p2p_scrubbed_001",
+        "om_p2p_scrubbed_001",
+        "oc_p2p_chat",
+        "im:oc_p2p_chat",
+    ] {
+        assert!(
+            !debug.contains(sensitive),
+            "debug leaked {sensitive}: {debug}"
+        );
+    }
+    assert!(debug.contains("sha256="));
     assert!(debug.contains("text_len: 12"));
 }
 

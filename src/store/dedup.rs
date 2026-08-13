@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use super::{StoreError, StoreHandle, now_ms, query_optional, request_bytes, sqlite_error};
 use crate::lark::api::{ChatMode, ResourceKind};
 use crate::lark::bridge::RetainedInbound;
+use crate::lark::normalize::ShortId;
 use crate::lark::normalize::{InboundEvent, ResourceDesc, ScopeKey};
 use crate::limits::{
     DEDUP_SWEEP_BATCH, STORE_INBOUND_BEGIN_MAX_KEY_BYTES, STORE_INBOUND_BEGIN_MAX_KEYS,
@@ -92,10 +93,20 @@ pub enum DedupOutcome {
 }
 
 /// Stable identity of one inbound row.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct InboundKey {
     pub(crate) tenant: TenantNamespace,
     pub(crate) event_id: String,
+}
+
+impl std::fmt::Debug for InboundKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InboundKey")
+            .field("tenant", &self.tenant)
+            .field("event_id", &ShortId(&self.event_id))
+            .finish()
+    }
 }
 
 impl InboundKey {
@@ -216,7 +227,9 @@ pub enum InboundDisposition {
 impl StoreHandle {
     /// Registers one inbound event under `(tenant, event_id)`.
     ///
-    /// Only IDs and the scope key are persisted — never message text.
+    /// Persists the bounded, versioned normalized payload for crash replay.
+    /// Payload content stays private to this module and never appears in
+    /// `Debug` output or dynamic error text.
     ///
     /// # Errors
     ///

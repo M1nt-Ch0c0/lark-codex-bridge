@@ -3,12 +3,12 @@
 //!
 //! [`LarkBridge::start`] resolves the bot identity (`GET /bot/v3/info`, so
 //! mention detection uses the real bot `open_id`), builds the normalizer, and
-//! installs it as the transport's inbound handler. Every completed `event`
-//! payload is normalized and pushed into a channel bounded by both count
-//! ([`LARK_INBOUND_EVENT_CAPACITY`]) and raw-payload bytes
-//! ([`LARK_INBOUND_EVENT_BYTE_BUDGET`]); the byte permit is parked inside the
-//! queued item and released only when the receiver dequeues and drops it,
-//! matching the transport/RPC permit pattern. A full channel fails the
+//! installs it as the transport's inbound handler. Legacy [`LarkBridge::start`]
+//! and [`LarkBridge::start_with`] budget queued events by raw wire-payload bytes.
+//! [`LarkBridge::start_with_runtime`] first durably registers each normalized
+//! event and budgets both startup replay and live traffic by the exact persisted
+//! payload size returned by the store. In either mode the byte permit is parked
+//! inside the queued item and released only when the receiver drops it. A full channel fails the
 //! handler, so the transport's receipt honestly reports `{code: 500}` instead
 //! of silently dropping the event. Card-action payloads are acknowledged with
 //! `{code: 200, data}` and logged as unsupported (IDs only) for this
@@ -31,7 +31,7 @@ use super::credentials::LarkCredentials;
 use super::error::LarkError;
 use super::frame::MessageType;
 use super::http::LarkHttp;
-use super::normalize::{InboundEvent, NormalizeOutcome, Normalizer};
+use super::normalize::{InboundEvent, NormalizeOutcome, Normalizer, ShortId};
 use super::token::TenantTokenProvider;
 use super::transport::{InboundFrameHandler, LarkTransport, TransportConfig, TransportHandle};
 use crate::limits::{LARK_INBOUND_EVENT_BYTE_BUDGET, LARK_INBOUND_EVENT_CAPACITY};
@@ -95,14 +95,14 @@ impl fmt::Debug for RetainedInbound {
 
 /// One normalized inbound event parked in the bounded channel.
 ///
-/// The byte-budget permit is held inside the item until the receiver dequeues
-/// and drops it, so a slow consumer back-pressures the handler (and therefore
-/// the receipt) instead of growing memory.
+/// The byte permit represents raw wire bytes in legacy mode and exact persisted
+/// payload bytes in durable-runtime mode. It is held until the receiver drops
+/// the item, bounding slow-consumer memory in both paths.
 pub struct QueuedInboundEvent {
     /// The normalized event.
     pub event: InboundEvent,
-    /// Byte-budget permit sized by the raw event payload; held until the
-    /// receiver dequeues and drops the item.
+    /// Byte-budget permit sized by raw wire bytes in legacy mode and exact
+    /// persisted payload bytes in durable-runtime mode; held until drop.
     pub permit: OwnedSemaphorePermit,
 }
 
@@ -118,8 +118,8 @@ impl fmt::Debug for QueuedInboundEvent {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("QueuedInboundEvent")
-            .field("event_id", &self.event.event_id)
-            .field("message_id", &self.event.message_id)
+            .field("event_id", &ShortId(&self.event.event_id))
+            .field("message_id", &ShortId(&self.event.message_id))
             .field("text_len", &self.event.text.len())
             .field("resource_count", &self.event.resources.len())
             .finish_non_exhaustive()
@@ -133,7 +133,8 @@ pub struct BridgeConfig {
     pub transport: TransportConfig,
     /// Count bound of the inbound event channel.
     pub event_capacity: usize,
-    /// Byte budget of the inbound event channel (raw payload bytes).
+    /// Byte budget of the inbound event channel: raw bytes for legacy startup,
+    /// exact persisted payload bytes for durable-runtime startup.
     pub event_byte_budget: usize,
 }
 

@@ -126,9 +126,9 @@ pub const LARK_TRANSPORT_EVENT_BYTE_BUDGET: usize = 8 * 1024 * 1024;
 /// handler so the frame receipt honestly reports `{code: 500}` instead of
 /// silently dropping the event.
 pub const LARK_INBOUND_EVENT_CAPACITY: usize = 256;
-/// Byte budget (sized by the raw event payloads) for events parked in the
-/// inbound event channel; permits are held until the receiver dequeues,
-/// matching the transport/RPC permit pattern.
+/// Byte budget for events parked in the inbound event channel: legacy bridge
+/// startup accounts raw wire payloads, while durable-runtime startup accounts
+/// exact persisted normalized payload bytes. Permits are held until drop.
 pub const LARK_INBOUND_EVENT_BYTE_BUDGET: usize = 8 * 1024 * 1024;
 
 /// Count bound of the single-writer store command channel. Every store

@@ -30,6 +30,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use super::api::{ChatMode, LarkApi, ResourceKind};
 use super::error::{LarkError, LarkErrorKind};
@@ -82,14 +83,17 @@ impl fmt::Debug for InboundEvent {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("InboundEvent")
-            .field("event_id", &self.event_id)
-            .field("message_id", &self.message_id)
-            .field("chat_id", &self.chat_id)
+            .field("event_id", &ShortId(&self.event_id))
+            .field("message_id", &ShortId(&self.message_id))
+            .field("chat_id", &ShortId(&self.chat_id))
             .field("sender_id_len", &self.sender_id.len())
             .field("chat_type", &self.chat_type)
-            .field("thread_id", &self.thread_id)
-            .field("root_id", &self.root_id)
-            .field("reply_to_message_id", &self.reply_to_message_id)
+            .field("thread_id", &self.thread_id.as_deref().map(ShortId))
+            .field("root_id", &self.root_id.as_deref().map(ShortId))
+            .field(
+                "reply_to_message_id",
+                &self.reply_to_message_id.as_deref().map(ShortId),
+            )
             .field("text_len", &self.text.len())
             .field("mentions_bot", &self.mentions_bot)
             .field("mention_all", &self.mention_all)
@@ -102,20 +106,53 @@ impl fmt::Debug for InboundEvent {
                     .map(|resource| resource.key.len())
                     .sum::<usize>(),
             )
-            .field("message_type", &self.message_type)
+            .field("message_type_len", &self.message_type.len())
             .field("create_time_ms", &self.create_time_ms)
             .field("scope", &self.scope)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
 /// Routing scope of one inbound event.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub enum ScopeKey {
     /// Whole-chat scope (`im:<chat_id>`).
     Chat(String),
     /// Topic-thread scope (`im:<chat_id>:thread:<thread_id>`).
     Thread(String, String),
+}
+
+impl fmt::Debug for ScopeKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Chat(chat_id) => formatter
+                .debug_struct("Chat")
+                .field("chat_id", &ShortId(chat_id))
+                .finish(),
+            Self::Thread(chat_id, thread_id) => formatter
+                .debug_struct("Thread")
+                .field("chat_id", &ShortId(chat_id))
+                .field("thread_id", &ShortId(thread_id))
+                .finish(),
+        }
+    }
+}
+
+pub(crate) struct ShortId<'a>(pub(crate) &'a str);
+
+impl fmt::Debug for ShortId<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let digest = Sha256::digest(self.0.as_bytes());
+        write!(
+            formatter,
+            "id(len={},sha256={:02x}{:02x}{:02x}{:02x})",
+            self.0.len(),
+            digest[0],
+            digest[1],
+            digest[2],
+            digest[3]
+        )
+    }
 }
 
 impl fmt::Display for ScopeKey {
