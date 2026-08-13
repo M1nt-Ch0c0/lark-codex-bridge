@@ -124,6 +124,9 @@ Keep SQL inside `src/store/*`; callers see async methods only:
 
 ```rust
 // dedup.rs
+// Task 3 supersedes this initial marker-only outcome/schema and the unbounded
+// sweep signature with a replayable payload, tenant namespace, atomic
+// inbound→turn APIs, and a bounded sweep.
 pub enum DedupOutcome { New, Duplicate { state: InboundEventState } }
 impl StoreHandle {
     pub async fn register_inbound(&self, tenant: &str, event: &InboundEvent) -> Result<DedupOutcome, StoreError>;
@@ -152,7 +155,7 @@ impl StoreHandle {
 }
 ```
 
-Legal inbound transitions are `received → accepted → completed|rejected` (plus `received → rejected`); anything else is a `StoreError` so a duplicate redelivery in TTL can never restart Codex. Turn and outbox state machines are enforced the same way.
+Legal inbound transitions are `received → accepted → completed|rejected` (plus `received → rejected`); anything else is a `StoreError` so a duplicate redelivery in TTL can never restart Codex. This is the historical Task 1 baseline: Task 3 removes the generic public `received → accepted` operation and permits that edge only inside its atomic starting-turn + inbound-association transaction. Turn and outbox state machines are enforced the same way.
 
 - [x] **Step 4: Test the store**
 
@@ -245,53 +248,241 @@ Run the Task 1 gate set with `cargo test --test runtime_policy --locked`. Commit
 - Modify: `src/store/dedup.rs`
 - Modify: `src/store/schema.rs`
 - Modify: `src/store/mod.rs`
+- Modify: `src/store/sessions.rs`
+- Modify: `src/lark/normalize.rs`
+- Modify: `src/lark/credentials.rs`
 - Modify: `src/limits.rs`
 - Modify: `tests/store.rs`
 - Create: `tests/runtime_intake.rs`
 - Modify: `tests/lark_bridge.rs`
+- Create: `tests/bridgews/mod.rs`
 
 **Interfaces:**
 
 - Consumes: `StoreHandle`, `LarkBridge::start_with`, normalized `InboundEvent`.
-- Produces: `DurableIntake`, `TenantNamespace`, `IntakeRuntime`, `IntakeHook`; extended `LarkBridge`.
+- Produces: `DurableIntake`, `TenantNamespace`, `IntakeRuntime`, `IntakeHook`, replay/claim outcome types; extended `LarkBridge`.
 
 - [ ] **Step 1: Upgrade inbound registration into a bounded replayable inbox**
 
-Add migration 2 rather than changing migration 1. `inbound_events` retains a
-versioned normalized payload and its byte length while a row is non-terminal,
-plus tenant-scoped message/state and terminal-sweep indexes. Existing v1 rows
-remain readable; a legacy `received` row without a payload makes recovery fail
-closed instead of being silently acknowledged and lost. Because the database
-now contains prompt/resource metadata, a newly created Unix database is mode
-`0600` (existing files are tightened before use); Debug/errors never expose the
-payload.
+Add migration 2 rather than changing migration 1. Use nullable
+`payload_version INTEGER`, nullable `payload_blob BLOB`,
+`payload_bytes INTEGER NOT NULL DEFAULT 0 CHECK(payload_bytes >= 0)`, and
+nullable `turn_row_id INTEGER REFERENCES turns(id) ON DELETE RESTRICT` on
+`inbound_events`; add `inbound_count INTEGER NOT NULL DEFAULT 0
+CHECK(inbound_count >= 0)` to `turns`. Add non-unique tenant/message/state,
+inbound→turn, and deterministic terminal-sweep indexes.
+Do not add a partial unique same-message index: v1 permits conflicting rows and
+the migration must remain atomic and reopenable. A v2 `accepted` row must have
+a turn association; `received` must not. Migration-2 insert/update triggers
+enforce the payload **column shape** of future writes: received has no turn and
+version 1/non-null blob/exact `payload_bytes == length(payload_blob)`; accepted
+has the same column shape and a same-scope turn; terminal has no payload and,
+when associated, points to a terminal/resolved turn. SQLite triggers do not
+claim to validate strict JSON semantics, duplicate/extra fields, enums, or
+scope logic; typed write/read plus startup scans own those checks. The triggers
+deliberately do not retroactively rewrite legacy rows; preparation validates
+those. Terminal
+payload clearing is logical
+SQLite clearing (`version/blob = NULL`, bytes = 0), not a claim of physical
+secure erasure from WAL/freelist.
 
-`register_inbound` serializes a private strict v1 DTO (no raw frame), validates
-per-key and payload byte caps, then performs exact-event lookup, active
-same-message lookup, count+byte capacity checks, and insertion in one SQLite
-transaction. Exact `(tenant,event_id)` duplicates are absorbed in every state.
-A new event ID for the same `(tenant,message_id)` is absorbed while the prior
-row is `received`/`accepted`/`completed`; a prior `rejected` row permits a new
-registration. Duplicate lookup happens before capacity checks and never
-refreshes `updated_ms`. A `received` duplicate returns its canonical stored
-event for replay; later states return only the canonical ID/state. Terminal
-transitions clear the stored payload while retaining the dedup marker.
+Milestone 2 never used the v1 table as the production receipt boundary, so v1
+tenant strings are development data and cannot be guessed/mapped to the new
+namespace. Legacy terminal rows remain readable/sweepable under their old
+tenant string. `DurableIntake::prepare` scans all namespaces for legacy
+`received` **or** `accepted` rows lacking a valid payload/association and fails
+closed. If a tenant/message has more than one non-`rejected` canonical
+candidate, registration/recovery returns static `CorruptData`; never choose one
+with `LIMIT 1`. A future real alias migration must take an explicit old→new
+mapping in one transaction rather than guessing `feishu`/`lark`.
 
-The durable collection has independent total row/byte caps and a live
-`received` row/byte cap no larger than the production inbound channel. Startup
-recovery reads every `received` row in deterministic order and rejects overflow
-rather than partially replaying it. Tenant namespaces are fixed-length hashes
-of tenant brand + app ID (never the app secret or the broad `feishu`/`lark`
-brand alone), so two apps sharing one database cannot collide.
+Persist a private `#[serde(deny_unknown_fields)]` v1 DTO (including private
+closed wire enums), never public serde derives on `InboundEvent`. Decode checks
+version, valid/strict JSON, declared versus actual blob length, row/DTO IDs and
+scope, scope/chat/thread consistency, the closed resource kind/open message
+type representation, and every logical field cap. Add explicit constants for
+ID bytes (4 KiB), serialized scope (12
+KiB), message type (256 B), text (1 MiB), resources (64), one resource key (4
+KiB), aggregate resource keys (256 KiB), and serialized payload (2 MiB); raise
+the single writer request cap to 3 MiB so a maximum valid DTO plus indexed
+columns is representable while
+the existing 8 MiB writer-byte budget still limits concurrency. Unknown
+version, invalid/duplicate/extra fields, inconsistency, or forged length is a
+content-free error.
+
+`register_inbound` uses this transaction order:
+
+1. validate only the fixed tenant namespace and the incoming event/message ID
+   presence and byte caps;
+2. exact `(tenant,event_id)` lookup — `received` strictly decodes and returns
+   the stored canonical payload, while accepted/terminal states return only
+   canonical ID/state without validating the untrusted redelivery body;
+3. query **all** same `(tenant,message_id)` non-rejected candidates — exactly
+   one is handled as above, more than one is corrupt, and all-rejected/none
+   continues (exact rejected still wins because exact lookup came first);
+4. only now logically validate and serialize the incoming DTO;
+5. check total row/logical-byte and `received` row/payload-byte capacity;
+6. insert `received` and commit.
+
+No duplicate inserts an alias row or refreshes `updated_ms`. Use distinct
+constants: total 65,536 rows/64 MiB variable retained bytes, `received` 256 rows/8
+MiB payload bytes, and the per-field/payload limits above. The total accounting
+is deliberately the sum of variable tenant/event/message/scope/reason/payload
+bytes (fixed state/timestamp/foreign-key scalars are covered by the row cap);
+every transition recomputes the resulting value, including a new rejection
+reason. Moving to accepted releases only the `received` quota, and terminal
+clearing releases payload
+bytes but retains marker row/key bytes. Startup recovery first checks count,
+declared/actual bytes, single-row caps, legacy corruption, and aggregate quota
+inside one writer job, then materializes exactly the complete current-tenant
+`received` set ordered by `(first_seen_ms,event_id)`; accepted rows are only
+integrity-checked/associated for later Task 8 reconciliation and never enter the
+ordinary business queue. On any error recovery returns no partial vector. The
+`retained_bytes` used by runtime is always the exact persisted blob length.
+
+`TenantNamespace` is an opaque 32-byte SHA-256 value stored as fixed 64-char
+hex. It hashes a domain-separated, length-framed stable tenant-brand tag and
+app ID; it never owns/prints credentials, app ID, app secret, or the broad
+brand alone. Two apps sharing one database therefore cannot collide.
+
+Add purpose-specific atomic APIs; do **not** expose a plain
+`received → accepted` claim that could create an orphan accepted row:
+
+```rust
+pub struct InboundKey { /* tenant namespace + canonical event ID */ }
+
+pub struct ClaimedInbound { /* canonical key + decoded persisted event + retained bytes */ }
+pub struct SkippedInbound { /* canonical key + observed state + associated turn, if any */ }
+
+pub enum BeginTurnOutcome {
+    Started { turn_row_id: i64, claimed: Vec<ClaimedInbound>, skipped: Vec<SkippedInbound> },
+    NoReceived { skipped: Vec<SkippedInbound> },
+}
+
+pub enum ResolveTurnOutcome {
+    Resolved { inbound_rows: usize },
+    AlreadyResolved { inbound_rows: usize },
+}
+
+pub async fn begin_turn_and_claim_inbound(
+    &self,
+    turn: NewTurnRow,
+    events: &[InboundKey],
+) -> Result<BeginTurnOutcome, StoreError>;
+pub async fn reject_received(
+    &self,
+    key: &InboundKey,
+    reason: InboundRejectionKind,
+) -> Result<InboundDisposition, StoreError>;
+pub async fn reject_received_and_enqueue_notice(
+    &self,
+    key: &InboundKey,
+    reason: InboundRejectionKind,
+    notice: NewOutboxRow,
+) -> Result<InboundDisposition, StoreError>;
+pub async fn recover_received(
+    &self,
+    tenant: &TenantNamespace,
+) -> Result<Vec<RetainedInbound>, StoreError>;
+pub async fn resolve_turn_and_finish_inbound_batch(
+    &self,
+    turn_row_id: i64,
+    turn: TurnResolution,
+    inbound: InboundTerminal,
+) -> Result<ResolveTurnOutcome, StoreError>;
+```
+
+Delete the old public `transition_inbound` API. Internal helpers cannot write
+accepted; that state is reachable only through `begin_turn_and_claim_inbound`.
+The begin API validates a bounded, unique, same-scope key set (at most 64 keys
+and 256 KiB aggregate key bytes) and reuses `record_turn`'s complete invariants:
+initial state is starting, client message ID uniqueness, request byte budget,
+and live recovery turn count+byte capacity. Task 4's batch cap must be no larger.
+In one transaction it partitions current `received` rows from already claimed
+rows, inserts one `starting` turn only when at least one remains, conditionally
+updates precisely that subset to `accepted` with the new turn ID, and returns
+the exact canonical claimed events for input assembly. Skippable rows are only
+accepted/completed/rejected and carry their key/state/turn; unknown rows, scope
+or turn mismatch, corruption, and duplicate input keys roll back everything.
+`claimed + skipped == unique input`, and all input/output vectors are checked
+against the count+byte bounds before materialization. This partitioning
+prevents one concurrent duplicate from stranding unrelated received rows in
+the same debounce batch.
+
+For turns with `inbound_count > 0`, the existing public `set_turn_state` may
+only perform the non-terminal `starting → running` update (including the Codex
+turn ID). Any completed/failed/interrupted/uncertain resolution must use the
+combined API; legacy/test turns with `inbound_count == 0` retain Task 1's state
+API. This prevents another public path from recreating a split terminal state.
+
+`reject_received` is an idempotent CAS with a closed static reason enum. Only a
+currently received row is changed, in one transaction, to rejected with reason
+and `updated_ms`, version/blob cleared and bytes zero; accepted is returned as
+already claimed and never modified. Same-reason rejected repeats are
+idempotent; completed or conflicting terminal state is a typed disposition.
+
+User-visible policy/stale/overload paths use
+`reject_received_and_enqueue_notice(key, reason, notice: NewOutboxRow)` instead
+of the bare CAS. In one transaction it first verifies the row is still received,
+validates/enqueues the deterministic notice under the existing outbox
+count+byte/idempotency rules, then rejects and clears payload. If the row was
+concurrently accepted, it writes no incorrect notice and returns
+`AlreadyClaimed`; if outbox capacity/persistence fails, the entire transaction
+rolls back so the received event remains replayable. Because intake may already
+have acknowledged durable receipt, the router first schedules a bounded local
+retry; Task 8's cancellation-aware periodic Received rescan is the durable
+fallback if that retry cannot fit or the process dies. The bare
+`reject_received` is reserved for silent/internal
+rejections whose contract explicitly requires no user notice.
+
+`resolve_turn_and_finish_inbound_batch` replaces separate turn/inbound final
+writes. `TurnResolution` deterministically maps completed to inbound completed,
+and failed/interrupted/uncertain to inbound rejected with a closed reason; the
+caller cannot request a conflicting pair. In one transaction the API validates
+the legal turn resolution, verifies an unresolved turn has exactly
+`inbound_count` accepted rows, updates the turn and all linked inbound rows,
+and clears payloads. `inbound_count` is the immutable historical claim count,
+not a remaining-marker count. A resolved turn may have 0..=`inbound_count`
+matching terminal markers because TTL sweeping can delete them in batches; it
+must have no accepted marker, and a same-resolution repeat returns
+`AlreadyResolved` even after all markers are swept. Missing turn, zero historical
+links for a runtime turn, unresolved count mismatch, or conflicting state fails
+closed. Projected final/failure/uncertainty outbox rows are persisted first with
+deterministic keys; a crash between outbox enqueue and this atomic resolve is
+safe to repeat. Thus no public future write can produce either an orphan
+accepted row or a terminal-turn/accepted-inbound split.
+
+For new runtime turns, `uncertain + terminal inbound + durable deterministic
+notice` is a resolved historical uncertainty: it no longer occupies live turn
+recovery count/bytes and is never automatically resumed. `starting`/`running`
+are unresolved recovery work. Legacy Task-1 rows with `inbound_count == 0` keep
+the old uncertain recovery semantics. A later manual uncertain→failed/
+interrupted resolution still uses the combined idempotent API and remains valid
+after marker sweeping.
+
+Because the database now contains prompt/resource metadata, a newly created
+Unix database is mode `0600`; an existing main file is tightened through its
+already-open file handle before SQLite opens/migrates, and any created WAL/SHM
+sidecars are verified/tightened before requests are served and verified again
+after reopen/recreation paths. Reject non-regular files. Debug/errors never
+expose payload, sender, resource keys, app ID, or a
+dynamic serde/SQLite message.
 
 - [ ] **Step 2: Extend bridge wiring with durable registration and startup replay**
 
-`runtime::intake::DurableIntake::prepare(store, credentials)` returns an
-`IntakeRuntime` containing a bounded startup recovery set and a hook. The hook
-is executed only for `NormalizeOutcome::Event` before the event enters the
-bounded channel:
+`runtime::intake::DurableIntake::prepare(store, &credentials)` borrows the
+credentials only long enough to derive the namespace/binding and returns a
+non-`Clone`, by-value `IntakeRuntime` containing a bounded startup recovery set
+and a hook. The hook captures only `StoreHandle + TenantNamespace`, never the
+credentials or secret. Put the transport seam types in `lark::bridge` and the
+store-backed implementation in `runtime::intake`:
 
 ```rust
+pub struct RetainedInbound {
+    event: Box<InboundEvent>,
+    retained_bytes: usize,
+}
+
 pub type IntakeHook = Arc<
     dyn Fn(Box<InboundEvent>)
         -> BoxFuture<'static, Result<IntakeVerdict, LarkError>>
@@ -300,59 +491,131 @@ pub type IntakeHook = Arc<
 >;
 
 pub enum IntakeVerdict {
-    Enqueue { event: Box<InboundEvent>, retained_bytes: usize },
+    Enqueue(RetainedInbound),
     DropDuplicate,
+}
+
+impl IntakeRuntime {
+    pub fn try_from_parts(
+        credentials: &LarkCredentials,
+        recovery: Vec<RetainedInbound>,
+        hook: IntakeHook,
+    ) -> Result<Self, LarkError>;
 }
 ```
 
-`LarkBridge::start_with_runtime(endpoints, creds, config, intake)` first verifies
-that the complete recovery set fits the configured count+byte channel, preloads
-it with byte permits, then starts transport with the hook. Existing
-`start`/`start_with` behavior stays unchanged. `New` and `Duplicate(Received)`
-enqueue the canonical persisted event; `Accepted`/terminal duplicates ack 200
-without enqueueing. Store failure, recovery overflow, channel fullness, or byte
-budget exhaustion fail the handler/startup. A live delivery receives 200 only
-after both the SQLite commit and bounded enqueue succeed. If commit succeeds
-but enqueue/handler later fails, the platform sees 500 and a redelivery replays
-the `received` row; a process restart preloads it. Receipt loss or concurrent
-startup replay may enqueue duplicates, but Task 4's atomic
-`received → accepted` claim is the single business-execution gate.
+`try_from_parts` is the narrow injection seam used by deterministic bridge
+tests (and custom durable intake implementations); it derives the binding
+without retaining credentials, validates the store-level recovery count/byte
+ceiling, and still defers the caller's smaller channel bounds to startup.
+Production `prepare` uses the same constructor. Fields stay private, there are
+no getters that can replay the set, and `start_with_runtime` consumes it exactly
+once.
 
-Any store error maps to a static, content-free `LarkError` classification;
-never log `?event`, payload JSON, sender ID, text, resource keys, or dynamic
-SQLite messages. Receipt still does not mean "Codex finished"—business failure
-is reported through the durable outbox.
+`LarkBridge::start_with_runtime(endpoints, creds, config, intake)` consumes the
+runtime, recomputes and verifies its credential binding, validates non-zero
+channel limits and checks both count capacity and byte budget against Tokio's
+`Semaphore::MAX_PERMITS`, and uses one channel/semaphore for
+startup and live traffic. Before starting the WebSocket transport, checked-add
+the complete recovery count/bytes and every `usize → u32`; reject overflow.
+Preload the complete set without an await: for each item use
+`try_reserve_owned`, then `try_acquire_many_owned`, then `OwnedPermit::send`.
+Any theoretical partial failure drops the local channel and all permits and
+returns no running transport. Bot-info HTTP may precede this, but the WebSocket
+must not start before preload completes. Existing `start`/`start_with` behavior
+stays unchanged and continues to budget legacy events by raw payload bytes;
+runtime events use exact persisted payload bytes, with docs updated accordingly.
+
+The live handler order is exactly `normalize → await hook → try-reserve count →
+try-acquire bytes → send → Ok`; nothing is reserved before the hook and there
+is no await after it returns `Enqueue`. `New` and `ReplayReceived` enqueue the
+canonical persisted event; accepted/terminal duplicates take `DropDuplicate`
+without touching queue capacity, so they still ack 200 when the queue is full.
+Store failure, channel fullness, or byte exhaustion fail the handler/startup.
+A live delivery receives 200 only after both SQLite commit and bounded enqueue.
+If the outer handler timeout cancels while a queued writer job later commits,
+or commit succeeds but permit/enqueue fails, the transport sends 500 and
+redelivery/restart replays the `received` row. If handler success is followed by
+a socket failure while sending the receipt, the platform receives no receipt
+(not a 500) and may redeliver; the same canonical replay semantics apply.
+Receipt loss or concurrent startup/live delivery may enqueue duplicates, but
+Task 4's combined turn-intent-and-claim transaction is the single
+business-execution gate.
+
+Map store errors to static Lark classifications: transient writer/SQLite/I/O to
+retryable, capacity/payload limits to exhausted, and corrupt/legacy/binding/
+version/invariant/startup failures to `ProtocolViolation`. Never interpolate
+the original error or log `?event`,
+payload JSON, sender ID, text, resource keys, app ID, or dynamic SQLite/serde
+messages. Tighten `InboundEvent`, `ResourceDesc`, `Normalizer`, credentials,
+queue/outcome/runtime Debug to counts/lengths/states and short non-sensitive
+fingerprints only. Receipt still does not mean "Codex finished"—business
+failure is reported through the durable outbox.
 
 - [ ] **Step 3: Add bounded terminal sweeping**
 
 Change sweeping to `sweep_inbound(older_than_ms, max_rows)`, clamp it to
 `DEDUP_SWEEP_BATCH`, and delete at most that many old
 `completed`/`rejected` rows in deterministic order. `received`/`accepted` and
-new terminal rows are never swept. Define `DEDUP_TTL` (7 days),
+new terminal rows are never swept. Sweeping never mutates historical
+`turns.inbound_count`; resolved-turn validation accepts any remaining matching
+marker count from zero through that historical value. Define `DEDUP_TTL` (7 days),
 `DEDUP_SWEEP_INTERVAL` (1 hour), and the batch bound here; Task 8 owns the one
-cancellation-aware periodic runner and invokes a first pass at startup.
+cancellation-aware periodic runner and invokes a first pass at startup. Also
+define a clamped `INBOUND_REPLAY_INTERVAL` (30 seconds) for Task 8's bounded
+current-tenant Received rescan; each scan is all-or-nothing and reuses
+`recover_received`'s count+byte bounds.
 
 - [ ] **Step 4: Test crash windows, dedup semantics, and bounds**
 
-Store tests cover migration 1→2 and reopen, strict payload round-trip, corrupt or
-legacy live payload failure, per-field/payload/total/live count+byte edges,
-transactional concurrent exact/same-message registration, exact duplicates in
-all four states, same-message behavior including prior rejection, duplicate at
-capacity, terminal payload clearing, duplicate TTL not refreshing, recovery
-ordering/bounds, and batched terminal-only sweeping. Unix verifies DB mode
-`0600`.
+Store tests create a real user-version-1 database and cover migration 1→2,
+rollback/reopen, all four legacy states, global fail-closed for legacy
+received/accepted, conflicting canonical candidates, strict payload round-trip,
+unknown version, invalid/extra/duplicate fields, row/DTO mismatch, forged
+length, and every logical/serialized/total/live count+byte exact/max+1 edge.
+They cover transactional concurrent exact/same-message registration, exact
+duplicates in all four states, exact-rejected precedence, same-message behavior
+including all-rejected, canonical content/ID replay, duplicate at capacity,
+terminal logical payload clearing, duplicate TTL not refreshing, recovery
+tenant isolation/order/all-or-nothing bounds, and batched terminal-only sweep.
+Atomic-turn tests prove duplicate key rejection, mixed-batch partitioning,
+whole-transaction rollback on unknown/mismatched rows, one winner under
+concurrency, all claimed rows share one turn, no accepted row lacks a turn,
+the begin path preserves every existing `record_turn` capacity/state invariant,
+atomic/idempotent turn+inbound resolution, trigger enforcement, and
+crash-visible turn association. The state-matrix tests require: received+NULL
+replays; received+turn is corrupt; accepted+NULL is corrupt; accepted linked to
+starting/running/uncertain enters recovery; accepted linked to a resolved turn
+is repairable only through the deterministic reconciliation workflow; terminal
+inbound linked to a live turn is corrupt; terminal+NULL or matching resolved
+turn is valid. Also resolve a multi-message turn, sweep its terminal markers in
+multiple batches, reopen between batches, and prove integrity validation plus
+`AlreadyResolved` still succeed. Prove a resolved uncertain runtime turn no
+longer consumes live recovery quota. Prove atomic reject+notice rolls back both
+on outbox capacity failure, writes neither a wrong notice nor rejection after a
+concurrent claim, and returns idempotently on retry. Unix verifies a
+new and pre-existing main DB plus any WAL/SHM sidecars have mode `0600`.
 
-Against the in-process WS harness plus a file store: the hook is called only for
-events; no receipt/queue item appears before its future resolves; first delivery
-persists then enqueues and returns 200; accepted/terminal duplicate returns 200
-without enqueueing; `received` duplicate replays the canonical stored event;
-store failure and full count/byte channel return 500; releasing capacity then
-redelivering succeeds; a 200 followed by bridge/store restart preloads the
-event exactly once before new transport traffic; startup recovery overflow
-fails closed; ignored/card paths bypass the hook; every drop/error path releases
-permits. Debug/error sentinel tests prove text, resource keys, app ID, and
-payload JSON never appear. Assert `IntakeHook` is `Send + Sync` and keep all
-test queues/fixtures count+byte bounded.
+Extract the bounded reusable WS harness to `tests/bridgews/mod.rs` (replace its
+current unbounded test channel, and bound connection concurrency instead of
+unrestricted per-connection task spawning). Against it plus a file store, a
+barrier proves no receipt/business queue item before hook resolution; first
+delivery persists
+then enqueues and returns 200; accepted/terminal duplicate returns 200 even
+when full; received duplicate replays old canonical ID/content. With a test
+channel configured below the store live cap, registration can commit and then
+return 500 on count/byte fullness; redelivery after release succeeds. When the
+store live cap is hit first, it returns 500 without a new row. Cover outer
+hook timeout after commit, receipt loss/concurrent duplicate queueing followed
+by one atomic turn claim, 200 then restart preload before any WS connection
+(bot-info HTTP may already have run), credential mismatch, zero/oversized
+limits, count/byte startup overflow with no partial receiver/connection,
+ignored/card bypass, and permit release for every
+drop/error/receiver-close path. Keep the legacy no-hook raw-byte tests. Debug/
+error sentinels prove text, sender, resource key, app ID, secret, and payload
+JSON never appear. Assert `IntakeHook: Send + Sync` and `IntakeRuntime: Send`;
+ownership tests use the consuming API, while review verifies that runtime does
+not implement Clone. Keep all test queues/fixtures count+byte bounded.
 
 - [ ] **Step 5: Verify and publish the task**
 
@@ -387,7 +650,7 @@ impl RouterHandle {
 }
 ```
 
-The router owns `ScopeKey → mpsc::Sender<ScopeCommand>` (`MAX_SCOPE_ACTORS`, LRU-ish eviction only for actors that are `Idle` with empty mailboxes — never evict a busy scope), one `Arc<Semaphore>` with `ACTIVE_TURN_PERMITS` (default 4) shared by all actors, and the store/policy handles. Non-owner or non-mention events are already filtered by `AccessPolicy` here and marked `rejected` in the dedup table. Every scope mailbox has `SCOPE_MAILBOX_CAPACITY` count and `SCOPE_MAILBOX_BYTE_BUDGET` bytes (permits ride the queued item, matching the existing pattern); a full mailbox transitions the event to `rejected` with reason `busy` and enqueues a user-visible busy notice through the outbox (design §13.3).
+The router owns `ScopeKey → mpsc::Sender<ScopeCommand>` (`MAX_SCOPE_ACTORS`, LRU-ish eviction only for actors that are `Idle` with empty mailboxes — never evict a busy scope), one `Arc<Semaphore>` with `ACTIVE_TURN_PERMITS` (default 4) shared by all actors, and the store/policy handles. Non-owner/non-mention, stale, and overload events use `reject_received_and_enqueue_notice`, so the deterministic user notice and terminal CAS are one transaction. Every scope mailbox has `SCOPE_MAILBOX_CAPACITY` count and `SCOPE_MAILBOX_BYTE_BUDGET` bytes (permits ride the queued item, matching the existing pattern); a full mailbox uses the same atomic API with the static `busy` reason (design §13.3). If the transaction cannot persist, the row remains received; retry it through a bounded router retry lane, falling back to Task 8's periodic durable Received rescan. Duplicate queue items keep their canonical `InboundKey`; actors coalesce duplicate keys before debounce, but correctness relies on the store transaction rather than memory dedup.
 
 - [ ] **Step 2: Implement the scope actor state machine**
 
@@ -407,15 +670,15 @@ Exactly the design §7 machine (`Idle → Debouncing → WaitingPermit → Start
 
 - On a user message while `Idle`, start a `SCOPE_DEBOUNCE_WINDOW` (600 ms) timer; messages arriving during the window accumulate into one batch (count `TURN_BATCH_MAX_MESSAGES`, bytes `TURN_BATCH_BYTE_BUDGET`).
 - After `WaitingPermit` acquires a semaphore permit, re-check message age (`TURN_MESSAGE_MAX_AGE`, stale → reject with notice), access policy, and the stored scope row's cwd/fingerprint before any RPC (design §7).
-- `StartingTurn`: ensure a thread — reuse `active_thread` when the scope row's fingerprint still matches (`client.resume_thread(ThreadResumeParams::new(thread_id))`), else `client.start_thread(ThreadStartParams { cwd, sandbox, approval_policy, .. })` and persist the mapping; then `client.start_turn(TurnStartParams::new(thread_id, inputs))` with `client_user_message_id` set to a bridge-generated UUID stored in the `turns` row before the RPC so a crash mid-call leaves an `uncertain` row instead of a silent gap.
+- `StartingTurn`: ensure a thread — reuse `active_thread` when the scope row's fingerprint still matches (`client.resume_thread(ThreadResumeParams::new(thread_id))`), else `client.start_thread(ThreadStartParams { cwd, sandbox, approval_policy, .. })` and persist the mapping. Re-canonicalize/re-authorize cwd immediately adjacent to every cwd-bearing RPC. Generate the client message UUID, then call `begin_turn_and_claim_inbound`: in one transaction it records the `starting` turn and attaches/accepts only the still-received subset. Assemble Codex input only from the returned claimed keys; if none remain, create no turn/RPC. Finally call `client.start_turn(TurnStartParams::new(thread_id, inputs))` with that persisted UUID. A crash before the transaction leaves rows received/replayable; a crash after it leaves every accepted row attached to the recoverable starting turn; a crash mid-RPC is uncertain and never blindly resent.
 - While `Running`, further user messages go to the next-batch buffer (never `turn/steer` in this milestone); `/stop` is the only thing that touches the live turn.
-- `Finalizing` waits for the authoritative `TurnOutcome` from the `ThreadSubscription` (never trust deltas for completion), hands the projector its result (Task 6), transitions the dedup rows of the batch to `completed`, releases the permit, then drains the next batch or goes `Idle`.
+- `Finalizing` waits for the authoritative `TurnOutcome` from the `ThreadSubscription` (never trust deltas for completion), hands the projector its result (Task 6) so any deterministic outbox rows are durable first, and calls `resolve_turn_and_finish_inbound_batch` to atomically resolve the turn plus its linked inbound set and clear payloads. It then releases the permit and drains the next batch or goes `Idle`. User-visible policy/age/overload paths use `reject_received_and_enqueue_notice`; the bare reject API is only for explicitly silent internal cases. No generic accepted or separate turn/inbound terminal transition is used.
 - Interrupt (`/stop`) calls `client.interrupt_turn` and then waits for `turn/completed` or `SCOPE_INTERRUPT_RECOVERY_TIMEOUT`; a new turn for the same scope cannot start while the old one is still active (design §7).
-- Supervisor transitions: `SupervisorHandle::changed()` delivering a non-`Ready` state fails in-flight turns as `uncertain` (the epoch died mid-flight), and actors pause turn starts until `Ready` returns; `thread/resume` happens lazily per scope on the next turn, not in a startup storm (design §13.1).
+- Supervisor transitions: `SupervisorHandle::changed()` delivering a non-`Ready` state durably enqueues the deterministic uncertainty notice, then atomically resolves the in-flight turn and inbound set as uncertain (the epoch died mid-flight); actors pause turn starts until `Ready` returns. Startup `thread/resume` remains lazy per scope rather than a storm, but a scope-specific recovery barrier always reconciles that scope's old work before it can start any newly received turn (design §13.1).
 
 - [ ] **Step 3: Test the actor against the fake app-server**
 
-Reuse `AppServerSupervisor::start_with_factory` with a scripted fake process factory: extract the private `FakeFactory`/`FakeControl` harness from `tests/supervisor.rs` into a shared integration-test helper module (e.g. `tests/fakecodex/mod.rs`) as part of this task, without changing `tests/supervisor.rs`'s scenarios. Cover: two messages inside 600 ms land in one turn (fake sees one `turn/start` with combined input); a message during `Running` produces a second turn only after the first completes; semaphore saturation queues a second scope's turn and starts it when the first finishes; permit re-check rejects a message that aged out; thread reuse on matching fingerprint vs `start_thread` on fingerprint change; `release_thread` on scope eviction/shutdown so routing state cannot leak; interrupt → waits for `turn/completed` before accepting new work; supervisor `Backoff` marks the in-flight turn `uncertain` and blocks new turns until `Ready`; mailbox overflow rejects with a busy notice; dedup rows end in `completed`/`rejected`, never stuck `accepted`.
+Reuse `AppServerSupervisor::start_with_factory` with a scripted fake process factory: extract the private `FakeFactory`/`FakeControl` harness from `tests/supervisor.rs` into a shared integration-test helper module (e.g. `tests/fakecodex/mod.rs`) as part of this task, without changing `tests/supervisor.rs`'s scenarios. Cover: two messages inside 600 ms land in one turn (fake sees one `turn/start` with combined input); duplicate queue copies and concurrent redelivery yield one claim/turn; a mixed batch omits an already-claimed key without stranding received siblings; crash injection before the atomic begin leaves received/replayable while injection after it leaves accepted rows linked to one starting turn; a message during `Running` produces a second turn only after the first completes; semaphore saturation queues a second scope's turn and starts it when the first finishes; permit re-check rejects a message that aged out; thread reuse on matching fingerprint vs `start_thread` on fingerprint change; `release_thread` on scope eviction/shutdown so routing state cannot leak; interrupt → waits for `turn/completed` before accepting new work; supervisor `Backoff` first durably enqueues the uncertainty notice, then atomically resolves the turn as `uncertain` plus its inbound set, and blocks new turns until `Ready`; mailbox overflow rejects with a busy notice; every accepted row has `turn_row_id`, and terminal/rejected paths leave none permanently orphaned.
 
 - [ ] **Step 4: Verify and publish the task**
 
@@ -583,11 +846,68 @@ Run the Task 1 gate set plus `cargo test --test attachments --locked` and `cargo
 
 - [ ] **Step 1: Assemble the application and the `run` subcommand**
 
-Startup order: load+validate config → open store (migrations) → start `AppServerSupervisor` → start `LarkBridge` with the durable intake hook → spawn outbox pump, router, sweeper/GC tasks → install signal handlers. Shutdown (SIGINT/SIGTERM) reverses it: stop intake (drop the transport), drain or deadline-bound in-flight turns (`APP_SHUTDOWN_GRACE`), flush the outbox pump's claimed batch back to `pending`, shut down the supervisor (no orphan app-server), close the store writer. `lark-codex-bridge run --config <path>` runs this; it prints one sanitized startup line (tenant, scope caps, db path) and then JSON `tracing` with the design §14 field set (`profile`, `scope_hash`, `thread_id`, `turn_id`, `message_id`, `connection_epoch`, phase, elapsed, error class).
+Startup order is fail-closed: load+validate config → open store/migrate →
+`DurableIntake::prepare` performs the global legacy/current-tenant inbox
+integrity scan and builds the complete received recovery set → validate every
+accepted↔turn↔scope association and build a bounded reconciliation worklist →
+start `AppServerSupervisor` → start `LarkBridge` with that already-validated
+runtime (it preloads received before opening WebSocket) → attach the receiver
+and spawn outbox pump, router, sweeper/GC tasks → install signal handlers. No
+WebSocket may connect before the pure-store checks complete. A failure after
+the supervisor starts but before the app is fully assembled must shut the
+supervisor down within its deadline. Shutdown (SIGINT/SIGTERM) reverses the
+order: stop intake (drop the transport), drain or deadline-bound in-flight turns
+(`APP_SHUTDOWN_GRACE`), flush the outbox pump's claimed batch back to `pending`,
+shut down the supervisor (no orphan app-server), close the store writer.
+`lark-codex-bridge run --config <path>` runs this; it prints one sanitized
+startup line (tenant, scope caps, db path) and then JSON `tracing` with the
+design §14 field set (`profile`, `scope_hash`, `thread_id`, `turn_id`,
+`message_id`, `connection_epoch`, phase, elapsed, error class).
 
 - [ ] **Step 2: Implement restart and uncertainty recovery**
 
-On startup the runtime reconciles: `turns` rows in `starting`/`running` are by definition uncertain (the process died); for each, resume the mapped thread lazily on the scope's next activity and use the `resume_thread` response's `thread.turns` (the typed client has no `thread/read` yet — `ThreadResumeResult` already embeds `Thread { turns: Vec<Turn> }`, whose `Turn.status` distinguishes `completed`/`interrupted`/`failed`/`inProgress`) to classify the old turn: terminal → mark it accordingly and replay nothing; still `inProgress` or unknown → mark `uncertain` and reply to the user asking them to re-issue the request, never blindly resend `turn/start` (design §13.1). Pending `outbox` rows resume delivery automatically; `uncertain_delivery` rows stay parked and visible in `/status`. `sending` rows from the dead process return to `pending` exactly once (claim recovery), protected by the idempotency key.
+Before transport startup, the runtime validates the complete v2 state matrix:
+received rows have no turn, and terminal rows never point to a live turn.
+Normally accepted rows have one same-scope unresolved turn. The sole repairable
+exception is an accepted row linked to a terminal/resolved turn from an older
+or partially upgraded writer; it enters the deterministic reconciliation
+worklist rather than failing before that worklist can be built. An unresolved starting/running
+runtime turn has exactly `inbound_count` accepted rows. A resolved runtime turn
+has no accepted rows and may retain 0..=`inbound_count` matching terminal
+markers after partial/full TTL sweep. It validates that every v2 `accepted`
+inbound row has a valid `turn_row_id`, every association points to the same
+scope, and the distinct turn/count+byte recovery worklist is bounded; an
+orphan/mismatch/overflow fails closed. Accepted rows linked to a turn that is
+already terminal are also put on the reconciliation worklist, so a crash
+between turn terminalization/outbox projection/inbound finalization cannot
+leave them permanently accepted. A resolved uncertain turn on this worklist may
+only be idempotently terminalized/cleaned up; it is never resumed or re-executed.
+`turns` rows in `starting`/`running` are by
+definition uncertain (the process died); any inconsistent legacy `uncertain`
+turn that still owns accepted inbound is recovery work too. The bounded
+worklist initializes a per-scope recovery barrier in the router: new events for
+that scope may queue within its count+byte mailbox, but cannot acquire an active
+turn permit or issue any RPC until old work is reconciled. For each, resume the mapped thread
+lazily on the scope's next activity and use the `resume_thread` response's
+`thread.turns` (the typed client has no `thread/read` yet —
+`ThreadResumeResult` already embeds `Thread { turns: Vec<Turn> }`, whose
+`Turn.status` distinguishes `completed`/`interrupted`/`failed`/`inProgress`) to
+classify the old turn. A terminal Codex turn is projected idempotently from its
+returned items, then `resolve_turn_and_finish_inbound_batch` atomically resolves
+its store turn and linked inbound batch.
+
+Still `inProgress` or unknown (including a crash after durable begin but before
+the RPC) becomes `uncertain`; atomically resolve the turn/inbound set only after
+a deterministic, durable user-notice outbox row exists, and ask the user to
+re-issue the request,
+never blindly resend `turn/start` (design §13.1). Pending `outbox` rows resume
+delivery automatically; `uncertain_delivery` rows stay parked and visible in
+`/status`. `sending` rows from the dead process return to `pending` exactly once
+(claim recovery), protected by the idempotency key. A cancellation-aware runner
+also rescans the current tenant's bounded Received set at startup and a clamped
+interval, trying to re-offer rows left durable by transient router/store/outbox
+failures; duplicate offers are harmless because the atomic begin/reject gates
+remain authoritative.
 
 - [ ] **Step 3: Fault-injection integration tests**
 

@@ -149,10 +149,24 @@ scope 规则：
 
 ### 5.3 去重与确认
 
-先在 SQLite 事务中登记 `(tenant, event_id/message_id)`，再进入业务队列。状态包括
-`received`、`accepted`、`completed` 和 `rejected`。相同事件在 TTL 内不会再次启动 Codex。
+先在 SQLite 事务中登记 `(tenant, event_id/message_id)` 并保存有界、版本化的 normalized
+payload，再进入有界业务队列。状态包括 `received`、`accepted`、`completed` 和 `rejected`。
+`received` 在重投或重启后从 SQLite 的 canonical payload 重放；`accepted` 只能与 durable turn
+intent 和 inbound→turn 关联在同一事务中产生，不能先 claim 再单独记录工作。相同事件在 TTL 内
+不会再次启动 Codex。
 
-WebSocket 回执只代表 bridge 已持久接收，不代表 Codex 已完成。业务失败通过飞书回复和日志呈现，不要求平台重投。
+turn 的最终状态与它关联的 inbound terminal 状态也在同一 SQLite 事务中提交；最终回复/故障通知
+先用确定性幂等键写入 outbox，再做这次终态事务。崩溃恢复因此可以安全地重复投影和收口，不能产生
+terminal turn + 永久 accepted inbound 的断裂状态。
+
+访问拒绝、过期和过载也不能先丢弃 payload 再尝试通知：确定性的 busy/policy notice outbox 行与
+`received → rejected`、payload 清理在同一事务中提交。若 outbox 无容量则整笔拒绝回滚并保留
+`received`；若 receipt 尚未发送则返回 500，否则由有界本地重试和周期性 SQLite Received 重扫
+恢复，不能因为平台先前已收到 200 就永久搁置。
+
+WebSocket 200 回执只在 SQLite commit 和无等待的有界队列入队都成功后发送，代表 bridge 已持久
+接收，不代表 Codex 已完成。commit 后入队失败返回 500，但该 `received` 行仍可由重投/重启恢复。
+业务失败通过飞书回复和日志呈现，不要求平台重投。
 
 ## 6. Codex app-server 客户端
 
@@ -228,7 +242,7 @@ Idle → Debouncing → WaitingPermit → StartingTurn → Running → Finalizin
 
 SQLite 使用 WAL、foreign keys 和单写者任务。首版表包含：
 
-- `inbound_events`：去重与处理状态；
+- `inbound_events`：tenant-scoped 去重、非终态 normalized payload、处理状态及 durable turn 关联；
 - `scopes`：scope、cwd、策略指纹和更新时间；
 - `threads`：scope 到 Codex thread 的 active/archived 映射；
 - `turns`：client message ID、Codex turn ID、状态和 uncertain 标志；
