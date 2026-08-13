@@ -108,6 +108,22 @@ pub const fn command_specs() -> &'static [CommandSpec] {
     &COMMAND_SPECS
 }
 
+/// Renders the stable first-stage command table for `/help` replies.
+///
+/// The runtime handler persists this returned text through the durable outbox;
+/// keeping rendering here prevents parser and help metadata from drifting.
+#[must_use]
+pub fn render_help() -> String {
+    let mut output = String::from("Available commands:\n");
+    for spec in command_specs() {
+        output.push_str(spec.usage);
+        output.push_str(" — ");
+        output.push_str(spec.description);
+        output.push('\n');
+    }
+    output
+}
+
 /// Parses one possible command.
 ///
 /// `Ok(None)` deliberately means “ordinary user input”, including unknown

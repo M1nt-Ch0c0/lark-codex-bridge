@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use lark_codex_bridge::runtime::commands::{
-    BridgeCommand, CommandParseError, command_specs, parse_command,
+    BridgeCommand, CommandParseError, command_specs, parse_command, render_help,
 };
 
 #[test]
@@ -52,6 +52,21 @@ fn command_table_is_the_single_exact_help_source() {
     );
     assert!(specs.iter().all(|spec| !spec.usage.is_empty()));
     assert!(specs.iter().all(|spec| !spec.description.is_empty()));
+}
+
+#[test]
+fn help_text_is_rendered_from_the_single_command_table() {
+    let help = render_help();
+    assert_eq!(help.lines().next(), Some("Available commands:"));
+    assert_eq!(help.lines().count(), command_specs().len() + 1);
+    for spec in command_specs() {
+        assert!(
+            help.lines()
+                .any(|line| line == format!("{} — {}", spec.usage, spec.description)),
+            "missing help entry for {}",
+            spec.name
+        );
+    }
 }
 
 #[test]
