@@ -57,8 +57,8 @@ impl OutboxState {
 
 /// One row of the `outbox` table.
 ///
-/// `Debug` reports IDs, kind, state, and byte size only — never the payload
-/// body, which carries message content.
+/// `Debug` reports lengths, kind, state, and byte size only — never payload or
+/// routing/idempotency values.
 #[derive(Clone, PartialEq, Eq)]
 pub struct OutboxRow {
     /// Row ID.
@@ -92,14 +92,17 @@ impl std::fmt::Debug for OutboxRow {
         formatter
             .debug_struct("OutboxRow")
             .field("id", &self.id)
-            .field("idempotency_key", &self.idempotency_key)
-            .field("scope_key", &self.scope_key)
+            .field("idempotency_key_len", &self.idempotency_key.len())
+            .field("scope_key_len", &self.scope_key.len())
             .field("kind", &self.kind)
             .field("payload_bytes", &self.payload_bytes)
             .field("state", &self.state)
             .field("attempts", &self.attempts)
             .field("next_retry_ms", &self.next_retry_ms)
-            .field("receipt_message_id", &self.receipt_message_id)
+            .field(
+                "receipt_message_id_len",
+                &self.receipt_message_id.as_ref().map(String::len),
+            )
             .field("created_ms", &self.created_ms)
             .field("updated_ms", &self.updated_ms)
             .finish_non_exhaustive()
@@ -125,8 +128,8 @@ impl std::fmt::Debug for NewOutboxRow {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("NewOutboxRow")
-            .field("idempotency_key", &self.idempotency_key)
-            .field("scope_key", &self.scope_key)
+            .field("idempotency_key_len", &self.idempotency_key.len())
+            .field("scope_key_len", &self.scope_key.len())
             .field("kind", &self.kind)
             .field("payload_bytes", &self.payload_json.len())
             .field("next_retry_ms", &self.next_retry_ms)

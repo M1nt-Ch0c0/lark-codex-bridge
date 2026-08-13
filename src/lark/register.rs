@@ -5,6 +5,7 @@
 //! server-directed intervals. A `user_info.tenant_brand == "lark"` response
 //! switches the accounts base to `accounts.larksuite.com` exactly once.
 
+use std::fmt;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
@@ -34,7 +35,7 @@ const MAX_INTERVAL_SECS: u64 = 60;
 const SLOW_DOWN_STEP: Duration = Duration::from_secs(5);
 
 /// QR challenge returned by [`RegistrationFlow::begin`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct QrChallenge {
     /// `verification_uri_complete` plus the SDK tracking parameters.
     pub url: String,
@@ -42,6 +43,17 @@ pub struct QrChallenge {
     pub expires_in: u64,
     /// Initial poll interval in seconds; server default 5.
     pub interval: u64,
+}
+
+impl fmt::Debug for QrChallenge {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("QrChallenge")
+            .field("url_bytes", &self.url.len())
+            .field("expires_in", &self.expires_in)
+            .field("interval", &self.interval)
+            .finish_non_exhaustive()
+    }
 }
 
 /// One step of the registration poll loop.

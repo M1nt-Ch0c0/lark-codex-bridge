@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{fmt, path::PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -45,7 +45,7 @@ pub enum Command {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 pub enum CodexCommand {
     /// Spawn the app-server, run the initialize handshake, and print a
     /// sanitized JSON summary of the supported installation.
@@ -53,6 +53,17 @@ pub enum CodexCommand {
         #[arg(long, default_value = "codex")]
         binary: PathBuf,
     },
+}
+
+impl fmt::Debug for CodexCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Probe { binary } => formatter
+                .debug_struct("Probe")
+                .field("binary_bytes", &binary.as_os_str().len())
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -67,7 +78,7 @@ pub enum LarkCommand {
     Probe,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 pub enum LarkAuthCommand {
     /// Register a new `PersonalAgent` app via the QR device flow, or validate
     /// and store existing app credentials.
@@ -86,6 +97,24 @@ pub enum LarkAuthCommand {
     },
     /// Validate stored credentials and print a sanitized identity summary.
     Check,
+}
+
+impl fmt::Debug for LarkAuthCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Register {
+                app_id,
+                app_secret,
+                tenant,
+            } => formatter
+                .debug_struct("Register")
+                .field("app_id_configured", &app_id.is_some())
+                .field("app_secret_configured", &app_secret.is_some())
+                .field("tenant", tenant)
+                .finish(),
+            Self::Check => formatter.write_str("Check"),
+        }
+    }
 }
 
 /// CLI spelling of the tenant brand.

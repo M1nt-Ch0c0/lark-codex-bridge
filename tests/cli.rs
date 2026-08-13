@@ -1,4 +1,6 @@
 use assert_cmd::cargo::cargo_bin_cmd;
+use clap::Parser;
+use lark_codex_bridge::cli::Cli;
 use predicates::prelude::*;
 
 #[test]
@@ -32,4 +34,33 @@ fn probe_reports_a_missing_codex_binary_without_panicking() {
         .failure()
         .stderr(predicate::str::contains("unable to run Codex binary"))
         .stderr(predicate::str::contains("panicked").not());
+}
+
+#[test]
+fn parsed_cli_debug_redacts_secrets_ids_and_absolute_paths() {
+    let auth = Cli::try_parse_from([
+        "lark-codex-bridge",
+        "lark",
+        "auth",
+        "register",
+        "--app-id",
+        "sensitive-app-id",
+        "--app-secret",
+        "sensitive-app-secret",
+        "--tenant",
+        "feishu",
+    ])
+    .expect("parse auth command");
+    let auth_debug = format!("{auth:?}");
+    assert!(!auth_debug.contains("sensitive"));
+
+    let codex = Cli::try_parse_from([
+        "lark-codex-bridge",
+        "codex",
+        "probe",
+        "--binary",
+        "/sensitive/customer/codex",
+    ])
+    .expect("parse codex command");
+    assert!(!format!("{codex:?}").contains("/sensitive/customer"));
 }

@@ -1150,6 +1150,25 @@ async fn outbox_enforces_aggregate_bytes_and_claim_batch_bytes() {
 }
 
 #[tokio::test]
+async fn outbox_debug_redacts_payload_routing_and_idempotency_values() {
+    let store = StoreHandle::open_in_memory().await.expect("open");
+    let row = NewOutboxRow {
+        idempotency_key: "sensitive-idempotency-key".to_owned(),
+        scope_key: "im:oc_sensitive:thread:omt_sensitive".to_owned(),
+        kind: "notice".to_owned(),
+        payload_json: "{\"text\":\"sensitive-payload\"}".to_owned(),
+        next_retry_ms: 0,
+    };
+    let new_debug = format!("{row:?}");
+    assert!(!new_debug.contains("sensitive"));
+    let persisted = store.enqueue_outbox(row).await.expect("enqueue");
+    let persisted_debug = format!("{persisted:?}");
+    assert!(!persisted_debug.contains("sensitive"));
+    assert!(persisted_debug.contains("payload_bytes"));
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
 async fn recovery_is_strict_all_or_nothing_and_tenant_isolated() {
     let temp = tempdir().expect("tempdir");
     let path = temp.path().join("store.sqlite");
