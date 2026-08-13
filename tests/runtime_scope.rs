@@ -1808,3 +1808,213 @@ async fn scope_snapshot_reports_only_structural_state_and_mailbox_depth() {
     router.shutdown().await.expect("shutdown");
     store.shutdown().await.expect("store shutdown");
 }
+
+#[tokio::test]
+async fn scope_mailbox_byte_budget_rejects_before_the_durable_inbox_limit() {
+    const LARGE_TEXT_BYTES: usize = 700 * 1024;
+
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RecordingSink::default());
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink.clone(),
+    )
+    .await
+    .expect("router");
+    let mut blocker = event("event-byte-blocker", "owner-runtime-scope");
+    blocker.text = "b".repeat(LARGE_TEXT_BYTES);
+    router
+        .route(queued_registered(&store, &namespace, blocker).await)
+        .await
+        .expect("route byte blocker");
+    let start_thread = control.next_request().await;
+    control
+        .respond(
+            &start_thread,
+            thread_result("thread-byte-budget", &workspace),
+        )
+        .await;
+    let start_turn = control.next_request().await;
+    respond_turn_started(&control, &start_turn, "turn-byte-budget").await;
+    wait_for_running_turn(&store, "turn-byte-budget").await;
+
+    let mut rejected = None;
+    for index in 0..16 {
+        let event_id = format!("event-byte-pending-{index}");
+        let mut pending = event(event_id.as_str(), "owner-runtime-scope");
+        pending.text = "p".repeat(LARGE_TEXT_BYTES);
+        router
+            .route(queued_registered(&store, &namespace, pending).await)
+            .await
+            .expect("route or durably reject byte pressure");
+        if store
+            .inbound_state(&namespace, event_id.as_str())
+            .await
+            .expect("inbound state")
+            == Some(InboundEventState::Rejected)
+        {
+            rejected = Some(event_id);
+            break;
+        }
+    }
+    assert!(
+        rejected.is_some(),
+        "actor byte budget must reject bounded input"
+    );
+    assert_eq!(
+        sink.rejections.lock().expect("rejections").as_slice(),
+        &[InboundRejectionKind::Overloaded]
+    );
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn idle_actor_eviction_releases_completed_thread_routes() {
+    let mut config = validated_config();
+    config.concurrency.max_scope_actors = 1;
+    config.validate().expect("single actor is valid");
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config).with_test_timings(
+        Duration::from_millis(1),
+        Duration::from_secs(60),
+        Duration::from_millis(1),
+    );
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        Arc::new(RecordingSink::default()),
+    )
+    .await
+    .expect("router");
+
+    for index in 0..=lark_codex_bridge::limits::CLIENT_PROJECTION_CAPACITY {
+        let event_id = format!("event-evict-{index}");
+        let chat_id = format!("chat-evict-{index}");
+        let thread_id = format!("thread-evict-{index}");
+        let turn_id = format!("turn-evict-{index}");
+        router
+            .route(
+                queued_registered(
+                    &store,
+                    &namespace,
+                    event_in_chat(event_id.as_str(), "owner-runtime-scope", chat_id.as_str()),
+                )
+                .await,
+            )
+            .await
+            .expect("route next scope");
+        let start_thread = control.next_request().await;
+        assert_eq!(start_thread["method"], "thread/start");
+        control
+            .respond(&start_thread, thread_result(thread_id.as_str(), &workspace))
+            .await;
+        let start_turn = control.next_request().await;
+        respond_turn_started(&control, &start_turn, turn_id.as_str()).await;
+        send_turn_completed(&control, thread_id.as_str(), turn_id.as_str(), "completed").await;
+        wait_for_inbound_states(
+            &store,
+            &namespace,
+            &[event_id.as_str()],
+            InboundEventState::Completed,
+        )
+        .await;
+    }
+    assert_eq!(router.snapshot().scope_count, 1);
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn connection_loss_before_atomic_begin_leaves_the_event_received_for_replay() {
+    let config = validated_config();
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config).with_test_timings(
+        Duration::from_millis(1),
+        Duration::from_secs(60),
+        Duration::from_millis(1),
+    );
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let (supervisor, first_control, second_control) = restarting_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        Arc::new(RecordingSink::default()),
+    )
+    .await
+    .expect("router");
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("event-before-begin-crash", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("route event");
+    let start_thread = first_control.next_request().await;
+    assert_eq!(start_thread["method"], "thread/start");
+    first_control.unexpected_exit();
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if router
+                .scope_snapshot(&ScopeKey::Chat("chat-runtime-scope".to_owned()))
+                .await
+                .expect("snapshot")
+                .is_some_and(|snapshot| {
+                    matches!(
+                        snapshot.state,
+                        lark_codex_bridge::runtime::scope::ScopeState::Failed { .. }
+                    )
+                })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("actor records the pre-begin failure");
+    assert_eq!(
+        store
+            .inbound_state(&namespace, "event-before-begin-crash")
+            .await
+            .expect("inbound state"),
+        Some(InboundEventState::Received)
+    );
+    assert!(
+        store
+            .uncertain_turns()
+            .await
+            .expect("live turns")
+            .is_empty()
+    );
+    second_control
+        .expect_no_request_for(Duration::from_millis(100))
+        .await;
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}

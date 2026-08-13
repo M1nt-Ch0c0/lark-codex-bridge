@@ -60,6 +60,24 @@ impl RouterSettings {
         }
     }
 
+    /// Overrides only scheduling timings for deterministic integration tests.
+    ///
+    /// The same non-zero validation and every production count/byte limit
+    /// remain enforced by [`Router::start`].
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_test_timings(
+        mut self,
+        debounce: Duration,
+        message_max_age: Duration,
+        finalization_retry: Duration,
+    ) -> Self {
+        self.debounce = debounce;
+        self.message_max_age = message_max_age;
+        self.finalization_retry = finalization_retry;
+        self
+    }
+
     fn validate(&self) -> Result<(), RouteError> {
         if self.active_turn_permits == 0
             || self.active_turn_permits > ROUTER_ACTIVE_TURN_HARD_LIMIT
