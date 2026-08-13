@@ -10,7 +10,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use super::config::LarkEndpoints;
-use super::error::LarkError;
+use super::error::{LarkError, check_code};
 use crate::limits::{LARK_HTTP_TIMEOUT, LARK_MAX_HTTP_BODY_BYTES};
 
 /// Shared HTTP client bound to one tenant's endpoints.
@@ -231,6 +231,11 @@ impl LarkHttp {
             .map_err(|_| LarkError::retryable(context))?;
         let status = response.status();
         ensure_success(status, context)?;
+        let is_json = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("application/json"));
         if let Some(length) = response.content_length() {
             if length > limit as u64 {
                 return Err(LarkError::exhausted(context, limit as u64));
@@ -246,6 +251,22 @@ impl LarkHttp {
                 return Err(LarkError::exhausted(context, limit as u64));
             }
             body.extend_from_slice(&chunk);
+        }
+        if is_json {
+            // A JSON content type on a binary resource endpoint means the
+            // server returned an error envelope instead of resource bytes;
+            // classify its code so token failures still trigger the caller's
+            // single forced refresh.
+            let envelope: serde_json::Value = serde_json::from_slice(&body)
+                .map_err(|_| LarkError::protocol("parsing a resource error envelope"))?;
+            let code = envelope
+                .get("code")
+                .and_then(serde_json::Value::as_i64)
+                .ok_or_else(|| LarkError::protocol("resource envelope missing code"))?;
+            check_code(code, context)?;
+            return Err(LarkError::protocol(
+                "resource endpoint returned a JSON envelope",
+            ));
         }
         Ok(Bytes::from(body))
     }

@@ -232,6 +232,7 @@ impl LarkApi {
             content: card_content(&card)?,
         };
         check_send_body(&body)?;
+        check_path_segment(message_id)?;
         let path = format!("{MESSAGES_PATH}/{message_id}");
         self.with_auth_retry(|token| {
             let path = path.clone();
@@ -268,6 +269,7 @@ impl LarkApi {
             thread_id: Option<String>,
         }
 
+        check_path_segment(message_id)?;
         let path = format!("{MESSAGES_PATH}/{message_id}");
         let data: MessageData = self
             .with_auth_retry(|token| {
@@ -312,6 +314,7 @@ impl LarkApi {
             chat_mode: Option<String>,
         }
 
+        check_path_segment(chat_id)?;
         let path = format!("/open-apis/im/v1/chats/{chat_id}");
         let data: ChatData = self
             .with_auth_retry(|token| {
@@ -342,6 +345,8 @@ impl LarkApi {
         file_key: &str,
         kind: ResourceKind,
     ) -> Result<ResourceData, LarkError> {
+        check_path_segment(message_id)?;
+        check_path_segment(file_key)?;
         let path = format!(
             "{MESSAGES_PATH}/{message_id}/resources/{file_key}?type={}",
             kind.as_str()
@@ -451,16 +456,18 @@ impl LarkApi {
             open_id: Option<String>,
         }
 
-        let token = self.tokens.token().await?;
-        let response: BotInfoResponse = self.http.get_json(BOT_INFO_PATH, Some(&token)).await?;
-        check_code(response.code, "fetching bot info")?;
-        let bot = response
-            .bot
-            .ok_or_else(|| LarkError::protocol("bot info response missing the bot object"))?;
-        Ok(BotInfo {
-            app_name: bot.app_name,
-            open_id: bot.open_id,
+        self.with_auth_retry(|token| async move {
+            let response: BotInfoResponse = self.http.get_json(BOT_INFO_PATH, Some(&token)).await?;
+            check_code(response.code, "fetching bot info")?;
+            let bot = response
+                .bot
+                .ok_or_else(|| LarkError::protocol("bot info response missing the bot object"))?;
+            Ok(BotInfo {
+                app_name: bot.app_name,
+                open_id: bot.open_id,
+            })
         })
+        .await
     }
 
     async fn send_message(&self, body: &SendBody<'_>) -> Result<MessageRef, LarkError> {
@@ -513,6 +520,7 @@ impl LarkApi {
             reply_in_thread: in_thread,
         };
         check_send_body(&body)?;
+        check_path_segment(message_id)?;
         let path = format!("{MESSAGES_PATH}/{message_id}/reply");
         let data: ReplyData = self
             .with_auth_retry(|token| {
@@ -660,6 +668,22 @@ fn check_upload_size(len: usize) -> Result<(), LarkError> {
         ));
     }
     Ok(())
+}
+
+/// Server-issued IDs (`om_…`/`oc_…`/`ou_…`) use a URL-safe alphabet; reject
+/// anything else before it is interpolated into a request path, so a hostile
+/// or corrupted ID can never rewrite the request target.
+fn check_path_segment(id: &str) -> Result<(), LarkError> {
+    if !id.is_empty()
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return Ok(());
+    }
+    Err(LarkError::protocol(
+        "server-issued ID contains unsafe characters",
+    ))
 }
 
 fn is_token_invalid(error: &LarkError) -> bool {

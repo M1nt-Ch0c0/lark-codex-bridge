@@ -552,6 +552,24 @@ async fn oversize_download_stream_is_aborted_mid_body() {
 }
 
 #[tokio::test]
+async fn download_classifies_a_json_error_envelope_instead_of_returning_it() {
+    let server = StubServer::start(token_plus(|_| {
+        StubResponse::json(200, r#"{"code":99991663,"msg":"scrubbed"}"#)
+    }))
+    .await;
+    let api = api_for(&server);
+
+    let error = api
+        .download_message_resource("om_msg", "file_key", ResourceKind::File)
+        .await
+        .expect_err("a JSON error envelope must not be returned as resource bytes");
+    assert!(
+        matches!(error, LarkError::PermanentAuth { .. }),
+        "token-invalid envelope should surface as PermanentAuth after one forced refresh, got {error}"
+    );
+}
+
+#[tokio::test]
 async fn upload_image_posts_the_exact_multipart_fields() {
     let server = StubServer::start(token_plus(|_| {
         StubResponse::json(200, r#"{"code":0,"data":{"image_key":"img_v3_uploaded"}}"#)
