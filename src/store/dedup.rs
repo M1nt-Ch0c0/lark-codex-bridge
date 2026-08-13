@@ -25,7 +25,7 @@ use crate::limits::{
     STORE_INBOUND_RESOURCE_KEY_MAX_BYTES, STORE_INBOUND_RESOURCE_KEY_MAX_TOTAL_BYTES,
     STORE_INBOUND_RESOURCE_MAX_COUNT, STORE_INBOUND_SCOPE_MAX_BYTES, STORE_INBOUND_TEXT_MAX_BYTES,
     STORE_OUTBOX_MAX_QUEUED_BYTES, STORE_OUTBOX_MAX_ROWS, STORE_OUTBOX_PAYLOAD_MAX_BYTES,
-    STORE_RECOVERY_TURN_MAX_BYTES, STORE_RECOVERY_TURN_MAX_ROWS,
+    STORE_RECOVERY_TURN_MAX_BYTES, STORE_RECOVERY_TURN_MAX_ROWS, STORE_REJECTION_REASON_MAX_BYTES,
 };
 use crate::runtime::intake::TenantNamespace;
 
@@ -376,6 +376,7 @@ impl StoreHandle {
                         context: "claiming an inbound row from another scope",
                     });
                 }
+                validate_stored_inbound_row(&transaction, &tenant, &stored)?;
                 match stored.state {
                     InboundEventState::Received => {
                         if stored.turn_row_id.is_some() {
@@ -386,28 +387,9 @@ impl StoreHandle {
                         let retained = retained_from_stored(stored)?;
                         received.push((key, retained));
                     }
-                    InboundEventState::Accepted => {
-                        if stored.turn_row_id.is_none() {
-                            return Err(StoreError::CorruptData {
-                                context: "skipping an unassociated accepted row",
-                            });
-                        }
-                        let _ = retained_from_stored(stored.clone())?;
-                        skipped.push(SkippedInbound {
-                            key,
-                            state: stored.state,
-                            turn_row_id: stored.turn_row_id,
-                        });
-                    }
-                    InboundEventState::Completed | InboundEventState::Rejected => {
-                        if stored.payload_version.is_some()
-                            || stored.payload_blob.is_some()
-                            || stored.payload_bytes != 0
-                        {
-                            return Err(StoreError::CorruptData {
-                                context: "skipping a terminal row with payload",
-                            });
-                        }
+                    InboundEventState::Accepted
+                    | InboundEventState::Completed
+                    | InboundEventState::Rejected => {
                         skipped.push(SkippedInbound {
                             key,
                             state: stored.state,
@@ -736,13 +718,19 @@ impl StoreHandle {
                 },
             )?;
             let existing = terminal_disposition(&stored, reason)?;
-            if let Some(disposition) = existing {
-                return Ok(disposition);
-            }
             if notice.scope_key != stored.scope_key {
                 return Err(StoreError::CorruptData {
                     context: "validating an inbound rejection notice scope",
                 });
+            }
+            if let Some(disposition) = existing {
+                if disposition == InboundDisposition::AlreadyRejected {
+                    enqueue_notice_in_transaction(&transaction, &notice)?;
+                    transaction.commit().map_err(|error| {
+                        sqlite_error("committing a backfilled rejection notice", &error)
+                    })?;
+                }
+                return Ok(disposition);
             }
             let _ = retained_from_stored(stored)?;
             enqueue_notice_in_transaction(&transaction, &notice)?;
@@ -1292,50 +1280,279 @@ fn validate_inbound_collection(connection: &rusqlite::Connection) -> Result<(), 
     }
     let mut statement = connection
         .prepare(
-            "SELECT event_id, message_id, scope_key, state, payload_version,
+            "SELECT tenant, event_id, message_id, scope_key, state, payload_version,
                     payload_blob, payload_bytes, turn_row_id, rejection_reason
-             FROM inbound_events WHERE state IN ('received', 'accepted')
-             ORDER BY tenant, event_id",
+             FROM inbound_events ORDER BY tenant, event_id",
         )
         .map_err(|error| sqlite_error("preparing inbound integrity scan", &error))?;
     let rows = statement
-        .query_map([], decode_stored_row)
+        .query_map([], |row| {
+            let tenant: String = row.get(0)?;
+            let state: String = row.get(4)?;
+            let Some(state) = InboundEventState::parse(&state) else {
+                return Err(rusqlite::Error::InvalidColumnType(
+                    4,
+                    "state".to_owned(),
+                    rusqlite::types::Type::Text,
+                ));
+            };
+            Ok((
+                tenant,
+                StoredInbound {
+                    event_id: row.get(1)?,
+                    message_id: row.get(2)?,
+                    scope_key: row.get(3)?,
+                    state,
+                    payload_version: row.get(5)?,
+                    payload_blob: row.get(6)?,
+                    payload_bytes: row.get(7)?,
+                    turn_row_id: row.get(8)?,
+                    rejection_reason: row.get(9)?,
+                },
+            ))
+        })
         .map_err(|error| sqlite_error("reading inbound integrity scan", &error))?;
     for row in rows {
-        let stored =
+        let (tenant, stored) =
             row.map_err(|error| sqlite_error("decoding inbound integrity scan", &error))?;
-        match stored.state {
-            InboundEventState::Received if stored.turn_row_id.is_some() => {
+        validate_stored_inbound_row(connection, &tenant, &stored)?;
+    }
+    validate_runtime_turn_groups(connection)?;
+    Ok(())
+}
+
+fn validate_stored_inbound_row(
+    connection: &rusqlite::Connection,
+    tenant: &str,
+    stored: &StoredInbound,
+) -> Result<(), StoreError> {
+    validate_nonempty_bounded(
+        tenant,
+        STORE_INBOUND_ID_MAX_BYTES,
+        "validating an inbound tenant",
+    )?;
+    validate_nonempty_bounded(
+        &stored.event_id,
+        STORE_INBOUND_ID_MAX_BYTES,
+        "validating a stored inbound event ID",
+    )?;
+    validate_nonempty_bounded(
+        &stored.message_id,
+        STORE_INBOUND_ID_MAX_BYTES,
+        "validating a stored inbound message ID",
+    )?;
+    validate_nonempty_bounded(
+        &stored.scope_key,
+        STORE_INBOUND_SCOPE_MAX_BYTES,
+        "validating a stored inbound scope",
+    )?;
+    if stored
+        .rejection_reason
+        .as_ref()
+        .is_some_and(|reason| reason.is_empty() || reason.len() > STORE_REJECTION_REASON_MAX_BYTES)
+    {
+        return Err(StoreError::CorruptData {
+            context: "validating an inbound rejection reason",
+        });
+    }
+    if stored.payload_bytes < 0
+        || usize::try_from(stored.payload_bytes).unwrap_or(usize::MAX)
+            > STORE_INBOUND_PAYLOAD_MAX_BYTES
+    {
+        return Err(StoreError::CorruptData {
+            context: "validating stored inbound payload bytes",
+        });
+    }
+
+    let current_namespace = is_tenant_namespace(tenant);
+    match stored.state {
+        InboundEventState::Received => {
+            if !current_namespace
+                || stored.turn_row_id.is_some()
+                || stored.rejection_reason.is_some()
+            {
                 return Err(StoreError::CorruptData {
-                    context: "validating an associated received row",
+                    context: "validating a received inbound row",
                 });
             }
-            InboundEventState::Accepted if stored.turn_row_id.is_none() => {
-                return Err(StoreError::CorruptData {
-                    context: "validating an unassociated accepted row",
-                });
-            }
-            InboundEventState::Received | InboundEventState::Accepted => {}
-            InboundEventState::Completed | InboundEventState::Rejected => unreachable!(),
+            let _ = retained_from_stored(stored.clone())?;
         }
-        if let Some(turn_row_id) = stored.turn_row_id {
-            let turn_scope: Option<String> = connection
-                .query_row(
-                    "SELECT scope_key FROM turns WHERE id = ?1",
-                    params![turn_row_id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|error| sqlite_error("validating an accepted turn", &error))?;
-            if turn_scope.as_deref() != Some(stored.scope_key.as_str()) {
+        InboundEventState::Accepted => {
+            if !current_namespace
+                || stored.turn_row_id.is_none()
+                || stored.rejection_reason.is_some()
+            {
                 return Err(StoreError::CorruptData {
-                    context: "validating an accepted turn association",
+                    context: "validating an accepted inbound row",
                 });
             }
+            let _ = retained_from_stored(stored.clone())?;
+            validate_turn_association(connection, stored)?;
         }
-        let _ = retained_from_stored(stored)?;
+        InboundEventState::Completed | InboundEventState::Rejected => {
+            if stored.payload_version.is_some()
+                || stored.payload_blob.is_some()
+                || stored.payload_bytes != 0
+                || (stored.state == InboundEventState::Completed
+                    && stored.rejection_reason.is_some())
+            {
+                return Err(StoreError::CorruptData {
+                    context: "validating a terminal inbound row",
+                });
+            }
+            if stored.turn_row_id.is_some() {
+                if !current_namespace {
+                    return Err(StoreError::CorruptData {
+                        context: "validating a terminal inbound tenant",
+                    });
+                }
+                validate_turn_association(connection, stored)?;
+            }
+        }
     }
     Ok(())
+}
+
+fn validate_turn_association(
+    connection: &rusqlite::Connection,
+    stored: &StoredInbound,
+) -> Result<(), StoreError> {
+    let turn_row_id = stored.turn_row_id.ok_or(StoreError::CorruptData {
+        context: "validating a missing inbound turn association",
+    })?;
+    let turn: Option<(String, String, i64, i64)> = connection
+        .query_row(
+            "SELECT scope_key, state, uncertain, inbound_count FROM turns WHERE id = ?1",
+            params![turn_row_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(|error| sqlite_error("validating an inbound turn association", &error))?;
+    let Some((turn_scope, turn_state, uncertain, inbound_count)) = turn else {
+        return Err(StoreError::CorruptData {
+            context: "validating a missing inbound turn",
+        });
+    };
+    if turn_scope != stored.scope_key || inbound_count <= 0 {
+        return Err(StoreError::CorruptData {
+            context: "validating an inbound turn scope and claim count",
+        });
+    }
+    let unresolved = matches!(turn_state.as_str(), "starting" | "running") && uncertain == 0
+        || turn_state == "uncertain" && uncertain == 1;
+    let resolved = matches!(
+        turn_state.as_str(),
+        "completed" | "failed" | "interrupted" | "uncertain"
+    ) && uncertain == 0;
+    match stored.state {
+        InboundEventState::Accepted if unresolved => Ok(()),
+        InboundEventState::Completed if resolved && turn_state == "completed" => Ok(()),
+        InboundEventState::Rejected if resolved => {
+            let expected_reason = match turn_state.as_str() {
+                "failed" => "turn_failed",
+                "interrupted" => "turn_interrupted",
+                "uncertain" => "turn_uncertain",
+                _ => {
+                    return Err(StoreError::CorruptData {
+                        context: "validating a rejected inbound turn outcome",
+                    });
+                }
+            };
+            if stored.rejection_reason.as_deref() == Some(expected_reason) {
+                Ok(())
+            } else {
+                Err(StoreError::CorruptData {
+                    context: "validating an inbound turn rejection reason",
+                })
+            }
+        }
+        _ => Err(StoreError::CorruptData {
+            context: "validating an inbound turn state association",
+        }),
+    }?;
+    validate_runtime_turn_group(
+        connection,
+        turn_row_id,
+        &turn_scope,
+        &turn_state,
+        uncertain,
+        inbound_count,
+    )
+}
+
+fn validate_runtime_turn_groups(connection: &rusqlite::Connection) -> Result<(), StoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT id, scope_key, state, uncertain, inbound_count
+             FROM turns
+             WHERE inbound_count > 0
+             ORDER BY id",
+        )
+        .map_err(|error| sqlite_error("preparing inbound turn integrity scan", &error))?;
+    let turns = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
+        .map_err(|error| sqlite_error("reading inbound turn integrity scan", &error))?;
+    for turn in turns {
+        let (id, scope, state, uncertain, inbound_count) =
+            turn.map_err(|error| sqlite_error("decoding inbound turn integrity scan", &error))?;
+        validate_runtime_turn_group(connection, id, &scope, &state, uncertain, inbound_count)?;
+    }
+    Ok(())
+}
+
+fn validate_runtime_turn_group(
+    connection: &rusqlite::Connection,
+    turn_row_id: i64,
+    scope: &str,
+    state: &str,
+    uncertain: i64,
+    inbound_count: i64,
+) -> Result<(), StoreError> {
+    let inbound_count = usize::try_from(inbound_count).map_err(|_| StoreError::CorruptData {
+        context: "validating an inbound turn historical count",
+    })?;
+    let unresolved = matches!(state, "starting" | "running") && uncertain == 0
+        || state == "uncertain" && uncertain == 1;
+    if unresolved {
+        return validate_unresolved_markers(connection, turn_row_id, scope, inbound_count);
+    }
+    if uncertain != 0 || !matches!(state, "completed" | "failed" | "interrupted" | "uncertain") {
+        return Err(StoreError::CorruptData {
+            context: "validating an inbound turn resolution state",
+        });
+    }
+    let expected_state = if state == "completed" {
+        "completed"
+    } else {
+        "rejected"
+    };
+    validate_resolved_markers(connection, turn_row_id, inbound_count, expected_state)
+}
+
+fn validate_nonempty_bounded(
+    value: &str,
+    limit: usize,
+    context: &'static str,
+) -> Result<(), StoreError> {
+    if value.is_empty() || value.len() > limit {
+        return Err(StoreError::CorruptData { context });
+    }
+    Ok(())
+}
+
+fn is_tenant_namespace(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn terminal_disposition(

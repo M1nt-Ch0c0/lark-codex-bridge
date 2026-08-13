@@ -11,6 +11,7 @@ use lark_codex_bridge::limits::{
     STORE_RECOVERY_TURN_MAX_BYTES, STORE_RECOVERY_TURN_MAX_ROWS, STORE_REQUEST_MAX_BYTES,
     STORE_WRITER_BYTE_BUDGET, STORE_WRITER_CAPACITY,
 };
+use lark_codex_bridge::runtime::intake::DurableIntake;
 use lark_codex_bridge::runtime::intake::TenantNamespace;
 use lark_codex_bridge::store::{
     BeginTurnOutcome, DedupOutcome, InboundDisposition, InboundEventState, InboundKey,
@@ -60,12 +61,167 @@ fn turn(message_id: &str, state: TurnState) -> NewTurnRow {
 }
 
 fn tenant_namespace(app_id: &str) -> TenantNamespace {
-    let credentials = LarkCredentials::new(
+    TenantNamespace::from_credentials(&credentials_for(app_id))
+}
+
+fn credentials_for(app_id: &str) -> LarkCredentials {
+    LarkCredentials::new(
         app_id.to_owned(),
         SecretString::from("test-secret".to_owned()),
         TenantBrand::Feishu,
+    )
+}
+
+async fn seed_accepted_file_store(
+    path: &std::path::Path,
+    app_id: &str,
+) -> (LarkCredentials, TenantNamespace, i64) {
+    let credentials = credentials_for(app_id);
+    let tenant = TenantNamespace::from_credentials(&credentials);
+    let store = StoreHandle::open(path).await.expect("open seed store");
+    store
+        .register_inbound(&tenant, &event("event-forged", "message-forged"))
+        .await
+        .expect("register seed");
+    let begun = store
+        .begin_turn_and_claim_inbound(
+            turn("original-forged-turn", TurnState::Starting),
+            &[InboundKey::new(tenant.clone(), "event-forged".to_owned())],
+        )
+        .await
+        .expect("claim seed");
+    let BeginTurnOutcome::Started { turn_row_id, .. } = begun else {
+        panic!("seed claim starts a turn")
+    };
+    store.shutdown().await.expect("shutdown seed store");
+    (credentials, tenant, turn_row_id)
+}
+
+async fn assert_forged_store_fails_recovery_and_skip(
+    path: &std::path::Path,
+    credentials: &LarkCredentials,
+    tenant: &TenantNamespace,
+    event_id: &str,
+) {
+    let store = StoreHandle::open(path).await.expect("reopen forged store");
+    assert!(
+        DurableIntake::prepare(store.clone(), credentials)
+            .await
+            .is_err(),
+        "startup preparation must reject the forged state"
     );
-    TenantNamespace::from_credentials(&credentials)
+    assert!(matches!(
+        store.recover_received(tenant).await,
+        Err(StoreError::CorruptData { .. } | StoreError::CapacityExceeded { .. })
+    ));
+    let skip = store
+        .begin_turn_and_claim_inbound(
+            turn("forged-skip-must-not-create", TurnState::Starting),
+            &[InboundKey::new(tenant.clone(), event_id.to_owned())],
+        )
+        .await;
+    assert!(
+        matches!(
+            skip,
+            Err(StoreError::CorruptData { .. }
+                | StoreError::CapacityExceeded { .. }
+                | StoreError::PayloadTooLarge { .. })
+        ),
+        "begin skip must reject the forged state, got {skip:?}"
+    );
+    store.shutdown().await.expect("shutdown forged store");
+    let connection = rusqlite::Connection::open(path).expect("inspect forged store");
+    let created: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM turns WHERE client_message_id = 'forged-skip-must-not-create'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count forged skip turns");
+    assert_eq!(created, 0, "failed skip validation cannot create a turn");
+}
+
+fn forge_turn_association(connection: &rusqlite::Connection, turn_row_id: i64, association: &str) {
+    match association {
+        "accepted-resolved" => connection
+            .execute(
+                "UPDATE turns SET state = 'failed', uncertain = 0 WHERE id = ?1",
+                [turn_row_id],
+            )
+            .expect("forge accepted resolved"),
+        "accepted-cross-scope" => connection
+            .execute(
+                "UPDATE turns SET scope_key = 'im:other-scope' WHERE id = ?1",
+                [turn_row_id],
+            )
+            .expect("forge accepted scope"),
+        "accepted-missing-turn" => connection
+            .execute("DELETE FROM turns WHERE id = ?1", [turn_row_id])
+            .expect("forge missing turn"),
+        "unresolved-count-mismatch" => connection
+            .execute(
+                "UPDATE turns SET inbound_count = 2 WHERE id = ?1",
+                [turn_row_id],
+            )
+            .expect("forge unresolved marker count"),
+        "terminal-live" => connection
+            .execute(
+                "UPDATE inbound_events
+                 SET state = 'rejected', rejection_reason = 'turn_failed',
+                     payload_version = NULL, payload_blob = NULL, payload_bytes = 0
+                 WHERE event_id = 'event-forged'",
+                [],
+            )
+            .expect("forge terminal linked live"),
+        "terminal-cross-scope" | "terminal-wrong-outcome" | "resolved-marker-overflow" => {
+            connection
+                .execute(
+                    "UPDATE turns SET state = 'completed', uncertain = 0 WHERE id = ?1",
+                    [turn_row_id],
+                )
+                .expect("forge completed turn");
+            connection
+                .execute(
+                    "UPDATE inbound_events
+                     SET state = 'completed', rejection_reason = NULL,
+                         payload_version = NULL, payload_blob = NULL, payload_bytes = 0
+                     WHERE event_id = 'event-forged'",
+                    [],
+                )
+                .expect("forge completed marker");
+            match association {
+                "terminal-cross-scope" => connection
+                    .execute(
+                        "UPDATE turns SET scope_key = 'im:other-scope' WHERE id = ?1",
+                        [turn_row_id],
+                    )
+                    .expect("forge terminal scope"),
+                "terminal-wrong-outcome" => connection
+                    .execute(
+                        "UPDATE inbound_events
+                         SET state = 'rejected', rejection_reason = 'turn_failed'
+                         WHERE event_id = 'event-forged'",
+                        [],
+                    )
+                    .expect("forge wrong terminal outcome"),
+                "resolved-marker-overflow" => connection
+                    .execute(
+                        "INSERT INTO inbound_events
+                         (tenant, event_id, message_id, scope_key, state,
+                          first_seen_ms, updated_ms, rejection_reason,
+                          payload_version, payload_blob, payload_bytes, turn_row_id)
+                         SELECT tenant, 'event-forged-extra', 'message-forged-extra', scope_key,
+                                'completed', 1, 1, NULL, NULL, NULL, 0, ?1
+                         FROM inbound_events WHERE event_id = 'event-forged'",
+                        [turn_row_id],
+                    )
+                    .expect("forge excess resolved marker"),
+                _ => unreachable!(),
+            };
+            1
+        }
+        _ => unreachable!(),
+    };
 }
 
 #[tokio::test]
@@ -1014,6 +1170,159 @@ async fn recovery_is_strict_all_or_nothing_and_tenant_isolated() {
 }
 
 #[tokio::test]
+async fn startup_and_begin_skip_reject_terminal_payload_and_field_corruption() {
+    let temp = tempdir().expect("tempdir");
+    for (index, field) in ["payload", "event_id", "message_id", "scope", "reason"]
+        .into_iter()
+        .enumerate()
+    {
+        let path = temp.path().join(format!("terminal-{field}.sqlite"));
+        let (credentials, tenant, turn_row_id) =
+            seed_accepted_file_store(&path, &format!("cli_terminal_shape_{index}")).await;
+        let connection = rusqlite::Connection::open(&path).expect("open raw terminal store");
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 DROP TRIGGER inbound_events_v2_shape_insert;
+                 DROP TRIGGER inbound_events_v2_shape_update;",
+            )
+            .expect("disable terminal guards");
+        connection
+            .execute(
+                "UPDATE turns SET state = 'failed', uncertain = 0 WHERE id = ?1",
+                [turn_row_id],
+            )
+            .expect("forge resolved turn");
+        connection
+            .execute(
+                "UPDATE inbound_events
+                 SET state = 'rejected', rejection_reason = 'turn_failed',
+                     payload_version = NULL, payload_blob = NULL, payload_bytes = 0
+                 WHERE event_id = 'event-forged'",
+                [],
+            )
+            .expect("forge valid terminal baseline");
+        let forged_event_id = "x".repeat(4 * 1024 + 1);
+        match field {
+            "payload" => connection
+                .execute(
+                    "UPDATE inbound_events
+                     SET payload_version = 1, payload_blob = X'78', payload_bytes = 1
+                     WHERE event_id = 'event-forged'",
+                    [],
+                )
+                .expect("forge terminal payload"),
+            "event_id" => connection
+                .execute(
+                    "UPDATE inbound_events SET event_id = ?1 WHERE event_id = 'event-forged'",
+                    [&forged_event_id],
+                )
+                .expect("forge event id"),
+            "message_id" => connection
+                .execute(
+                    "UPDATE inbound_events SET message_id = ?1 WHERE event_id = 'event-forged'",
+                    ["x".repeat(4 * 1024 + 1)],
+                )
+                .expect("forge message id"),
+            "scope" => connection
+                .execute(
+                    "UPDATE inbound_events SET scope_key = ?1 WHERE event_id = 'event-forged'",
+                    ["x".repeat(12 * 1024 + 1)],
+                )
+                .expect("forge scope"),
+            "reason" => connection
+                .execute(
+                    "UPDATE inbound_events SET rejection_reason = ?1
+                     WHERE event_id = 'event-forged'",
+                    ["x".repeat(129)],
+                )
+                .expect("forge reason"),
+            _ => unreachable!(),
+        };
+        drop(connection);
+        let event_id = if field == "event_id" {
+            forged_event_id.as_str()
+        } else {
+            "event-forged"
+        };
+        assert_forged_store_fails_recovery_and_skip(&path, &credentials, &tenant, event_id).await;
+    }
+}
+
+#[tokio::test]
+async fn startup_and_begin_skip_reject_forged_turn_associations() {
+    let temp = tempdir().expect("tempdir");
+    for (index, association) in [
+        "accepted-resolved",
+        "accepted-cross-scope",
+        "accepted-missing-turn",
+        "unresolved-count-mismatch",
+        "terminal-live",
+        "terminal-cross-scope",
+        "terminal-wrong-outcome",
+        "resolved-marker-overflow",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let path = temp
+            .path()
+            .join(format!("association-{association}.sqlite"));
+        let (credentials, tenant, turn_row_id) =
+            seed_accepted_file_store(&path, &format!("cli_association_{index}")).await;
+        let connection = rusqlite::Connection::open(&path).expect("open raw association store");
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 DROP TRIGGER inbound_events_v2_shape_insert;
+                 DROP TRIGGER inbound_events_v2_shape_update;",
+            )
+            .expect("disable association guards");
+        forge_turn_association(&connection, turn_row_id, association);
+        drop(connection);
+        assert_forged_store_fails_recovery_and_skip(&path, &credentials, &tenant, "event-forged")
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn legal_legacy_v1_terminal_rows_migrate_prepare_and_sweep() {
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("legacy-terminal.sqlite");
+    let connection = rusqlite::Connection::open(&path).expect("open legacy store");
+    connection
+        .execute_batch(lark_codex_bridge::store::schema::MIGRATIONS[0].sql)
+        .expect("apply migration one");
+    connection
+        .execute_batch(
+            "INSERT INTO inbound_events
+             (tenant,event_id,message_id,scope_key,state,first_seen_ms,updated_ms,rejection_reason)
+             VALUES
+             ('legacy-tenant','legacy-completed','legacy-message-1','im:legacy','completed',1,1,NULL),
+             ('legacy-tenant','legacy-rejected','legacy-message-2','im:legacy','rejected',1,1,'legacy_reason');
+             PRAGMA user_version = 1;",
+        )
+        .expect("seed legacy terminals");
+    drop(connection);
+
+    let credentials = credentials_for("cli_legacy_terminal_prepare");
+    let store = StoreHandle::open(&path)
+        .await
+        .expect("migrate legacy store");
+    let _runtime = DurableIntake::prepare(store.clone(), &credentials)
+        .await
+        .expect("legacy terminal rows do not block startup");
+    assert_eq!(
+        store
+            .sweep_inbound(i64::MAX, 2)
+            .await
+            .expect("sweep legacy"),
+        2
+    );
+    store.shutdown().await.expect("shutdown legacy store");
+}
+
+#[tokio::test]
 async fn atomic_rejection_notice_validates_scope_and_duplicate_identity() {
     let store = StoreHandle::open_in_memory().await.expect("open");
     let tenant = tenant_namespace("cli_notice_identity");
@@ -1101,6 +1410,67 @@ async fn atomic_rejection_notice_validates_scope_and_duplicate_identity() {
             .expect("conflict state"),
         Some(InboundEventState::Received)
     );
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn atomic_rejection_backfills_and_validates_a_bare_rejection_notice() {
+    let store = StoreHandle::open_in_memory().await.expect("open");
+    let tenant = tenant_namespace("cli_notice_backfill");
+    let inbound = event("event-notice-backfill", "message-notice-backfill");
+    store
+        .register_inbound(&tenant, &inbound)
+        .await
+        .expect("register");
+    let key = InboundKey::new(tenant, inbound.event_id);
+    assert_eq!(
+        store
+            .reject_received(&key, InboundRejectionKind::Policy)
+            .await
+            .expect("bare rejection"),
+        InboundDisposition::Rejected
+    );
+    assert_eq!(store.outbox_depth().await.expect("empty depth").pending, 0);
+
+    let notice = outbox("notice-backfill", "original-body");
+    for _ in 0..2 {
+        assert_eq!(
+            store
+                .reject_received_and_enqueue_notice(
+                    &key,
+                    InboundRejectionKind::Policy,
+                    notice.clone(),
+                )
+                .await
+                .expect("backfill or identical retry"),
+            InboundDisposition::AlreadyRejected
+        );
+        assert_eq!(store.outbox_depth().await.expect("depth").pending, 1);
+    }
+
+    let mut wrong_body = notice.clone();
+    wrong_body.payload_json = "changed-body".to_owned();
+    assert!(matches!(
+        store
+            .reject_received_and_enqueue_notice(&key, InboundRejectionKind::Policy, wrong_body,)
+            .await,
+        Err(StoreError::CorruptData { .. })
+    ));
+    let mut wrong_scope = notice.clone();
+    wrong_scope.scope_key = "im:wrong-scope".to_owned();
+    assert!(matches!(
+        store
+            .reject_received_and_enqueue_notice(&key, InboundRejectionKind::Policy, wrong_scope,)
+            .await,
+        Err(StoreError::CorruptData { .. })
+    ));
+    let claimed = store
+        .claim_outbox_batch(i64::MAX, 2)
+        .await
+        .expect("claim original notice");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].scope_key, notice.scope_key);
+    assert_eq!(claimed[0].payload_json, notice.payload_json);
     store.shutdown().await.expect("shutdown");
 }
 
