@@ -223,3 +223,12 @@ pub const MAX_XDG_USER_DIRS_BYTES: usize = 16 * 1024;
 pub const DEFAULT_ACTIVE_TURN_PERMITS: usize = 4;
 /// Default number of independently serialized scope actors.
 pub const DEFAULT_MAX_SCOPE_ACTORS: usize = 256;
+
+/// Count bound of commands waiting for the scope router task.
+pub const ROUTER_COMMAND_CAPACITY: usize = 256;
+/// Aggregate exact persisted inbound bytes waiting in the router command queue.
+pub const ROUTER_COMMAND_BYTE_BUDGET: usize = 8 * 1024 * 1024;
+/// Hard upper bound accepted for configured concurrent active turns.
+pub const ROUTER_ACTIVE_TURN_HARD_LIMIT: usize = 64;
+/// Hard upper bound accepted for configured resident scope actors.
+pub const ROUTER_SCOPE_ACTOR_HARD_LIMIT: usize = DEFAULT_MAX_SCOPE_ACTORS;
