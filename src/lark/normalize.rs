@@ -85,6 +85,7 @@ impl fmt::Debug for InboundEvent {
             .field("event_id", &self.event_id)
             .field("message_id", &self.message_id)
             .field("chat_id", &self.chat_id)
+            .field("sender_id_len", &self.sender_id.len())
             .field("chat_type", &self.chat_type)
             .field("thread_id", &self.thread_id)
             .field("root_id", &self.root_id)

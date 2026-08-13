@@ -1024,16 +1024,28 @@ async fn atomic_rejection_notice_validates_scope_and_duplicate_identity() {
         .await
         .expect("register success");
     let success_key = InboundKey::new(tenant.clone(), success.event_id.clone());
+    let success_notice = outbox("notice-success", "notice-body");
     assert_eq!(
         store
             .reject_received_and_enqueue_notice(
                 &success_key,
                 InboundRejectionKind::Policy,
-                outbox("notice-success", "notice-body"),
+                success_notice.clone(),
             )
             .await
             .expect("atomic success"),
         InboundDisposition::Rejected
+    );
+    assert_eq!(
+        store
+            .reject_received_and_enqueue_notice(
+                &success_key,
+                InboundRejectionKind::Policy,
+                success_notice,
+            )
+            .await
+            .expect("identical retry"),
+        InboundDisposition::AlreadyRejected
     );
     assert_eq!(store.outbox_depth().await.expect("depth").pending, 1);
 

@@ -142,7 +142,7 @@ impl DurableIntake {
         let recovery = store
             .recover_received(&namespace)
             .await
-            .map_err(map_store_error)?;
+            .map_err(|error| map_store_error(&error))?;
         let hook_store = store;
         let hook_namespace = namespace;
         let hook: IntakeHook = Arc::new(move |event| {
@@ -152,7 +152,7 @@ impl DurableIntake {
                 match store
                     .register_inbound(&namespace, &event)
                     .await
-                    .map_err(map_store_error)?
+                    .map_err(|error| map_store_error(&error))?
                 {
                     DedupOutcome::New(retained) | DedupOutcome::ReplayReceived(retained) => {
                         Ok(IntakeVerdict::Enqueue(retained))
@@ -166,14 +166,14 @@ impl DurableIntake {
     }
 }
 
-fn map_store_error(error: StoreError) -> LarkError {
+fn map_store_error(error: &StoreError) -> LarkError {
     match error {
         StoreError::QueueFull
         | StoreError::Closed
         | StoreError::Io { .. }
         | StoreError::Sqlite { .. } => LarkError::retryable("persisting an inbound event"),
         StoreError::PayloadTooLarge { limit, .. } => {
-            LarkError::exhausted("persisting an inbound event payload", limit)
+            LarkError::exhausted("persisting an inbound event payload", *limit)
         }
         StoreError::CapacityExceeded { .. } => LarkError::exhausted(
             "persisting the bounded inbound collection",

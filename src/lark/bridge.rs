@@ -263,6 +263,7 @@ impl LarkBridge {
     ///
     /// Returns a classified error for credential binding, invalid limits,
     /// startup recovery overflow, HTTP setup, or bot identity failures.
+    #[allow(clippy::too_many_lines)]
     pub async fn start_with_runtime(
         endpoints: LarkEndpoints,
         creds: LarkCredentials,

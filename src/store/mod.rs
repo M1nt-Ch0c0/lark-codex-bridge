@@ -241,12 +241,32 @@ impl StoreHandle {
             .try_acquire_many_owned(permits)
             .map_err(|_| StoreError::QueueFull)?;
         let (respond, wait) = oneshot::channel();
-        let job = Box::new(move |connection: &mut Connection| {
+        let respond = Arc::new(Mutex::new(Some(respond)));
+        let execute_respond = Arc::clone(&respond);
+        let execute = Box::new(move |connection: &mut Connection| {
             let _permit = permit;
-            let _ = respond.send(job(connection));
+            let result = job(connection);
+            Box::new(move |validation: Result<(), StoreError>| {
+                let final_result = match validation {
+                    Ok(()) => result,
+                    Err(error) => Err(error),
+                };
+                if let Ok(mut respond) = execute_respond.lock()
+                    && let Some(respond) = respond.take()
+                {
+                    let _ = respond.send(final_result);
+                }
+            }) as writer::StoreCompletion
+        });
+        let reject = Box::new(move |error: StoreError| {
+            if let Ok(mut respond) = respond.lock()
+                && let Some(respond) = respond.take()
+            {
+                let _ = respond.send(Err(error));
+            }
         });
         self.sender
-            .try_send(StoreRequest::Job(job))
+            .try_send(StoreRequest::Job { execute, reject })
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => StoreError::QueueFull,
                 mpsc::error::TrySendError::Closed(_) => StoreError::Closed,
@@ -536,5 +556,37 @@ mod tests {
         );
 
         drop(reservation);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn post_job_sidecar_validation_precedes_the_typed_response() {
+        let temp = tempdir().expect("tempdir");
+        let path = temp.path().join("post-job.sqlite");
+        let store = StoreHandle::open(&path).await.expect("open");
+        let mut shm = path.as_os_str().to_os_string();
+        shm.push("-shm");
+        let shm = PathBuf::from(shm);
+        assert!(shm.exists(), "SQLite created shm");
+        let sabotage = shm.clone();
+        let result = store
+            .run(move |_connection| {
+                std::fs::remove_file(&sabotage).map_err(|_| StoreError::Io {
+                    context: "removing the sidecar in the validation test",
+                })?;
+                std::fs::create_dir(&sabotage).map_err(|_| StoreError::Io {
+                    context: "replacing the sidecar in the validation test",
+                })?;
+                Ok(())
+            })
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::InvalidPath { .. } | StoreError::Io { .. })
+            ),
+            "post-job validation error must replace typed success: {result:?}"
+        );
+        let _ = store.shutdown().await;
     }
 }

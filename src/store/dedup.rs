@@ -298,6 +298,12 @@ impl StoreHandle {
     }
 
     /// Atomically creates a starting turn and claims its received inbound rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified store error for invalid keys/state, capacity,
+    /// corruption, or any failed SQLite transaction.
+    #[allow(clippy::too_many_lines)]
     pub async fn begin_turn_and_claim_inbound(
         &self,
         turn: super::NewTurnRow,
@@ -452,6 +458,12 @@ impl StoreHandle {
     }
 
     /// Atomically terminalizes a runtime turn and all linked accepted rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified store error for an illegal/conflicting resolution,
+    /// broken cross-row invariants, or any failed SQLite transaction.
+    #[allow(clippy::too_many_lines)]
     pub async fn resolve_turn_and_finish_inbound_batch(
         &self,
         turn_row_id: i64,
@@ -622,6 +634,11 @@ impl StoreHandle {
     }
 
     /// Recovers the complete bounded current-tenant received set.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified store error when any global or tenant row violates
+    /// strict payload, association, canonical-message, count, or byte bounds.
     pub async fn recover_received(
         &self,
         tenant: &TenantNamespace,
@@ -649,6 +666,11 @@ impl StoreHandle {
     }
 
     /// Idempotently rejects one currently received row.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified store error for an unknown/corrupt row, conflicting
+    /// terminal disposition, or failed SQLite transaction.
     pub async fn reject_received(
         &self,
         key: &InboundKey,
@@ -670,6 +692,11 @@ impl StoreHandle {
     }
 
     /// Atomically enqueues a notice and rejects one currently received row.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified store error for invalid notice identity/scope,
+    /// outbox capacity, row races/invariants, or failed SQLite persistence.
     pub async fn reject_received_and_enqueue_notice(
         &self,
         key: &InboundKey,
@@ -1394,25 +1421,24 @@ fn enqueue_notice_in_transaction(
             });
         }
         return Ok(());
-    } else {
-        let (count, bytes): (i64, i64) = transaction
-            .query_row(
-                "SELECT COUNT(*), COALESCE(SUM(payload_bytes), 0) FROM outbox
-                 WHERE state IN ('pending', 'sending')",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(|error| sqlite_error("checking rejection notice capacity", &error))?;
-        if u64::try_from(count).unwrap_or(u64::MAX) >= STORE_OUTBOX_MAX_ROWS
-            || u64::try_from(bytes)
-                .unwrap_or(u64::MAX)
-                .saturating_add(payload_bytes)
-                > STORE_OUTBOX_MAX_QUEUED_BYTES
-        {
-            return Err(StoreError::CapacityExceeded {
-                context: "enqueueing an inbound rejection notice",
-            });
-        }
+    }
+    let (count, bytes): (i64, i64) = transaction
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(payload_bytes), 0) FROM outbox
+             WHERE state IN ('pending', 'sending')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| sqlite_error("checking rejection notice capacity", &error))?;
+    if u64::try_from(count).unwrap_or(u64::MAX) >= STORE_OUTBOX_MAX_ROWS
+        || u64::try_from(bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_add(payload_bytes)
+            > STORE_OUTBOX_MAX_QUEUED_BYTES
+    {
+        return Err(StoreError::CapacityExceeded {
+            context: "enqueueing an inbound rejection notice",
+        });
     }
     let now = now_ms();
     let inserted = transaction

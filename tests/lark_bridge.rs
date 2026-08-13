@@ -332,16 +332,15 @@ async fn durable_runtime_rejects_binding_mismatch_and_zero_limits() {
         SecretString::from("other-secret"),
         TenantBrand::Feishu,
     );
-    let error = match LarkBridge::start_with_runtime(
+    let Err(error) = LarkBridge::start_with_runtime(
         endpoints_for(&stub),
         other,
         BridgeConfig::default(),
         mismatch,
     )
     .await
-    {
-        Ok(_) => panic!("credential mismatch must fail"),
-        Err(error) => error,
+    else {
+        panic!("credential mismatch must fail");
     };
     assert_eq!(
         error.kind(),
@@ -355,7 +354,7 @@ async fn durable_runtime_rejects_binding_mismatch_and_zero_limits() {
     let zero = DurableIntake::prepare(store.clone(), &original)
         .await
         .expect("prepare zero");
-    let error = match LarkBridge::start_with_runtime(
+    let Err(error) = LarkBridge::start_with_runtime(
         endpoints_for(&stub),
         original,
         BridgeConfig {
@@ -365,9 +364,8 @@ async fn durable_runtime_rejects_binding_mismatch_and_zero_limits() {
         zero,
     )
     .await
-    {
-        Ok(_) => panic!("zero count bound must fail"),
-        Err(error) => error,
+    else {
+        panic!("zero count bound must fail");
     };
     assert_eq!(
         error.kind(),

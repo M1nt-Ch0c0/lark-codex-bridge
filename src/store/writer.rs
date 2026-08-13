@@ -20,12 +20,20 @@ use crate::limits::{STORE_BUSY_TIMEOUT, STORE_WRITER_CAPACITY};
 /// One request toward the writer task.
 pub(crate) enum StoreRequest {
     /// A unit of work executed against the connection. The closure carries
-    /// its own reply oneshot, so responses stay typed at the call site.
-    Job(Box<dyn FnOnce(&mut Connection) + Send>),
+    /// a delayed completion so sidecar validation can precede the reply.
+    Job {
+        /// Executes the typed operation and returns a validation-gated reply.
+        execute: Box<dyn FnOnce(&mut Connection) -> StoreCompletion + Send>,
+        /// Replies with a pre-execution validation error without running it.
+        reject: Box<dyn FnOnce(StoreError) + Send>,
+    },
     /// Graceful stop: the writer exits after every request queued ahead of
     /// this one has been processed.
     Shutdown,
 }
+
+/// Completes one typed request only after post-job validation has run.
+pub(crate) type StoreCompletion = Box<dyn FnOnce(Result<(), StoreError>) + Send>;
 
 /// Handle pieces returned by [`spawn`]: the command channel and the writer
 /// thread's join handle.
@@ -79,16 +87,21 @@ fn writer_main(
     let _ = init.send(Ok(()));
     while let Some(request) = receiver.blocking_recv() {
         match request {
-            StoreRequest::Job(job) => {
+            StoreRequest::Job { execute, reject } => {
                 if let StoreLocation::File(path) = &location
-                    && tighten_database_sidecars(path).is_err()
+                    && let Err(error) = tighten_database_sidecars(path)
                 {
+                    reject(error);
                     break;
                 }
-                job(&mut connection);
-                if let StoreLocation::File(path) = &location
-                    && tighten_database_sidecars(path).is_err()
-                {
+                let completion = execute(&mut connection);
+                let validation = match &location {
+                    StoreLocation::File(path) => tighten_database_sidecars(path),
+                    StoreLocation::InMemory => Ok(()),
+                };
+                let failed = validation.is_err();
+                completion(validation);
+                if failed {
                     break;
                 }
             }
