@@ -634,3 +634,109 @@ async fn shutdown_durably_resolves_a_running_turn_as_uncertain() {
     );
     store.shutdown().await.expect("store shutdown");
 }
+
+#[tokio::test]
+async fn message_while_running_waits_then_resumes_the_same_thread() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RecordingSink::default());
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink.clone(),
+    )
+    .await
+    .expect("router");
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("event-first-turn", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("route first turn");
+    let start_thread = control.next_request().await;
+    assert_eq!(start_thread["method"], "thread/start");
+    control
+        .respond(&start_thread, thread_result("thread-reused", &workspace))
+        .await;
+    let first_turn = control.next_request().await;
+    assert_eq!(first_turn["method"], "turn/start");
+    control
+        .respond(
+            &first_turn,
+            json!({"turn": turn("turn-first", "inProgress")}),
+        )
+        .await;
+
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("event-second-turn", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("queue second turn");
+    control
+        .expect_no_request_for(Duration::from_millis(100))
+        .await;
+    control
+        .send_json(json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-reused",
+                "turn": turn("turn-first", "completed")
+            }
+        }))
+        .await;
+
+    let resume_thread = control.next_request().await;
+    assert_eq!(resume_thread["method"], "thread/resume");
+    assert_eq!(resume_thread["params"]["threadId"], "thread-reused");
+    control
+        .respond(&resume_thread, thread_result("thread-reused", &workspace))
+        .await;
+    let second_turn = control.next_request().await;
+    assert_eq!(second_turn["method"], "turn/start");
+    assert_eq!(second_turn["params"]["threadId"], "thread-reused");
+    control
+        .respond(
+            &second_turn,
+            json!({"turn": turn("turn-second", "inProgress")}),
+        )
+        .await;
+    control
+        .send_json(json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-reused",
+                "turn": turn("turn-second", "completed")
+            }
+        }))
+        .await;
+
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-first-turn", "event-second-turn"],
+        InboundEventState::Completed,
+    )
+    .await;
+    assert_eq!(sink.finalizations.lock().expect("finalizations").len(), 2);
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
