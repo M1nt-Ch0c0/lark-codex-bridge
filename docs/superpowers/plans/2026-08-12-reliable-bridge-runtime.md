@@ -235,42 +235,130 @@ Fixtures cover: minimal config fills safe defaults; full config round-trips; unk
 
 Run the Task 1 gate set with `cargo test --test runtime_policy --locked`. Commit `feat: add bridge config and owner-only access policy`.
 
-## Task 3: Durable Inbound Dedup at the Receipt Boundary
+## Task 3: Durable Inbound Inbox and Dedup at the Receipt Boundary
 
 **Files:**
 
 - Modify: `src/lark/bridge.rs`
 - Create: `src/runtime/intake.rs`
-- Modify: `tests/store.rs` (or create `tests/runtime_intake.rs`)
+- Modify: `src/runtime/mod.rs`
+- Modify: `src/store/dedup.rs`
+- Modify: `src/store/schema.rs`
+- Modify: `src/store/mod.rs`
 - Modify: `src/limits.rs`
+- Modify: `tests/store.rs`
+- Create: `tests/runtime_intake.rs`
+- Modify: `tests/lark_bridge.rs`
 
 **Interfaces:**
 
-- Consumes: `StoreHandle::register_inbound/transition_inbound`, `LarkBridge::start_with`.
-- Produces: `IntakeHook` wiring; extended `LarkBridge`.
+- Consumes: `StoreHandle`, `LarkBridge::start_with`, normalized `InboundEvent`.
+- Produces: `DurableIntake`, `TenantNamespace`, `IntakeRuntime`, `IntakeHook`; extended `LarkBridge`.
 
-- [ ] **Step 1: Extend the bridge wiring with a pre-enqueue durability hook**
+- [ ] **Step 1: Upgrade inbound registration into a bounded replayable inbox**
 
-`LarkBridge` gains an optional hook executed inside the transport handler before the event enters the bounded channel, so the `{code: 200}` frame receipt means "durably registered in SQLite", not "parked in memory" (design §5.3):
+Add migration 2 rather than changing migration 1. `inbound_events` retains a
+versioned normalized payload and its byte length while a row is non-terminal,
+plus tenant-scoped message/state and terminal-sweep indexes. Existing v1 rows
+remain readable; a legacy `received` row without a payload makes recovery fail
+closed instead of being silently acknowledged and lost. Because the database
+now contains prompt/resource metadata, a newly created Unix database is mode
+`0600` (existing files are tightened before use); Debug/errors never expose the
+payload.
+
+`register_inbound` serializes a private strict v1 DTO (no raw frame), validates
+per-key and payload byte caps, then performs exact-event lookup, active
+same-message lookup, count+byte capacity checks, and insertion in one SQLite
+transaction. Exact `(tenant,event_id)` duplicates are absorbed in every state.
+A new event ID for the same `(tenant,message_id)` is absorbed while the prior
+row is `received`/`accepted`/`completed`; a prior `rejected` row permits a new
+registration. Duplicate lookup happens before capacity checks and never
+refreshes `updated_ms`. A `received` duplicate returns its canonical stored
+event for replay; later states return only the canonical ID/state. Terminal
+transitions clear the stored payload while retaining the dedup marker.
+
+The durable collection has independent total row/byte caps and a live
+`received` row/byte cap no larger than the production inbound channel. Startup
+recovery reads every `received` row in deterministic order and rejects overflow
+rather than partially replaying it. Tenant namespaces are fixed-length hashes
+of tenant brand + app ID (never the app secret or the broad `feishu`/`lark`
+brand alone), so two apps sharing one database cannot collide.
+
+- [ ] **Step 2: Extend bridge wiring with durable registration and startup replay**
+
+`runtime::intake::DurableIntake::prepare(store, credentials)` returns an
+`IntakeRuntime` containing a bounded startup recovery set and a hook. The hook
+is executed only for `NormalizeOutcome::Event` before the event enters the
+bounded channel:
 
 ```rust
-pub type IntakeHook = Arc<dyn Fn(InboundEvent) -> BoxFuture<'static, Result<IntakeVerdict, LarkError>> + Send + Sync>;
-pub enum IntakeVerdict { Accept, DropDuplicate }
+pub type IntakeHook = Arc<
+    dyn Fn(Box<InboundEvent>)
+        -> BoxFuture<'static, Result<IntakeVerdict, LarkError>>
+        + Send
+        + Sync,
+>;
+
+pub enum IntakeVerdict {
+    Enqueue { event: Box<InboundEvent>, retained_bytes: usize },
+    DropDuplicate,
+}
 ```
 
-`LarkBridge::start_with_runtime(endpoints, creds, config, hook)` (name may settle during implementation) installs the hook; a `DropDuplicate` verdict acks `{code: 200}` without enqueuing (the platform's redelivery is legitimately absorbed). The existing `start`/`start_with` keep their exact current behavior so milestone-2 tests stay green; the hook only runs for `NormalizeOutcome::Event`, and hook failure propagates as handler failure → `{code: 500}` receipt → platform retry (safe: registration is idempotent).
+`LarkBridge::start_with_runtime(endpoints, creds, config, intake)` first verifies
+that the complete recovery set fits the configured count+byte channel, preloads
+it with byte permits, then starts transport with the hook. Existing
+`start`/`start_with` behavior stays unchanged. `New` and `Duplicate(Received)`
+enqueue the canonical persisted event; `Accepted`/terminal duplicates ack 200
+without enqueueing. Store failure, recovery overflow, channel fullness, or byte
+budget exhaustion fail the handler/startup. A live delivery receives 200 only
+after both the SQLite commit and bounded enqueue succeed. If commit succeeds
+but enqueue/handler later fails, the platform sees 500 and a redelivery replays
+the `received` row; a process restart preloads it. Receipt loss or concurrent
+startup replay may enqueue duplicates, but Task 4's atomic
+`received → accepted` claim is the single business-execution gate.
 
-- [ ] **Step 2: Implement the intake path**
+Any store error maps to a static, content-free `LarkError` classification;
+never log `?event`, payload JSON, sender ID, text, resource keys, or dynamic
+SQLite messages. Receipt still does not mean "Codex finished"—business failure
+is reported through the durable outbox.
 
-`runtime::intake::durable_hook(store, tenant)` returns the hook: `register_inbound` inside one store transaction; `DedupOutcome::New` → `Accept` (state stays `received` until the scope actor accepts the work, Task 4), `Duplicate { state }` → `DropDuplicate` with a structured log (`event_id`, prior state only). A periodic sweeper (`DEDUP_TTL`, default 7 days; sweep interval `DEDUP_SWEEP_INTERVAL`, default 1 h) prunes terminal rows so the table stays bounded; the sweep budget (`DEDUP_SWEEP_BATCH`) caps rows per pass. Document that the receipt still does not mean "Codex finished" — business failure surfaces as a Lark reply (design §5.3).
+- [ ] **Step 3: Add bounded terminal sweeping**
 
-- [ ] **Step 3: Test dedup at the boundary**
+Change sweeping to `sweep_inbound(older_than_ms, max_rows)`, clamp it to
+`DEDUP_SWEEP_BATCH`, and delete at most that many old
+`completed`/`rejected` rows in deterministic order. `received`/`accepted` and
+new terminal rows are never swept. Define `DEDUP_TTL` (7 days),
+`DEDUP_SWEEP_INTERVAL` (1 hour), and the batch bound here; Task 8 owns the one
+cancellation-aware periodic runner and invokes a first pass at startup.
 
-Against an in-process WS server (reuse the `tests/lark_bridge.rs` harness) plus a file-backed store: first delivery accepts and enqueues; redelivery of the same `event_id` within TTL acks 200 without a second enqueue and without touching Codex; same `message_id` under a new `event_id` (platform repost) is deduplicated via the message-id index per the documented rule chosen in Step 2 (pick one rule — dedup on `(tenant, event_id)` primary and additionally absorb `(tenant, message_id)` duplicates seen in a `received/accepted/completed` state — and test it); store failure → 500 receipt → redelivery later succeeds; duplicates survive a bridge restart (reopen the same DB); sweep prunes only terminal rows past TTL.
+- [ ] **Step 4: Test crash windows, dedup semantics, and bounds**
 
-- [ ] **Step 4: Verify and publish the task**
+Store tests cover migration 1→2 and reopen, strict payload round-trip, corrupt or
+legacy live payload failure, per-field/payload/total/live count+byte edges,
+transactional concurrent exact/same-message registration, exact duplicates in
+all four states, same-message behavior including prior rejection, duplicate at
+capacity, terminal payload clearing, duplicate TTL not refreshing, recovery
+ordering/bounds, and batched terminal-only sweeping. Unix verifies DB mode
+`0600`.
 
-Run the Task 1 gate set plus `cargo test --test runtime_intake --locked` and `cargo test --test lark_bridge --locked`. Commit `feat: persist inbound dedup before Lark frame receipts`.
+Against the in-process WS harness plus a file store: the hook is called only for
+events; no receipt/queue item appears before its future resolves; first delivery
+persists then enqueues and returns 200; accepted/terminal duplicate returns 200
+without enqueueing; `received` duplicate replays the canonical stored event;
+store failure and full count/byte channel return 500; releasing capacity then
+redelivering succeeds; a 200 followed by bridge/store restart preloads the
+event exactly once before new transport traffic; startup recovery overflow
+fails closed; ignored/card paths bypass the hook; every drop/error path releases
+permits. Debug/error sentinel tests prove text, resource keys, app ID, and
+payload JSON never appear. Assert `IntakeHook` is `Send + Sync` and keep all
+test queues/fixtures count+byte bounded.
+
+- [ ] **Step 5: Verify and publish the task**
+
+Run the Task 1 gate set plus `cargo test --test runtime_intake --locked`,
+`cargo test --test lark_bridge --locked`, and `cargo test --test store --locked`.
+Commit `feat: persist a replayable inbound inbox before Lark receipts`.
 
 ## Task 4: Scope Runtime — Router, Scope Actor, Global Turn Semaphore
 
