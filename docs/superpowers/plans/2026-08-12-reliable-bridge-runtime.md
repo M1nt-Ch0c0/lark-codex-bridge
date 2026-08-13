@@ -79,7 +79,7 @@
 - Produces: `StoreHandle`, `StoreError`, `InboundEventState`, `DedupOutcome`, `ScopeRow`, `ThreadRow`, `TurnRow`, `OutboxRow`, `Migration`.
 - Consumes: `rusqlite`, `lark::normalize::{InboundEvent, ScopeKey}`.
 
-- [ ] **Step 1: Add the milestone dependency set**
+- [x] **Step 1: Add the milestone dependency set**
 
 Append to `[dependencies]` with exact pins (verify the lockfile resolves each; bump to the newest compatible patch if the pin fails to resolve and record the chosen version in the commit message):
 
@@ -90,7 +90,7 @@ sha2 = "0.11.0"
 
 `bundled` keeps CI hermetic on all three platforms; no ORM, no `sqlx`/`diesel` (design §15). No async SQLite wrapper crate: the writer task is a plain `std::thread` (or `tokio::task::spawn_blocking` loop) owned by this module.
 
-- [ ] **Step 2: Implement schema, migrations, and the single-writer store**
+- [x] **Step 2: Implement schema, migrations, and the single-writer store**
 
 ```rust
 pub struct StoreHandle { /* bounded mpsc to the writer task */ }
@@ -118,7 +118,7 @@ impl StoreHandle {
 
 All writer requests travel one bounded channel (`STORE_WRITER_CAPACITY` count; oversized payloads rejected before enqueue) and are answered by oneshot; the task processes them sequentially so every transaction has exactly one author. `payload_bytes` mirrors the serialized size so byte budgets can be enforced in queries without re-parsing.
 
-- [ ] **Step 3: Implement the typed store queries used by later tasks**
+- [x] **Step 3: Implement the typed store queries used by later tasks**
 
 Keep SQL inside `src/store/*`; callers see async methods only:
 
@@ -154,11 +154,11 @@ impl StoreHandle {
 
 Legal inbound transitions are `received → accepted → completed|rejected` (plus `received → rejected`); anything else is a `StoreError` so a duplicate redelivery in TTL can never restart Codex. Turn and outbox state machines are enforced the same way.
 
-- [ ] **Step 4: Test the store**
+- [x] **Step 4: Test the store**
 
 Cover: pragmas actually applied (`PRAGMA journal_mode` returns `wal`, foreign keys enforced by a failing insert); migrations apply once and survive reopen (`user_version` persisted); concurrent writers serialize (N tasks × M writes, final count exact); channel bound rejection; dedup register/duplicate/same-message-different-event; illegal transition rejection; TTL sweep; outbox idempotent enqueue (same `idempotency_key` returns the existing row), claim is atomic under concurrent claimers, complete records the receipt; foreign-key cascade behavior for attachment leases; reopen persistence for every table.
 
-- [ ] **Step 5: Verify and publish the task**
+- [x] **Step 5: Verify and publish the task**
 
 Run:
 
