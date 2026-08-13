@@ -16,12 +16,14 @@ use crate::config::BridgeConfig;
 use crate::lark::bridge::QueuedInboundEvent;
 use crate::limits::{
     ROUTER_ACTIVE_TURN_HARD_LIMIT, ROUTER_COMMAND_BYTE_BUDGET, ROUTER_COMMAND_CAPACITY,
-    ROUTER_SCOPE_ACTOR_HARD_LIMIT,
+    ROUTER_CONTROL_BYTE_BUDGET, ROUTER_CONTROL_CAPACITY, ROUTER_SCOPE_ACTOR_HARD_LIMIT,
+    STORE_INBOUND_SCOPE_MAX_BYTES,
 };
 use crate::runtime::intake::TenantNamespace;
 use crate::runtime::policy::{AccessDecision, AccessPolicy};
 use crate::runtime::scope::{
-    ActorRouteError, DurableReplySink, ReplySinkError, ScopeActorHandle, SupervisorAccess,
+    ActorRouteError, DurableReplySink, InterruptOutcome, ReplySinkError, ScopeActorHandle,
+    SupervisorAccess,
 };
 use crate::store::{InboundKey, InboundRejectionKind, StoreError, StoreHandle};
 
@@ -165,12 +167,14 @@ impl Router {
             return Err(error);
         }
         let (sender, receiver) = mpsc::channel(ROUTER_COMMAND_CAPACITY);
+        let (control_sender, control_receiver) = mpsc::channel(ROUTER_CONTROL_CAPACITY);
         let snapshot = Arc::new(RwLock::new(RouterSnapshot::default()));
         let task_snapshot = Arc::clone(&snapshot);
         let active_turn_capacity = settings.active_turn_permits;
         let active_turns = Arc::new(Semaphore::new(active_turn_capacity));
         let task = tokio::spawn(run_router(
             receiver,
+            control_receiver,
             store,
             tenant,
             policy,
@@ -182,7 +186,9 @@ impl Router {
         ));
         Ok(RouterHandle {
             sender,
+            control_sender,
             byte_budget: Arc::new(Semaphore::new(ROUTER_COMMAND_BYTE_BUDGET)),
+            control_byte_budget: Arc::new(Semaphore::new(ROUTER_CONTROL_BYTE_BUDGET)),
             snapshot,
             active_turns,
             active_turn_capacity,
@@ -194,7 +200,9 @@ impl Router {
 /// Client handle for routing and orderly shutdown.
 pub struct RouterHandle {
     sender: mpsc::Sender<RouterCommand>,
+    control_sender: mpsc::Sender<RouterControl>,
     byte_budget: Arc<Semaphore>,
+    control_byte_budget: Arc<Semaphore>,
     snapshot: Arc<RwLock<RouterSnapshot>>,
     active_turns: Arc<Semaphore>,
     active_turn_capacity: usize,
@@ -240,6 +248,40 @@ impl RouterHandle {
         snapshot
     }
 
+    /// Requests interruption of the active turn for one scope.
+    ///
+    /// The control travels a dedicated bounded lane so ordinary inbound
+    /// backlog cannot block `/stop` behind user messages.
+    ///
+    /// # Errors
+    ///
+    /// Returns a static classification when the control lane or router is
+    /// unavailable, or when the app-server rejects the interrupt RPC.
+    pub async fn interrupt(
+        &self,
+        scope: &crate::lark::normalize::ScopeKey,
+    ) -> Result<InterruptOutcome, RouteError> {
+        let scope_key = scope.to_string();
+        if scope_key.len() > STORE_INBOUND_SCOPE_MAX_BYTES {
+            return Err(RouteError::Capacity);
+        }
+        let bytes = u32::try_from(scope_key.len()).map_err(|_| RouteError::Capacity)?;
+        let permit = self
+            .control_byte_budget
+            .clone()
+            .try_acquire_many_owned(bytes)
+            .map_err(|_| RouteError::Capacity)?;
+        let (respond, wait) = oneshot::channel();
+        self.control_sender
+            .try_send(RouterControl::Interrupt {
+                scope_key,
+                _queue_permit: permit,
+                respond,
+            })
+            .map_err(|_| RouteError::Capacity)?;
+        wait.await.map_err(|_| RouteError::Closed)?
+    }
+
     /// Stops the router, its actors, and finally the owned supervisor.
     ///
     /// # Errors
@@ -270,9 +312,18 @@ enum RouterCommand {
     },
 }
 
+enum RouterControl {
+    Interrupt {
+        scope_key: String,
+        _queue_permit: OwnedSemaphorePermit,
+        respond: oneshot::Sender<Result<InterruptOutcome, RouteError>>,
+    },
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_router(
     mut receiver: mpsc::Receiver<RouterCommand>,
+    mut control_receiver: mpsc::Receiver<RouterControl>,
     store: StoreHandle,
     tenant: TenantNamespace,
     policy: AccessPolicy,
@@ -287,6 +338,19 @@ async fn run_router(
     let mut supervisor_open = true;
     loop {
         tokio::select! {
+            biased;
+            control = control_receiver.recv() => {
+                let Some(control) = control else { break };
+                match control {
+                    RouterControl::Interrupt { scope_key, respond, .. } => {
+                        let result = match actors.get(&scope_key) {
+                            Some(actor) => actor.interrupt().await.map_err(|()| RouteError::ActorUnavailable),
+                            None => Ok(InterruptOutcome::NoActiveTurn),
+                        };
+                        let _ = respond.send(result);
+                    }
+                }
+            }
             state = supervisor.changed(), if supervisor_open => {
                 if state.is_ok() {
                     supervisor_tx.send_replace(supervisor_access(&supervisor));

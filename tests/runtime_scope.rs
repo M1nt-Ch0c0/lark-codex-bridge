@@ -19,7 +19,9 @@ use lark_codex_bridge::limits::{ROUTER_ACTIVE_TURN_HARD_LIMIT, ROUTER_SCOPE_ACTO
 use lark_codex_bridge::runtime::intake::TenantNamespace;
 use lark_codex_bridge::runtime::policy::AccessPolicy;
 use lark_codex_bridge::runtime::router::{RouteError, Router, RouterSettings};
-use lark_codex_bridge::runtime::scope::{DurableReplySink, ReplySinkError, TurnFinalization};
+use lark_codex_bridge::runtime::scope::{
+    DurableReplySink, InterruptOutcome, ReplySinkError, TurnFinalization,
+};
 use lark_codex_bridge::store::{
     DedupOutcome, InboundEventState, InboundRejectionKind, NewOutboxRow, StoreHandle,
     TurnResolution,
@@ -327,6 +329,23 @@ async fn wait_for_inbound_states(
     })
     .await
     .expect("inbound events reach the expected state");
+}
+
+async fn wait_for_running_turn(store: &StoreHandle, codex_turn_id: &str) {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let turns = store.uncertain_turns().await.expect("live turns");
+            if turns.iter().any(|turn| {
+                turn.state == lark_codex_bridge::store::TurnState::Running
+                    && turn.codex_turn_id.as_deref() == Some(codex_turn_id)
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("turn becomes active");
 }
 
 #[tokio::test]
@@ -1193,6 +1212,107 @@ async fn policy_fingerprint_change_archives_the_old_thread_before_starting_a_new
             .codex_thread_id,
         "thread-new-policy"
     );
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn interrupt_waits_for_terminal_completion_before_the_next_turn() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RecordingSink::default());
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink,
+    )
+    .await
+    .expect("router");
+    let first = event("event-interrupt-first", "owner-runtime-scope");
+    let scope = first.scope.clone();
+    router
+        .route(queued_registered(&store, &namespace, first).await)
+        .await
+        .expect("route first turn");
+    let start_thread = control.next_request().await;
+    control
+        .respond(&start_thread, thread_result("thread-interrupt", &workspace))
+        .await;
+    let first_turn = control.next_request().await;
+    respond_turn_started(&control, &first_turn, "turn-interrupt-first").await;
+    wait_for_running_turn(&store, "turn-interrupt-first").await;
+
+    let (interrupt, ()) = tokio::join!(router.interrupt(&scope), async {
+        let request = control.next_request().await;
+        assert_eq!(request["method"], "turn/interrupt");
+        assert_eq!(request["params"]["threadId"], "thread-interrupt");
+        assert_eq!(request["params"]["turnId"], "turn-interrupt-first");
+        control.respond(&request, json!({})).await;
+    });
+    assert_eq!(
+        interrupt.expect("interrupt request"),
+        InterruptOutcome::Requested
+    );
+
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("event-interrupt-second", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("queue second turn");
+    control
+        .expect_no_request_for(Duration::from_millis(100))
+        .await;
+    send_turn_completed(
+        &control,
+        "thread-interrupt",
+        "turn-interrupt-first",
+        "interrupted",
+    )
+    .await;
+
+    let resume = control.next_request().await;
+    assert_eq!(resume["method"], "thread/resume");
+    control
+        .respond(&resume, thread_result("thread-interrupt", &workspace))
+        .await;
+    let second_turn = control.next_request().await;
+    assert_eq!(second_turn["method"], "turn/start");
+    respond_turn_started(&control, &second_turn, "turn-interrupt-second").await;
+    send_turn_completed(
+        &control,
+        "thread-interrupt",
+        "turn-interrupt-second",
+        "completed",
+    )
+    .await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-interrupt-first"],
+        InboundEventState::Rejected,
+    )
+    .await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-interrupt-second"],
+        InboundEventState::Completed,
+    )
+    .await;
     router.shutdown().await.expect("shutdown");
     store.shutdown().await.expect("store shutdown");
 }

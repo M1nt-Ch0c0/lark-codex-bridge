@@ -13,7 +13,7 @@ use tokio::time::{Instant, sleep, sleep_until};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::codex::client::{AppServerClient, AppServerEvent, ThreadId, TurnOutcome};
+use crate::codex::client::{AppServerClient, AppServerEvent, ThreadId, TurnId, TurnOutcome};
 use crate::codex::types::{
     SandboxMode, ThreadResumeParams, ThreadStartParams, TurnSandboxPolicy, TurnStartParams,
     TurnStatus, UserInput,
@@ -130,6 +130,16 @@ pub enum ScopeState {
     Failed { kind: ScopeFailureKind },
 }
 
+/// Result of a high-priority interruption request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InterruptOutcome {
+    /// The app-server accepted an interrupt for the active turn. The actor
+    /// still waits for the authoritative `turn/completed` notification.
+    Requested,
+    /// The scope has no active Codex turn.
+    NoActiveTurn,
+}
+
 /// Static scope failure category safe for snapshots and logs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScopeFailureKind {
@@ -172,6 +182,7 @@ pub(crate) struct ScopeActorHandle {
     sender: mpsc::Sender<ScopeCommand>,
     budget: Arc<Semaphore>,
     state: Arc<RwLock<ScopeState>>,
+    active_turn: Arc<RwLock<Option<ActiveTurn>>>,
     store: StoreHandle,
     supervisor: watch::Receiver<SupervisorAccess>,
     shutdown: CancellationToken,
@@ -191,6 +202,8 @@ impl ScopeActorHandle {
         let (sender, receiver) = mpsc::channel(SCOPE_MAILBOX_CAPACITY);
         let state = Arc::new(RwLock::new(ScopeState::Idle));
         let task_state = Arc::clone(&state);
+        let active_turn = Arc::new(RwLock::new(None));
+        let task_active_turn = Arc::clone(&active_turn);
         let shutdown = CancellationToken::new();
         let join = tokio::spawn(run_scope_actor(
             scope.clone(),
@@ -202,6 +215,7 @@ impl ScopeActorHandle {
             active_turns,
             sink,
             task_state,
+            task_active_turn,
             shutdown.clone(),
         ));
         Self {
@@ -209,6 +223,7 @@ impl ScopeActorHandle {
             sender,
             budget: Arc::new(Semaphore::new(SCOPE_MAILBOX_BYTE_BUDGET)),
             state,
+            active_turn,
             store,
             supervisor,
             shutdown,
@@ -253,6 +268,19 @@ impl ScopeActorHandle {
         self.state() == ScopeState::Idle && self.sender.capacity() == SCOPE_MAILBOX_CAPACITY
     }
 
+    pub(crate) async fn interrupt(&self) -> Result<InterruptOutcome, ()> {
+        let active = self.active_turn.read().map_err(|_| ())?.clone();
+        let Some(active) = active else {
+            return Ok(InterruptOutcome::NoActiveTurn);
+        };
+        active
+            .client
+            .interrupt_turn(&active.thread_id, &active.turn_id)
+            .await
+            .map_err(|_| ())?;
+        Ok(InterruptOutcome::Requested)
+    }
+
     pub(crate) async fn shutdown(mut self) {
         self.shutdown.cancel();
         if let Some(join) = self.join.take() {
@@ -268,6 +296,13 @@ pub(crate) enum ActorRouteError {
     Closed,
 }
 
+#[derive(Clone)]
+struct ActiveTurn {
+    client: Arc<AppServerClient>,
+    thread_id: ThreadId,
+    turn_id: TurnId,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_scope_actor(
     scope: ScopeKey,
@@ -279,6 +314,7 @@ async fn run_scope_actor(
     active_turns: Arc<Semaphore>,
     sink: Arc<dyn DurableReplySink>,
     state: Arc<RwLock<ScopeState>>,
+    active_turn: Arc<RwLock<Option<ActiveTurn>>>,
     shutdown: CancellationToken,
 ) {
     let mut deferred = None;
@@ -336,6 +372,7 @@ async fn run_scope_actor(
                     Arc::clone(&active_turns),
                     Arc::clone(&sink),
                     &state,
+                    &active_turn,
                     &shutdown,
                 )
                 .await;
@@ -363,6 +400,7 @@ async fn process_batch(
     active_turns: Arc<Semaphore>,
     sink: Arc<dyn DurableReplySink>,
     state: &Arc<RwLock<ScopeState>>,
+    active_turn: &RwLock<Option<ActiveTurn>>,
     shutdown: &CancellationToken,
 ) -> Result<(), ScopeFailureKind> {
     let batch = deduplicate_batch(batch);
@@ -502,6 +540,14 @@ async fn process_batch(
         return Ok(());
     }
     set_state(state, ScopeState::Running { turn_row_id });
+    set_active_turn(
+        active_turn,
+        Some(ActiveTurn {
+            client: Arc::clone(&client),
+            thread_id: ThreadId::from(thread_id.as_str()),
+            turn_id: TurnId::from(started.id.as_str()),
+        }),
+    )?;
     let outcome = loop {
         let event = tokio::select! {
             biased;
@@ -518,6 +564,7 @@ async fn process_batch(
             _ => {}
         }
     };
+    set_active_turn(active_turn, None)?;
     set_state(state, ScopeState::Finalizing { turn_row_id });
     let Some(outcome) = outcome else {
         finalize_uncertain(
@@ -837,4 +884,13 @@ fn set_state(state: &RwLock<ScopeState>, next: ScopeState) {
     if let Ok(mut state) = state.write() {
         *state = next;
     }
+}
+
+fn set_active_turn(
+    active_turn: &RwLock<Option<ActiveTurn>>,
+    next: Option<ActiveTurn>,
+) -> Result<(), ScopeFailureKind> {
+    let mut current = active_turn.write().map_err(|_| ScopeFailureKind::Client)?;
+    *current = next;
+    Ok(())
 }
