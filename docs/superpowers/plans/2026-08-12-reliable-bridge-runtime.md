@@ -630,13 +630,21 @@ Commit `feat: persist a replayable inbound inbox before Lark receipts`.
 - Create: `src/runtime/router.rs`
 - Create: `src/runtime/scope.rs`
 - Create: `tests/runtime_scope.rs`
+- Create: `tests/fakecodex/mod.rs`
+- Modify: `tests/supervisor.rs`
 - Modify: `src/runtime/mod.rs`
 - Modify: `src/limits.rs`
 
 **Interfaces:**
 
-- Consumes: `StoreHandle`, `AccessPolicy`, `SupervisorHandle`, `AppServerClient` (`start_thread`, `resume_thread`, `start_turn`, `interrupt_turn`, `subscribe`, `release_thread`), `QueuedInboundEvent`.
-- Produces: `Router`, `RouterHandle`, `ScopeActor`, `ScopeState`, `TurnRequest`, `ScopeSnapshot`.
+- Consumes: `StoreHandle`, `TenantNamespace`, validated runtime/Codex settings,
+  `AccessPolicy`, `SupervisorHandle`, `AppServerClient` (`start_thread`,
+  `resume_thread`, `start_turn`, `interrupt_turn`, `subscribe`,
+  `release_thread`), `QueuedInboundEvent`, and the durable reply sink seam
+  implemented by Task 6.
+- Produces: `Router`, `RouterHandle`, `RouterSettings`, `ScopeActor`,
+  `ScopeState`, `TurnRequest`, `TurnFinalization`, `DurableReplySink`, and
+  `ScopeSnapshot`.
 
 - [ ] **Step 1: Implement the router with bounded actor registry and the global semaphore**
 
@@ -650,7 +658,36 @@ impl RouterHandle {
 }
 ```
 
+`Router::start` takes the credential-derived `TenantNamespace` explicitly;
+the queued normalized event deliberately does not duplicate it. Every durable
+`InboundKey` is constructed from that fixed namespace plus the canonical
+persisted event ID. It also consumes a redacted `RouterSettings` value derived
+from the already validated `BridgeConfig`: optional default workspace, active
+turn and actor caps, Codex sandbox/approval/model settings, and production
+timings. A missing default workspace and missing scope row is a policy
+rejection with a durable notice, never the process cwd. Zero/oversized
+configured bounds fail startup. A narrow `start_with_settings` seam permits
+short deterministic timings in tests but enforces the same count/byte limits.
+
+The router command queue, retry lane, every scope mailbox, debounce/next-batch
+buffer, actor registry, and snapshot materialization each get count and byte
+bounds in `limits.rs`. The per-turn message cap is at most Task 3's 64-key
+atomic-claim cap, and its input-byte cap stays below the app-server outbound
+value limit. Mailbox accounting uses the durable queue item's exact persisted
+byte permit; moving an item between bridge/router/actor queues never leaves an
+unbounded or unaccounted copy. Rejecting or dropping an item releases every
+permit exactly once.
+
 The router owns `ScopeKey → mpsc::Sender<ScopeCommand>` (`MAX_SCOPE_ACTORS`, LRU-ish eviction only for actors that are `Idle` with empty mailboxes — never evict a busy scope), one `Arc<Semaphore>` with `ACTIVE_TURN_PERMITS` (default 4) shared by all actors, and the store/policy handles. Non-owner/non-mention, stale, and overload events use `reject_received_and_enqueue_notice`, so the deterministic user notice and terminal CAS are one transaction. Every scope mailbox has `SCOPE_MAILBOX_CAPACITY` count and `SCOPE_MAILBOX_BYTE_BUDGET` bytes (permits ride the queued item, matching the existing pattern); a full mailbox uses the same atomic API with the static `busy` reason (design §13.3). If the transaction cannot persist, the row remains received; retry it through a bounded router retry lane, falling back to Task 8's periodic durable Received rescan. Duplicate queue items keep their canonical `InboundKey`; actors coalesce duplicate keys before debounce, but correctness relies on the store transaction rather than memory dedup.
+
+The single router task owns the non-`Clone` `SupervisorHandle` and selects its
+state changes alongside route commands. It publishes only the latest epoch
+availability and current `Arc<AppServerClient>` through a `watch` channel to
+actors; supervisor loss is therefore not a lossy mailbox command and cannot be
+blocked behind ordinary scope traffic. Router shutdown first stops/joins every
+actor (releasing client thread routes), then shuts down the owned supervisor.
+Snapshots expose only counts, states, and short structural IDs—never prompt,
+sender, cwd, or full scope contents.
 
 - [ ] **Step 2: Implement the scope actor state machine**
 
@@ -666,6 +703,19 @@ pub enum ScopeState {
 }
 ```
 
+Task 4 must not clear an accepted payload before Task 6 can make its business
+reply durable. Define an object-safe, `Send + Sync` `DurableReplySink` seam
+using boxed futures. It creates deterministic `NewOutboxRow` notices for
+policy/stale/overload rejection and, for `TurnFinalization`, persists all
+authoritative final/failure/uncertainty rows before returning the matching
+`TurnResolution`. The actor calls
+`resolve_turn_and_finish_inbound_batch` only after that future succeeds. A sink
+failure leaves the turn and accepted inbound rows unresolved, retains the
+global permit/recovery barrier, and retries with bounded state; it never starts
+another turn for the scope. Task 4 tests use a recording sink to prove ordering;
+Task 6 supplies the real projector/outbox adapter without changing actor
+control flow.
+
 Exactly the design §7 machine (`Idle → Debouncing → WaitingPermit → StartingTurn → Running → Finalizing → Idle`, `Failed` reachable from `StartingTurn`/`Running`). Behavior:
 
 - On a user message while `Idle`, start a `SCOPE_DEBOUNCE_WINDOW` (600 ms) timer; messages arriving during the window accumulate into one batch (count `TURN_BATCH_MAX_MESSAGES`, bytes `TURN_BATCH_BYTE_BUDGET`).
@@ -676,9 +726,28 @@ Exactly the design §7 machine (`Idle → Debouncing → WaitingPermit → Start
 - Interrupt (`/stop`) calls `client.interrupt_turn` and then waits for `turn/completed` or `SCOPE_INTERRUPT_RECOVERY_TIMEOUT`; a new turn for the same scope cannot start while the old one is still active (design §7).
 - Supervisor transitions: `SupervisorHandle::changed()` delivering a non-`Ready` state durably enqueues the deterministic uncertainty notice, then atomically resolves the in-flight turn and inbound set as uncertain (the epoch died mid-flight); actors pause turn starts until `Ready` returns. Startup `thread/resume` remains lazy per scope rather than a storm, but a scope-specific recovery barrier always reconciles that scope's old work before it can start any newly received turn (design §13.1).
 
+For a stored scope, revalidation must return the exact same canonical cwd and
+current policy fingerprint. A changed/disappeared/out-of-policy path fails
+closed; a policy fingerprint change archives the old active mapping before any
+new thread is created. Pass the canonical cwd and complete configured
+sandbox/approval/network/model policy to thread start/resume and turn start,
+and revalidate immediately before each cwd-bearing RPC. Subscribe to the
+thread before `turn/start`. The client message UUID is persisted in the atomic
+begin and sent as the exact `client_user_message_id`. After `turn/start`
+returns, persist `running` plus the exact Codex turn ID before treating the
+turn as normally active; any uncertain start failure follows the durable
+uncertainty finalization path rather than retrying the RPC.
+
 - [ ] **Step 3: Test the actor against the fake app-server**
 
 Reuse `AppServerSupervisor::start_with_factory` with a scripted fake process factory: extract the private `FakeFactory`/`FakeControl` harness from `tests/supervisor.rs` into a shared integration-test helper module (e.g. `tests/fakecodex/mod.rs`) as part of this task, without changing `tests/supervisor.rs`'s scenarios. Cover: two messages inside 600 ms land in one turn (fake sees one `turn/start` with combined input); duplicate queue copies and concurrent redelivery yield one claim/turn; a mixed batch omits an already-claimed key without stranding received siblings; crash injection before the atomic begin leaves received/replayable while injection after it leaves accepted rows linked to one starting turn; a message during `Running` produces a second turn only after the first completes; semaphore saturation queues a second scope's turn and starts it when the first finishes; permit re-check rejects a message that aged out; thread reuse on matching fingerprint vs `start_thread` on fingerprint change; `release_thread` on scope eviction/shutdown so routing state cannot leak; interrupt → waits for `turn/completed` before accepting new work; supervisor `Backoff` first durably enqueues the uncertainty notice, then atomically resolves the turn as `uncertain` plus its inbound set, and blocks new turns until `Ready`; mailbox overflow rejects with a busy notice; every accepted row has `turn_row_id`, and terminal/rejected paths leave none permanently orphaned.
+
+Also cover namespace-correct `InboundKey` construction, absent-default-workspace
+rejection, zero/hard-cap settings, router/retry/mailbox count+byte exhaustion,
+supervisor state delivery while the ordinary mailbox is full, exact
+`client_user_message_id`, cwd/policy revalidation at every RPC, and the hard
+ordering `durable reply sink success → combined resolve`. A sink failure must
+leave accepted payloads and the active permit intact until a successful retry.
 
 - [ ] **Step 4: Verify and publish the task**
 
