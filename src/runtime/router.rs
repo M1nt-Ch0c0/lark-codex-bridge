@@ -1,14 +1,15 @@
 //! Bounded tenant-scoped routing into one actor per Lark scope.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
-use crate::codex::supervisor::{SupervisorError, SupervisorHandle};
+use crate::codex::supervisor::{SupervisorError, SupervisorHandle, SupervisorState};
 use crate::codex::types::{ApprovalPolicy, SandboxMode};
 use crate::config::BridgeConfig;
 use crate::lark::bridge::QueuedInboundEvent;
@@ -18,7 +19,9 @@ use crate::limits::{
 };
 use crate::runtime::intake::TenantNamespace;
 use crate::runtime::policy::{AccessDecision, AccessPolicy};
-use crate::runtime::scope::{DurableReplySink, ReplySinkError};
+use crate::runtime::scope::{
+    ActorRouteError, DurableReplySink, ReplySinkError, ScopeActorHandle, SupervisorAccess,
+};
 use crate::store::{InboundKey, InboundRejectionKind, StoreError, StoreHandle};
 
 /// Redacted, validated inputs used by the scope runtime.
@@ -168,6 +171,7 @@ impl Router {
             store,
             tenant,
             policy,
+            settings,
             supervisor,
             sink,
             task_snapshot,
@@ -253,50 +257,192 @@ enum RouterCommand {
     },
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_router(
     mut receiver: mpsc::Receiver<RouterCommand>,
     store: StoreHandle,
     tenant: TenantNamespace,
     policy: AccessPolicy,
-    supervisor: SupervisorHandle,
+    settings: RouterSettings,
+    mut supervisor: SupervisorHandle,
     sink: Arc<dyn DurableReplySink>,
     snapshot: Arc<RwLock<RouterSnapshot>>,
 ) -> Result<(), RouteError> {
-    while let Some(command) = receiver.recv().await {
-        match command {
-            RouterCommand::Route { event, respond, .. } => {
-                if let Ok(mut current) = snapshot.write() {
-                    current.queued_commands = receiver.len();
+    let active_turns = Arc::new(Semaphore::new(settings.active_turn_permits));
+    let (supervisor_tx, supervisor_rx) = watch::channel(supervisor_access(&supervisor));
+    let mut actors = HashMap::<String, ScopeActorHandle>::new();
+    let mut supervisor_open = true;
+    loop {
+        tokio::select! {
+            state = supervisor.changed(), if supervisor_open => {
+                if state.is_ok() {
+                    supervisor_tx.send_replace(supervisor_access(&supervisor));
+                } else {
+                    supervisor_open = false;
+                    supervisor_tx.send_replace(SupervisorAccess { epoch: 0, client: None });
                 }
-                let result = route_one(&store, &tenant, &policy, sink.as_ref(), *event).await;
-                let _ = respond.send(result);
             }
-            RouterCommand::Shutdown { respond } => {
-                let _ = respond.send(());
-                supervisor.shutdown().await?;
-                return Ok(());
+            command = receiver.recv() => {
+                let Some(command) = command else { break };
+                match command {
+                    RouterCommand::Route { event, respond, .. } => {
+                        let result = route_one(
+                            &store,
+                            &tenant,
+                            &policy,
+                            &settings,
+                            &supervisor_rx,
+                            Arc::clone(&active_turns),
+                            Arc::clone(&sink),
+                            &mut actors,
+                            *event,
+                        ).await;
+                        update_snapshot(
+                            &snapshot,
+                            actors.len(),
+                            receiver.len(),
+                            settings.active_turn_permits.saturating_sub(active_turns.available_permits()),
+                        );
+                        let _ = respond.send(result);
+                    }
+                    RouterCommand::Shutdown { respond } => {
+                        shutdown_actors(actors).await;
+                        supervisor.shutdown().await?;
+                        let _ = respond.send(());
+                        return Ok(());
+                    }
+                }
             }
         }
     }
+    shutdown_actors(actors).await;
     supervisor.shutdown().await?;
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn route_one(
     store: &StoreHandle,
     tenant: &TenantNamespace,
     policy: &AccessPolicy,
-    sink: &dyn DurableReplySink,
+    settings: &RouterSettings,
+    supervisor: &watch::Receiver<SupervisorAccess>,
+    active_turns: Arc<Semaphore>,
+    sink: Arc<dyn DurableReplySink>,
+    actors: &mut HashMap<String, ScopeActorHandle>,
     queued: QueuedInboundEvent,
 ) -> Result<(), RouteError> {
     let decision = policy.decide(&queued.event);
-    if decision == AccessDecision::Allow {
-        return Err(RouteError::ActorUnavailable);
-    }
     let key = InboundKey::new(tenant.clone(), queued.event.event_id.clone());
-    let notice = sink.rejection_notice(&queued.event, InboundRejectionKind::Policy)?;
+    if decision != AccessDecision::Allow {
+        return reject_with_notice(
+            store,
+            sink.as_ref(),
+            &key,
+            &queued.event,
+            InboundRejectionKind::Policy,
+        )
+        .await;
+    }
+    let scope_key = queued.event.scope.to_string();
+    if !actors.contains_key(&scope_key) {
+        if actors.len() >= settings.max_scope_actors {
+            let idle = actors
+                .iter()
+                .find_map(|(key, actor)| actor.is_idle_and_empty().then(|| key.clone()));
+            if let Some(idle) = idle {
+                if let Some(actor) = actors.remove(&idle) {
+                    actor.shutdown().await;
+                }
+            } else {
+                return reject_with_notice(
+                    store,
+                    sink.as_ref(),
+                    &key,
+                    &queued.event,
+                    InboundRejectionKind::Overloaded,
+                )
+                .await;
+            }
+        }
+        actors.insert(
+            scope_key.clone(),
+            ScopeActorHandle::spawn(
+                queued.event.scope.clone(),
+                store.clone(),
+                policy.clone(),
+                settings.clone(),
+                supervisor.clone(),
+                active_turns,
+                Arc::clone(&sink),
+            ),
+        );
+    }
+    let event = queued.event.clone();
+    let route = actors
+        .get(&scope_key)
+        .ok_or(RouteError::ActorUnavailable)?
+        .try_route(key.clone(), queued);
+    match route {
+        Ok(()) => Ok(()),
+        Err(ActorRouteError::Capacity) => {
+            reject_with_notice(
+                store,
+                sink.as_ref(),
+                &key,
+                &event,
+                InboundRejectionKind::Overloaded,
+            )
+            .await
+        }
+        Err(ActorRouteError::Closed) => Err(RouteError::ActorUnavailable),
+    }
+}
+
+async fn reject_with_notice(
+    store: &StoreHandle,
+    sink: &dyn DurableReplySink,
+    key: &InboundKey,
+    event: &crate::lark::normalize::InboundEvent,
+    reason: InboundRejectionKind,
+) -> Result<(), RouteError> {
+    let notice = sink.rejection_notice(event, reason)?;
     store
-        .reject_received_and_enqueue_notice(&key, InboundRejectionKind::Policy, notice)
+        .reject_received_and_enqueue_notice(key, reason, notice)
         .await?;
     Ok(())
+}
+
+fn supervisor_access(supervisor: &SupervisorHandle) -> SupervisorAccess {
+    let epoch = match supervisor.state() {
+        SupervisorState::Starting { epoch }
+        | SupervisorState::Ready { epoch, .. }
+        | SupervisorState::Backoff { epoch, .. } => epoch,
+        SupervisorState::Degraded { .. } | SupervisorState::Stopped => 0,
+    };
+    SupervisorAccess {
+        epoch,
+        client: supervisor.client().ok(),
+    }
+}
+
+async fn shutdown_actors(actors: HashMap<String, ScopeActorHandle>) {
+    for actor in actors.into_values() {
+        actor.shutdown().await;
+    }
+}
+
+fn update_snapshot(
+    snapshot: &RwLock<RouterSnapshot>,
+    scope_count: usize,
+    queued_commands: usize,
+    active_turns: usize,
+) {
+    if let Ok(mut current) = snapshot.write() {
+        *current = RouterSnapshot {
+            scope_count,
+            queued_commands,
+            active_turns,
+        };
+    }
 }

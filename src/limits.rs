@@ -232,3 +232,11 @@ pub const ROUTER_COMMAND_BYTE_BUDGET: usize = 8 * 1024 * 1024;
 pub const ROUTER_ACTIVE_TURN_HARD_LIMIT: usize = 64;
 /// Hard upper bound accepted for configured resident scope actors.
 pub const ROUTER_SCOPE_ACTOR_HARD_LIMIT: usize = DEFAULT_MAX_SCOPE_ACTORS;
+/// Count bound of one scope actor's totally ordered mailbox.
+pub const SCOPE_MAILBOX_CAPACITY: usize = 64;
+/// Exact persisted inbound bytes parked in one scope actor mailbox.
+pub const SCOPE_MAILBOX_BYTE_BUDGET: usize = 8 * 1024 * 1024;
+/// Maximum durable inbound rows claimed into one Codex turn.
+pub const TURN_BATCH_MAX_MESSAGES: usize = 64;
+/// Maximum normalized text bytes assembled into one Codex turn request.
+pub const TURN_BATCH_TEXT_BYTE_BUDGET: usize = 768 * 1024;

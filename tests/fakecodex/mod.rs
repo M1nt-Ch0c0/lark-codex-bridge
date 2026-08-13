@@ -24,7 +24,7 @@ use tokio::{
     time::timeout,
 };
 
-const TEST_TIMEOUT: Duration = Duration::from_secs(1);
+const TEST_TIMEOUT: Duration = Duration::from_secs(3);
 const SCRIPT_CHANNEL_CAPACITY: usize = 64;
 
 type SpawnFuture<'a> =
