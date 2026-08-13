@@ -10,3 +10,6 @@
 .DS_Store
 .idea/
 .vscode/
+
+# Local-only development handoff (not for publication)
+docs/DEVELOPMENT_HANDOFF.md
