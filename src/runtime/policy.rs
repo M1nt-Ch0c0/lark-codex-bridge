@@ -860,33 +860,54 @@ mod tests {
     }
 
     #[test]
-    fn platform_root_collections_enforce_count_and_raw_aggregate_byte_limits() {
+    fn platform_root_collections_enforce_count_limit_before_retention() {
         let temp = scratch();
         let home = temp.path().join("home");
         fs::create_dir(&home).expect("home should be created");
         let too_many = vec![temp.path().to_path_buf(); MAX_PLATFORM_PROTECTED_ROOTS + 1];
+        assert!(encoded_path_bytes(&too_many) <= MAX_PLATFORM_PROTECTED_ROOT_BYTES);
         assert!(PlatformRoots::new(&home, too_many, vec![], vec![]).is_err());
+    }
 
-        let deep_parent = temp.path().join("r".repeat(200)).join("s".repeat(100));
-        fs::create_dir_all(&deep_parent).expect("deep parent should be created");
-        let oversized = (0..MAX_PLATFORM_PROTECTED_ROOTS)
+    #[cfg(unix)]
+    #[test]
+    fn platform_root_collections_enforce_raw_aggregate_bytes_before_canonical_dedup() {
+        use std::os::unix::fs::symlink;
+
+        let temp = scratch();
+        let home = temp.path().join("home");
+        let target = temp.path().join("target");
+        fs::create_dir(&home).expect("home should be created");
+        fs::create_dir(&target).expect("short canonical target should be created");
+        let aliases = (0..MAX_PLATFORM_PROTECTED_ROOTS)
             .map(|index| {
-                let directory = deep_parent.join(format!("root-{index:02}"));
-                fs::create_dir(&directory).expect("bounded root should be created");
-                directory
+                let alias = temp
+                    .path()
+                    .join(format!("raw-{index:02}-{}", "a".repeat(230)));
+                symlink(&target, &alias).expect("long root alias should be created");
+                alias
             })
             .collect::<Vec<_>>();
-        assert_eq!(oversized.len(), MAX_PLATFORM_PROTECTED_ROOTS);
+        assert_eq!(aliases.len(), MAX_PLATFORM_PROTECTED_ROOTS);
         assert!(
-            oversized
+            aliases
                 .iter()
                 .all(|path| path.is_absolute() && path.is_dir())
         );
-        assert!(oversized.iter().all(|path| {
+        assert!(aliases.iter().all(|path| {
             path.as_os_str().as_encoded_bytes().len() < MAX_PLATFORM_PROTECTED_ROOT_BYTES
         }));
-        assert!(encoded_path_bytes(&oversized) > MAX_PLATFORM_PROTECTED_ROOT_BYTES);
-        assert!(PlatformRoots::new(&home, oversized, vec![], vec![]).is_err());
+        assert!(encoded_path_bytes(&aliases) > MAX_PLATFORM_PROTECTED_ROOT_BYTES);
+        let mut canonical = aliases
+            .iter()
+            .map(|path| fs::canonicalize(path).expect("alias should canonicalize"))
+            .collect::<Vec<_>>();
+        canonical.sort();
+        canonical.dedup();
+        assert_eq!(canonical, [fs::canonicalize(&target).unwrap()]);
+        assert!(encoded_path_bytes(&canonical) <= MAX_PLATFORM_PROTECTED_ROOT_BYTES);
+
+        assert!(PlatformRoots::new(&home, aliases, vec![], vec![]).is_err());
     }
 
     #[cfg(unix)]
