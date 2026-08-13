@@ -79,7 +79,19 @@ fn writer_main(
     let _ = init.send(Ok(()));
     while let Some(request) = receiver.blocking_recv() {
         match request {
-            StoreRequest::Job(job) => job(&mut connection),
+            StoreRequest::Job(job) => {
+                if let StoreLocation::File(path) = &location
+                    && tighten_database_sidecars(path).is_err()
+                {
+                    break;
+                }
+                job(&mut connection);
+                if let StoreLocation::File(path) = &location
+                    && tighten_database_sidecars(path).is_err()
+                {
+                    break;
+                }
+            }
             StoreRequest::Shutdown => break,
         }
     }

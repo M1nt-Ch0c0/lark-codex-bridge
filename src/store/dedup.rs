@@ -699,6 +699,11 @@ impl StoreHandle {
             if let Some(disposition) = existing {
                 return Ok(disposition);
             }
+            if notice.scope_key != stored.scope_key {
+                return Err(StoreError::CorruptData {
+                    context: "validating an inbound rejection notice scope",
+                });
+            }
             let _ = retained_from_stored(stored)?;
             enqueue_notice_in_transaction(&transaction, &notice)?;
             let disposition = reject_received_in_transaction(&transaction, &key, reason)?;
@@ -1359,15 +1364,37 @@ fn enqueue_notice_in_transaction(
             limit: u64::try_from(STORE_OUTBOX_PAYLOAD_MAX_BYTES).unwrap_or(u64::MAX),
         });
     }
-    let exists: bool = transaction
+    let existing: Option<(String, String, String, i64, i64)> = transaction
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM outbox WHERE idempotency_key = ?1)",
+            "SELECT scope_key, kind, payload_json, payload_bytes, next_retry_ms
+             FROM outbox WHERE idempotency_key = ?1",
             params![notice.idempotency_key],
-            |row| row.get(0),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
+        .optional()
         .map_err(|error| sqlite_error("checking a rejection notice key", &error))?;
     let payload_bytes = u64::try_from(notice.payload_json.len()).unwrap_or(u64::MAX);
-    if !exists {
+    if let Some((scope_key, kind, payload_json, stored_bytes, next_retry_ms)) = existing {
+        if scope_key != notice.scope_key
+            || kind != notice.kind
+            || payload_json != notice.payload_json
+            || u64::try_from(stored_bytes).ok() != Some(payload_bytes)
+            || next_retry_ms != notice.next_retry_ms
+        {
+            return Err(StoreError::CorruptData {
+                context: "validating an inbound rejection notice idempotency key",
+            });
+        }
+        return Ok(());
+    } else {
         let (count, bytes): (i64, i64) = transaction
             .query_row(
                 "SELECT COUNT(*), COALESCE(SUM(payload_bytes), 0) FROM outbox
@@ -1388,9 +1415,9 @@ fn enqueue_notice_in_transaction(
         }
     }
     let now = now_ms();
-    transaction
+    let inserted = transaction
         .execute(
-            "INSERT OR IGNORE INTO outbox
+            "INSERT INTO outbox
              (idempotency_key, scope_key, kind, payload_json, payload_bytes,
               state, attempts, next_retry_ms, created_ms, updated_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6, ?7, ?7)",
@@ -1405,6 +1432,11 @@ fn enqueue_notice_in_transaction(
             ],
         )
         .map_err(|error| sqlite_error("enqueueing an inbound rejection notice", &error))?;
+    if inserted != 1 {
+        return Err(StoreError::CorruptData {
+            context: "inserting an inbound rejection notice",
+        });
+    }
     Ok(())
 }
 

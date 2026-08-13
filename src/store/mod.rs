@@ -415,7 +415,9 @@ fn tighten_open_file(_file: &std::fs::File, _context: &'static str) -> Result<()
 
 pub(crate) fn tighten_database_sidecars(path: &Path) -> Result<(), StoreError> {
     for suffix in ["-wal", "-shm"] {
-        let sidecar = PathBuf::from(format!("{}{}", path.to_string_lossy(), suffix));
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        let sidecar = PathBuf::from(sidecar);
         let mut options = std::fs::OpenOptions::new();
         options.read(true).write(true);
         let file = match options.open(&sidecar) {

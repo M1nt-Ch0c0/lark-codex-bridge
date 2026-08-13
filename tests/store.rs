@@ -961,6 +961,22 @@ async fn recovery_is_strict_all_or_nothing_and_tenant_isolated() {
         .register_inbound(&other, &event("event-other", "message-other"))
         .await
         .expect("other");
+    store.shutdown().await.expect("shutdown before seed");
+    let connection = rusqlite::Connection::open(&path).expect("seed ordering");
+    connection
+        .execute(
+            "UPDATE inbound_events SET first_seen_ms = 10 WHERE event_id = 'event-b'",
+            [],
+        )
+        .expect("seed first");
+    connection
+        .execute(
+            "UPDATE inbound_events SET first_seen_ms = 20 WHERE event_id = 'event-a'",
+            [],
+        )
+        .expect("seed second");
+    drop(connection);
+    let store = StoreHandle::open(&path).await.expect("reopen ordered");
     let recovered = store.recover_received(&tenant).await.expect("recover");
     assert_eq!(recovered.len(), 2);
     assert_eq!(recovered[0].event().event_id, "event-b");
@@ -994,6 +1010,194 @@ async fn recovery_is_strict_all_or_nothing_and_tenant_isolated() {
         store.recover_received(&tenant).await,
         Err(StoreError::CorruptData { .. })
     ));
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn atomic_rejection_notice_validates_scope_and_duplicate_identity() {
+    let store = StoreHandle::open_in_memory().await.expect("open");
+    let tenant = tenant_namespace("cli_notice_identity");
+
+    let success = event("event-notice-success", "message-notice-success");
+    store
+        .register_inbound(&tenant, &success)
+        .await
+        .expect("register success");
+    let success_key = InboundKey::new(tenant.clone(), success.event_id.clone());
+    assert_eq!(
+        store
+            .reject_received_and_enqueue_notice(
+                &success_key,
+                InboundRejectionKind::Policy,
+                outbox("notice-success", "notice-body"),
+            )
+            .await
+            .expect("atomic success"),
+        InboundDisposition::Rejected
+    );
+    assert_eq!(store.outbox_depth().await.expect("depth").pending, 1);
+
+    let mismatch = event("event-notice-mismatch", "message-notice-mismatch");
+    store
+        .register_inbound(&tenant, &mismatch)
+        .await
+        .expect("register mismatch");
+    let mismatch_key = InboundKey::new(tenant.clone(), mismatch.event_id.clone());
+    let mut wrong_scope = outbox("notice-wrong-scope", "body");
+    wrong_scope.scope_key = "im:another-chat".to_owned();
+    assert!(matches!(
+        store
+            .reject_received_and_enqueue_notice(
+                &mismatch_key,
+                InboundRejectionKind::Policy,
+                wrong_scope,
+            )
+            .await,
+        Err(StoreError::CorruptData { .. })
+    ));
+    assert_eq!(
+        store
+            .inbound_state(&tenant, &mismatch.event_id)
+            .await
+            .expect("mismatch state"),
+        Some(InboundEventState::Received)
+    );
+
+    let conflict = event("event-notice-conflict", "message-notice-conflict");
+    store
+        .register_inbound(&tenant, &conflict)
+        .await
+        .expect("register conflict");
+    store
+        .enqueue_outbox(outbox("notice-conflict", "original-body"))
+        .await
+        .expect("seed conflicting idempotency key");
+    assert!(matches!(
+        store
+            .reject_received_and_enqueue_notice(
+                &InboundKey::new(tenant.clone(), conflict.event_id.clone()),
+                InboundRejectionKind::Policy,
+                outbox("notice-conflict", "different-body"),
+            )
+            .await,
+        Err(StoreError::CorruptData { .. })
+    ));
+    assert_eq!(
+        store
+            .inbound_state(&tenant, &conflict.event_id)
+            .await
+            .expect("conflict state"),
+        Some(InboundEventState::Received)
+    );
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn atomic_rejection_notice_rolls_back_at_real_outbox_byte_capacity() {
+    let store = StoreHandle::open_in_memory().await.expect("open");
+    let payload = "x".repeat(STORE_OUTBOX_PAYLOAD_MAX_BYTES);
+    let rows = STORE_OUTBOX_MAX_QUEUED_BYTES
+        / u64::try_from(STORE_OUTBOX_PAYLOAD_MAX_BYTES).expect("payload bytes");
+    for index in 0..rows {
+        store
+            .enqueue_outbox(outbox(&format!("capacity-{index}"), &payload))
+            .await
+            .expect("fill byte capacity");
+    }
+    let tenant = tenant_namespace("cli_notice_capacity");
+    let inbound = event("event-notice-capacity", "message-notice-capacity");
+    store
+        .register_inbound(&tenant, &inbound)
+        .await
+        .expect("register");
+    assert!(matches!(
+        store
+            .reject_received_and_enqueue_notice(
+                &InboundKey::new(tenant.clone(), inbound.event_id.clone()),
+                InboundRejectionKind::Overloaded,
+                outbox("capacity-overflow-notice", "x"),
+            )
+            .await,
+        Err(StoreError::CapacityExceeded { .. })
+    ));
+    assert_eq!(
+        store
+            .inbound_state(&tenant, &inbound.event_id)
+            .await
+            .expect("rollback state"),
+        Some(InboundEventState::Received)
+    );
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn atomic_rejection_notice_and_turn_claim_have_one_consistent_winner() {
+    let store = StoreHandle::open_in_memory().await.expect("open");
+    let tenant = tenant_namespace("cli_notice_claim_race");
+    let inbound = event("event-notice-race", "message-notice-race");
+    store
+        .register_inbound(&tenant, &inbound)
+        .await
+        .expect("register");
+    let key = InboundKey::new(tenant, inbound.event_id);
+    let claim_keys = [key.clone()];
+    let (rejected, claimed) = tokio::join!(
+        store.reject_received_and_enqueue_notice(
+            &key,
+            InboundRejectionKind::Policy,
+            outbox("race-notice", "body"),
+        ),
+        store.begin_turn_and_claim_inbound(turn("race-turn", TurnState::Starting), &claim_keys)
+    );
+    match (
+        rejected.expect("rejection result"),
+        claimed.expect("claim result"),
+    ) {
+        (InboundDisposition::Rejected, BeginTurnOutcome::NoReceived { skipped }) => {
+            assert_eq!(skipped.len(), 1);
+            assert_eq!(store.outbox_depth().await.expect("depth").pending, 1);
+        }
+        (InboundDisposition::AlreadyClaimed { .. }, BeginTurnOutcome::Started { claimed, .. }) => {
+            assert_eq!(claimed.len(), 1);
+            assert_eq!(store.outbox_depth().await.expect("depth").pending, 0);
+        }
+        other => panic!("inconsistent race outcome: {other:?}"),
+    }
+    store.shutdown().await.expect("shutdown");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn database_sidecars_are_retightened_for_non_utf8_paths() {
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let temp = tempdir().expect("tempdir");
+    let mut name = b"private-".to_vec();
+    name.push(0xff);
+    name.extend_from_slice(b".sqlite");
+    let path = temp.path().join(std::ffi::OsString::from_vec(name));
+    let store = StoreHandle::open(&path).await.expect("open non-UTF-8");
+    let mut wal = path.as_os_str().to_os_string();
+    wal.push("-wal");
+    let mut shm = path.as_os_str().to_os_string();
+    shm.push("-shm");
+    for sidecar in [&wal, &shm] {
+        let sidecar = std::path::Path::new(sidecar);
+        assert!(sidecar.exists(), "SQLite created the sidecar");
+        std::fs::set_permissions(sidecar, std::fs::Permissions::from_mode(0o666))
+            .expect("loosen sidecar");
+    }
+    store.pragmas().await.expect("request retightens sidecars");
+    for sidecar in [&wal, &shm] {
+        assert_eq!(
+            std::fs::metadata(std::path::Path::new(sidecar))
+                .expect("metadata")
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
     store.shutdown().await.expect("shutdown");
 }
 
