@@ -1,0 +1,20 @@
+owners = ["ou_owner_123456", "ou_admin_654321"]
+
+[workspace]
+allow_roots = []
+network_access = true
+
+[concurrency]
+active_turn_permits = 9
+max_scope_actors = 31
+
+[codex]
+binary = "/opt/codex/bin/codex"
+codex_home = "/opt/codex/home"
+model = "gpt-5.6"
+sandbox = "read-only"
+approval_policy = "on-request"
+
+[paths]
+database = "state/bridge.sqlite3"
+attachment_cache = "cache/attachments"

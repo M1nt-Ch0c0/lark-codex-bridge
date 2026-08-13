@@ -172,3 +172,16 @@ pub const STORE_OUTBOX_MAX_ATTEMPTS: u32 = 8;
 /// Maximum length of a stored inbound-event rejection reason; reasons are
 /// operator-facing classifications, never message content.
 pub const STORE_REJECTION_REASON_MAX_BYTES: usize = 128;
+
+/// Maximum distinct owner open IDs retained in the runtime configuration.
+pub const MAX_CONFIG_OWNERS: usize = 256;
+/// Aggregate UTF-8 byte budget for configured owner IDs.
+pub const MAX_CONFIG_OWNER_BYTES: usize = 32 * 1024;
+/// Maximum canonical workspace roots retained in the runtime configuration.
+pub const MAX_CONFIG_ALLOW_ROOTS: usize = 64;
+/// Aggregate encoded-path byte budget for configured workspace roots.
+pub const MAX_CONFIG_ALLOW_ROOT_BYTES: usize = 16 * 1024;
+/// Default concurrent active Codex turns.
+pub const DEFAULT_ACTIVE_TURN_PERMITS: usize = 4;
+/// Default number of independently serialized scope actors.
+pub const DEFAULT_MAX_SCOPE_ACTORS: usize = 256;
