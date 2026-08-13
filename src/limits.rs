@@ -181,6 +181,12 @@ pub const MAX_CONFIG_OWNER_BYTES: usize = 32 * 1024;
 pub const MAX_CONFIG_ALLOW_ROOTS: usize = 64;
 /// Aggregate encoded-path byte budget for configured workspace roots.
 pub const MAX_CONFIG_ALLOW_ROOT_BYTES: usize = 16 * 1024;
+/// Maximum distinct canonical protected roots retained by the platform policy.
+pub const MAX_PLATFORM_PROTECTED_ROOTS: usize = 64;
+/// Aggregate encoded-path byte budget for canonical protected roots.
+pub const MAX_PLATFORM_PROTECTED_ROOT_BYTES: usize = 16 * 1024;
+/// Maximum bytes parsed from the freedesktop user-directory configuration.
+pub const MAX_XDG_USER_DIRS_BYTES: usize = 16 * 1024;
 /// Default concurrent active Codex turns.
 pub const DEFAULT_ACTIVE_TURN_PERMITS: usize = 4;
 /// Default number of independently serialized scope actors.

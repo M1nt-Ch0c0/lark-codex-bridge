@@ -6,7 +6,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 use crate::codex::process::CodexProcessConfig;
@@ -41,6 +41,8 @@ pub enum ConfigError {
     AllowRootsTooLarge,
     #[error("bridge configuration contains an invalid workspace allow root")]
     InvalidAllowRoot,
+    #[error("bridge configuration contains an invalid runtime path")]
+    InvalidRuntimePath,
     #[error("bridge configuration default workspace is not permitted")]
     InvalidDefaultWorkspace,
     #[error("unable to determine safe platform filesystem roots")]
@@ -60,6 +62,7 @@ impl fmt::Debug for ConfigError {
             Self::TooManyAllowRoots => "TooManyAllowRoots",
             Self::AllowRootsTooLarge => "AllowRootsTooLarge",
             Self::InvalidAllowRoot => "InvalidAllowRoot",
+            Self::InvalidRuntimePath => "InvalidRuntimePath",
             Self::InvalidDefaultWorkspace => "InvalidDefaultWorkspace",
             Self::PlatformRoots => "PlatformRoots",
         };
@@ -85,29 +88,8 @@ impl fmt::Debug for BridgeConfig {
             .debug_struct("BridgeConfig")
             .field("owner_count", &self.owners.len())
             .field(
-                "owner_suffixes",
-                &self
-                    .owners
-                    .iter()
-                    .map(|owner| {
-                        owner
-                            .chars()
-                            .rev()
-                            .take(6)
-                            .collect::<String>()
-                            .chars()
-                            .rev()
-                            .collect::<String>()
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .field(
-                "default_workspace",
-                &self
-                    .default_workspace
-                    .as_ref()
-                    .and_then(|path| fs::canonicalize(path).ok())
-                    .map(|path| path.display().to_string()),
+                "default_workspace_configured",
+                &self.default_workspace.is_some(),
             )
             .field("workspace", &self.workspace)
             .field("concurrency", &self.concurrency)
@@ -209,8 +191,8 @@ impl BridgeConfig {
                 .map_err(|_| ConfigError::Read)?
                 .join(parent)
         };
-        self.paths.database = resolve_relative_path(&parent, &self.paths.database);
-        self.paths.attachment_cache = resolve_relative_path(&parent, &self.paths.attachment_cache);
+        self.paths.database = resolve_relative_path(&parent, &self.paths.database)?;
+        self.paths.attachment_cache = resolve_relative_path(&parent, &self.paths.attachment_cache)?;
         Ok(())
     }
 }
@@ -265,14 +247,6 @@ impl fmt::Debug for WorkspacePolicy {
         formatter
             .debug_struct("WorkspacePolicy")
             .field("allow_root_count", &self.allow_roots.len())
-            .field(
-                "canonical_allow_roots",
-                &self
-                    .allow_roots
-                    .iter()
-                    .filter_map(|path| fs::canonicalize(path).ok())
-                    .collect::<Vec<_>>(),
-            )
             .field("network_access", &self.network_access)
             .finish()
     }
@@ -296,14 +270,110 @@ impl Default for ConcurrencyConfig {
 }
 
 /// Codex process and policy settings.
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Clone, Serialize)]
 pub struct CodexSection {
     pub binary: PathBuf,
     pub codex_home: Option<PathBuf>,
     pub model: Option<String>,
     pub sandbox: SandboxMode,
     pub approval_policy: ApprovalPolicy,
+}
+
+impl<'de> Deserialize<'de> for CodexSection {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let config = CodexSectionConfig::deserialize(deserializer)?;
+        Ok(Self {
+            binary: config.binary,
+            codex_home: config.codex_home,
+            model: config.model,
+            sandbox: config.sandbox,
+            approval_policy: config.approval_policy.into(),
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct CodexSectionConfig {
+    binary: PathBuf,
+    codex_home: Option<PathBuf>,
+    model: Option<String>,
+    sandbox: SandboxMode,
+    approval_policy: ConfigApprovalPolicy,
+}
+
+impl Default for CodexSectionConfig {
+    fn default() -> Self {
+        let defaults = CodexSection::default();
+        Self {
+            binary: defaults.binary,
+            codex_home: defaults.codex_home,
+            model: defaults.model,
+            sandbox: defaults.sandbox,
+            approval_policy: ConfigApprovalPolicy::default(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ConfigApprovalPolicy {
+    Named(String),
+    Granular(StrictGranularApprovalWrapper),
+}
+
+impl Default for ConfigApprovalPolicy {
+    fn default() -> Self {
+        Self::Named("never".to_owned())
+    }
+}
+
+impl From<ConfigApprovalPolicy> for ApprovalPolicy {
+    fn from(policy: ConfigApprovalPolicy) -> Self {
+        match policy {
+            ConfigApprovalPolicy::Named(name) => Self::Named(name),
+            ConfigApprovalPolicy::Granular(wrapper) => Self::Granular {
+                granular: wrapper.granular.into(),
+            },
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictGranularApprovalWrapper {
+    granular: StrictGranularApprovalPolicy,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)] // Mirrors the five RPC approval switches exactly.
+struct StrictGranularApprovalPolicy {
+    #[serde(default)]
+    mcp_elicitations: bool,
+    #[serde(default)]
+    rules: bool,
+    #[serde(default)]
+    sandbox_approval: bool,
+    #[serde(default)]
+    request_permissions: bool,
+    #[serde(default)]
+    skill_approval: bool,
+}
+
+impl From<StrictGranularApprovalPolicy> for crate::codex::types::GranularApprovalPolicy {
+    fn from(policy: StrictGranularApprovalPolicy) -> Self {
+        Self {
+            mcp_elicitations: policy.mcp_elicitations,
+            rules: policy.rules,
+            sandbox_approval: policy.sandbox_approval,
+            request_permissions: policy.request_permissions,
+            skill_approval: policy.skill_approval,
+        }
+    }
 }
 
 impl Default for CodexSection {
@@ -375,11 +445,35 @@ impl fmt::Debug for PathsSection {
     }
 }
 
-fn resolve_relative_path(parent: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        return path.to_path_buf();
+fn resolve_relative_path(parent: &Path, path: &Path) -> Result<PathBuf, ConfigError> {
+    if !parent.is_absolute() {
+        return Err(ConfigError::InvalidRuntimePath);
     }
-    lexical_normalize(&parent.join(path))
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    #[cfg(windows)]
+    if path.has_root() || matches!(path.components().next(), Some(Component::Prefix(_))) {
+        return Err(ConfigError::InvalidRuntimePath);
+    }
+    Ok(lexical_normalize(&parent.join(path)))
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drive_relative_and_root_relative_runtime_paths_fail_closed() {
+        let parent = Path::new(r"C:\config\lark-codex-bridge");
+
+        assert!(resolve_relative_path(parent, Path::new(r"C:state\bridge.sqlite3")).is_err());
+        assert!(resolve_relative_path(parent, Path::new(r"\state\bridge.sqlite3")).is_err());
+        assert_eq!(
+            resolve_relative_path(parent, Path::new(r"state\bridge.sqlite3")).unwrap(),
+            parent.join(r"state\bridge.sqlite3")
+        );
+    }
 }
 
 fn lexical_normalize(path: &Path) -> PathBuf {

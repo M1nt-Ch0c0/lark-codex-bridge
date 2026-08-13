@@ -7,9 +7,7 @@ use lark_codex_bridge::config::{
 };
 use lark_codex_bridge::lark::api::ChatMode;
 use lark_codex_bridge::lark::normalize::{InboundEvent, ScopeKey};
-use lark_codex_bridge::runtime::policy::{
-    AccessDecision, AccessPolicy, PlatformRoots, WorkspaceRejection,
-};
+use lark_codex_bridge::runtime::policy::{AccessDecision, AccessPolicy, WorkspaceRejection};
 use tempfile::TempDir;
 
 const MINIMAL_CONFIG: &str = include_str!("fixtures/runtime/config_minimal.toml");
@@ -42,6 +40,17 @@ fn event(sender: &str, chat_type: ChatMode, mentions_bot: bool) -> InboundEvent 
     }
 }
 
+fn event_with_mentions(
+    sender: &str,
+    chat_type: ChatMode,
+    mentions_bot: bool,
+    mention_all: bool,
+) -> InboundEvent {
+    let mut event = event(sender, chat_type, mentions_bot);
+    event.mention_all = mention_all;
+    event
+}
+
 fn policy_config(allow_root: PathBuf) -> BridgeConfig {
     BridgeConfig {
         owners: vec!["ou_owner_123456".to_owned()],
@@ -56,22 +65,29 @@ fn policy_config(allow_root: PathBuf) -> BridgeConfig {
     }
 }
 
-fn roots(base: &Path) -> PlatformRoots {
-    let home = base.join("home");
-    let temp = base.join("temp");
-    let system = base.join("system");
-    let desktop = home.join("Desktop");
-    let downloads = home.join("Downloads");
-    for path in [&home, &temp, &system, &desktop, &downloads] {
-        fs::create_dir_all(path).expect("test root should be created");
-    }
-    PlatformRoots::new(&home, &temp, vec![system], Some(desktop), Some(downloads))
-        .expect("test roots should be canonicalized")
+fn policy(allow_root: PathBuf) -> AccessPolicy {
+    AccessPolicy::from_config(&policy_config(allow_root)).expect("safe test policy should build")
 }
 
-fn policy(base: &Path, allow_root: PathBuf) -> AccessPolicy {
-    AccessPolicy::with_platform_roots(&policy_config(allow_root), &roots(base))
-        .expect("safe test policy should build")
+fn production_home() -> PathBuf {
+    #[cfg(windows)]
+    {
+        std::env::var_os("USERPROFILE")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                let drive = std::env::var_os("HOMEDRIVE")?;
+                let path = std::env::var_os("HOMEPATH")?;
+                Some(PathBuf::from(drive).join(path))
+            })
+            .expect("test environment should expose its home directory")
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .expect("test environment should expose its home directory")
+    }
 }
 
 #[test]
@@ -126,6 +142,12 @@ fn full_config_round_trips_and_resolves_only_runtime_relative_paths() {
         temp.path().join("cache/attachments")
     );
     assert_eq!(config.codex.binary, PathBuf::from("/opt/codex/bin/codex"));
+
+    let encoded = toml::to_string(&config).expect("full config should serialize");
+    let reparsed = toml::from_str::<BridgeConfig>(&encoded).expect("full config should reparse");
+    assert_eq!(reparsed.owners, config.owners);
+    assert_eq!(reparsed.codex.approval_policy, config.codex.approval_policy);
+    assert_eq!(reparsed.paths.database, config.paths.database);
 }
 
 #[test]
@@ -138,6 +160,107 @@ fn config_rejects_unknown_keys_at_every_schema_level() {
         "owners = [\"ou_owner_123456\"]\n[paths]\nunexpected = true",
     ] {
         assert!(toml::from_str::<BridgeConfig>(source).is_err());
+    }
+}
+
+#[test]
+fn granular_approval_rejects_unknown_wrapper_and_inner_keys() {
+    let wrapper_unknown = r#"
+owners = ["ou_owner_123456"]
+
+[codex.approval_policy]
+unexpected_wrapper = true
+
+[codex.approval_policy.granular]
+mcp_elicitations = false
+rules = false
+sandbox_approval = false
+request_permissions = false
+skill_approval = false
+"#;
+    let inner_unknown = r#"
+owners = ["ou_owner_123456"]
+
+[codex.approval_policy.granular]
+mcp_elicitations = false
+rules = false
+sandbox_approval = false
+request_permissions = false
+skill_approval = false
+unexpected_inner = true
+"#;
+
+    assert!(toml::from_str::<BridgeConfig>(wrapper_unknown).is_err());
+    assert!(toml::from_str::<BridgeConfig>(inner_unknown).is_err());
+}
+
+#[test]
+fn valid_granular_approval_converts_to_the_rpc_policy_type() {
+    let source = r#"
+owners = ["ou_owner_123456"]
+
+[codex.approval_policy.granular]
+mcp_elicitations = true
+rules = false
+sandbox_approval = true
+request_permissions = false
+skill_approval = true
+"#;
+
+    let config =
+        toml::from_str::<BridgeConfig>(source).expect("strict granular policy should parse");
+    assert_eq!(
+        config.codex.approval_policy,
+        ApprovalPolicy::Granular {
+            granular: GranularApprovalPolicy {
+                mcp_elicitations: true,
+                rules: false,
+                sandbox_approval: true,
+                request_permissions: false,
+                skill_approval: true,
+            },
+        }
+    );
+    let encoded = toml::to_string(&config).expect("valid granular config should serialize");
+    let reparsed =
+        toml::from_str::<BridgeConfig>(&encoded).expect("serialized granular config should parse");
+    assert_eq!(reparsed.codex.approval_policy, config.codex.approval_policy);
+}
+
+#[test]
+fn granular_approval_omissions_default_every_bit_to_false() {
+    let empty = r#"
+owners = ["ou_owner_123456"]
+
+[codex.approval_policy.granular]
+"#;
+    let config = toml::from_str::<BridgeConfig>(empty)
+        .expect("an empty granular policy should conservatively parse");
+    assert_eq!(
+        config.codex.approval_policy,
+        ApprovalPolicy::Granular {
+            granular: granular_all_false(),
+        }
+    );
+
+    let fields = [
+        "mcp_elicitations",
+        "rules",
+        "sandbox_approval",
+        "request_permissions",
+        "skill_approval",
+    ];
+    for (field, expected) in fields.into_iter().zip(granular_single_bit_policies()) {
+        let source = format!(
+            "owners = [\"ou_owner_123456\"]\n\n[codex.approval_policy.granular]\n{field} = true\n"
+        );
+        let config = toml::from_str::<BridgeConfig>(&source)
+            .expect("a single granular override should conservatively parse");
+        assert_eq!(
+            config.codex.approval_policy,
+            ApprovalPolicy::Granular { granular: expected },
+            "unexpected default for {field}"
+        );
     }
 }
 
@@ -170,12 +293,55 @@ fn config_rejects_missing_owners_and_oversized_owner_or_root_collections() {
     assert!(config.validate().is_err());
 }
 
+#[cfg(unix)]
+#[test]
+fn config_rechecks_allow_root_bytes_after_canonicalization() {
+    use std::os::unix::fs::symlink;
+
+    let temp = scratch();
+    let deep = temp
+        .path()
+        .join("canonical-targets")
+        .join("x".repeat(200))
+        .join("y".repeat(100));
+    fs::create_dir_all(&deep).expect("deep canonical target should be created");
+    let mut aliases = Vec::new();
+    for index in 0..lark_codex_bridge::limits::MAX_CONFIG_ALLOW_ROOTS {
+        let target = deep.join(format!("target-{index:02}"));
+        fs::create_dir(&target).expect("distinct canonical target should be created");
+        let alias = temp.path().join(format!("alias-{index:02}"));
+        symlink(target, &alias).expect("short allow-root alias should be created");
+        aliases.push(alias);
+    }
+    let raw_bytes = aliases
+        .iter()
+        .map(|path| path.as_os_str().as_encoded_bytes().len())
+        .sum::<usize>();
+    let canonical_bytes = aliases
+        .iter()
+        .map(|path| {
+            fs::canonicalize(path)
+                .expect("alias should canonicalize")
+                .as_os_str()
+                .as_encoded_bytes()
+                .len()
+        })
+        .sum::<usize>();
+    assert!(raw_bytes <= lark_codex_bridge::limits::MAX_CONFIG_ALLOW_ROOT_BYTES);
+    assert!(canonical_bytes > lark_codex_bridge::limits::MAX_CONFIG_ALLOW_ROOT_BYTES);
+
+    let mut config = policy_config(aliases.remove(0));
+    config.workspace.allow_roots.extend(aliases);
+
+    assert!(config.validate().is_err());
+}
+
 #[test]
 fn owner_and_direct_mention_gate_uses_chat_mode_not_scope() {
     let temp = scratch();
     let allowed = temp.path().join("safe");
     fs::create_dir_all(&allowed).expect("safe root should be created");
-    let policy = policy(temp.path(), allowed);
+    let policy = policy(allowed);
 
     assert_eq!(
         policy.decide(&event("ou_owner_123456", ChatMode::P2p, false)),
@@ -186,7 +352,20 @@ fn owner_and_direct_mention_gate_uses_chat_mode_not_scope() {
         AccessDecision::DenyNotOwner
     );
     assert_eq!(
+        policy.decide(&event("ou_stranger", ChatMode::Group, false)),
+        AccessDecision::DenyNotOwner
+    );
+    assert_eq!(
         policy.decide(&event("ou_owner_123456", ChatMode::Group, false)),
+        AccessDecision::DenyMissingMention
+    );
+    assert_eq!(
+        policy.decide(&event_with_mentions(
+            "ou_owner_123456",
+            ChatMode::Group,
+            false,
+            true,
+        )),
         AccessDecision::DenyMissingMention
     );
     assert_eq!(
@@ -207,7 +386,7 @@ fn workspace_validator_fails_closed_and_canonicalizes_safe_aliases() {
     let outside = temp.path().join("outside");
     fs::create_dir_all(&project).expect("project should be created");
     fs::create_dir_all(&outside).expect("outside should be created");
-    let policy = policy(temp.path(), allowed.clone());
+    let policy = policy(allowed.clone());
 
     assert_eq!(
         policy.validate_workspace(Path::new("project")),
@@ -242,44 +421,26 @@ fn workspace_validator_fails_closed_and_canonicalizes_safe_aliases() {
 }
 
 #[test]
-fn workspace_validator_hard_denies_injected_roots_before_allow_roots() {
+fn production_policy_hard_denies_filesystem_and_home_roots() {
     let temp = scratch();
-    let all = temp.path().to_path_buf();
-    let broad_policy = policy(temp.path(), all);
-    let injected = roots(temp.path());
+    let safe = temp.path().join("safe");
+    fs::create_dir_all(&safe).expect("safe root should be created");
+    let policy = policy(safe);
 
-    #[cfg(unix)]
+    let home = production_home();
     assert_eq!(
-        broad_policy.validate_workspace(Path::new("/")),
-        Err(WorkspaceRejection::FilesystemRoot)
-    );
-    assert_eq!(
-        broad_policy.validate_workspace(&injected.home),
+        policy.validate_workspace(&home),
         Err(WorkspaceRejection::HomeRoot)
     );
+    for broad_root in [home.join("Desktop"), home.join("Downloads")] {
+        if broad_root.is_dir() {
+            assert!(AccessPolicy::from_config(&policy_config(broad_root)).is_err());
+        }
+    }
+    #[cfg(unix)]
     assert_eq!(
-        broad_policy.validate_workspace(&injected.temp),
-        Err(WorkspaceRejection::TempTree)
-    );
-    assert_eq!(
-        broad_policy.validate_workspace(&injected.system_trees[0]),
-        Err(WorkspaceRejection::SystemTree)
-    );
-    assert_eq!(
-        broad_policy.validate_workspace(injected.desktop.as_ref().unwrap()),
-        Err(WorkspaceRejection::DesktopOrDownloads)
-    );
-    assert_eq!(
-        broad_policy.validate_workspace(injected.downloads.as_ref().unwrap()),
-        Err(WorkspaceRejection::DesktopOrDownloads)
-    );
-
-    let safe_home = injected.home.join("safe-project");
-    fs::create_dir_all(&safe_home).expect("safe home child should be created");
-    let safe_policy = policy(temp.path(), safe_home.clone());
-    assert_eq!(
-        safe_policy.validate_workspace(&safe_home).unwrap(),
-        fs::canonicalize(safe_home).unwrap()
+        policy.validate_workspace(Path::new("/")),
+        Err(WorkspaceRejection::FilesystemRoot)
     );
 }
 
@@ -294,7 +455,7 @@ fn workspace_validator_rejects_symlink_escape() {
     fs::create_dir_all(&allowed).expect("safe root should be created");
     fs::create_dir_all(&outside).expect("outside root should be created");
     symlink(&outside, allowed.join("escape")).expect("symlink should be created");
-    let policy = policy(temp.path(), allowed);
+    let policy = policy(allowed);
 
     assert_eq!(
         policy.validate_workspace(&temp.path().join("safe/escape")),
@@ -331,15 +492,69 @@ fn canonical_allow_roots_are_deduplicated_and_default_workspace_must_be_usable()
 }
 
 #[test]
+fn policy_construction_rejects_missing_file_and_protected_allow_roots() {
+    let temp = scratch();
+    let missing = temp.path().join("missing");
+    assert!(AccessPolicy::from_config(&policy_config(missing)).is_err());
+
+    let file = temp.path().join("file");
+    fs::write(&file, "not a directory").expect("allow-root file should be created");
+    assert!(AccessPolicy::from_config(&policy_config(file)).is_err());
+
+    let home = production_home();
+    assert!(AccessPolicy::from_config(&policy_config(home)).is_err());
+
+    #[cfg(unix)]
+    {
+        assert!(AccessPolicy::from_config(&policy_config(PathBuf::from("/"))).is_err());
+        assert!(AccessPolicy::from_config(&policy_config(PathBuf::from("/tmp"))).is_err());
+        assert!(AccessPolicy::from_config(&policy_config(PathBuf::from("/etc"))).is_err());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn policy_construction_rejects_dangling_allow_root() {
+    use std::os::unix::fs::symlink;
+
+    let temp = scratch();
+    let dangling = temp.path().join("dangling");
+    symlink(temp.path().join("absent-target"), &dangling).expect("dangling symlink should build");
+
+    assert!(AccessPolicy::from_config(&policy_config(dangling)).is_err());
+}
+
+#[test]
 fn fingerprint_is_stable_for_aliases_and_changes_for_every_policy_dimension() {
     let temp = scratch();
     let safe = temp.path().join("safe");
     let one = safe.join("one");
     let two = safe.join("two");
+    let outside = temp.path().join("outside");
     fs::create_dir_all(&one).expect("workspace should be created");
     fs::create_dir_all(&two).expect("workspace should be created");
-    let baseline = policy(temp.path(), safe.clone());
+    fs::create_dir_all(&outside).expect("outside workspace should be created");
+    let baseline = policy(safe.clone());
     let first = baseline.fingerprint(&one).unwrap();
+    assert_eq!(first.as_str().len(), 32);
+    assert!(
+        first
+            .as_str()
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    );
+    assert_eq!(
+        baseline.fingerprint(Path::new("relative-workspace")),
+        Err(WorkspaceRejection::Relative)
+    );
+    assert_eq!(
+        baseline.fingerprint(&safe.join("missing-workspace")),
+        Err(WorkspaceRejection::Inaccessible)
+    );
+    assert_eq!(
+        baseline.fingerprint(&outside),
+        Err(WorkspaceRejection::OutsideAllowRoots)
+    );
     assert_eq!(first, baseline.fingerprint(&safe.join("one/.")).unwrap());
     assert_ne!(first, baseline.fingerprint(&two).unwrap());
 
@@ -354,29 +569,57 @@ fn fingerprint_is_stable_for_aliases_and_changes_for_every_policy_dimension() {
 
     let mut sandbox_config = policy_config(safe.clone());
     sandbox_config.codex.sandbox = SandboxMode::ReadOnly;
-    let sandbox = AccessPolicy::with_platform_roots(&sandbox_config, &roots(temp.path())).unwrap();
-    assert_ne!(first, sandbox.fingerprint(&one).unwrap());
+    let sandbox = AccessPolicy::from_config(&sandbox_config).unwrap();
+    let read_only_fingerprint = sandbox.fingerprint(&one).unwrap();
+    assert_ne!(first, read_only_fingerprint);
+
+    let mut danger_config = policy_config(safe.clone());
+    danger_config.codex.sandbox = SandboxMode::DangerFullAccess;
+    let danger = AccessPolicy::from_config(&danger_config).unwrap();
+    let danger_fingerprint = danger.fingerprint(&one).unwrap();
+    assert_ne!(first, danger_fingerprint);
+    assert_ne!(read_only_fingerprint, danger_fingerprint);
 
     let mut named_config = policy_config(safe.clone());
     named_config.codex.approval_policy = ApprovalPolicy::Named("on-request".to_owned());
-    let named = AccessPolicy::with_platform_roots(&named_config, &roots(temp.path())).unwrap();
+    let named = AccessPolicy::from_config(&named_config).unwrap();
     assert_ne!(first, named.fingerprint(&one).unwrap());
 
-    for granular in granular_policies() {
-        let mut granular_config = policy_config(safe.clone());
-        granular_config.codex.approval_policy = ApprovalPolicy::Granular { granular };
-        let granular_policy =
-            AccessPolicy::with_platform_roots(&granular_config, &roots(temp.path())).unwrap();
-        assert_ne!(first, granular_policy.fingerprint(&one).unwrap());
+    let mut granular_config = policy_config(safe.clone());
+    granular_config.codex.approval_policy = ApprovalPolicy::Granular {
+        granular: granular_all_false(),
+    };
+    let granular_baseline = AccessPolicy::from_config(&granular_config).unwrap();
+    let granular_baseline_fingerprint = granular_baseline.fingerprint(&one).unwrap();
+    assert_ne!(first, granular_baseline_fingerprint);
+
+    for granular in granular_single_bit_policies() {
+        let mut changed = policy_config(safe.clone());
+        changed.codex.approval_policy = ApprovalPolicy::Granular { granular };
+        let changed = AccessPolicy::from_config(&changed).unwrap();
+        assert_ne!(
+            granular_baseline_fingerprint,
+            changed.fingerprint(&one).unwrap()
+        );
     }
 
     let mut network_config = policy_config(safe);
     network_config.workspace.network_access = true;
-    let network = AccessPolicy::with_platform_roots(&network_config, &roots(temp.path())).unwrap();
+    let network = AccessPolicy::from_config(&network_config).unwrap();
     assert_ne!(first, network.fingerprint(&one).unwrap());
 }
 
-fn granular_policies() -> [GranularApprovalPolicy; 5] {
+fn granular_all_false() -> GranularApprovalPolicy {
+    GranularApprovalPolicy {
+        mcp_elicitations: false,
+        rules: false,
+        sandbox_approval: false,
+        request_permissions: false,
+        skill_approval: false,
+    }
+}
+
+fn granular_single_bit_policies() -> [GranularApprovalPolicy; 5] {
     [
         GranularApprovalPolicy {
             mcp_elicitations: true,
@@ -431,7 +674,7 @@ fn debug_and_error_output_never_echo_sensitive_config_or_requested_paths() {
     assert!(!debug.contains("ou_extremely_sensitive_owner_123456"));
     assert!(!debug.contains("/outside/secret"));
 
-    let policy = AccessPolicy::with_platform_roots(&config, &roots(temp.path())).unwrap();
+    let policy = AccessPolicy::from_config(&config).unwrap();
     let rejected = policy
         .validate_workspace(&temp.path().join("private-requested-path"))
         .unwrap_err();
@@ -440,4 +683,34 @@ fn debug_and_error_output_never_echo_sensitive_config_or_requested_paths() {
     assert!(!format!("{policy:?}").contains("ou_extremely_sensitive_owner_123456"));
     let config_error = BridgeConfig::default().validate().unwrap_err();
     assert!(!format!("{config_error:?} {config_error}").contains("private-requested-path"));
+    let decision = AccessDecision::DenyWorkspace {
+        reason: "STATIC_REASON_SENTINEL",
+    };
+    assert_eq!(format!("{decision:?}"), "DenyWorkspace");
+}
+
+#[test]
+fn unvalidated_config_debug_shows_only_counts_presence_and_static_summaries() {
+    let temp = scratch();
+    let path_sentinel = temp.path().join("debug-path-sentinel");
+    fs::create_dir_all(&path_sentinel).expect("debug sentinel directory should be created");
+    let mut config = policy_config(path_sentinel.clone());
+    config.owners = vec!["ou_sensitive_OWNER_FRAGMENT".to_owned()];
+    config.default_workspace = Some(path_sentinel.clone());
+    config.codex.binary = path_sentinel.join("binary-sentinel");
+    config.codex.codex_home = Some(path_sentinel.join("home-sentinel"));
+    config.paths.database = path_sentinel.join("database-sentinel");
+    config.paths.attachment_cache = path_sentinel.join("cache-sentinel");
+
+    let debug = format!("{config:?}");
+
+    assert!(debug.contains("owner_count: 1"));
+    assert!(debug.contains("default_workspace_configured: true"));
+    assert!(debug.contains("allow_root_count: 1"));
+    assert!(!debug.contains("OWNER_FRAGMENT"));
+    assert!(!debug.contains(&path_sentinel.display().to_string()));
+    assert!(!debug.contains("binary-sentinel"));
+    assert!(!debug.contains("database-sentinel"));
+    assert!(!debug.contains("cache-sentinel"));
+    assert!(!format!("{:?}", config.workspace).contains(&path_sentinel.display().to_string()));
 }
