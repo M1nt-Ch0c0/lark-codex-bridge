@@ -372,7 +372,16 @@ async fn process_batch(
         return Ok(());
     }
     let batch = eligible;
-    let (cwd, fingerprint) = prepare_workspace(scope, store, policy, settings).await?;
+    let (cwd, fingerprint) = match prepare_workspace(scope, store, policy, settings).await {
+        Ok(workspace) => workspace,
+        Err(ScopeFailureKind::Policy) => {
+            for item in &batch {
+                reject_item(store, sink.as_ref(), item, InboundRejectionKind::Policy).await?;
+            }
+            return Ok(());
+        }
+        Err(kind) => return Err(kind),
+    };
     let client = wait_for_client(&mut supervisor, shutdown).await?;
     set_state(state, ScopeState::StartingTurn);
     let thread_id = tokio::select! {

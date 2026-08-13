@@ -12,9 +12,10 @@ use lark_codex_bridge::lark::bridge::QueuedInboundEvent;
 use lark_codex_bridge::lark::config::TenantBrand;
 use lark_codex_bridge::lark::credentials::LarkCredentials;
 use lark_codex_bridge::lark::normalize::{InboundEvent, ScopeKey};
+use lark_codex_bridge::limits::{ROUTER_ACTIVE_TURN_HARD_LIMIT, ROUTER_SCOPE_ACTOR_HARD_LIMIT};
 use lark_codex_bridge::runtime::intake::TenantNamespace;
 use lark_codex_bridge::runtime::policy::AccessPolicy;
-use lark_codex_bridge::runtime::router::{Router, RouterSettings};
+use lark_codex_bridge::runtime::router::{RouteError, Router, RouterSettings};
 use lark_codex_bridge::runtime::scope::{DurableReplySink, ReplySinkError, TurnFinalization};
 use lark_codex_bridge::store::{
     DedupOutcome, InboundEventState, InboundRejectionKind, NewOutboxRow, StoreHandle,
@@ -140,6 +141,23 @@ async fn ready_supervisor() -> (
     .await
     .expect("ready supervisor");
     (supervisor, control)
+}
+
+async fn assert_invalid_router_settings(config: &BridgeConfig) {
+    let policy = AccessPolicy::from_config(config).expect("policy");
+    let settings = RouterSettings::from_config(config);
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let result = Router::start(
+        store.clone(),
+        TenantNamespace::from_credentials(&credentials()),
+        policy,
+        settings,
+        degraded_supervisor().await,
+        Arc::new(RecordingSink::default()),
+    )
+    .await;
+    assert!(matches!(result, Err(RouteError::InvalidSettings)));
+    store.shutdown().await.expect("store shutdown");
 }
 
 fn thread(thread_id: &str, cwd: &std::path::Path) -> Value {
@@ -431,6 +449,73 @@ async fn permit_recheck_atomically_rejects_a_stale_event_before_any_rpc() {
     );
     router.shutdown().await.expect("shutdown");
     store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn missing_default_workspace_is_a_durable_policy_rejection() {
+    let mut config = validated_config();
+    config.default_workspace = None;
+    config.validate().expect("optional workspace remains valid");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RecordingSink::default());
+    let supervisor = degraded_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink.clone(),
+    )
+    .await
+    .expect("router");
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("event-no-workspace", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("route event");
+
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-no-workspace"],
+        InboundEventState::Rejected,
+    )
+    .await;
+    assert_eq!(
+        *sink.rejections.lock().expect("rejections"),
+        vec![InboundRejectionKind::Policy]
+    );
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn router_rejects_zero_and_hard_cap_runtime_settings() {
+    let mut zero = validated_config();
+    zero.concurrency.active_turn_permits = 0;
+    assert_invalid_router_settings(&zero).await;
+
+    let mut active_over = validated_config();
+    active_over.concurrency.active_turn_permits = ROUTER_ACTIVE_TURN_HARD_LIMIT + 1;
+    assert_invalid_router_settings(&active_over).await;
+
+    let mut actor_zero = validated_config();
+    actor_zero.concurrency.max_scope_actors = 0;
+    assert_invalid_router_settings(&actor_zero).await;
+
+    let mut actor_over = validated_config();
+    actor_over.concurrency.max_scope_actors = ROUTER_SCOPE_ACTOR_HARD_LIMIT + 1;
+    assert_invalid_router_settings(&actor_over).await;
 }
 
 #[tokio::test]
