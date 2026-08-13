@@ -262,7 +262,7 @@ Run the Task 1 gate set with `cargo test --test runtime_policy --locked`. Commit
 - Consumes: `StoreHandle`, `LarkBridge::start_with`, normalized `InboundEvent`.
 - Produces: `DurableIntake`, `TenantNamespace`, `IntakeRuntime`, `IntakeHook`, replay/claim outcome types; extended `LarkBridge`.
 
-- [ ] **Step 1: Upgrade inbound registration into a bounded replayable inbox**
+- [x] **Step 1: Upgrade inbound registration into a bounded replayable inbox**
 
 Add migration 2 rather than changing migration 1. Use nullable
 `payload_version INTEGER`, nullable `payload_blob BLOB`,
@@ -468,7 +468,7 @@ after reopen/recreation paths. Reject non-regular files. Debug/errors never
 expose payload, sender, resource keys, app ID, or a
 dynamic serde/SQLite message.
 
-- [ ] **Step 2: Extend bridge wiring with durable registration and startup replay**
+- [x] **Step 2: Extend bridge wiring with durable registration and startup replay**
 
 `runtime::intake::DurableIntake::prepare(store, &credentials)` borrows the
 credentials only long enough to derive the namespace/binding and returns a
@@ -552,7 +552,7 @@ queue/outcome/runtime Debug to counts/lengths/states and short non-sensitive
 fingerprints only. Receipt still does not mean "Codex finished"—business
 failure is reported through the durable outbox.
 
-- [ ] **Step 3: Add bounded terminal sweeping**
+- [x] **Step 3: Add bounded terminal sweeping**
 
 Change sweeping to `sweep_inbound(older_than_ms, max_rows)`, clamp it to
 `DEDUP_SWEEP_BATCH`, and delete at most that many old
@@ -566,7 +566,7 @@ define a clamped `INBOUND_REPLAY_INTERVAL` (30 seconds) for Task 8's bounded
 current-tenant Received rescan; each scan is all-or-nothing and reuses
 `recover_received`'s count+byte bounds.
 
-- [ ] **Step 4: Test crash windows, dedup semantics, and bounds**
+- [x] **Step 4: Test crash windows, dedup semantics, and bounds**
 
 Store tests create a real user-version-1 database and cover migration 1→2,
 rollback/reopen, all four legacy states, global fail-closed for legacy
@@ -617,7 +617,7 @@ JSON never appear. Assert `IntakeHook: Send + Sync` and `IntakeRuntime: Send`;
 ownership tests use the consuming API, while review verifies that runtime does
 not implement Clone. Keep all test queues/fixtures count+byte bounded.
 
-- [ ] **Step 5: Verify and publish the task**
+- [x] **Step 5: Verify and publish the task**
 
 Run the Task 1 gate set plus `cargo test --test runtime_intake --locked`,
 `cargo test --test lark_bridge --locked`, and `cargo test --test store --locked`.
