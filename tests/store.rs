@@ -13,9 +13,9 @@ use lark_codex_bridge::limits::{
 };
 use lark_codex_bridge::runtime::intake::TenantNamespace;
 use lark_codex_bridge::store::{
-    BeginTurnOutcome, DedupOutcome, InboundEventState, InboundKey, InboundTerminal, NewOutboxRow,
-    NewTurnRow, OutboxEnqueue, OutboxState, ResolveTurnOutcome, StoreError, StoreHandle,
-    TurnResolution, TurnState,
+    BeginTurnOutcome, DedupOutcome, InboundDisposition, InboundEventState, InboundKey,
+    InboundRejectionKind, InboundTerminal, NewOutboxRow, NewTurnRow, OutboxEnqueue, OutboxState,
+    ResolveTurnOutcome, StoreError, StoreHandle, TurnResolution, TurnState,
 };
 use secrecy::SecretString;
 use tempfile::tempdir;
@@ -393,7 +393,13 @@ async fn dedup_transitions_and_ttl_are_fail_closed() {
         )
         .await
         .expect("complete");
-    assert_eq!(store.sweep_inbound(i64::MAX).await.expect("sweep"), 1);
+    assert_eq!(
+        store
+            .sweep_inbound(i64::MAX, u32::MAX)
+            .await
+            .expect("sweep"),
+        1
+    );
     assert_eq!(
         store.inbound_state(&tenant, "event-2").await.expect("live"),
         None
@@ -932,6 +938,185 @@ async fn outbox_enforces_aggregate_bytes_and_claim_batch_bytes() {
     assert_eq!(
         claimed.len(),
         STORE_OUTBOX_CLAIM_MAX_BYTES / STORE_OUTBOX_PAYLOAD_MAX_BYTES
+    );
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn recovery_is_strict_all_or_nothing_and_tenant_isolated() {
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("store.sqlite");
+    let tenant = tenant_namespace("cli_recovery_test");
+    let other = tenant_namespace("cli_recovery_other");
+    let store = StoreHandle::open(&path).await.expect("open");
+    store
+        .register_inbound(&tenant, &event("event-b", "message-b"))
+        .await
+        .expect("b");
+    store
+        .register_inbound(&tenant, &event("event-a", "message-a"))
+        .await
+        .expect("a");
+    store
+        .register_inbound(&other, &event("event-other", "message-other"))
+        .await
+        .expect("other");
+    let recovered = store.recover_received(&tenant).await.expect("recover");
+    assert_eq!(recovered.len(), 2);
+    assert_eq!(recovered[0].event().event_id, "event-b");
+    assert_eq!(recovered[1].event().event_id, "event-a");
+    store.shutdown().await.expect("shutdown");
+
+    let connection = rusqlite::Connection::open(&path).expect("mutate");
+    let (row_id, payload): (i64, Vec<u8>) = connection
+        .query_row(
+            "SELECT rowid, payload_blob FROM inbound_events WHERE event_id = 'event-a'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("payload");
+    let mut value: serde_json::Value = serde_json::from_slice(&payload).expect("json");
+    value
+        .as_object_mut()
+        .expect("object")
+        .insert("unexpected".to_owned(), serde_json::Value::Bool(true));
+    let forged = serde_json::to_vec(&value).expect("encode");
+    connection
+        .execute(
+            "UPDATE inbound_events SET payload_blob = ?2, payload_bytes = ?3 WHERE rowid = ?1",
+            rusqlite::params![row_id, forged, i64::try_from(forged.len()).expect("length")],
+        )
+        .expect("forge strict payload");
+    drop(connection);
+
+    let store = StoreHandle::open(&path).await.expect("reopen");
+    assert!(matches!(
+        store.recover_received(&tenant).await,
+        Err(StoreError::CorruptData { .. })
+    ));
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn reject_notice_rolls_back_and_rejection_is_idempotent() {
+    let store = StoreHandle::open_in_memory().await.expect("open");
+    let tenant = tenant_namespace("cli_reject_test");
+    let inbound = event("event-reject", "message-reject");
+    store
+        .register_inbound(&tenant, &inbound)
+        .await
+        .expect("register");
+    let key = InboundKey::new(tenant.clone(), inbound.event_id.clone());
+    let mut notice = outbox("reject-notice", "");
+    notice.payload_json = "x".repeat(STORE_OUTBOX_PAYLOAD_MAX_BYTES + 1);
+    assert!(matches!(
+        store
+            .reject_received_and_enqueue_notice(&key, InboundRejectionKind::Overloaded, notice,)
+            .await,
+        Err(StoreError::PayloadTooLarge { .. })
+    ));
+    assert_eq!(
+        store.recover_received(&tenant).await.expect("replay").len(),
+        1
+    );
+    assert_eq!(
+        store
+            .reject_received(&key, InboundRejectionKind::Overloaded)
+            .await
+            .expect("reject"),
+        InboundDisposition::Rejected
+    );
+    assert_eq!(
+        store
+            .reject_received(&key, InboundRejectionKind::Overloaded)
+            .await
+            .expect("idempotent"),
+        InboundDisposition::AlreadyRejected
+    );
+    assert!(
+        store
+            .recover_received(&tenant)
+            .await
+            .expect("none")
+            .is_empty()
+    );
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn runtime_turn_terminalization_is_combined_and_survives_marker_sweep() {
+    let store = StoreHandle::open_in_memory().await.expect("open");
+    let tenant = tenant_namespace("cli_sweep_test");
+    let inbound = event("event-sweep", "message-sweep");
+    store
+        .register_inbound(&tenant, &inbound)
+        .await
+        .expect("register");
+    let started = store
+        .begin_turn_and_claim_inbound(
+            turn("sweep-turn", TurnState::Starting),
+            &[InboundKey::new(tenant, inbound.event_id)],
+        )
+        .await
+        .expect("begin");
+    let BeginTurnOutcome::Started { turn_row_id, .. } = started else {
+        panic!("started")
+    };
+    store
+        .set_turn_state(turn_row_id, TurnState::Running, Some("codex-sweep"))
+        .await
+        .expect("running");
+    assert!(matches!(
+        store
+            .set_turn_state(turn_row_id, TurnState::Completed, None)
+            .await,
+        Err(StoreError::InvalidTransition { .. })
+    ));
+    store
+        .resolve_turn_and_finish_inbound_batch(
+            turn_row_id,
+            TurnResolution::Completed,
+            InboundTerminal::Completed,
+        )
+        .await
+        .expect("resolve");
+    assert_eq!(store.sweep_inbound(i64::MAX, 1).await.expect("sweep"), 1);
+    assert_eq!(
+        store
+            .resolve_turn_and_finish_inbound_batch(
+                turn_row_id,
+                TurnResolution::Completed,
+                InboundTerminal::Completed,
+            )
+            .await
+            .expect("already resolved after sweep"),
+        ResolveTurnOutcome::AlreadyResolved { inbound_rows: 1 }
+    );
+    assert_eq!(
+        store
+            .turn_row(turn_row_id)
+            .await
+            .expect("turn")
+            .expect("turn")
+            .inbound_count,
+        1
+    );
+    store.shutdown().await.expect("shutdown");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn file_store_tightens_existing_database_permissions() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("private.sqlite");
+    std::fs::write(&path, []).expect("seed file");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).expect("loosen");
+    let store = StoreHandle::open(&path).await.expect("open");
+    assert_eq!(
+        std::fs::metadata(&path).expect("metadata").mode() & 0o777,
+        0o600
     );
     store.shutdown().await.expect("shutdown");
 }

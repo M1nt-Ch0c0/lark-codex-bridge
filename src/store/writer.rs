@@ -14,7 +14,7 @@ use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
 
 use super::schema::MIGRATIONS;
-use super::{FileReservation, StoreError, sqlite_error};
+use super::{FileReservation, StoreError, sqlite_error, tighten_database_sidecars};
 use crate::limits::{STORE_BUSY_TIMEOUT, STORE_WRITER_CAPACITY};
 
 /// One request toward the writer task.
@@ -102,6 +102,9 @@ fn open_and_migrate(location: &StoreLocation) -> Result<Connection, StoreError> 
     };
     apply_pragmas(&connection)?;
     migrate(&mut connection)?;
+    if let StoreLocation::File(path) = location {
+        tighten_database_sidecars(path)?;
+    }
     Ok(connection)
 }
 

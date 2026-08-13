@@ -17,13 +17,14 @@ use crate::lark::api::{ChatMode, ResourceKind};
 use crate::lark::bridge::RetainedInbound;
 use crate::lark::normalize::{InboundEvent, ResourceDesc, ScopeKey};
 use crate::limits::{
-    STORE_INBOUND_BEGIN_MAX_KEY_BYTES, STORE_INBOUND_BEGIN_MAX_KEYS, STORE_INBOUND_ID_MAX_BYTES,
-    STORE_INBOUND_MAX_BYTES, STORE_INBOUND_MAX_ROWS, STORE_INBOUND_MESSAGE_TYPE_MAX_BYTES,
-    STORE_INBOUND_PAYLOAD_MAX_BYTES, STORE_INBOUND_RECEIVED_MAX_BYTES,
-    STORE_INBOUND_RECEIVED_MAX_ROWS, STORE_INBOUND_RESOURCE_KEY_MAX_BYTES,
-    STORE_INBOUND_RESOURCE_KEY_MAX_TOTAL_BYTES, STORE_INBOUND_RESOURCE_MAX_COUNT,
-    STORE_INBOUND_SCOPE_MAX_BYTES, STORE_INBOUND_TEXT_MAX_BYTES, STORE_RECOVERY_TURN_MAX_BYTES,
-    STORE_RECOVERY_TURN_MAX_ROWS,
+    DEDUP_SWEEP_BATCH, STORE_INBOUND_BEGIN_MAX_KEY_BYTES, STORE_INBOUND_BEGIN_MAX_KEYS,
+    STORE_INBOUND_ID_MAX_BYTES, STORE_INBOUND_MAX_BYTES, STORE_INBOUND_MAX_ROWS,
+    STORE_INBOUND_MESSAGE_TYPE_MAX_BYTES, STORE_INBOUND_PAYLOAD_MAX_BYTES,
+    STORE_INBOUND_RECEIVED_MAX_BYTES, STORE_INBOUND_RECEIVED_MAX_ROWS,
+    STORE_INBOUND_RESOURCE_KEY_MAX_BYTES, STORE_INBOUND_RESOURCE_KEY_MAX_TOTAL_BYTES,
+    STORE_INBOUND_RESOURCE_MAX_COUNT, STORE_INBOUND_SCOPE_MAX_BYTES, STORE_INBOUND_TEXT_MAX_BYTES,
+    STORE_OUTBOX_MAX_QUEUED_BYTES, STORE_OUTBOX_MAX_ROWS, STORE_OUTBOX_PAYLOAD_MAX_BYTES,
+    STORE_RECOVERY_TURN_MAX_BYTES, STORE_RECOVERY_TURN_MAX_ROWS,
 };
 use crate::runtime::intake::TenantNamespace;
 
@@ -173,6 +174,43 @@ pub enum ResolveTurnOutcome {
     Resolved { inbound_rows: usize },
     /// The same resolution had already been committed.
     AlreadyResolved { inbound_rows: usize },
+}
+
+/// Closed operator-facing rejection classifications.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboundRejectionKind {
+    /// Local bounded capacity is exhausted.
+    Overloaded,
+    /// Runtime policy refused the event.
+    Policy,
+    /// Event is too old to process safely.
+    Stale,
+    /// Internal processing refused the event without exposing content.
+    Internal,
+}
+
+impl InboundRejectionKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Overloaded => "overloaded",
+            Self::Policy => "policy",
+            Self::Stale => "stale",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+/// Result of an idempotent received-row rejection attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboundDisposition {
+    /// This call changed received to rejected.
+    Rejected,
+    /// The same rejection was already committed.
+    AlreadyRejected,
+    /// A turn already claimed the event.
+    AlreadyClaimed { turn_row_id: i64 },
+    /// The row was already completed.
+    AlreadyCompleted,
 }
 
 impl StoreHandle {
@@ -558,6 +596,95 @@ impl StoreHandle {
         .await
     }
 
+    /// Recovers the complete bounded current-tenant received set.
+    pub async fn recover_received(
+        &self,
+        tenant: &TenantNamespace,
+    ) -> Result<Vec<RetainedInbound>, StoreError> {
+        let tenant = tenant.as_hex();
+        self.run_sized(tenant.len(), move |connection| {
+            validate_inbound_collection(connection)?;
+            let mut statement = connection
+                .prepare(
+                    "SELECT event_id, message_id, scope_key, state, payload_version,
+                            payload_blob, payload_bytes, turn_row_id, rejection_reason
+                     FROM inbound_events
+                     WHERE tenant = ?1 AND state = 'received'
+                     ORDER BY first_seen_ms, event_id",
+                )
+                .map_err(|error| sqlite_error("preparing received recovery", &error))?;
+            let stored = statement
+                .query_map(params![tenant], decode_stored_row)
+                .map_err(|error| sqlite_error("reading received recovery", &error))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| sqlite_error("decoding received recovery", &error))?;
+            stored.into_iter().map(retained_from_stored).collect()
+        })
+        .await
+    }
+
+    /// Idempotently rejects one currently received row.
+    pub async fn reject_received(
+        &self,
+        key: &InboundKey,
+        reason: InboundRejectionKind,
+    ) -> Result<InboundDisposition, StoreError> {
+        let key = key.clone();
+        let request_size = key.tenant.as_hex().len() + key.event_id.len();
+        self.run_sized(request_size, move |connection| {
+            let transaction = connection
+                .transaction()
+                .map_err(|error| sqlite_error("starting inbound rejection", &error))?;
+            let disposition = reject_received_in_transaction(&transaction, &key, reason)?;
+            transaction
+                .commit()
+                .map_err(|error| sqlite_error("committing inbound rejection", &error))?;
+            Ok(disposition)
+        })
+        .await
+    }
+
+    /// Atomically enqueues a notice and rejects one currently received row.
+    pub async fn reject_received_and_enqueue_notice(
+        &self,
+        key: &InboundKey,
+        reason: InboundRejectionKind,
+        notice: super::NewOutboxRow,
+    ) -> Result<InboundDisposition, StoreError> {
+        let key = key.clone();
+        let request_size = request_bytes(&[
+            &key.tenant.as_hex(),
+            &key.event_id,
+            &notice.idempotency_key,
+            &notice.scope_key,
+            &notice.kind,
+            &notice.payload_json,
+        ]);
+        self.run_sized(request_size, move |connection| {
+            let transaction = connection
+                .transaction()
+                .map_err(|error| sqlite_error("starting rejection notice", &error))?;
+            let tenant = key.tenant.as_hex();
+            let stored = read_inbound_row(&transaction, &tenant, &key.event_id)?.ok_or(
+                StoreError::NotFound {
+                    context: "rejecting an unknown inbound row",
+                },
+            )?;
+            let existing = terminal_disposition(&stored, reason)?;
+            if let Some(disposition) = existing {
+                return Ok(disposition);
+            }
+            let _ = retained_from_stored(stored)?;
+            enqueue_notice_in_transaction(&transaction, &notice)?;
+            let disposition = reject_received_in_transaction(&transaction, &key, reason)?;
+            transaction
+                .commit()
+                .map_err(|error| sqlite_error("committing rejection notice", &error))?;
+            Ok(disposition)
+        })
+        .await
+    }
+
     /// Deletes terminal (`completed`/`rejected`) inbound rows last updated
     /// before `older_than_ms`, returning the number of pruned rows. Non-
     /// terminal rows are never swept.
@@ -565,13 +692,25 @@ impl StoreHandle {
     /// # Errors
     ///
     /// Returns an error when the writer task or SQLite fails.
-    pub async fn sweep_inbound(&self, older_than_ms: i64) -> Result<u64, StoreError> {
+    pub async fn sweep_inbound(
+        &self,
+        older_than_ms: i64,
+        max_rows: u32,
+    ) -> Result<u64, StoreError> {
+        let max_rows = max_rows.min(DEDUP_SWEEP_BATCH);
+        if max_rows == 0 {
+            return Ok(0);
+        }
         self.run(move |connection| {
             let deleted = connection
                 .execute(
                     "DELETE FROM inbound_events
-                     WHERE state IN ('completed', 'rejected') AND updated_ms < ?1",
-                    params![older_than_ms],
+                     WHERE rowid IN (
+                         SELECT rowid FROM inbound_events
+                         WHERE state IN ('completed', 'rejected') AND updated_ms < ?1
+                         ORDER BY updated_ms, tenant, event_id LIMIT ?2
+                     )",
+                    params![older_than_ms, max_rows],
                 )
                 .map_err(|error| sqlite_error("sweeping inbound events", &error))?;
             Ok(u64::try_from(deleted).unwrap_or(u64::MAX))
@@ -590,6 +729,7 @@ struct StoredInbound {
     payload_blob: Option<Vec<u8>>,
     payload_bytes: i64,
     turn_row_id: Option<i64>,
+    rejection_reason: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -865,7 +1005,7 @@ fn read_inbound_row(
     connection
         .query_row(
             "SELECT event_id, message_id, scope_key, state, payload_version,
-                    payload_blob, payload_bytes, turn_row_id
+                    payload_blob, payload_bytes, turn_row_id, rejection_reason
              FROM inbound_events WHERE tenant = ?1 AND event_id = ?2",
             params![tenant, event_id],
             decode_stored_row,
@@ -882,7 +1022,7 @@ fn read_message_candidates(
     let mut statement = connection
         .prepare(
             "SELECT event_id, message_id, scope_key, state, payload_version,
-                    payload_blob, payload_bytes, turn_row_id
+                    payload_blob, payload_bytes, turn_row_id, rejection_reason
              FROM inbound_events
              WHERE tenant = ?1 AND message_id = ?2 AND state != 'rejected'
              ORDER BY event_id",
@@ -913,6 +1053,7 @@ fn decode_stored_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredInbound>
         payload_blob: row.get(5)?,
         payload_bytes: row.get(6)?,
         turn_row_id: row.get(7)?,
+        rejection_reason: row.get(8)?,
     })
 }
 
@@ -1011,6 +1152,208 @@ fn ensure_inbound_capacity(
             context: "registering an inbound event",
         });
     }
+    Ok(())
+}
+
+fn validate_inbound_collection(connection: &rusqlite::Connection) -> Result<(), StoreError> {
+    let (rows, logical_bytes, received_rows, received_bytes): (i64, i64, i64, i64) = connection
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(
+                 LENGTH(CAST(tenant AS BLOB)) + LENGTH(CAST(event_id AS BLOB)) +
+                 LENGTH(CAST(message_id AS BLOB)) + LENGTH(CAST(scope_key AS BLOB)) +
+                 COALESCE(LENGTH(CAST(rejection_reason AS BLOB)), 0) + payload_bytes
+             ), 0),
+             COALESCE(SUM(CASE WHEN state = 'received' THEN 1 ELSE 0 END), 0),
+             COALESCE(SUM(CASE WHEN state = 'received' THEN payload_bytes ELSE 0 END), 0)
+             FROM inbound_events",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(|error| sqlite_error("validating inbound collection bounds", &error))?;
+    if u64::try_from(rows).unwrap_or(u64::MAX) > STORE_INBOUND_MAX_ROWS
+        || u64::try_from(logical_bytes).unwrap_or(u64::MAX) > STORE_INBOUND_MAX_BYTES
+        || u64::try_from(received_rows).unwrap_or(u64::MAX) > STORE_INBOUND_RECEIVED_MAX_ROWS
+        || u64::try_from(received_bytes).unwrap_or(u64::MAX) > STORE_INBOUND_RECEIVED_MAX_BYTES
+    {
+        return Err(StoreError::CapacityExceeded {
+            context: "recovering the inbound collection",
+        });
+    }
+    let conflicting: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM inbound_events WHERE state != 'rejected'
+                 GROUP BY tenant, message_id HAVING COUNT(*) > 1
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| sqlite_error("checking canonical inbound messages", &error))?;
+    if conflicting {
+        return Err(StoreError::CorruptData {
+            context: "validating canonical inbound messages",
+        });
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT event_id, message_id, scope_key, state, payload_version,
+                    payload_blob, payload_bytes, turn_row_id, rejection_reason
+             FROM inbound_events WHERE state IN ('received', 'accepted')
+             ORDER BY tenant, event_id",
+        )
+        .map_err(|error| sqlite_error("preparing inbound integrity scan", &error))?;
+    let rows = statement
+        .query_map([], decode_stored_row)
+        .map_err(|error| sqlite_error("reading inbound integrity scan", &error))?;
+    for row in rows {
+        let stored =
+            row.map_err(|error| sqlite_error("decoding inbound integrity scan", &error))?;
+        match stored.state {
+            InboundEventState::Received if stored.turn_row_id.is_some() => {
+                return Err(StoreError::CorruptData {
+                    context: "validating an associated received row",
+                });
+            }
+            InboundEventState::Accepted if stored.turn_row_id.is_none() => {
+                return Err(StoreError::CorruptData {
+                    context: "validating an unassociated accepted row",
+                });
+            }
+            InboundEventState::Received | InboundEventState::Accepted => {}
+            InboundEventState::Completed | InboundEventState::Rejected => unreachable!(),
+        }
+        if let Some(turn_row_id) = stored.turn_row_id {
+            let turn_scope: Option<String> = connection
+                .query_row(
+                    "SELECT scope_key FROM turns WHERE id = ?1",
+                    params![turn_row_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| sqlite_error("validating an accepted turn", &error))?;
+            if turn_scope.as_deref() != Some(stored.scope_key.as_str()) {
+                return Err(StoreError::CorruptData {
+                    context: "validating an accepted turn association",
+                });
+            }
+        }
+        let _ = retained_from_stored(stored)?;
+    }
+    Ok(())
+}
+
+fn terminal_disposition(
+    stored: &StoredInbound,
+    reason: InboundRejectionKind,
+) -> Result<Option<InboundDisposition>, StoreError> {
+    match stored.state {
+        InboundEventState::Received => Ok(None),
+        InboundEventState::Accepted => stored
+            .turn_row_id
+            .map(|turn_row_id| Some(InboundDisposition::AlreadyClaimed { turn_row_id }))
+            .ok_or(StoreError::CorruptData {
+                context: "rejecting an unassociated accepted row",
+            }),
+        InboundEventState::Completed => Ok(Some(InboundDisposition::AlreadyCompleted)),
+        InboundEventState::Rejected
+            if stored.rejection_reason.as_deref() == Some(reason.as_str()) =>
+        {
+            Ok(Some(InboundDisposition::AlreadyRejected))
+        }
+        InboundEventState::Rejected => Err(StoreError::InvalidTransition {
+            context: "rejecting an inbound row with a conflicting reason",
+        }),
+    }
+}
+
+fn reject_received_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    key: &InboundKey,
+    reason: InboundRejectionKind,
+) -> Result<InboundDisposition, StoreError> {
+    let tenant = key.tenant.as_hex();
+    let stored =
+        read_inbound_row(transaction, &tenant, &key.event_id)?.ok_or(StoreError::NotFound {
+            context: "rejecting an unknown inbound row",
+        })?;
+    if let Some(disposition) = terminal_disposition(&stored, reason)? {
+        return Ok(disposition);
+    }
+    let _ = retained_from_stored(stored)?;
+    let changed = transaction
+        .execute(
+            "UPDATE inbound_events
+             SET state = 'rejected', rejection_reason = ?3,
+                 payload_version = NULL, payload_blob = NULL, payload_bytes = 0,
+                 updated_ms = ?4
+             WHERE tenant = ?1 AND event_id = ?2 AND state = 'received'",
+            params![tenant, key.event_id, reason.as_str(), now_ms()],
+        )
+        .map_err(|error| sqlite_error("rejecting a received inbound row", &error))?;
+    if changed != 1 {
+        return Err(StoreError::CorruptData {
+            context: "rejecting a concurrently changed inbound row",
+        });
+    }
+    Ok(InboundDisposition::Rejected)
+}
+
+fn enqueue_notice_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    notice: &super::NewOutboxRow,
+) -> Result<(), StoreError> {
+    if notice.payload_json.len() > STORE_OUTBOX_PAYLOAD_MAX_BYTES {
+        return Err(StoreError::PayloadTooLarge {
+            context: "enqueueing an inbound rejection notice",
+            limit: u64::try_from(STORE_OUTBOX_PAYLOAD_MAX_BYTES).unwrap_or(u64::MAX),
+        });
+    }
+    let exists: bool = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM outbox WHERE idempotency_key = ?1)",
+            params![notice.idempotency_key],
+            |row| row.get(0),
+        )
+        .map_err(|error| sqlite_error("checking a rejection notice key", &error))?;
+    let payload_bytes = u64::try_from(notice.payload_json.len()).unwrap_or(u64::MAX);
+    if !exists {
+        let (count, bytes): (i64, i64) = transaction
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(payload_bytes), 0) FROM outbox
+                 WHERE state IN ('pending', 'sending')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|error| sqlite_error("checking rejection notice capacity", &error))?;
+        if u64::try_from(count).unwrap_or(u64::MAX) >= STORE_OUTBOX_MAX_ROWS
+            || u64::try_from(bytes)
+                .unwrap_or(u64::MAX)
+                .saturating_add(payload_bytes)
+                > STORE_OUTBOX_MAX_QUEUED_BYTES
+        {
+            return Err(StoreError::CapacityExceeded {
+                context: "enqueueing an inbound rejection notice",
+            });
+        }
+    }
+    let now = now_ms();
+    transaction
+        .execute(
+            "INSERT OR IGNORE INTO outbox
+             (idempotency_key, scope_key, kind, payload_json, payload_bytes,
+              state, attempts, next_retry_ms, created_ms, updated_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6, ?7, ?7)",
+            params![
+                notice.idempotency_key,
+                notice.scope_key,
+                notice.kind,
+                notice.payload_json,
+                i64::try_from(payload_bytes).unwrap_or(i64::MAX),
+                notice.next_retry_ms,
+                now
+            ],
+        )
+        .map_err(|error| sqlite_error("enqueueing an inbound rejection notice", &error))?;
     Ok(())
 }
 

@@ -391,15 +391,17 @@ impl StoreHandle {
         let codex_turn_id = codex_turn_id.map(str::to_owned);
         let request_size = request_bytes(&[codex_turn_id.as_deref().unwrap_or_default()]);
         self.run_sized(request_size, move |connection| {
-            let (current, scope_key, client_message_id, current_thread_id, current_turn_id): (
-                String,
-                String,
-                String,
-                Option<String>,
-                Option<String>,
-            ) = connection
+            let (
+                current,
+                scope_key,
+                client_message_id,
+                current_thread_id,
+                current_turn_id,
+                inbound_count,
+            ): (String, String, String, Option<String>, Option<String>, i64) = connection
                 .query_row(
-                    "SELECT state, scope_key, client_message_id, codex_thread_id, codex_turn_id
+                    "SELECT state, scope_key, client_message_id, codex_thread_id, codex_turn_id,
+                            inbound_count
                      FROM turns WHERE id = ?1",
                     params![id],
                     |row| {
@@ -409,6 +411,7 @@ impl StoreHandle {
                             row.get(2)?,
                             row.get(3)?,
                             row.get(4)?,
+                            row.get(5)?,
                         ))
                     },
                 )
@@ -425,6 +428,16 @@ impl StoreHandle {
             if !legal_turn_transition(from, state) {
                 return Err(StoreError::InvalidTransition {
                     context: "transitioning a turn",
+                });
+            }
+            if inbound_count > 0 && !(from == TurnState::Starting && state == TurnState::Running) {
+                return Err(StoreError::InvalidTransition {
+                    context: "terminalizing an inbound turn outside the combined API",
+                });
+            }
+            if inbound_count < 0 {
+                return Err(StoreError::CorruptData {
+                    context: "validating a turn inbound count",
                 });
             }
             let transaction = connection
@@ -484,7 +497,8 @@ impl StoreHandle {
                     "SELECT id, scope_key, client_message_id, codex_thread_id, codex_turn_id,
                             state, uncertain, created_ms, updated_ms, inbound_count
                      FROM turns
-                     WHERE state IN ('starting', 'running', 'uncertain')
+                     WHERE state IN ('starting', 'running')
+                        OR (state = 'uncertain' AND uncertain = 1)
                      ORDER BY id LIMIT ?1",
                 )
                 .map_err(|error| sqlite_error("listing uncertain turns", &error))?;
@@ -533,7 +547,8 @@ fn recovery_usage(
                  COALESCE(LENGTH(CAST(codex_turn_id AS BLOB)), 0)
              ), 0)
              FROM turns
-             WHERE state IN ('starting', 'running', 'uncertain')
+             WHERE (state IN ('starting', 'running')
+                    OR (state = 'uncertain' AND uncertain = 1))
                AND (?1 IS NULL OR id != ?1)",
             params![exclude_id],
             |row| Ok((row.get(0)?, row.get(1)?)),

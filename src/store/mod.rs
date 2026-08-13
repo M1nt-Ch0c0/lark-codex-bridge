@@ -38,8 +38,9 @@ use crate::limits::{STORE_REQUEST_MAX_BYTES, STORE_WRITER_BYTE_BUDGET};
 
 pub use attachments::{AttachmentLeaseRow, AttachmentRow};
 pub use dedup::{
-    BeginTurnOutcome, ClaimedInbound, DedupOutcome, InboundEventState, InboundKey, InboundTerminal,
-    ResolveTurnOutcome, SkippedInbound, TurnResolution,
+    BeginTurnOutcome, ClaimedInbound, DedupOutcome, InboundDisposition, InboundEventState,
+    InboundKey, InboundRejectionKind, InboundTerminal, ResolveTurnOutcome, SkippedInbound,
+    TurnResolution,
 };
 pub use outbox::{NewOutboxRow, OutboxDepth, OutboxEnqueue, OutboxRow, OutboxState};
 pub use sessions::{NewTurnRow, ScopeRow, ThreadRow, ThreadStatus, TurnRow, TurnState};
@@ -375,17 +376,68 @@ fn prepare_database_file(path: &Path) -> Result<PathBuf, StoreError> {
     std::fs::create_dir_all(parent).map_err(|_| StoreError::Io {
         context: "creating the database directory",
     })?;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&absolute)
-        .map_err(|_| StoreError::Io {
-            context: "creating the database file",
-        })?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&absolute).map_err(|_| StoreError::Io {
+        context: "creating the database file",
+    })?;
+    let metadata = file.metadata().map_err(|_| StoreError::Io {
+        context: "validating the database file",
+    })?;
+    if !metadata.is_file() {
+        return Err(StoreError::InvalidPath {
+            context: "opening a non-regular database file",
+        });
+    }
+    tighten_open_file(&file, "tightening the database file")?;
     std::fs::canonicalize(absolute).map_err(|_| StoreError::Io {
         context: "resolving the database path",
     })
+}
+
+#[cfg(unix)]
+fn tighten_open_file(file: &std::fs::File, context: &'static str) -> Result<(), StoreError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|_| StoreError::Io { context })
+}
+
+#[cfg(not(unix))]
+fn tighten_open_file(_file: &std::fs::File, _context: &'static str) -> Result<(), StoreError> {
+    Ok(())
+}
+
+pub(crate) fn tighten_database_sidecars(path: &Path) -> Result<(), StoreError> {
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = PathBuf::from(format!("{}{}", path.to_string_lossy(), suffix));
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true);
+        let file = match options.open(&sidecar) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                return Err(StoreError::Io {
+                    context: "opening a database sidecar",
+                });
+            }
+        };
+        let metadata = file.metadata().map_err(|_| StoreError::Io {
+            context: "validating a database sidecar",
+        })?;
+        if !metadata.is_file() {
+            return Err(StoreError::InvalidPath {
+                context: "opening a non-regular database sidecar",
+            });
+        }
+        tighten_open_file(&file, "tightening a database sidecar")?;
+    }
+    Ok(())
 }
 
 /// Adds captured strings' UTF-8 byte lengths without overflowing.
