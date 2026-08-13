@@ -5,6 +5,8 @@
 //! consumes a cwd, then compare the returned canonical path before reuse.
 
 use std::env;
+#[cfg(any(windows, test))]
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -501,11 +503,8 @@ fn discovered_desktop_download_trees(home: &Path) -> Result<Vec<PathBuf>, Worksp
     }
     #[cfg(not(windows))]
     {
-        let mut candidates = vec![home.join("Desktop"), home.join("Downloads")];
-        for path in read_xdg_user_directories(home)? {
-            candidates.push(path);
-        }
-        existing_directories(candidates)
+        let source = read_xdg_user_directory_source(home)?;
+        desktop_download_trees_from_xdg_source(home, source.as_deref())
     }
 }
 
@@ -525,7 +524,7 @@ fn existing_directories(
 }
 
 #[cfg(not(windows))]
-fn read_xdg_user_directories(home: &Path) -> Result<Vec<PathBuf>, WorkspaceRejection> {
+fn read_xdg_user_directory_source(home: &Path) -> Result<Option<String>, WorkspaceRejection> {
     let config_home = env::var_os("XDG_CONFIG_HOME")
         .filter(|value| !value.is_empty())
         .map_or_else(|| home.join(".config"), PathBuf::from);
@@ -534,28 +533,46 @@ fn read_xdg_user_directories(home: &Path) -> Result<Vec<PathBuf>, WorkspaceRejec
     }
     let source = match fs::read_to_string(config_home.join("user-dirs.dirs")) {
         Ok(source) => source,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(WorkspaceRejection::Inaccessible),
     };
     if source.len() > crate::limits::MAX_XDG_USER_DIRS_BYTES {
         return Err(WorkspaceRejection::Inaccessible);
     }
-    parse_xdg_user_directories(home, &source)
+    Ok(Some(source))
 }
 
 #[cfg(not(windows))]
-fn parse_xdg_user_directories(
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+enum XdgUserDirectory {
+    #[default]
+    Unspecified,
+    Disabled,
+    Path(PathBuf),
+}
+
+#[cfg(not(windows))]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct XdgUserDirectoryConfig {
+    desktop: XdgUserDirectory,
+    downloads: XdgUserDirectory,
+}
+
+#[cfg(not(windows))]
+fn parse_xdg_user_directory_config(
     home: &Path,
     source: &str,
-) -> Result<Vec<PathBuf>, WorkspaceRejection> {
-    let mut paths = Vec::new();
+) -> Result<XdgUserDirectoryConfig, WorkspaceRejection> {
+    let mut config = XdgUserDirectoryConfig::default();
     for line in source.lines() {
         let Some((key, raw)) = line.split_once('=') else {
             continue;
         };
-        if !matches!(key.trim(), "XDG_DESKTOP_DIR" | "XDG_DOWNLOAD_DIR") {
-            continue;
-        }
+        let destination = match key.trim() {
+            "XDG_DESKTOP_DIR" => &mut config.desktop,
+            "XDG_DOWNLOAD_DIR" => &mut config.downloads,
+            _ => continue,
+        };
         let value = raw.trim();
         let Some(value) = value
             .strip_prefix('"')
@@ -563,12 +580,16 @@ fn parse_xdg_user_directories(
         else {
             return Err(WorkspaceRejection::Inaccessible);
         };
-        if value.contains(['`', '$']) && !value.starts_with("$HOME/") && value != "$HOME" {
+        if value == "$HOME" {
+            // The XDG user-dirs specification uses $HOME as the disabled
+            // sentinel. It is not a request to protect the entire home tree.
+            *destination = XdgUserDirectory::Disabled;
+            continue;
+        }
+        if value.contains(['`', '$']) && !value.starts_with("$HOME/") {
             return Err(WorkspaceRejection::Inaccessible);
         }
-        let path = if value == "$HOME" {
-            home.to_path_buf()
-        } else if let Some(relative) = value.strip_prefix("$HOME/") {
+        let path = if let Some(relative) = value.strip_prefix("$HOME/") {
             if relative.split('/').any(|component| component == "..") {
                 return Err(WorkspaceRejection::Inaccessible);
             }
@@ -580,33 +601,103 @@ fn parse_xdg_user_directories(
             }
             path
         };
-        paths.push(path);
+        *destination = XdgUserDirectory::Path(path);
     }
-    Ok(paths)
+    Ok(config)
 }
 
-fn discovered_system_trees() -> Result<Vec<PathBuf>, WorkspaceRejection> {
-    #[cfg(windows)]
-    let candidates = {
-        let windows = env::var_os("SystemRoot")
-            .filter(|value| !value.is_empty())
-            .or_else(|| env::var_os("WINDIR").filter(|value| !value.is_empty()))
-            .map(PathBuf::from);
-        let Some(windows) = windows else {
-            return Err(WorkspaceRejection::Inaccessible);
-        };
-        if !windows.is_absolute()
-            || !matches!(fs::metadata(&windows), Ok(metadata) if metadata.is_dir())
-        {
-            return Err(WorkspaceRejection::Inaccessible);
+#[cfg(not(windows))]
+fn desktop_download_trees_from_xdg_source(
+    home: &Path,
+    source: Option<&str>,
+) -> Result<Vec<PathBuf>, WorkspaceRejection> {
+    let config = source.map_or_else(
+        || Ok(XdgUserDirectoryConfig::default()),
+        |source| parse_xdg_user_directory_config(home, source),
+    )?;
+    let mut directories = Vec::with_capacity(2);
+    for (directory, fallback) in [
+        (config.desktop, home.join("Desktop")),
+        (config.downloads, home.join("Downloads")),
+    ] {
+        match directory {
+            XdgUserDirectory::Unspecified => {
+                directories.extend(existing_directories([fallback])?);
+            }
+            XdgUserDirectory::Disabled => {}
+            XdgUserDirectory::Path(path) => directories.push(canonical_directory(&path)?),
         }
-        [
-            Some(windows),
-            env::var_os("ProgramFiles").map(PathBuf::from),
-            env::var_os("ProgramFiles(x86)").map(PathBuf::from),
-            env::var_os("ProgramData").map(PathBuf::from),
-        ]
+    }
+    Ok(directories)
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone)]
+struct WindowsSystemEnvironment {
+    system_root: Option<OsString>,
+    windir: Option<OsString>,
+    program_files: Option<OsString>,
+    program_files_x86: Option<OsString>,
+    program_data: Option<OsString>,
+}
+
+#[cfg(windows)]
+impl WindowsSystemEnvironment {
+    fn read_production() -> Self {
+        Self {
+            system_root: env::var_os("SystemRoot"),
+            windir: env::var_os("WINDIR"),
+            program_files: env::var_os("ProgramFiles"),
+            program_files_x86: env::var_os("ProgramFiles(x86)"),
+            program_data: env::var_os("ProgramData"),
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn windows_system_trees_from_environment(
+    environment: &WindowsSystemEnvironment,
+    is_64_bit: bool,
+) -> Result<Vec<PathBuf>, WorkspaceRejection> {
+    let windows = if environment.system_root.is_some() {
+        required_environment_directory(environment.system_root.as_deref())?
+    } else {
+        required_environment_directory(environment.windir.as_deref())?
     };
+    let program_files = required_environment_directory(environment.program_files.as_deref())?;
+    let program_data = required_environment_directory(environment.program_data.as_deref())?;
+    let mut directories = vec![windows, program_files];
+    if is_64_bit {
+        directories.push(required_environment_directory(
+            environment.program_files_x86.as_deref(),
+        )?);
+    }
+    directories.push(program_data);
+    Ok(directories)
+}
+
+#[cfg(any(windows, test))]
+fn required_environment_directory(value: Option<&OsStr>) -> Result<PathBuf, WorkspaceRejection> {
+    let value = value
+        .filter(|value| !value.is_empty())
+        .ok_or(WorkspaceRejection::Inaccessible)?;
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(WorkspaceRejection::Inaccessible);
+    }
+    canonical_directory(&path).map_err(|_| WorkspaceRejection::Inaccessible)
+}
+
+#[cfg(windows)]
+fn discovered_system_trees() -> Result<Vec<PathBuf>, WorkspaceRejection> {
+    windows_system_trees_from_environment(
+        &WindowsSystemEnvironment::read_production(),
+        cfg!(target_pointer_width = "64"),
+    )
+}
+
+#[cfg(not(windows))]
+fn discovered_system_trees() -> Result<Vec<PathBuf>, WorkspaceRejection> {
     #[cfg(target_os = "macos")]
     let candidates = [
         Some(PathBuf::from("/Applications")),
@@ -769,17 +860,177 @@ mod tests {
     }
 
     #[test]
-    fn platform_root_collections_enforce_count_and_byte_limits_before_retention() {
+    fn platform_root_collections_enforce_count_and_raw_aggregate_byte_limits() {
         let temp = scratch();
         let home = temp.path().join("home");
         fs::create_dir(&home).expect("home should be created");
         let too_many = vec![temp.path().to_path_buf(); MAX_PLATFORM_PROTECTED_ROOTS + 1];
         assert!(PlatformRoots::new(&home, too_many, vec![], vec![]).is_err());
 
-        let oversized = vec![PathBuf::from(
-            "x".repeat(MAX_PLATFORM_PROTECTED_ROOT_BYTES + 1),
-        )];
+        let deep_parent = temp.path().join("r".repeat(200)).join("s".repeat(100));
+        fs::create_dir_all(&deep_parent).expect("deep parent should be created");
+        let oversized = (0..MAX_PLATFORM_PROTECTED_ROOTS)
+            .map(|index| {
+                let directory = deep_parent.join(format!("root-{index:02}"));
+                fs::create_dir(&directory).expect("bounded root should be created");
+                directory
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(oversized.len(), MAX_PLATFORM_PROTECTED_ROOTS);
+        assert!(
+            oversized
+                .iter()
+                .all(|path| path.is_absolute() && path.is_dir())
+        );
+        assert!(oversized.iter().all(|path| {
+            path.as_os_str().as_encoded_bytes().len() < MAX_PLATFORM_PROTECTED_ROOT_BYTES
+        }));
+        assert!(encoded_path_bytes(&oversized) > MAX_PLATFORM_PROTECTED_ROOT_BYTES);
         assert!(PlatformRoots::new(&home, oversized, vec![], vec![]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn platform_root_collections_recheck_aggregate_bytes_after_canonicalization() {
+        use std::os::unix::fs::symlink;
+
+        let temp = scratch();
+        let home = temp.path().join("home");
+        fs::create_dir(&home).expect("home should be created");
+        let deep_parent = temp
+            .path()
+            .join("canonical-targets")
+            .join("x".repeat(200))
+            .join("y".repeat(100));
+        fs::create_dir_all(&deep_parent).expect("deep canonical parent should be created");
+        let aliases = (0..MAX_PLATFORM_PROTECTED_ROOTS)
+            .map(|index| {
+                let target = deep_parent.join(format!("target-{index:02}"));
+                fs::create_dir(&target).expect("canonical target should be created");
+                let alias = temp.path().join(format!("a{index:02}"));
+                symlink(&target, &alias).expect("short root alias should be created");
+                alias
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(aliases.len(), MAX_PLATFORM_PROTECTED_ROOTS);
+        assert!(
+            aliases
+                .iter()
+                .all(|path| path.is_absolute() && path.is_dir())
+        );
+        assert!(encoded_path_bytes(&aliases) <= MAX_PLATFORM_PROTECTED_ROOT_BYTES);
+        let canonical = aliases
+            .iter()
+            .map(|path| fs::canonicalize(path).expect("alias should canonicalize"))
+            .collect::<Vec<_>>();
+        assert!(encoded_path_bytes(&canonical) > MAX_PLATFORM_PROTECTED_ROOT_BYTES);
+
+        assert!(PlatformRoots::new(&home, aliases, vec![], vec![]).is_err());
+    }
+
+    #[test]
+    fn windows_system_discovery_rejects_missing_or_invalid_mandatory_roots() {
+        let temp = scratch();
+        let windows = temp.path().join("Windows");
+        let program_files = temp.path().join("Program Files");
+        let program_files_x86 = temp.path().join("Program Files (x86)");
+        let program_data = temp.path().join("ProgramData");
+        for directory in [&windows, &program_files, &program_files_x86, &program_data] {
+            fs::create_dir(directory).expect("synthetic Windows root should be created");
+        }
+        let file = temp.path().join("not-a-directory");
+        fs::write(&file, b"file").expect("synthetic file should be created");
+
+        let valid = WindowsSystemEnvironment {
+            system_root: Some(windows.clone().into_os_string()),
+            windir: None,
+            program_files: Some(program_files.clone().into_os_string()),
+            program_files_x86: Some(program_files_x86.clone().into_os_string()),
+            program_data: Some(program_data.clone().into_os_string()),
+        };
+        assert_eq!(
+            windows_system_trees_from_environment(&valid, true)
+                .expect("complete 64-bit Windows roots should validate")
+                .len(),
+            4
+        );
+
+        let missing_values = ["system_root", "windir", "program_files", "program_data"];
+        for field in missing_values {
+            let mut environment = valid.clone();
+            match field {
+                "system_root" => environment.system_root = None,
+                "windir" => {
+                    environment.system_root = None;
+                    environment.windir = None;
+                }
+                "program_files" => environment.program_files = None,
+                "program_data" => environment.program_data = None,
+                _ => unreachable!(),
+            }
+            if field == "system_root" {
+                environment.windir = Some(windows.clone().into_os_string());
+                assert!(windows_system_trees_from_environment(&environment, true).is_ok());
+            } else {
+                assert_eq!(
+                    windows_system_trees_from_environment(&environment, true),
+                    Err(WorkspaceRejection::Inaccessible),
+                    "missing {field} must fail closed"
+                );
+            }
+        }
+
+        let invalid_values = [
+            OsString::new(),
+            OsString::from("relative-root"),
+            temp.path().join("missing-root").into_os_string(),
+            file.into_os_string(),
+        ];
+        for field in [
+            "system_root",
+            "windir",
+            "program_files",
+            "program_files_x86",
+            "program_data",
+        ] {
+            for invalid in &invalid_values {
+                let mut environment = valid.clone();
+                match field {
+                    "system_root" => {
+                        environment.system_root = Some(invalid.clone());
+                        environment.windir = None;
+                    }
+                    "windir" => {
+                        environment.system_root = None;
+                        environment.windir = Some(invalid.clone());
+                    }
+                    "program_files" => environment.program_files = Some(invalid.clone()),
+                    "program_files_x86" => {
+                        environment.program_files_x86 = Some(invalid.clone());
+                    }
+                    "program_data" => environment.program_data = Some(invalid.clone()),
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    windows_system_trees_from_environment(&environment, true),
+                    Err(WorkspaceRejection::Inaccessible),
+                    "invalid {field} must fail closed"
+                );
+            }
+        }
+
+        let mut without_x86 = valid;
+        without_x86.program_files_x86 = None;
+        assert_eq!(
+            windows_system_trees_from_environment(&without_x86, true),
+            Err(WorkspaceRejection::Inaccessible)
+        );
+        assert_eq!(
+            windows_system_trees_from_environment(&without_x86, false)
+                .expect("32-bit Windows may ignore ProgramFiles(x86)")
+                .len(),
+            3
+        );
     }
 
     #[cfg(unix)]
@@ -795,7 +1046,7 @@ mod tests {
     #[test]
     fn xdg_user_directory_parser_accepts_only_absolute_or_home_anchored_paths() {
         let home = Path::new("/home/tester");
-        let parsed = parse_xdg_user_directories(
+        let parsed = parse_xdg_user_directory_config(
             home,
             "XDG_DESKTOP_DIR=\"$HOME/Work Desk\"\nXDG_DOWNLOAD_DIR=\"/srv/drop\"\n",
         )
@@ -803,15 +1054,75 @@ mod tests {
 
         assert_eq!(
             parsed,
-            [
-                PathBuf::from("/home/tester/Work Desk"),
-                PathBuf::from("/srv/drop")
-            ]
+            XdgUserDirectoryConfig {
+                desktop: XdgUserDirectory::Path(PathBuf::from("/home/tester/Work Desk")),
+                downloads: XdgUserDirectory::Path(PathBuf::from("/srv/drop")),
+            }
         );
-        assert!(parse_xdg_user_directories(home, "XDG_DESKTOP_DIR=\"relative\"\n").is_err());
+        assert!(parse_xdg_user_directory_config(home, "XDG_DESKTOP_DIR=\"relative\"\n").is_err());
         assert!(
-            parse_xdg_user_directories(home, "XDG_DOWNLOAD_DIR=\"$HOME/../escape\"\n").is_err()
+            parse_xdg_user_directory_config(home, "XDG_DOWNLOAD_DIR=\"$HOME/../escape\"\n")
+                .is_err()
         );
-        assert!(parse_xdg_user_directories(home, "XDG_DOWNLOAD_DIR=\"$OTHER/drop\"\n").is_err());
+        assert!(
+            parse_xdg_user_directory_config(home, "XDG_DOWNLOAD_DIR=\"$OTHER/drop\"\n").is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xdg_declared_directories_are_mandatory_but_absent_fallbacks_are_optional() {
+        use std::os::unix::fs::symlink;
+
+        let temp = scratch();
+        let home = temp.path().join("home");
+        fs::create_dir(&home).expect("home should be created");
+
+        let missing = temp.path().join("declared-missing");
+        let missing_source = format!("XDG_DESKTOP_DIR=\"{}\"\n", missing.display());
+        parse_xdg_user_directory_config(&home, &missing_source)
+            .expect("the missing absolute declaration should parse");
+        assert_eq!(
+            desktop_download_trees_from_xdg_source(&home, Some(&missing_source)),
+            Err(WorkspaceRejection::Inaccessible)
+        );
+
+        let dangling = temp.path().join("declared-dangling");
+        symlink(temp.path().join("absent-target"), &dangling)
+            .expect("dangling declaration should be created");
+        let dangling_source = format!("XDG_DOWNLOAD_DIR=\"{}\"\n", dangling.display());
+        parse_xdg_user_directory_config(&home, &dangling_source)
+            .expect("the dangling absolute declaration should parse");
+        assert_eq!(
+            desktop_download_trees_from_xdg_source(&home, Some(&dangling_source)),
+            Err(WorkspaceRejection::Inaccessible)
+        );
+
+        let file = temp.path().join("declared-file");
+        fs::write(&file, b"not a directory").expect("declared file should be created");
+        let file_source = format!("XDG_DESKTOP_DIR=\"{}\"\n", file.display());
+        parse_xdg_user_directory_config(&home, &file_source)
+            .expect("the absolute file declaration should parse");
+        assert_eq!(
+            desktop_download_trees_from_xdg_source(&home, Some(&file_source)),
+            Err(WorkspaceRejection::NotDirectory)
+        );
+
+        assert_eq!(
+            desktop_download_trees_from_xdg_source(&home, None)
+                .expect("absent profile fallbacks may be ignored"),
+            Vec::<PathBuf>::new()
+        );
+
+        for fallback in [home.join("Desktop"), home.join("Downloads")] {
+            fs::create_dir(fallback).expect("profile fallback should be created");
+        }
+        let disabled_source = "XDG_DESKTOP_DIR=\"$HOME\"\nXDG_DOWNLOAD_DIR=\"$HOME\"\n";
+        assert_eq!(
+            desktop_download_trees_from_xdg_source(&home, Some(disabled_source))
+                .expect("the XDG disabled sentinel should be accepted"),
+            Vec::<PathBuf>::new(),
+            "$HOME disables the user directory and must not protect the whole home or its fallback"
+        );
     }
 }
