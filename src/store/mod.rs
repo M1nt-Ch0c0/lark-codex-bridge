@@ -145,8 +145,7 @@ impl StoreHandle {
     ///
     /// Returns an error when the database cannot be opened or migrated.
     pub async fn open(path: &Path) -> Result<Self, StoreError> {
-        let database_path = prepare_database_file(path)?;
-        let reservation = FileReservation::reserve(&database_path)?;
+        let (database_path, reservation) = prepare_and_reserve_file_store(path)?;
         Ok(Self::from_parts(
             writer::spawn(
                 writer::StoreLocation::File(database_path),
@@ -279,6 +278,12 @@ impl StoreHandle {
     }
 }
 
+fn prepare_and_reserve_file_store(path: &Path) -> Result<(PathBuf, FileReservation), StoreError> {
+    let database_path = prepare_database_file(path)?;
+    let reservation = FileReservation::reserve(&database_path)?;
+    Ok((database_path, reservation))
+}
+
 static LIVE_FILE_STORES: OnceLock<Mutex<HashSet<FileIdentity>>> = OnceLock::new();
 
 #[derive(Clone, Hash, PartialEq, Eq)]
@@ -407,5 +412,66 @@ pub(crate) fn query_optional<T>(
         Ok(value) => Ok(Some(value)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(error) => Err(sqlite_error(context, &error)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn file_preparation_reserves_actual_identity_before_writer_spawn() {
+        let temp = tempdir().expect("tempdir");
+        let target = temp.path().join("target.sqlite");
+        assert!(!target.exists());
+
+        let (database_path, reservation) =
+            prepare_and_reserve_file_store(&target).expect("prepare target");
+        assert_eq!(
+            database_path,
+            std::fs::canonicalize(&target).expect("canonical target")
+        );
+        assert_eq!(
+            std::fs::metadata(&target).expect("target metadata").len(),
+            0
+        );
+        assert!(matches!(
+            prepare_and_reserve_file_store(&target),
+            Err(StoreError::AlreadyOpen)
+        ));
+        assert_eq!(
+            std::fs::metadata(&target).expect("target metadata").len(),
+            0
+        );
+
+        drop(reservation);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_alias_is_rejected_before_writer_spawn() {
+        let temp = tempdir().expect("tempdir");
+        let target = temp.path().join("target.sqlite");
+        let alias = temp.path().join("alias.sqlite");
+        std::os::unix::fs::symlink(&target, &alias).expect("dangling symlink");
+        assert!(!target.exists());
+
+        let (_database_path, reservation) =
+            prepare_and_reserve_file_store(&target).expect("prepare target");
+        assert_eq!(
+            std::fs::metadata(&target).expect("target metadata").len(),
+            0
+        );
+        assert!(matches!(
+            prepare_and_reserve_file_store(&alias),
+            Err(StoreError::AlreadyOpen)
+        ));
+        assert_eq!(
+            std::fs::metadata(&target).expect("target metadata").len(),
+            0
+        );
+
+        drop(reservation);
     }
 }
