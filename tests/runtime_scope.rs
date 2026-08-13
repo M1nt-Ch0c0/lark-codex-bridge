@@ -1428,6 +1428,92 @@ async fn supervisor_epoch_loss_finalizes_uncertain_before_queued_work_resumes() 
 }
 
 #[tokio::test]
+async fn supervisor_epoch_loss_is_observed_while_the_scope_mailbox_is_full() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RecordingSink::default());
+    let (supervisor, first_control, _second_control) = restarting_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink.clone(),
+    )
+    .await
+    .expect("router");
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("event-full-epoch-running", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("route running turn");
+    let start_thread = first_control.next_request().await;
+    first_control
+        .respond(
+            &start_thread,
+            thread_result("thread-full-epoch", &workspace),
+        )
+        .await;
+    let start_turn = first_control.next_request().await;
+    respond_turn_started(&first_control, &start_turn, "turn-full-epoch").await;
+    wait_for_running_turn(&store, "turn-full-epoch").await;
+
+    for index in 0..SCOPE_MAILBOX_CAPACITY {
+        router
+            .route(
+                queued_registered(
+                    &store,
+                    &namespace,
+                    event(
+                        format!("event-full-epoch-pending-{index}").as_str(),
+                        "owner-runtime-scope",
+                    ),
+                )
+                .await,
+            )
+            .await
+            .expect("fill scope mailbox");
+    }
+
+    first_control.unexpected_exit();
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-full-epoch-running"],
+        InboundEventState::Rejected,
+    )
+    .await;
+    assert_eq!(
+        sink.finalizations.lock().expect("finalizations")[0].1,
+        TurnResolution::Uncertain
+    );
+    assert_eq!(
+        store
+            .inbound_state(
+                &namespace,
+                format!("event-full-epoch-pending-{}", SCOPE_MAILBOX_CAPACITY - 1).as_str(),
+            )
+            .await
+            .expect("queued inbound state"),
+        Some(InboundEventState::Received)
+    );
+
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
 async fn mixed_batch_omits_an_already_claimed_key_without_stranding_its_sibling() {
     let config = validated_config();
     let workspace = config.default_workspace.clone().expect("workspace");
