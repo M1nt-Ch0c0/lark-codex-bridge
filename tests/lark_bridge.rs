@@ -3,6 +3,7 @@
 //! full-channel `{code: 500}` receipts, card-action acks, degraded-event
 //! delivery, and the one-shot `lark probe` round trip.
 
+mod bridgews;
 mod larkstub;
 
 use std::net::SocketAddr;
@@ -11,27 +12,29 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, StreamExt};
 use lark_codex_bridge::lark::api::ChatMode;
-use lark_codex_bridge::lark::bridge::{BridgeConfig, LarkBridge};
+use lark_codex_bridge::lark::bridge::{BridgeConfig, IntakeHook, IntakeVerdict, LarkBridge};
 use lark_codex_bridge::lark::config::{LarkEndpoints, TenantBrand};
 use lark_codex_bridge::lark::credentials::LarkCredentials;
-use lark_codex_bridge::lark::frame::{Frame, FrameMethod, Header, header_key};
+use lark_codex_bridge::lark::frame::{Frame, Header, header_key};
 use lark_codex_bridge::lark::http::LarkHttp;
 use lark_codex_bridge::lark::normalize::ScopeKey;
 use lark_codex_bridge::lark::transport::{LarkTransport, TransportHandle};
+use lark_codex_bridge::runtime::intake::{DurableIntake, IntakeRuntime, TenantNamespace};
+use lark_codex_bridge::store::{
+    BeginTurnOutcome, InboundEventState, InboundKey, InboundTerminal, NewTurnRow, StoreHandle,
+    TurnResolution, TurnState,
+};
 use larkstub::{RecordedRequest, StubResponse, StubServer};
 use secrecy::SecretString;
 use serde_json::Value;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use tokio::sync::{Notify, Semaphore, mpsc};
 use tokio::time::timeout;
-use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use url::Url;
 
+use bridgews::TestWsServer;
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 const TOKEN_PATH: &str = "/open-apis/auth/v3/tenant_access_token/internal";
 const BOT_INFO_PATH: &str = "/open-apis/bot/v3/info";
@@ -63,6 +66,13 @@ fn endpoint_body(ws_addr: SocketAddr) -> String {
     )
 }
 
+fn p2p_fixture_with_ids(event_id: &str, message_id: &str) -> Vec<u8> {
+    let mut payload: Value = serde_json::from_str(P2P_TEXT_FIXTURE).expect("fixture JSON");
+    payload["header"]["event_id"] = Value::String(event_id.to_owned());
+    payload["event"]["message"]["message_id"] = Value::String(message_id.to_owned());
+    serde_json::to_vec(&payload).expect("encode fixture")
+}
+
 /// Serves tokens, bot info, and the endpoint bootstrap; chat-mode lookups
 /// delegate to `chat_mode`.
 fn bridge_stub(
@@ -90,140 +100,6 @@ fn bridge_stub(
         }
         StubResponse::text(404, "not found")
     })
-}
-
-// ---------------------------------------------------------------------------
-// In-process WebSocket server (same pattern as tests/lark_transport.rs)
-// ---------------------------------------------------------------------------
-struct TestWsServer {
-    addr: SocketAddr,
-    incoming: mpsc::UnboundedReceiver<TestWsConn>,
-    task: JoinHandle<()>,
-}
-
-struct TestWsConn {
-    ws: WebSocketStream<TcpStream>,
-}
-
-impl TestWsServer {
-    async fn start() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("ws listener binds");
-        let addr = listener.local_addr().expect("ws addr");
-        let (tx, incoming) = mpsc::unbounded_channel();
-        let task = tokio::spawn(async move {
-            loop {
-                let Ok((stream, _)) = listener.accept().await else {
-                    return;
-                };
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    if let Ok(ws) = tokio_tungstenite::accept_async(stream).await {
-                        let _ = tx.send(TestWsConn { ws });
-                    }
-                });
-            }
-        });
-        Self {
-            addr,
-            incoming,
-            task,
-        }
-    }
-
-    async fn accept(&mut self) -> TestWsConn {
-        timeout(TEST_TIMEOUT, self.incoming.recv())
-            .await
-            .expect("a connection arrives")
-            .expect("connection channel stays open")
-    }
-}
-
-impl Drop for TestWsServer {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-impl TestWsConn {
-    async fn recv_frame(&mut self) -> Frame {
-        let message = timeout(TEST_TIMEOUT, self.ws.next())
-            .await
-            .expect("a frame arrives")
-            .expect("socket stays open")
-            .expect("frame decodes at the ws layer");
-        let Message::Binary(bytes) = message else {
-            panic!("expected a binary frame, got {message:?}");
-        };
-        Frame::decode_bytes(&bytes).expect("pbbp2 frame decodes")
-    }
-
-    async fn send_frame(&mut self, frame: &Frame) {
-        self.ws
-            .send(Message::Binary(frame.encode_to_vec().into()))
-            .await
-            .expect("frame sends");
-    }
-
-    /// Sends a single-fragment data frame of the given type (`event`/`card`).
-    async fn send_data(&mut self, ty: &str, message_id: &str, payload: &[u8]) {
-        let mut frame = Frame::ping(7);
-        frame.method = FrameMethod::Data.as_wire();
-        frame.headers = vec![
-            Header {
-                key: header_key::TYPE.to_owned(),
-                value: ty.to_owned(),
-            },
-            Header {
-                key: header_key::MESSAGE_ID.to_owned(),
-                value: message_id.to_owned(),
-            },
-            Header {
-                key: header_key::SUM.to_owned(),
-                value: "1".to_owned(),
-            },
-            Header {
-                key: header_key::SEQ.to_owned(),
-                value: "0".to_owned(),
-            },
-            Header {
-                key: header_key::TRACE_ID.to_owned(),
-                value: format!("tr-{message_id}"),
-            },
-        ];
-        frame.payload = Some(Bytes::from(payload.to_vec()));
-        self.send_frame(&frame).await;
-    }
-
-    /// Sends a control pong frame carrying a `ClientConfig` payload.
-    async fn send_pong(&mut self, config_json: &str) {
-        let mut frame = Frame::ping(7);
-        frame.headers = vec![Header {
-            key: header_key::TYPE.to_owned(),
-            value: "pong".to_owned(),
-        }];
-        frame.payload = Some(Bytes::from(config_json.as_bytes().to_vec()));
-        self.send_frame(&frame).await;
-    }
-
-    /// Reads frames until one has a `biz_rt` header (a receipt); returns its
-    /// `message_id` and decoded JSON body.
-    async fn recv_receipt(&mut self) -> (String, Value) {
-        loop {
-            let frame = self.recv_frame().await;
-            let headers = frame.frame_headers();
-            if headers.biz_rt().is_some() {
-                let body: Value =
-                    serde_json::from_slice(frame.payload.as_ref().expect("receipt payload"))
-                        .expect("receipt payload is json");
-                return (
-                    headers.message_id().expect("receipt message_id").to_owned(),
-                    body,
-                );
-            }
-        }
-    }
 }
 
 /// Starts the HTTP stub and WS server, then a bridge pointed at both.
@@ -380,6 +256,316 @@ async fn degraded_events_are_still_delivered() {
     assert_eq!(event.text, "status?");
 
     handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn durable_runtime_persists_before_200_and_preloads_on_restart() {
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let credentials = test_credentials();
+    let namespace = TenantNamespace::from_credentials(&credentials);
+    let intake = DurableIntake::prepare(store.clone(), &credentials)
+        .await
+        .expect("prepare");
+    let mut ws_server = TestWsServer::start().await;
+    let stub = StubServer::start(bridge_stub(ws_server.addr, |_| {
+        StubResponse::text(500, "unused")
+    }))
+    .await;
+    let (handle, mut events) = LarkBridge::start_with_runtime(
+        endpoints_for(&stub),
+        credentials.clone(),
+        BridgeConfig::default(),
+        intake,
+    )
+    .await
+    .expect("durable bridge starts");
+    let mut conn = ws_server.accept().await;
+    let _ping = conn.recv_frame().await;
+    conn.send_data("event", "m-durable", P2P_TEXT_FIXTURE.as_bytes())
+        .await;
+    let (_, receipt) = conn.recv_receipt().await;
+    assert_eq!(receipt["code"], 200);
+    assert_eq!(
+        store
+            .inbound_state(&namespace, "evt_p2p_scrubbed_001")
+            .await
+            .expect("persisted"),
+        Some(InboundEventState::Received),
+        "receipt follows the SQLite commit"
+    );
+    let queued = events.recv().await.expect("live event");
+    assert_eq!(queued.event.event_id, "evt_p2p_scrubbed_001");
+    drop(queued);
+    handle.shutdown().await;
+
+    let restart = DurableIntake::prepare(store.clone(), &credentials)
+        .await
+        .expect("restart prepare");
+    let (handle, mut replay) = LarkBridge::start_with_runtime(
+        endpoints_for(&stub),
+        credentials,
+        BridgeConfig::default(),
+        restart,
+    )
+    .await
+    .expect("restart bridge");
+    let replayed = replay.try_recv().expect("startup recovery is preloaded");
+    assert_eq!(replayed.event.event_id, "evt_p2p_scrubbed_001");
+    handle.shutdown().await;
+    store.shutdown().await.expect("shutdown store");
+}
+
+#[tokio::test]
+async fn durable_runtime_rejects_binding_mismatch_and_zero_limits() {
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let original = test_credentials();
+    let mut ws_server = TestWsServer::start().await;
+    let stub = StubServer::start(bridge_stub(ws_server.addr, |_| {
+        StubResponse::text(500, "unused")
+    }))
+    .await;
+    let mismatch = DurableIntake::prepare(store.clone(), &original)
+        .await
+        .expect("prepare mismatch");
+    let other = LarkCredentials::new(
+        "cli_other_app".to_owned(),
+        SecretString::from("other-secret"),
+        TenantBrand::Feishu,
+    );
+    let error = match LarkBridge::start_with_runtime(
+        endpoints_for(&stub),
+        other,
+        BridgeConfig::default(),
+        mismatch,
+    )
+    .await
+    {
+        Ok(_) => panic!("credential mismatch must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.kind(),
+        lark_codex_bridge::lark::error::LarkErrorKind::ProtocolViolation
+    );
+    assert!(
+        ws_server.incoming.try_recv().is_err(),
+        "no WebSocket starts"
+    );
+
+    let zero = DurableIntake::prepare(store.clone(), &original)
+        .await
+        .expect("prepare zero");
+    let error = match LarkBridge::start_with_runtime(
+        endpoints_for(&stub),
+        original,
+        BridgeConfig {
+            event_capacity: 0,
+            ..BridgeConfig::default()
+        },
+        zero,
+    )
+    .await
+    {
+        Ok(_) => panic!("zero count bound must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.kind(),
+        lark_codex_bridge::lark::error::LarkErrorKind::ProtocolViolation
+    );
+    assert!(ws_server.incoming.try_recv().is_err(), "still no WebSocket");
+    store.shutdown().await.expect("shutdown store");
+}
+
+#[tokio::test]
+async fn durable_hook_blocks_receipt_until_it_resolves() {
+    let credentials = test_credentials();
+    let entered = Arc::new(Notify::new());
+    let gate = Arc::new(Semaphore::new(0));
+    let hook: IntakeHook = {
+        let entered = Arc::clone(&entered);
+        let gate = Arc::clone(&gate);
+        Arc::new(move |_event| {
+            let entered = Arc::clone(&entered);
+            let gate = Arc::clone(&gate);
+            async move {
+                entered.notify_one();
+                let _permit = gate.acquire_owned().await.expect("gate stays open");
+                Ok(IntakeVerdict::DropDuplicate)
+            }
+            .boxed()
+        })
+    };
+    let runtime = IntakeRuntime::try_from_parts(&credentials, Vec::new(), hook).expect("runtime");
+    let mut ws_server = TestWsServer::start().await;
+    let stub = StubServer::start(bridge_stub(ws_server.addr, |_| {
+        StubResponse::text(500, "unused")
+    }))
+    .await;
+    let (handle, mut events) = LarkBridge::start_with_runtime(
+        endpoints_for(&stub),
+        credentials,
+        BridgeConfig::default(),
+        runtime,
+    )
+    .await
+    .expect("start");
+    let mut conn = ws_server.accept().await;
+    let _ping = conn.recv_frame().await;
+    conn.send_data("event", "m-hook", P2P_TEXT_FIXTURE.as_bytes())
+        .await;
+    timeout(TEST_TIMEOUT, entered.notified())
+        .await
+        .expect("hook entered");
+    assert!(
+        timeout(Duration::from_millis(100), conn.recv_receipt())
+            .await
+            .is_err(),
+        "receipt waits for the durable hook"
+    );
+    assert!(events.try_recv().is_err(), "business queue is still empty");
+    gate.add_permits(1);
+    let (_, receipt) = conn.recv_receipt().await;
+    assert_eq!(receipt["code"], 200);
+    assert!(
+        events.try_recv().is_err(),
+        "duplicate verdict is not enqueued"
+    );
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn terminal_duplicate_acks_200_even_when_durable_channel_is_full() {
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let credentials = test_credentials();
+    let namespace = TenantNamespace::from_credentials(&credentials);
+    let runtime = DurableIntake::prepare(store.clone(), &credentials)
+        .await
+        .expect("prepare");
+    let mut ws_server = TestWsServer::start().await;
+    let stub = StubServer::start(bridge_stub(ws_server.addr, |_| {
+        StubResponse::text(500, "unused")
+    }))
+    .await;
+    let (handle, mut events) = LarkBridge::start_with_runtime(
+        endpoints_for(&stub),
+        credentials,
+        BridgeConfig {
+            event_capacity: 1,
+            ..BridgeConfig::default()
+        },
+        runtime,
+    )
+    .await
+    .expect("start");
+    let mut conn = ws_server.accept().await;
+    let _ping = conn.recv_frame().await;
+    conn.send_data("event", "m-new", P2P_TEXT_FIXTURE.as_bytes())
+        .await;
+    assert_eq!(conn.recv_receipt().await.1["code"], 200);
+
+    let begun = store
+        .begin_turn_and_claim_inbound(
+            NewTurnRow {
+                scope_key: "im:oc_p2p_chat".to_owned(),
+                client_message_id: "bridge-terminal-turn".to_owned(),
+                codex_thread_id: Some("thread-bridge".to_owned()),
+                state: TurnState::Starting,
+            },
+            &[InboundKey::new(
+                namespace,
+                "evt_p2p_scrubbed_001".to_owned(),
+            )],
+        )
+        .await
+        .expect("claim");
+    let BeginTurnOutcome::Started { turn_row_id, .. } = begun else {
+        panic!("started")
+    };
+    store
+        .set_turn_state(turn_row_id, TurnState::Running, Some("codex-bridge"))
+        .await
+        .expect("running");
+    store
+        .resolve_turn_and_finish_inbound_batch(
+            turn_row_id,
+            TurnResolution::Completed,
+            InboundTerminal::Completed,
+        )
+        .await
+        .expect("resolve");
+
+    conn.send_data("event", "m-terminal-duplicate", P2P_TEXT_FIXTURE.as_bytes())
+        .await;
+    assert_eq!(conn.recv_receipt().await.1["code"], 200);
+    assert_eq!(
+        events
+            .try_recv()
+            .expect("original remains queued")
+            .event
+            .event_id,
+        "evt_p2p_scrubbed_001"
+    );
+    handle.shutdown().await;
+    store.shutdown().await.expect("shutdown store");
+}
+
+#[tokio::test]
+async fn committed_row_replays_after_channel_full_500() {
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let credentials = test_credentials();
+    let namespace = TenantNamespace::from_credentials(&credentials);
+    let runtime = DurableIntake::prepare(store.clone(), &credentials)
+        .await
+        .expect("prepare");
+    let mut ws_server = TestWsServer::start().await;
+    let stub = StubServer::start(bridge_stub(ws_server.addr, |_| {
+        StubResponse::text(500, "unused")
+    }))
+    .await;
+    let (handle, mut events) = LarkBridge::start_with_runtime(
+        endpoints_for(&stub),
+        credentials,
+        BridgeConfig {
+            event_capacity: 1,
+            ..BridgeConfig::default()
+        },
+        runtime,
+    )
+    .await
+    .expect("start");
+    let mut conn = ws_server.accept().await;
+    let _ping = conn.recv_frame().await;
+    let first = p2p_fixture_with_ids("event-capacity-first", "message-capacity-first");
+    let second = p2p_fixture_with_ids("event-capacity-second", "message-capacity-second");
+    conn.send_data("event", "m-capacity-first", &first).await;
+    assert_eq!(conn.recv_receipt().await.1["code"], 200);
+    conn.send_data("event", "m-capacity-second", &second).await;
+    assert_eq!(conn.recv_receipt().await.1["code"], 500);
+    assert_eq!(
+        store
+            .inbound_state(&namespace, "event-capacity-second")
+            .await
+            .expect("persisted after 500"),
+        Some(InboundEventState::Received)
+    );
+    assert_eq!(
+        events.recv().await.expect("drain first").event.event_id,
+        "event-capacity-first"
+    );
+    conn.send_data("event", "m-capacity-retry", &second).await;
+    assert_eq!(conn.recv_receipt().await.1["code"], 200);
+    assert_eq!(
+        events
+            .recv()
+            .await
+            .expect("canonical replay")
+            .event
+            .event_id,
+        "event-capacity-second"
+    );
+    handle.shutdown().await;
+    store.shutdown().await.expect("shutdown store");
 }
 
 // ---------------------------------------------------------------------------
