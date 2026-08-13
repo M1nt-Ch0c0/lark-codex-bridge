@@ -16,7 +16,8 @@ use lark_codex_bridge::lark::config::TenantBrand;
 use lark_codex_bridge::lark::credentials::LarkCredentials;
 use lark_codex_bridge::lark::normalize::{InboundEvent, ScopeKey};
 use lark_codex_bridge::limits::{
-    ROUTER_ACTIVE_TURN_HARD_LIMIT, ROUTER_SCOPE_ACTOR_HARD_LIMIT, SCOPE_MAILBOX_CAPACITY,
+    ROUTER_ACTIVE_TURN_HARD_LIMIT, ROUTER_COMMAND_BYTE_BUDGET, ROUTER_SCOPE_ACTOR_HARD_LIMIT,
+    SCOPE_MAILBOX_CAPACITY,
 };
 use lark_codex_bridge::runtime::intake::TenantNamespace;
 use lark_codex_bridge::runtime::policy::AccessPolicy;
@@ -1674,6 +1675,51 @@ async fn full_scope_mailbox_atomically_rejects_the_overflow_with_a_busy_notice()
         vec![InboundRejectionKind::Overloaded]
     );
     assert_eq!(store.outbox_depth().await.expect("outbox").pending, 1);
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn router_command_byte_budget_refuses_an_oversized_retained_item() {
+    let config = validated_config();
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        degraded_supervisor().await,
+        Arc::new(RecordingSink::default()),
+    )
+    .await
+    .expect("router");
+    let mut queued = queued_registered(
+        &store,
+        &namespace,
+        event("event-router-byte-overflow", "owner-runtime-scope"),
+    )
+    .await;
+    let retained_bytes = ROUTER_COMMAND_BYTE_BUDGET + 1;
+    queued.permit = Arc::new(Semaphore::new(retained_bytes))
+        .acquire_many_owned(u32::try_from(retained_bytes).expect("retained bytes fit"))
+        .await
+        .expect("oversized synthetic retained permit");
+
+    assert!(matches!(
+        router.route(queued).await,
+        Err(RouteError::Capacity)
+    ));
+    assert_eq!(
+        store
+            .inbound_state(&namespace, "event-router-byte-overflow")
+            .await
+            .expect("inbound state"),
+        Some(InboundEventState::Received)
+    );
+
     router.shutdown().await.expect("shutdown");
     store.shutdown().await.expect("store shutdown");
 }
