@@ -1548,7 +1548,9 @@ async fn atomic_rejection_notice_and_turn_claim_have_one_consistent_winner() {
     store.shutdown().await.expect("shutdown");
 }
 
-#[cfg(unix)]
+// Darwin rejects this invalid UTF-8 filename before SQLite or the store can
+// observe it. Other Unix platforms exercise the byte-preserving sidecar path.
+#[cfg(all(unix, not(target_vendor = "apple")))]
 #[tokio::test]
 async fn database_sidecars_are_retightened_for_non_utf8_paths() {
     use std::os::unix::ffi::OsStringExt;
