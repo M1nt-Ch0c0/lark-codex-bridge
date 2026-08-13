@@ -67,18 +67,22 @@ fn writer_main(
     location: StoreLocation,
     mut receiver: mpsc::Receiver<StoreRequest>,
     init: oneshot::Sender<Result<(), StoreError>>,
-    _reservation: Option<FileReservation>,
+    mut reservation: Option<FileReservation>,
 ) {
     let mut connection = match open_and_migrate(&location) {
-        Ok(connection) => {
-            let _ = init.send(Ok(()));
-            connection
-        }
+        Ok(connection) => connection,
         Err(error) => {
             let _ = init.send(Err(error));
             return;
         }
     };
+    if let (StoreLocation::File(path), Some(file_reservation)) = (&location, reservation.as_mut()) {
+        if let Err(error) = file_reservation.promote(path) {
+            let _ = init.send(Err(error));
+            return;
+        }
+    }
+    let _ = init.send(Ok(()));
     while let Some(request) = receiver.blocking_recv() {
         match request {
             StoreRequest::Job(job) => job(&mut connection),

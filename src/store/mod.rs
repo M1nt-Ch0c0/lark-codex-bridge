@@ -278,22 +278,51 @@ impl StoreHandle {
     }
 }
 
-static LIVE_FILE_STORES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+static LIVE_FILE_STORES: OnceLock<Mutex<HashSet<FileIdentity>>> = OnceLock::new();
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+enum FileIdentity {
+    Provisional(PathBuf),
+    #[cfg(unix)]
+    Unix {
+        device: u64,
+        inode: u64,
+    },
+    #[cfg(not(unix))]
+    Canonical(PathBuf),
+}
 
 /// Process-local reservation held by the writer thread for its full lifetime.
 pub(crate) struct FileReservation {
-    key: PathBuf,
+    key: FileIdentity,
 }
 
 impl FileReservation {
     fn reserve(path: &Path) -> Result<Self, StoreError> {
-        let key = normalized_file_key(path)?;
+        let key = file_identity(path)?;
         let stores = LIVE_FILE_STORES.get_or_init(|| Mutex::new(HashSet::new()));
         let mut stores = stores.lock().map_err(|_| StoreError::Closed)?;
         if !stores.insert(key.clone()) {
             return Err(StoreError::AlreadyOpen);
         }
         Ok(Self { key })
+    }
+
+    pub(crate) fn promote(&mut self, path: &Path) -> Result<(), StoreError> {
+        let actual = file_identity(path)?;
+        if actual == self.key {
+            return Ok(());
+        }
+        let stores = LIVE_FILE_STORES.get_or_init(|| Mutex::new(HashSet::new()));
+        let mut stores = stores.lock().map_err(|_| StoreError::Closed)?;
+        if stores.contains(&actual) {
+            return Err(StoreError::AlreadyOpen);
+        }
+        let removed = stores.remove(&self.key);
+        debug_assert!(removed);
+        stores.insert(actual.clone());
+        self.key = actual;
+        Ok(())
     }
 }
 
@@ -307,7 +336,7 @@ impl Drop for FileReservation {
     }
 }
 
-fn normalized_file_key(path: &Path) -> Result<PathBuf, StoreError> {
+fn file_identity(path: &Path) -> Result<FileIdentity, StoreError> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -317,6 +346,27 @@ fn normalized_file_key(path: &Path) -> Result<PathBuf, StoreError> {
             })?
             .join(path)
     };
+    if absolute.exists() {
+        let canonical = std::fs::canonicalize(&absolute).map_err(|_| StoreError::Io {
+            context: "resolving the database path",
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            let metadata = std::fs::metadata(canonical).map_err(|_| StoreError::Io {
+                context: "resolving the database path",
+            })?;
+            return Ok(FileIdentity::Unix {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            });
+        }
+        #[cfg(not(unix))]
+        {
+            return Ok(FileIdentity::Canonical(canonical));
+        }
+    }
     let parent = absolute.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent).map_err(|_| StoreError::Io {
         context: "creating the database directory",
@@ -324,11 +374,11 @@ fn normalized_file_key(path: &Path) -> Result<PathBuf, StoreError> {
     let canonical_parent = std::fs::canonicalize(parent).map_err(|_| StoreError::Io {
         context: "resolving the database path",
     })?;
-    Ok(
-        canonical_parent.join(absolute.file_name().ok_or(StoreError::Io {
+    Ok(FileIdentity::Provisional(canonical_parent.join(
+        absolute.file_name().ok_or(StoreError::Io {
             context: "resolving the database path",
-        })?),
-    )
+        })?,
+    )))
 }
 
 /// Adds captured strings' UTF-8 byte lengths without overflowing.

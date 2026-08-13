@@ -1,4 +1,6 @@
 use std::collections::HashSet;
+use std::future::Future;
+use std::task::{Context, Poll, Waker};
 
 use lark_codex_bridge::lark::api::ChatMode;
 use lark_codex_bridge::lark::normalize::{InboundEvent, ScopeKey};
@@ -178,6 +180,27 @@ async fn file_store_rejects_a_second_live_open_until_the_writer_exits() {
         .expect("shutdown");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn file_store_rejects_symlink_and_hard_link_aliases() {
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("store.sqlite");
+    let link = temp.path().join("store-link.sqlite");
+    let hard_link = temp.path().join("store-hard-link.sqlite");
+    let first = StoreHandle::open(&path).await.expect("open");
+    std::os::unix::fs::symlink(&path, &link).expect("symlink");
+    std::fs::hard_link(&path, &hard_link).expect("hard link");
+    assert!(matches!(
+        StoreHandle::open(&link).await,
+        Err(StoreError::AlreadyOpen)
+    ));
+    assert!(matches!(
+        StoreHandle::open(&hard_link).await,
+        Err(StoreError::AlreadyOpen)
+    ));
+    first.shutdown().await.expect("shutdown");
+}
+
 #[tokio::test]
 async fn dedup_transitions_and_ttl_are_fail_closed() {
     let store = StoreHandle::open_in_memory().await.expect("open");
@@ -284,6 +307,30 @@ async fn live_turn_recovery_has_transactional_count_and_byte_bounds() {
         })
         .sum();
     assert!(recovery_bytes <= STORE_RECOVERY_TURN_MAX_BYTES);
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn live_turn_recovery_rejects_byte_overflow_before_count_overflow() {
+    let store = StoreHandle::open_in_memory().await.expect("open");
+    let identifier = "x".repeat(400 * 1024);
+    store
+        .record_turn(turn(&format!("{identifier}-one"), TurnState::Starting))
+        .await
+        .expect("first fits");
+    store
+        .record_turn(turn(&format!("{identifier}-two"), TurnState::Starting))
+        .await
+        .expect("second fits");
+    assert!(matches!(
+        store
+            .record_turn(turn(&format!("{identifier}-three"), TurnState::Starting))
+            .await,
+        Err(StoreError::CapacityExceeded { .. })
+    ));
+    assert!(
+        store.uncertain_turns().await.expect("bounded rows").len() < STORE_RECOVERY_TURN_MAX_ROWS
+    );
     store.shutdown().await.expect("shutdown");
 }
 
@@ -581,31 +628,27 @@ async fn writer_channel_rejects_overflow_and_oversized_typed_inputs() {
     let lock = rusqlite::Connection::open(&path).expect("lock connection");
     lock.execute_batch("PRAGMA busy_timeout = 5000; BEGIN IMMEDIATE")
         .expect("write lock");
-    let task_count = STORE_WRITER_CAPACITY * 4;
-    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(task_count + 1));
-    let mut joins = Vec::new();
-    for number in 0..task_count {
-        let store = store.clone();
-        let barrier = barrier.clone();
-        joins.push(tokio::spawn(async move {
-            barrier.wait().await;
-            store
-                .enqueue_outbox(outbox(&format!("queued-{number}"), "x"))
-                .await
-        }));
-    }
-    barrier.wait().await;
-    lock.execute_batch("ROLLBACK").expect("release lock");
+    let waker = Waker::noop();
+    let mut context = Context::from_waker(waker);
+    let mut queued = Vec::new();
     let mut queue_full = false;
-    for join in joins {
-        if matches!(join.await.expect("join"), Err(StoreError::QueueFull)) {
-            queue_full = true;
+    for number in 0..=(STORE_WRITER_CAPACITY + 1) {
+        let mut future = Box::pin(store.enqueue_outbox(outbox(&format!("queued-{number}"), "x")));
+        match future.as_mut().poll(&mut context) {
+            Poll::Pending => queued.push(future),
+            Poll::Ready(Err(StoreError::QueueFull)) => {
+                queue_full = true;
+                break;
+            }
+            Poll::Ready(other) => panic!("unexpected writer saturation result: {other:?}"),
         }
     }
     assert!(
         queue_full,
-        "typed callers observe the bounded writer channel"
+        "manually polled typed futures fill the writer channel"
     );
+    lock.execute_batch("ROLLBACK").expect("release lock");
+    drop(queued);
     store.shutdown().await.expect("shutdown");
 }
 
@@ -619,32 +662,30 @@ async fn writer_byte_budget_and_cancelled_callers_release_permits_after_dequeue(
         .expect("write lock");
     let key_bytes = 256 * 1024;
     let key = "k".repeat(key_bytes);
-    let sends = STORE_WRITER_BYTE_BUDGET / key_bytes + 2;
-    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(sends + 1));
-    let mut joins = Vec::new();
-    for number in 0..sends {
-        let store = store.clone();
-        let barrier = barrier.clone();
-        let key = format!("{key}-{number}");
-        joins.push(tokio::spawn(async move {
-            barrier.wait().await;
-            store.enqueue_outbox(outbox(&key, "x")).await
-        }));
+    let request_bytes = key.len() + "im:oc_test".len() + "final".len() + 1;
+    let permits = STORE_WRITER_BYTE_BUDGET / request_bytes;
+    let waker = Waker::noop();
+    let mut context = Context::from_waker(waker);
+    let mut cancelled = Box::pin(store.enqueue_outbox(outbox(&key, "x")));
+    assert!(matches!(
+        cancelled.as_mut().poll(&mut context),
+        Poll::Pending
+    ));
+    drop(cancelled);
+    let mut queued = Vec::new();
+    for _ in 1..permits {
+        let mut future = Box::pin(store.enqueue_outbox(outbox(&key, "x")));
+        assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+        queued.push(future);
     }
-    barrier.wait().await;
-    let cancelled = joins.pop().expect("queued caller");
-    cancelled.abort();
+    let mut overflow = Box::pin(store.enqueue_outbox(outbox(&key, "x")));
+    assert!(matches!(
+        overflow.as_mut().poll(&mut context),
+        Poll::Ready(Err(StoreError::QueueFull))
+    ));
+    drop(overflow);
     lock.execute_batch("ROLLBACK").expect("release lock");
-    let mut queue_full = false;
-    for join in joins {
-        if matches!(join.await.expect("join"), Err(StoreError::QueueFull)) {
-            queue_full = true;
-        }
-    }
-    assert!(
-        queue_full,
-        "byte permits reject callers before count capacity"
-    );
+    drop(queued);
     store
         .enqueue_outbox(outbox("after-cancel", "x"))
         .await
