@@ -16,7 +16,8 @@ use lark_codex_bridge::runtime::intake::TenantNamespace;
 use lark_codex_bridge::store::{
     BeginTurnOutcome, DedupOutcome, InboundDisposition, InboundEventState, InboundKey,
     InboundRejectionKind, InboundTerminal, NewOutboxRow, NewTurnRow, OutboxEnqueue, OutboxState,
-    ResolveTurnOutcome, StoreError, StoreHandle, TurnResolution, TurnState,
+    ResolveTurnOutcome, ScopeRow, StoreError, StoreHandle, ThreadRow, ThreadStatus, TurnResolution,
+    TurnRow, TurnState,
 };
 use secrecy::SecretString;
 use tempfile::tempdir;
@@ -1067,6 +1068,56 @@ async fn scope_paths_are_redacted_and_non_utf8_paths_are_refused() {
         ));
     }
     store.shutdown().await.expect("shutdown");
+}
+
+#[test]
+fn durable_session_rows_redact_scope_and_workspace_values_from_debug() {
+    let scope_key = "im:oc_sensitive:thread:omt_sensitive".to_owned();
+    let thread_id = "codex-thread-sensitive".to_owned();
+    let scope = ScopeRow {
+        scope_key: scope_key.clone(),
+        cwd: std::path::PathBuf::from("/workspace/secret-project"),
+        policy_fingerprint: "secret-policy-fingerprint".to_owned(),
+        updated_ms: 1,
+    };
+    let thread = ThreadRow {
+        scope_key: scope_key.clone(),
+        codex_thread_id: thread_id.clone(),
+        status: ThreadStatus::Active,
+        created_ms: 2,
+        archived_ms: None,
+    };
+    let turn = TurnRow {
+        id: 3,
+        scope_key: scope_key.clone(),
+        client_message_id: "client-message-sensitive".to_owned(),
+        codex_thread_id: Some(thread_id.clone()),
+        codex_turn_id: Some("codex-turn-sensitive".to_owned()),
+        state: TurnState::Running,
+        uncertain: false,
+        created_ms: 4,
+        updated_ms: 5,
+        inbound_count: 1,
+    };
+    let new_turn = NewTurnRow {
+        scope_key,
+        client_message_id: "new-client-message-sensitive".to_owned(),
+        codex_thread_id: Some(thread_id),
+        state: TurnState::Starting,
+    };
+
+    for debug in [
+        format!("{scope:?}"),
+        format!("{thread:?}"),
+        format!("{turn:?}"),
+        format!("{new_turn:?}"),
+    ] {
+        assert!(
+            !debug.contains("sensitive"),
+            "leaked session value: {debug}"
+        );
+        assert!(!debug.contains("secret-project"), "leaked path: {debug}");
+    }
 }
 
 #[tokio::test]
