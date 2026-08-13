@@ -1591,3 +1591,136 @@ async fn full_scope_mailbox_atomically_rejects_the_overflow_with_a_busy_notice()
     router.shutdown().await.expect("shutdown");
     store.shutdown().await.expect("store shutdown");
 }
+
+#[tokio::test]
+async fn connection_loss_after_turn_start_write_is_uncertain_and_never_auto_resent() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RecordingSink::default());
+    let (supervisor, first_control, second_control) = restarting_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink.clone(),
+    )
+    .await
+    .expect("router");
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("event-start-uncertain", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("route event");
+    let start_thread = first_control.next_request().await;
+    first_control
+        .respond(
+            &start_thread,
+            thread_result("thread-start-uncertain", &workspace),
+        )
+        .await;
+    let start_turn = first_control.next_request().await;
+    assert_eq!(start_turn["method"], "turn/start");
+    first_control.unexpected_exit();
+
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-start-uncertain"],
+        InboundEventState::Rejected,
+    )
+    .await;
+    assert_eq!(
+        sink.finalizations.lock().expect("finalizations")[0].1,
+        TurnResolution::Uncertain
+    );
+    assert!(
+        store
+            .uncertain_turns()
+            .await
+            .expect("live turns")
+            .is_empty()
+    );
+    second_control
+        .expect_no_request_for(Duration::from_millis(100))
+        .await;
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn busy_actor_registry_rejects_a_new_scope_without_evicting_live_work() {
+    let mut config = validated_config();
+    config.concurrency.max_scope_actors = 1;
+    config.validate().expect("single actor is valid");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RecordingSink::default());
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        degraded_supervisor().await,
+        sink.clone(),
+    )
+    .await
+    .expect("router");
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event_in_chat("event-actor-live", "owner-runtime-scope", "chat-live"),
+            )
+            .await,
+        )
+        .await
+        .expect("route live actor");
+    sleep(Duration::from_millis(700)).await;
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event_in_chat("event-actor-overflow", "owner-runtime-scope", "chat-new"),
+            )
+            .await,
+        )
+        .await
+        .expect("new scope becomes a durable overload rejection");
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-actor-overflow"],
+        InboundEventState::Rejected,
+    )
+    .await;
+    assert_eq!(router.snapshot().scope_count, 1);
+    assert_eq!(
+        *sink.rejections.lock().expect("rejections"),
+        vec![InboundRejectionKind::Overloaded]
+    );
+    assert_eq!(
+        store
+            .inbound_state(&namespace, "event-actor-live")
+            .await
+            .expect("live state"),
+        Some(InboundEventState::Received)
+    );
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
