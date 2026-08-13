@@ -1724,3 +1724,87 @@ async fn busy_actor_registry_rejects_a_new_scope_without_evicting_live_work() {
     router.shutdown().await.expect("shutdown");
     store.shutdown().await.expect("store shutdown");
 }
+
+#[tokio::test]
+async fn scope_snapshot_reports_only_structural_state_and_mailbox_depth() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        Arc::new(RecordingSink::default()),
+    )
+    .await
+    .expect("router");
+    let first = event("event-snapshot-first", "owner-runtime-scope");
+    let scope = first.scope.clone();
+    assert_eq!(router.scope_snapshot(&scope).await.expect("snapshot"), None);
+    router
+        .route(queued_registered(&store, &namespace, first).await)
+        .await
+        .expect("route first turn");
+    let start_thread = control.next_request().await;
+    control
+        .respond(&start_thread, thread_result("thread-snapshot", &workspace))
+        .await;
+    let start_turn = control.next_request().await;
+    respond_turn_started(&control, &start_turn, "turn-snapshot").await;
+    wait_for_running_turn(&store, "turn-snapshot").await;
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("event-snapshot-queued", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("queue next turn");
+    let snapshot = router
+        .scope_snapshot(&scope)
+        .await
+        .expect("snapshot")
+        .expect("scope exists");
+    assert!(matches!(
+        snapshot.state,
+        lark_codex_bridge::runtime::scope::ScopeState::Running { .. }
+    ));
+    assert_eq!(snapshot.queued_messages, 1);
+    let debug = format!("{snapshot:?}");
+    assert!(!debug.contains("owner-runtime-scope"));
+    assert!(!debug.contains("event-snapshot"));
+    assert!(!debug.contains(workspace.to_string_lossy().as_ref()));
+
+    send_turn_completed(&control, "thread-snapshot", "turn-snapshot", "completed").await;
+    let resume = control.next_request().await;
+    control
+        .respond(&resume, thread_result("thread-snapshot", &workspace))
+        .await;
+    let queued_turn = control.next_request().await;
+    respond_turn_started(&control, &queued_turn, "turn-snapshot-queued").await;
+    send_turn_completed(
+        &control,
+        "thread-snapshot",
+        "turn-snapshot-queued",
+        "completed",
+    )
+    .await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-snapshot-first", "event-snapshot-queued"],
+        InboundEventState::Completed,
+    )
+    .await;
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}

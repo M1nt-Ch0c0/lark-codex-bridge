@@ -23,7 +23,7 @@ use crate::runtime::intake::TenantNamespace;
 use crate::runtime::policy::{AccessDecision, AccessPolicy};
 use crate::runtime::scope::{
     ActorRouteError, DurableReplySink, InterruptOutcome, ReplySinkError, ScopeActorHandle,
-    SupervisorAccess,
+    ScopeSnapshot, SupervisorAccess,
 };
 use crate::store::{InboundKey, InboundRejectionKind, StoreError, StoreHandle};
 
@@ -282,6 +282,37 @@ impl RouterHandle {
         wait.await.map_err(|_| RouteError::Closed)?
     }
 
+    /// Returns a redacted structural snapshot for one resident scope actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns a static classification when the bounded control lane or
+    /// router is unavailable.
+    pub async fn scope_snapshot(
+        &self,
+        scope: &crate::lark::normalize::ScopeKey,
+    ) -> Result<Option<ScopeSnapshot>, RouteError> {
+        let scope_key = scope.to_string();
+        if scope_key.len() > STORE_INBOUND_SCOPE_MAX_BYTES {
+            return Err(RouteError::Capacity);
+        }
+        let bytes = u32::try_from(scope_key.len()).map_err(|_| RouteError::Capacity)?;
+        let permit = self
+            .control_byte_budget
+            .clone()
+            .try_acquire_many_owned(bytes)
+            .map_err(|_| RouteError::Capacity)?;
+        let (respond, wait) = oneshot::channel();
+        self.control_sender
+            .try_send(RouterControl::Snapshot {
+                scope_key,
+                _queue_permit: permit,
+                respond,
+            })
+            .map_err(|_| RouteError::Capacity)?;
+        wait.await.map_err(|_| RouteError::Closed)
+    }
+
     /// Stops the router, its actors, and finally the owned supervisor.
     ///
     /// # Errors
@@ -318,6 +349,11 @@ enum RouterControl {
         _queue_permit: OwnedSemaphorePermit,
         respond: oneshot::Sender<Result<InterruptOutcome, RouteError>>,
     },
+    Snapshot {
+        scope_key: String,
+        _queue_permit: OwnedSemaphorePermit,
+        respond: oneshot::Sender<Option<ScopeSnapshot>>,
+    },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -347,6 +383,10 @@ async fn run_router(
                             Some(actor) => actor.interrupt().await.map_err(|()| RouteError::ActorUnavailable),
                             None => Ok(InterruptOutcome::NoActiveTurn),
                         };
+                        let _ = respond.send(result);
+                    }
+                    RouterControl::Snapshot { scope_key, respond, .. } => {
+                        let result = actors.get(&scope_key).map(ScopeActorHandle::snapshot);
                         let _ = respond.send(result);
                     }
                 }

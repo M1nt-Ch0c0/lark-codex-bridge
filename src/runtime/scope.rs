@@ -140,6 +140,16 @@ pub enum InterruptOutcome {
     NoActiveTurn,
 }
 
+/// Redacted per-scope diagnostics safe for `/status` assembly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScopeSnapshot {
+    /// Current actor state without message or filesystem contents.
+    pub state: ScopeState,
+    /// Inbound messages waiting in the actor mailbox; the item currently
+    /// executing is represented by `state` rather than this count.
+    pub queued_messages: usize,
+}
+
 /// Static scope failure category safe for snapshots and logs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScopeFailureKind {
@@ -266,6 +276,13 @@ impl ScopeActorHandle {
 
     pub(crate) fn is_idle_and_empty(&self) -> bool {
         self.state() == ScopeState::Idle && self.sender.capacity() == SCOPE_MAILBOX_CAPACITY
+    }
+
+    pub(crate) fn snapshot(&self) -> ScopeSnapshot {
+        ScopeSnapshot {
+            state: self.state(),
+            queued_messages: self.sender.max_capacity() - self.sender.capacity(),
+        }
     }
 
     pub(crate) async fn interrupt(&self) -> Result<InterruptOutcome, ()> {
