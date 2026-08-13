@@ -15,10 +15,11 @@ pub struct Migration {
 }
 
 /// All migrations in ascending `user_version` order.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "initial bridge schema",
-    sql: "
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial bridge schema",
+        sql: "
 CREATE TABLE inbound_events (
     tenant TEXT NOT NULL,
     event_id TEXT NOT NULL,
@@ -96,4 +97,89 @@ CREATE TABLE attachment_leases (
     FOREIGN KEY (turn_row_id) REFERENCES turns (id) ON DELETE CASCADE
 );
 ",
-}];
+    },
+    Migration {
+        version: 2,
+        name: "replayable inbound inbox",
+        sql: "
+ALTER TABLE inbound_events ADD COLUMN payload_version INTEGER;
+ALTER TABLE inbound_events ADD COLUMN payload_blob BLOB;
+ALTER TABLE inbound_events ADD COLUMN payload_bytes INTEGER NOT NULL DEFAULT 0
+    CHECK (payload_bytes >= 0);
+ALTER TABLE inbound_events ADD COLUMN turn_row_id INTEGER
+    REFERENCES turns(id) ON DELETE RESTRICT;
+ALTER TABLE turns ADD COLUMN inbound_count INTEGER NOT NULL DEFAULT 0
+    CHECK (inbound_count >= 0);
+
+CREATE INDEX inbound_events_tenant_message_state
+    ON inbound_events (tenant, message_id, state);
+CREATE INDEX inbound_events_turn_row ON inbound_events (turn_row_id);
+CREATE INDEX inbound_events_terminal_sweep
+    ON inbound_events (state, updated_ms, tenant, event_id);
+
+CREATE TRIGGER inbound_events_v2_shape_insert
+BEFORE INSERT ON inbound_events
+WHEN
+    (NEW.state = 'received' AND NOT (
+        NEW.turn_row_id IS NULL AND NEW.payload_version = 1 AND
+        NEW.payload_blob IS NOT NULL AND
+        NEW.payload_bytes = length(NEW.payload_blob)
+    ))
+ OR (NEW.state = 'accepted' AND NOT (
+        NEW.turn_row_id IS NOT NULL AND NEW.payload_version = 1 AND
+        NEW.payload_blob IS NOT NULL AND
+        NEW.payload_bytes = length(NEW.payload_blob) AND
+        EXISTS (
+            SELECT 1 FROM turns
+            WHERE id = NEW.turn_row_id AND scope_key = NEW.scope_key
+        )
+    ))
+ OR (NEW.state IN ('completed', 'rejected') AND NOT (
+        NEW.payload_version IS NULL AND NEW.payload_blob IS NULL AND
+        NEW.payload_bytes = 0 AND (
+            NEW.turn_row_id IS NULL OR EXISTS (
+                SELECT 1 FROM turns
+                WHERE id = NEW.turn_row_id AND scope_key = NEW.scope_key
+                  AND (state IN ('completed', 'failed', 'interrupted')
+                       OR (state = 'uncertain' AND uncertain = 0))
+            )
+        )
+    ))
+BEGIN
+    SELECT RAISE(ABORT, 'invalid inbound v2 shape');
+END;
+
+CREATE TRIGGER inbound_events_v2_shape_update
+BEFORE UPDATE ON inbound_events
+WHEN
+    (NEW.state = 'received' AND NOT (
+        NEW.turn_row_id IS NULL AND NEW.payload_version = 1 AND
+        NEW.payload_blob IS NOT NULL AND
+        NEW.payload_bytes = length(NEW.payload_blob)
+    ))
+ OR (NEW.state = 'accepted' AND NOT (
+        NEW.turn_row_id IS NOT NULL AND NEW.payload_version = 1 AND
+        NEW.payload_blob IS NOT NULL AND
+        NEW.payload_bytes = length(NEW.payload_blob) AND
+        EXISTS (
+            SELECT 1 FROM turns
+            WHERE id = NEW.turn_row_id AND scope_key = NEW.scope_key
+        )
+    ))
+ OR (NEW.state IN ('completed', 'rejected') AND NOT (
+        NEW.payload_version IS NULL AND NEW.payload_blob IS NULL AND
+        NEW.payload_bytes = 0 AND (
+            NEW.turn_row_id IS NULL OR EXISTS (
+                SELECT 1 FROM turns
+                WHERE id = NEW.turn_row_id AND scope_key = NEW.scope_key
+                  AND (state IN ('completed', 'failed', 'interrupted')
+                       OR (state = 'uncertain' AND uncertain = 0))
+            )
+        )
+    ))
+BEGIN
+    SELECT RAISE(ABORT, 'invalid inbound v2 shape');
+END;
+",
+    },
+];

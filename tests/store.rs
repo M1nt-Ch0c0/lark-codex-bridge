@@ -3,16 +3,21 @@ use std::future::Future;
 use std::task::{Context, Poll, Waker};
 
 use lark_codex_bridge::lark::api::ChatMode;
+use lark_codex_bridge::lark::config::TenantBrand;
+use lark_codex_bridge::lark::credentials::LarkCredentials;
 use lark_codex_bridge::lark::normalize::{InboundEvent, ScopeKey};
 use lark_codex_bridge::limits::{
     STORE_OUTBOX_CLAIM_MAX_BYTES, STORE_OUTBOX_MAX_QUEUED_BYTES, STORE_OUTBOX_PAYLOAD_MAX_BYTES,
     STORE_RECOVERY_TURN_MAX_BYTES, STORE_RECOVERY_TURN_MAX_ROWS, STORE_REQUEST_MAX_BYTES,
     STORE_WRITER_BYTE_BUDGET, STORE_WRITER_CAPACITY,
 };
+use lark_codex_bridge::runtime::intake::TenantNamespace;
 use lark_codex_bridge::store::{
-    DedupOutcome, InboundEventState, NewOutboxRow, NewTurnRow, OutboxEnqueue, OutboxState,
-    StoreError, StoreHandle, TurnState,
+    BeginTurnOutcome, DedupOutcome, InboundEventState, InboundKey, InboundTerminal, NewOutboxRow,
+    NewTurnRow, OutboxEnqueue, OutboxState, ResolveTurnOutcome, StoreError, StoreHandle,
+    TurnResolution, TurnState,
 };
+use secrecy::SecretString;
 use tempfile::tempdir;
 
 fn event(event_id: &str, message_id: &str) -> InboundEvent {
@@ -54,18 +59,138 @@ fn turn(message_id: &str, state: TurnState) -> NewTurnRow {
     }
 }
 
+fn tenant_namespace(app_id: &str) -> TenantNamespace {
+    let credentials = LarkCredentials::new(
+        app_id.to_owned(),
+        SecretString::from("test-secret".to_owned()),
+        TenantBrand::Feishu,
+    );
+    TenantNamespace::from_credentials(&credentials)
+}
+
+#[tokio::test]
+async fn migration_two_persists_strict_inbound_payload_columns() {
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("store.sqlite");
+    let store = StoreHandle::open(&path).await.expect("open");
+    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 2);
+    store.shutdown().await.expect("shutdown");
+
+    let connection = rusqlite::Connection::open(&path).expect("inspect");
+    let inbound_columns = connection
+        .prepare("PRAGMA table_info(inbound_events)")
+        .expect("prepare inbound columns")
+        .query_map([], |row| row.get::<_, String>(1))
+        .expect("query inbound columns")
+        .collect::<Result<HashSet<_>, _>>()
+        .expect("decode inbound columns");
+    for name in [
+        "payload_version",
+        "payload_blob",
+        "payload_bytes",
+        "turn_row_id",
+    ] {
+        assert!(inbound_columns.contains(name), "missing {name}");
+    }
+    let turn_columns = connection
+        .prepare("PRAGMA table_info(turns)")
+        .expect("prepare turn columns")
+        .query_map([], |row| row.get::<_, String>(1))
+        .expect("query turn columns")
+        .collect::<Result<HashSet<_>, _>>()
+        .expect("decode turn columns");
+    assert!(turn_columns.contains("inbound_count"));
+}
+
+#[tokio::test]
+async fn registration_replays_canonical_payload_and_atomic_turn_resolution() {
+    let store = StoreHandle::open_in_memory().await.expect("open");
+    let tenant = tenant_namespace("cli_store_test");
+    let canonical = event("event-canonical", "message-canonical");
+    let first = store
+        .register_inbound(&tenant, &canonical)
+        .await
+        .expect("register canonical");
+    assert!(matches!(first, DedupOutcome::New(_)));
+
+    let mut redelivery = event("event-alias", "message-canonical");
+    redelivery.text = "untrusted redelivery body".to_owned();
+    let replay = store
+        .register_inbound(&tenant, &redelivery)
+        .await
+        .expect("replay canonical");
+    let DedupOutcome::ReplayReceived(retained) = replay else {
+        panic!("expected canonical replay")
+    };
+    assert_eq!(retained.event().event_id, canonical.event_id);
+    assert_eq!(retained.event().text, canonical.text);
+    assert!(retained.retained_bytes() > canonical.text.len());
+
+    let key = InboundKey::new(tenant.clone(), canonical.event_id.clone());
+    let started = store
+        .begin_turn_and_claim_inbound(turn("atomic-turn", TurnState::Starting), &[key])
+        .await
+        .expect("begin and claim");
+    let BeginTurnOutcome::Started {
+        turn_row_id,
+        claimed,
+        skipped,
+    } = started
+    else {
+        panic!("received row must start a turn")
+    };
+    assert_eq!(claimed.len(), 1);
+    assert!(skipped.is_empty());
+    assert_eq!(
+        store
+            .turn_row(turn_row_id)
+            .await
+            .expect("turn row")
+            .expect("turn row")
+            .inbound_count,
+        1
+    );
+    store
+        .set_turn_state(turn_row_id, TurnState::Running, Some("codex-turn-atomic"))
+        .await
+        .expect("runtime turn may enter running");
+
+    let resolved = store
+        .resolve_turn_and_finish_inbound_batch(
+            turn_row_id,
+            TurnResolution::Completed,
+            InboundTerminal::Completed,
+        )
+        .await
+        .expect("atomic resolve");
+    assert_eq!(resolved, ResolveTurnOutcome::Resolved { inbound_rows: 1 });
+    assert_eq!(
+        store
+            .resolve_turn_and_finish_inbound_batch(
+                turn_row_id,
+                TurnResolution::Completed,
+                InboundTerminal::Completed,
+            )
+            .await
+            .expect("idempotent resolve"),
+        ResolveTurnOutcome::AlreadyResolved { inbound_rows: 1 }
+    );
+    store.shutdown().await.expect("shutdown");
+}
+
 #[tokio::test]
 async fn file_store_applies_pragmas_and_persists_every_typed_table() {
     let temp = tempdir().expect("tempdir");
     let path = temp.path().join("store.sqlite");
     let scope = ScopeKey::Chat("oc_test".to_owned());
+    let tenant = tenant_namespace("cli_persistence_test");
     let store = StoreHandle::open(&path).await.expect("open");
     let pragmas = store.pragmas().await.expect("pragmas");
     assert_eq!(pragmas.journal_mode, "wal");
     assert!(pragmas.foreign_keys);
     assert_eq!(pragmas.busy_timeout_ms, 5_000);
     assert_eq!(pragmas.synchronous, 1);
-    assert_eq!(pragmas.user_version, 1);
+    assert_eq!(pragmas.user_version, 2);
     store
         .upsert_scope(&scope, temp.path(), "fp")
         .await
@@ -86,13 +211,13 @@ async fn file_store_applies_pragmas_and_persists_every_typed_table() {
         .add_attachment_lease("hash-1", turn_id)
         .await
         .expect("lease");
-    assert_eq!(
+    assert!(matches!(
         store
-            .register_inbound("tenant", &event("event-1", "message-1"))
+            .register_inbound(&tenant, &event("event-1", "message-1"))
             .await
             .expect("inbound"),
-        DedupOutcome::New
-    );
+        DedupOutcome::New(_)
+    ));
     let queued = store
         .enqueue_outbox(outbox("outbox-1", "{}"))
         .await
@@ -101,7 +226,7 @@ async fn file_store_applies_pragmas_and_persists_every_typed_table() {
     store.shutdown().await.expect("shutdown");
 
     let store = StoreHandle::open(&path).await.expect("reopen");
-    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 1);
+    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 2);
     assert!(store.scope_row(&scope).await.expect("scope").is_some());
     assert_eq!(
         store
@@ -130,7 +255,7 @@ async fn file_store_applies_pragmas_and_persists_every_typed_table() {
     );
     assert_eq!(
         store
-            .inbound_state("tenant", "event-1")
+            .inbound_state(&tenant, "event-1")
             .await
             .expect("inbound"),
         Some(InboundEventState::Received)
@@ -146,7 +271,7 @@ async fn rejects_future_schema_versions_without_mutating_the_database() {
     {
         let connection = rusqlite::Connection::open(&path).expect("seed");
         connection
-            .pragma_update(None, "user_version", 2_u32)
+            .pragma_update(None, "user_version", 3_u32)
             .expect("version");
     }
     assert!(matches!(
@@ -157,7 +282,7 @@ async fn rejects_future_schema_versions_without_mutating_the_database() {
     let version: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .expect("version");
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
 }
 
 #[tokio::test]
@@ -226,48 +351,52 @@ async fn concurrent_dangling_symlink_and_target_allow_one_open() {
 #[tokio::test]
 async fn dedup_transitions_and_ttl_are_fail_closed() {
     let store = StoreHandle::open_in_memory().await.expect("open");
+    let tenant = tenant_namespace("cli_dedup_test");
     let first = event("event-1", "message-1");
-    assert_eq!(
-        store.register_inbound("tenant", &first).await.expect("new"),
-        DedupOutcome::New
-    );
-    assert_eq!(
-        store
-            .register_inbound("tenant", &first)
-            .await
-            .expect("duplicate"),
-        DedupOutcome::Duplicate {
-            state: InboundEventState::Received
-        }
-    );
-    assert_eq!(
-        store
-            .register_inbound("tenant", &event("event-2", "message-1"))
-            .await
-            .expect("new event"),
-        DedupOutcome::New
-    );
+    assert!(matches!(
+        store.register_inbound(&tenant, &first).await.expect("new"),
+        DedupOutcome::New(_)
+    ));
     assert!(matches!(
         store
-            .transition_inbound("tenant", "event-1", InboundEventState::Completed, None)
-            .await,
-        Err(StoreError::InvalidTransition { .. })
+            .register_inbound(&tenant, &first)
+            .await
+            .expect("duplicate"),
+        DedupOutcome::ReplayReceived(_)
     ));
-    store
-        .transition_inbound("tenant", "event-1", InboundEventState::Accepted, None)
+    assert!(matches!(
+        store
+            .register_inbound(&tenant, &event("event-2", "message-1"))
+            .await
+            .expect("same-message replay"),
+        DedupOutcome::ReplayReceived(_)
+    ));
+    let started = store
+        .begin_turn_and_claim_inbound(
+            turn("dedup-turn", TurnState::Starting),
+            &[InboundKey::new(tenant.clone(), "event-1".to_owned())],
+        )
         .await
-        .expect("accept");
+        .expect("claim");
+    let BeginTurnOutcome::Started { turn_row_id, .. } = started else {
+        panic!("received row starts a turn")
+    };
     store
-        .transition_inbound("tenant", "event-1", InboundEventState::Completed, None)
+        .set_turn_state(turn_row_id, TurnState::Running, Some("codex-dedup"))
+        .await
+        .expect("running");
+    store
+        .resolve_turn_and_finish_inbound_batch(
+            turn_row_id,
+            TurnResolution::Completed,
+            InboundTerminal::Completed,
+        )
         .await
         .expect("complete");
     assert_eq!(store.sweep_inbound(i64::MAX).await.expect("sweep"), 1);
     assert_eq!(
-        store
-            .inbound_state("tenant", "event-2")
-            .await
-            .expect("live"),
-        Some(InboundEventState::Received)
+        store.inbound_state(&tenant, "event-2").await.expect("live"),
+        None
     );
     store.shutdown().await.expect("shutdown");
 }

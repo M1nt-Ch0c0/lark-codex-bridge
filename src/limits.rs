@@ -139,7 +139,7 @@ pub const STORE_WRITER_CAPACITY: usize = 256;
 /// Total bytes retained by requests waiting for the single store writer.
 pub const STORE_WRITER_BYTE_BUDGET: usize = 8 * 1024 * 1024;
 /// Maximum bytes of identifiers and metadata captured by one store request.
-pub const STORE_REQUEST_MAX_BYTES: usize = 512 * 1024;
+pub const STORE_REQUEST_MAX_BYTES: usize = 3 * 1024 * 1024;
 /// `PRAGMA busy_timeout` for the store connection.
 pub const STORE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Hard cap on one serialized outbox payload, enforced before the row is
@@ -155,9 +155,41 @@ pub const STORE_OUTBOX_MAX_ROWS: u64 = 1024;
 /// Maximum durable payload bytes in pending and sending outbox records.
 pub const STORE_OUTBOX_MAX_QUEUED_BYTES: u64 = 8 * 1024 * 1024;
 /// Maximum durable inbound dedup records before producers must be swept.
-pub const STORE_INBOUND_MAX_ROWS: u64 = 4096;
-/// Maximum stored inbound identifier bytes.
-pub const STORE_INBOUND_MAX_BYTES: u64 = 4 * 1024 * 1024;
+pub const STORE_INBOUND_MAX_ROWS: u64 = 65_536;
+/// Maximum variable bytes retained by all inbound marker rows.
+pub const STORE_INBOUND_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum rows that may retain replayable received payloads.
+pub const STORE_INBOUND_RECEIVED_MAX_ROWS: u64 = 256;
+/// Maximum serialized payload bytes retained by received rows.
+pub const STORE_INBOUND_RECEIVED_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// Maximum bytes in one inbound identifier.
+pub const STORE_INBOUND_ID_MAX_BYTES: usize = 4 * 1024;
+/// Maximum bytes in a serialized inbound scope.
+pub const STORE_INBOUND_SCOPE_MAX_BYTES: usize = 12 * 1024;
+/// Maximum bytes in an open message-type string.
+pub const STORE_INBOUND_MESSAGE_TYPE_MAX_BYTES: usize = 256;
+/// Maximum normalized message text bytes.
+pub const STORE_INBOUND_TEXT_MAX_BYTES: usize = 1024 * 1024;
+/// Maximum number of resource descriptors on one event.
+pub const STORE_INBOUND_RESOURCE_MAX_COUNT: usize = 64;
+/// Maximum bytes in one resource key.
+pub const STORE_INBOUND_RESOURCE_KEY_MAX_BYTES: usize = 4 * 1024;
+/// Maximum aggregate resource-key bytes on one event.
+pub const STORE_INBOUND_RESOURCE_KEY_MAX_TOTAL_BYTES: usize = 256 * 1024;
+/// Maximum bytes in one strict serialized inbound payload.
+pub const STORE_INBOUND_PAYLOAD_MAX_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum input rows for one atomic begin-and-claim transaction.
+pub const STORE_INBOUND_BEGIN_MAX_KEYS: usize = 64;
+/// Maximum tenant/event key bytes for one begin-and-claim transaction.
+pub const STORE_INBOUND_BEGIN_MAX_KEY_BYTES: usize = 256 * 1024;
+/// Maximum terminal rows deleted by one deterministic sweep.
+pub const DEDUP_SWEEP_BATCH: u32 = 256;
+/// Dedup terminal-marker retention window.
+pub const DEDUP_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// Interval between bounded terminal-marker sweeps.
+pub const DEDUP_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// Interval for cancellation-aware received-row rescans.
+pub const INBOUND_REPLAY_INTERVAL: Duration = Duration::from_secs(30);
 /// Maximum durable attachment cache entries tracked by the store.
 pub const STORE_ATTACHMENT_MAX_ROWS: u64 = 4096;
 /// Maximum durable attachment bytes tracked by the store.

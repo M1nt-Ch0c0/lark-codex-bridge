@@ -150,6 +150,8 @@ pub struct TurnRow {
     pub created_ms: i64,
     /// Last update, milliseconds since the Unix epoch.
     pub updated_ms: i64,
+    /// Immutable number of inbound rows historically claimed by this turn.
+    pub inbound_count: usize,
 }
 
 /// Fields needed to record a new turn row.
@@ -480,7 +482,7 @@ impl StoreHandle {
             let mut statement = connection
                 .prepare(
                     "SELECT id, scope_key, client_message_id, codex_thread_id, codex_turn_id,
-                            state, uncertain, created_ms, updated_ms
+                            state, uncertain, created_ms, updated_ms, inbound_count
                      FROM turns
                      WHERE state IN ('starting', 'running', 'uncertain')
                      ORDER BY id LIMIT ?1",
@@ -508,7 +510,7 @@ impl StoreHandle {
         self.run(move |connection| {
             let row = connection.query_row(
                 "SELECT id, scope_key, client_message_id, codex_thread_id, codex_turn_id,
-                        state, uncertain, created_ms, updated_ms
+                        state, uncertain, created_ms, updated_ms, inbound_count
                  FROM turns WHERE id = ?1",
                 params![id],
                 read_turn_row,
@@ -598,6 +600,7 @@ fn read_turn_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnRow> {
         uncertain: row.get::<_, i64>(6)? != 0,
         created_ms: row.get(7)?,
         updated_ms: row.get(8)?,
+        inbound_count: usize::try_from(row.get::<_, i64>(9)?).unwrap_or(usize::MAX),
     })
 }
 

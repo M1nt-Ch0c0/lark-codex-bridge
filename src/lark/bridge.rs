@@ -35,6 +35,48 @@ use super::token::TenantTokenProvider;
 use super::transport::{InboundFrameHandler, LarkTransport, TransportConfig, TransportHandle};
 use crate::limits::{LARK_INBOUND_EVENT_BYTE_BUDGET, LARK_INBOUND_EVENT_CAPACITY};
 
+/// One canonical persisted inbound event and the exact retained blob size.
+pub struct RetainedInbound {
+    event: Box<InboundEvent>,
+    retained_bytes: usize,
+}
+
+impl RetainedInbound {
+    pub(crate) fn new(event: Box<InboundEvent>, retained_bytes: usize) -> Self {
+        Self {
+            event,
+            retained_bytes,
+        }
+    }
+
+    /// Borrows the canonical persisted event.
+    #[must_use]
+    pub fn event(&self) -> &InboundEvent {
+        &self.event
+    }
+
+    /// Returns the exact persisted payload byte length.
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+
+    /// Consumes the retained value and returns its event.
+    #[must_use]
+    pub fn into_event(self) -> Box<InboundEvent> {
+        self.event
+    }
+}
+
+impl fmt::Debug for RetainedInbound {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RetainedInbound")
+            .field("retained_bytes", &self.retained_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
 /// One normalized inbound event parked in the bounded channel.
 ///
 /// The byte-budget permit is held inside the item until the receiver dequeues

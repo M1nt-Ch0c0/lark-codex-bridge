@@ -37,7 +37,10 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 use crate::limits::{STORE_REQUEST_MAX_BYTES, STORE_WRITER_BYTE_BUDGET};
 
 pub use attachments::{AttachmentLeaseRow, AttachmentRow};
-pub use dedup::{DedupOutcome, InboundEventState};
+pub use dedup::{
+    BeginTurnOutcome, ClaimedInbound, DedupOutcome, InboundEventState, InboundKey, InboundTerminal,
+    ResolveTurnOutcome, SkippedInbound, TurnResolution,
+};
 pub use outbox::{NewOutboxRow, OutboxDepth, OutboxEnqueue, OutboxRow, OutboxState};
 pub use sessions::{NewTurnRow, ScopeRow, ThreadRow, ThreadStatus, TurnRow, TurnState};
 use writer::StoreRequest;
@@ -101,6 +104,12 @@ pub enum StoreError {
     #[error("store capacity is exhausted while {context}")]
     CapacityExceeded {
         /// Static description of the bounded collection.
+        context: &'static str,
+    },
+    /// Persisted data violates a closed schema or cross-row invariant.
+    #[error("store data is corrupt while {context}")]
+    CorruptData {
+        /// Static description of the failed integrity check.
         context: &'static str,
     },
     /// A path cannot be represented losslessly by this schema.
