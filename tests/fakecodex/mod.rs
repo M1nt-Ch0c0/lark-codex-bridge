@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::{
     collections::VecDeque,
     future::Future,
@@ -18,11 +20,12 @@ use semver::Version;
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, duplex},
-    sync::oneshot,
+    sync::{Mutex as AsyncMutex, mpsc, oneshot},
     time::timeout,
 };
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(1);
+const SCRIPT_CHANNEL_CAPACITY: usize = 64;
 
 type SpawnFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Box<dyn AppServerProcess>, ProcessError>> + Send + 'a>>;
@@ -43,6 +46,10 @@ pub(crate) struct FakeControl {
     exit: Arc<Mutex<Option<oneshot::Sender<ProcessExit>>>>,
     hold: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     terminate_calls: Arc<Mutex<Vec<Duration>>>,
+    requests_tx: mpsc::Sender<Value>,
+    requests_rx: Arc<AsyncMutex<mpsc::Receiver<Value>>>,
+    outputs_tx: mpsc::Sender<Value>,
+    outputs_rx: Arc<Mutex<Option<mpsc::Receiver<Value>>>>,
 }
 
 impl FakeControl {
@@ -75,6 +82,28 @@ impl FakeControl {
     pub(crate) fn terminate_calls(&self) -> Vec<Duration> {
         self.terminate_calls.lock().expect("terminate lock").clone()
     }
+
+    pub(crate) async fn next_request(&self) -> Value {
+        timeout(TEST_TIMEOUT, self.requests_rx.lock().await.recv())
+            .await
+            .expect("fake request timeout")
+            .expect("fake request channel remains open")
+    }
+
+    pub(crate) async fn send_json(&self, value: Value) {
+        self.outputs_tx
+            .send(value)
+            .await
+            .expect("fake output channel remains open");
+    }
+
+    pub(crate) async fn respond(&self, request: &Value, result: Value) {
+        self.send_json(json!({
+            "id": request.get("id").expect("request contains an id"),
+            "result": result
+        }))
+        .await;
+    }
 }
 
 impl FakeFactory {
@@ -86,10 +115,16 @@ impl FakeFactory {
     }
 
     pub(crate) fn ready() -> (FakeOutcome, FakeControl) {
+        let (requests_tx, requests_rx) = mpsc::channel(SCRIPT_CHANNEL_CAPACITY);
+        let (outputs_tx, outputs_rx) = mpsc::channel(SCRIPT_CHANNEL_CAPACITY);
         let control = FakeControl {
             exit: Arc::new(Mutex::new(None)),
             hold: Arc::new(Mutex::new(None)),
             terminate_calls: Arc::new(Mutex::new(Vec::new())),
+            requests_tx,
+            requests_rx: Arc::new(AsyncMutex::new(requests_rx)),
+            outputs_tx,
+            outputs_rx: Arc::new(Mutex::new(Some(outputs_rx))),
         };
         (FakeOutcome::Ready(control.clone()), control)
     }
@@ -136,10 +171,15 @@ impl FakeProcess {
         let (hold_tx, hold_rx) = oneshot::channel();
         *control.exit.lock().expect("exit lock") = Some(exit_tx);
         *control.hold.lock().expect("hold lock") = Some(hold_tx);
+        let requests = control.requests_tx.clone();
+        let outputs = control
+            .outputs_rx
+            .lock()
+            .expect("outputs lock")
+            .take()
+            .expect("fake process takes outputs once");
         tokio::spawn(async move {
-            initialize_fake(&mut app_stdout, app_stdin).await;
-            // Keep the pipes open until the fake process exits, like a live child.
-            let _ = hold_rx.await;
+            serve_fake(&mut app_stdout, app_stdin, requests, outputs, hold_rx).await;
         });
         Self {
             control,
@@ -201,9 +241,39 @@ impl AppServerProcess for FakeProcess {
     }
 }
 
-async fn initialize_fake(stdout: &mut DuplexStream, stdin: DuplexStream) {
+async fn serve_fake(
+    stdout: &mut DuplexStream,
+    stdin: DuplexStream,
+    requests: mpsc::Sender<Value>,
+    mut outputs: mpsc::Receiver<Value>,
+    mut hold: oneshot::Receiver<()>,
+) {
     let mut stdin = BufReader::new(stdin);
-    let request = read_line(&mut stdin).await;
+    initialize_fake(stdout, &mut stdin).await;
+    loop {
+        let mut line = String::new();
+        tokio::select! {
+            _ = &mut hold => break,
+            output = outputs.recv() => {
+                let Some(output) = output else { break };
+                write_line(stdout, output).await;
+            }
+            result = stdin.read_line(&mut line) => {
+                let Ok(bytes) = result else { break };
+                if bytes == 0 {
+                    break;
+                }
+                let request = serde_json::from_str(&line).expect("valid scripted request JSON");
+                if requests.send(request).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn initialize_fake(stdout: &mut DuplexStream, stdin: &mut BufReader<DuplexStream>) {
+    let request = read_line(stdin).await;
     assert_eq!(request["method"], "initialize");
     write_line(
         stdout,
@@ -218,7 +288,7 @@ async fn initialize_fake(stdout: &mut DuplexStream, stdin: DuplexStream) {
         }),
     )
     .await;
-    let initialized = read_line(&mut stdin).await;
+    let initialized = read_line(stdin).await;
     assert_eq!(initialized["method"], "initialized");
 }
 
