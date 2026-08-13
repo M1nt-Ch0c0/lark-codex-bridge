@@ -191,7 +191,7 @@ Commit `feat: add SQLite store with WAL, migrations, and single-writer task`.
 - Produces: `BridgeConfig`, `WorkspacePolicy`, `AccessPolicy`, `PolicyFingerprint`, `AccessDecision`.
 - Consumes: `toml`, `secrecy`, `lark::normalize::InboundEvent`.
 
-- [ ] **Step 1: Implement the bridge config schema with safe defaults**
+- [x] **Step 1: Implement the bridge config schema with safe defaults**
 
 ```rust
 pub struct BridgeConfig {
@@ -211,7 +211,7 @@ pub struct WorkspacePolicy {
 
 Load from an explicit TOML path (`run --config`), else the platform config dir. Every field has a conservative default; unknown keys are rejected. `BridgeConfig::validate` canonicalizes `allow_roots`, requires at least one owner (otherwise startup fails with an actionable error rather than silently allowing nobody — the distinction is logged), and requires `default_workspace` to pass the same validation as `/cd`. Config `Debug` shows owner count and paths, never owner IDs beyond a trailing-6-char fragment (matching the reference's `sender.slice(-6)` logging habit) and never any secret.
 
-- [ ] **Step 2: Implement the access policy and workspace validator**
+- [x] **Step 2: Implement the access policy and workspace validator**
 
 ```rust
 pub enum AccessDecision { Allow, DenyNotOwner, DenyMissingMention, DenyWorkspace { reason: &'static str } }
@@ -227,11 +227,11 @@ impl AccessPolicy {
 
 Semantics (design §11, reference `commands/index.ts` gates): sender must be in `owners`; group and topic messages must have `mentions_bot == true` (p2p exempt); the workspace validator rejects `/`, the user's home root itself (home subdirectories are fine), system roots (`/etc`, `/usr`, `/bin`, `/System`, `C:\Windows`, …), temp roots, and desktop/download roots, then requires the canonical path to sit under an `allow_roots` entry. `PolicyFingerprint` is a truncated SHA-256 over the canonical cwd, sandbox mode, approval policy, and network flag — any change means the old Codex thread is not reused (design §8).
 
-- [ ] **Step 3: Test config and policy**
+- [x] **Step 3: Test config and policy**
 
 Fixtures cover: minimal config fills safe defaults; full config round-trips; unknown key rejection; missing owner fails validation; p2p owner allowed; p2p non-owner denied; group without @ denied even for the owner; topic message with @ allowed; each workspace rejection class; fingerprint changes on cwd/sandbox/network change and is stable otherwise; `Debug` redaction (no full owner IDs, no secrets).
 
-- [ ] **Step 4: Verify and publish the task**
+- [x] **Step 4: Verify and publish the task**
 
 Run the Task 1 gate set with `cargo test --test runtime_policy --locked`. Commit `feat: add bridge config and owner-only access policy`.
 
