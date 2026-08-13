@@ -455,7 +455,7 @@ Commit `feat: add Lark OpenAPI client for messages, cards, and media`.
 - Consumes: `LarkApi` (backfill), bot open_id.
 - Produces: `InboundEvent`, `ScopeKey`, `Normalizer`, `NormalizeOutcome`.
 
-- [ ] **Step 1: Define the stable inbound model and scope rules**
+- [x] **Step 1: Define the stable inbound model and scope rules**
 
 ```rust
 pub struct InboundEvent {
@@ -481,15 +481,15 @@ pub enum ScopeKey { Chat(String), Thread(String, String) } // renders im:<chat_i
 
 Scope rules per design §5.2: p2p and plain group messages → `im:<chat_id>`; topic messages with a `thread_id` → `im:<chat_id>:thread:<thread_id>`; document comments (`doc:<file_token>`) are out of scope for this milestone.
 
-- [ ] **Step 2: Implement normalization with mention, topic, and quote handling**
+- [x] **Step 2: Implement normalization with mention, topic, and quote handling**
 
 Parse `im.message.receive_v1` payloads (`header.event_id`, `event.sender.sender_id.open_id`, `event.message.{message_id, chat_id, chat_type, message_type, content, mentions, root_id, parent_id, thread_id, create_time}`). Detect bot mentions via the `mentions` array against the bot open_id and `<at user_id="all">` for mention-all; strip mention tags from the text. Maintain a bounded `chat_id → ChatMode` cache (count + TTL) that falls back to `Group` on lookup failure and is invalidated when a message carries a `thread_id` that contradicts a cached non-topic entry, matching the reference `ChatModeCache`. When a topic-group event lacks `thread_id`, backfill once via `LarkApi::get_message` (whose raw item keeps `thread_id` even when the event dropped it, per the reference `thread-id.ts`); on backfill failure fall back to chat-level scope and record the degradation reason. For quoted messages, resolve `parent_id`/quote content only within a bounded single fetch — no recursive history walks in this milestone; full history backfill belongs to the scope-runtime milestone.
 
-- [ ] **Step 3: Add normalization fixture tests**
+- [x] **Step 3: Add normalization fixture tests**
 
 Fixtures cover p2p text, group message with bot @ (text stripped, `mentions_bot`), group without @, topic reply with `thread_id`, topic event missing `thread_id` recovered by stubbed backfill, backfill failure degradation, quoted message linkage, image/file message resource descriptors, unknown message types preserved via the open `message_type` string, and scope-key rendering for both forms.
 
-- [ ] **Step 4: Verify and publish the task**
+- [x] **Step 4: Verify and publish the task**
 
 Run:
 

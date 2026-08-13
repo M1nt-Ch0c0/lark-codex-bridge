@@ -1,0 +1,33 @@
+{
+  "schema": "2.0",
+  "header": {
+    "event_id": "evt_quote_scrubbed_004",
+    "event_type": "im.message.receive_v1",
+    "create_time": "1700000003000",
+    "token": "scrubbed-verification-token",
+    "app_id": "cli_scrubbed",
+    "tenant_key": "tenant_scrubbed"
+  },
+  "event": {
+    "sender": {
+      "sender_id": {
+        "union_id": "on_scrubbed_erin",
+        "user_id": "user_scrubbed_erin",
+        "open_id": "ou_erin"
+      },
+      "sender_type": "user",
+      "tenant_key": "tenant_scrubbed"
+    },
+    "message": {
+      "message_id": "om_quote_004",
+      "root_id": "om_quoted_root",
+      "parent_id": "om_quoted_parent",
+      "create_time": "1700000003321",
+      "chat_id": "oc_group_chat",
+      "chat_type": "group",
+      "message_type": "text",
+      "content": "{\"text\":\"agreed, ship it\"}",
+      "mentions": []
+    }
+  }
+}

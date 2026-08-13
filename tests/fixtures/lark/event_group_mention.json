@@ -1,0 +1,54 @@
+{
+  "schema": "2.0",
+  "header": {
+    "event_id": "evt_group_scrubbed_002",
+    "event_type": "im.message.receive_v1",
+    "create_time": "1700000001000",
+    "token": "scrubbed-verification-token",
+    "app_id": "cli_scrubbed",
+    "tenant_key": "tenant_scrubbed"
+  },
+  "event": {
+    "sender": {
+      "sender_id": {
+        "union_id": "on_scrubbed_carol",
+        "user_id": "user_scrubbed_carol",
+        "open_id": "ou_carol"
+      },
+      "sender_type": "user",
+      "tenant_key": "tenant_scrubbed"
+    },
+    "message": {
+      "message_id": "om_group_002",
+      "root_id": "",
+      "parent_id": "",
+      "create_time": "1700000001456",
+      "chat_id": "oc_group_chat",
+      "chat_type": "group",
+      "message_type": "text",
+      "content": "{\"text\":\"<at user_id=\\\"ou_bot\\\">Bridge Bot</at> <at user_id=\\\"ou_bob\\\">Bob</at> status?\"}",
+      "mentions": [
+        {
+          "key": "@_user_1",
+          "id": {
+            "union_id": "on_scrubbed_bot",
+            "user_id": "user_scrubbed_bot",
+            "open_id": "ou_bot"
+          },
+          "name": "Bridge Bot",
+          "tenant_key": "tenant_scrubbed"
+        },
+        {
+          "key": "@_user_2",
+          "id": {
+            "union_id": "on_scrubbed_bob",
+            "user_id": "user_scrubbed_bob",
+            "open_id": "ou_bob"
+          },
+          "name": "Bob",
+          "tenant_key": "tenant_scrubbed"
+        }
+      ]
+    }
+  }
+}

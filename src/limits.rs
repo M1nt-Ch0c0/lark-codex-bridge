@@ -100,6 +100,21 @@ pub const LARK_DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(30);
 pub const LARK_WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Bounded grace for the Lark WebSocket actor to close the socket on shutdown.
 pub const LARK_TRANSPORT_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+/// Count bound of the normalizer's `chat_id → ChatMode` cache. Overflow
+/// evicts the oldest entry.
+pub const LARK_CHAT_MODE_CACHE_CAPACITY: usize = 256;
+/// TTL of one cached chat-mode entry. Admins can convert a plain group into a
+/// topic group, so entries must expire even when no message-level `thread_id`
+/// ever contradicts them.
+pub const LARK_CHAT_MODE_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
+/// Byte cap on a `chat_id` eligible for caching; longer IDs are looked up on
+/// every message instead of growing the cache key space.
+pub const LARK_CHAT_MODE_CACHE_KEY_BYTES: usize = 128;
+/// Upper bound on one raw inbound event payload handed to the normalizer.
+/// The fragment reassembler already enforces the same cap; the normalizer
+/// re-checks at its own boundary so direct callers are bounded too.
+pub const LARK_MAX_EVENT_PAYLOAD_BYTES: usize = LARK_FRAGMENT_MESSAGE_BYTES;
+
 /// Count bound of the transport observation channel (state/messages/anomalies).
 pub const LARK_TRANSPORT_EVENT_CAPACITY: usize = 64;
 /// Byte budget for message payloads parked in the transport observation

@@ -13,6 +13,7 @@ pub mod error;
 pub mod fragments;
 pub mod frame;
 pub mod http;
+pub mod normalize;
 pub mod register;
 pub mod token;
 pub mod transport;
