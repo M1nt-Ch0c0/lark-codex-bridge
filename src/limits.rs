@@ -130,3 +130,40 @@ pub const LARK_INBOUND_EVENT_CAPACITY: usize = 256;
 /// inbound event channel; permits are held until the receiver dequeues,
 /// matching the transport/RPC permit pattern.
 pub const LARK_INBOUND_EVENT_BYTE_BUDGET: usize = 8 * 1024 * 1024;
+
+/// Count bound of the single-writer store command channel. Every store
+/// request (reads included) travels this channel to the one blocking writer
+/// task; a full channel fails the caller fast instead of growing an
+/// unbounded backlog in front of the database.
+pub const STORE_WRITER_CAPACITY: usize = 256;
+/// Total bytes retained by requests waiting for the single store writer.
+pub const STORE_WRITER_BYTE_BUDGET: usize = 8 * 1024 * 1024;
+/// Maximum bytes of identifiers and metadata captured by one store request.
+pub const STORE_REQUEST_MAX_BYTES: usize = 512 * 1024;
+/// `PRAGMA busy_timeout` for the store connection.
+pub const STORE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Hard cap on one serialized outbox payload, enforced before the row is
+/// enqueued. Matches the Lark send body cap so anything persisted can also
+/// be sent.
+pub const STORE_OUTBOX_PAYLOAD_MAX_BYTES: usize = LARK_MAX_SEND_BODY_BYTES;
+/// Upper clamp for one atomic outbox claim batch.
+pub const STORE_OUTBOX_CLAIM_MAX_BATCH: u32 = 64;
+/// Total payload bytes materialized by one claimed outbox batch.
+pub const STORE_OUTBOX_CLAIM_MAX_BYTES: usize = 1024 * 1024;
+/// Maximum durable pending or sending outbox records.
+pub const STORE_OUTBOX_MAX_ROWS: u64 = 1024;
+/// Maximum durable payload bytes in pending and sending outbox records.
+pub const STORE_OUTBOX_MAX_QUEUED_BYTES: u64 = 8 * 1024 * 1024;
+/// Maximum durable inbound dedup records before producers must be swept.
+pub const STORE_INBOUND_MAX_ROWS: u64 = 4096;
+/// Maximum stored inbound identifier bytes.
+pub const STORE_INBOUND_MAX_BYTES: u64 = 4 * 1024 * 1024;
+/// Maximum durable attachment cache entries tracked by the store.
+pub const STORE_ATTACHMENT_MAX_ROWS: u64 = 4096;
+/// Maximum durable attachment bytes tracked by the store.
+pub const STORE_ATTACHMENT_MAX_BYTES: u64 = 256 * 1024 * 1024;
+/// Send attempts after which an outbox row is marked terminally `failed`.
+pub const STORE_OUTBOX_MAX_ATTEMPTS: u32 = 8;
+/// Maximum length of a stored inbound-event rejection reason; reasons are
+/// operator-facing classifications, never message content.
+pub const STORE_REJECTION_REASON_MAX_BYTES: usize = 128;

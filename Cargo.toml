@@ -19,10 +19,12 @@ flate2 = "1.1.9"
 futures-util = "0.3.34"
 prost = { version = "0.14.4", default-features = false, features = ["derive", "std"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "multipart", "form"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 secrecy = { version = "0.10.3", features = ["serde"] }
 semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+sha2 = "0.11.0"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["macros", "process", "rt-multi-thread", "signal", "sync", "time", "io-util"] }
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-native-roots"] }
