@@ -244,3 +244,5 @@ pub const SCOPE_MAILBOX_BYTE_BUDGET: usize = 8 * 1024 * 1024;
 pub const TURN_BATCH_MAX_MESSAGES: usize = 64;
 /// Maximum normalized text bytes assembled into one Codex turn request.
 pub const TURN_BATCH_TEXT_BYTE_BUDGET: usize = 768 * 1024;
+/// Maximum bytes parsed as one recognized first-stage bridge command.
+pub const BRIDGE_COMMAND_MAX_BYTES: usize = 16 * 1024;
