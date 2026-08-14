@@ -20,6 +20,7 @@ use lark_codex_bridge::lark::http::LarkHttp;
 use lark_codex_bridge::lark::normalize::{InboundEvent, ScopeKey};
 use lark_codex_bridge::lark::token::TenantTokenProvider;
 use lark_codex_bridge::lark::transport::TransportState;
+use lark_codex_bridge::limits::STORE_OUTBOX_MAX_ATTEMPTS;
 use lark_codex_bridge::outbox::{
     DeliveryClass, OutboxError, OutboxOperation, OutboxPump, OutboxPumpConfig, OutboxReplySink,
     classify_delivery,
@@ -82,6 +83,20 @@ fn reply_requests(server: &StubServer) -> Vec<RecordedRequest> {
         .into_iter()
         .filter(|request| request.path.starts_with("/open-apis/im/v1/messages/"))
         .collect()
+}
+
+fn reply_text(request: &RecordedRequest) -> String {
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&request.body).expect("reply request should be JSON");
+    let content = envelope["content"]
+        .as_str()
+        .expect("reply request should carry a content string");
+    let content: serde_json::Value =
+        serde_json::from_str(content).expect("content should be a JSON string");
+    content["text"]
+        .as_str()
+        .expect("content should carry text")
+        .to_owned()
 }
 
 fn fast_config() -> OutboxPumpConfig {
@@ -291,8 +306,22 @@ fn delivery_classification_distinguishes_the_three_outcomes() {
         }),
         DeliveryClass::Uncertain
     );
+    // An explicit 4xx rejection is a definitive server response (nothing was
+    // sent), so it must be safe-to-retry — never uncertain.
     assert_eq!(
-        classify_delivery(&LarkError::ProtocolViolation { context: "send" }),
+        classify_delivery(&LarkError::ProtocolViolation {
+            context: "send",
+            code: Some(400),
+        }),
+        DeliveryClass::Retryable
+    );
+    // A protocol violation without a peer status (unparseable body, missing
+    // fields) means the send may have been applied: uncertain.
+    assert_eq!(
+        classify_delivery(&LarkError::ProtocolViolation {
+            context: "send",
+            code: None,
+        }),
         DeliveryClass::Uncertain
     );
     assert_eq!(
@@ -454,6 +483,86 @@ async fn retryable_failure_backs_off_and_eventually_succeeds() {
 }
 
 #[tokio::test]
+async fn explicit_http_4xx_rejection_is_bounded_retry_not_uncertain() {
+    // A definitive 4xx (the server responded and sent nothing) must never be
+    // parked as uncertain_delivery: it is safe to retry, bounded by the
+    // attempt cap, and then terminally failed.
+    let server = StubServer::start(token_plus(|_| {
+        StubResponse::json(400, r#"{"code":400,"msg":"bad request"}"#)
+    }))
+    .await;
+    let api = api_for(&server);
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let id = enqueue_reply(&store, "1:final:evt_1", "om_parent", None, "the answer").await;
+    let (_, rx) = watch::channel(TransportState::Connected);
+    let pump = OutboxPump::spawn(store.clone(), api, rx, fast_config());
+
+    let row = wait_for_state(&store, id, OutboxState::Failed).await;
+    assert_eq!(row.state, OutboxState::Failed);
+    assert_eq!(row.attempts, STORE_OUTBOX_MAX_ATTEMPTS);
+    assert_eq!(
+        reply_requests(&server).len(),
+        usize::try_from(STORE_OUTBOX_MAX_ATTEMPTS).unwrap(),
+        "the bounded retry must exhaust the attempt cap exactly once per attempt"
+    );
+
+    // A failed row is terminal: it is never re-claimed.
+    let requests_before = reply_requests(&server).len();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(reply_requests(&server).len(), requests_before);
+    assert_eq!(
+        store
+            .outbox_row(id)
+            .await
+            .expect("row")
+            .expect("exists")
+            .state,
+        OutboxState::Failed
+    );
+
+    pump.shutdown().await;
+}
+
+#[tokio::test]
+async fn retryable_exhaustion_marks_row_failed_and_stops_claiming() {
+    // A persistently retryable send failure must exhaust the bounded attempt
+    // budget and terminally fail the row, never re-claiming it afterwards.
+    let server = StubServer::start(token_plus(|_| {
+        StubResponse::json(200, r#"{"code":230001,"msg":"busy"}"#)
+    }))
+    .await;
+    let api = api_for(&server);
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let id = enqueue_reply(&store, "1:final:evt_1", "om_parent", None, "the answer").await;
+    let (_, rx) = watch::channel(TransportState::Connected);
+    let pump = OutboxPump::spawn(store.clone(), api, rx, fast_config());
+
+    let row = wait_for_state(&store, id, OutboxState::Failed).await;
+    assert_eq!(row.state, OutboxState::Failed);
+    assert_eq!(row.attempts, STORE_OUTBOX_MAX_ATTEMPTS);
+    assert_eq!(
+        reply_requests(&server).len(),
+        usize::try_from(STORE_OUTBOX_MAX_ATTEMPTS).unwrap(),
+        "exactly the attempt cap of send attempts before terminal failure"
+    );
+
+    let requests_before = reply_requests(&server).len();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(reply_requests(&server).len(), requests_before);
+    assert_eq!(
+        store
+            .outbox_row(id)
+            .await
+            .expect("row")
+            .expect("exists")
+            .state,
+        OutboxState::Failed
+    );
+
+    pump.shutdown().await;
+}
+
+#[tokio::test]
 async fn permanent_auth_is_terminal_failed_without_resend() {
     let server = StubServer::start(token_plus(|_| {
         StubResponse::json(200, r#"{"code":99991661,"msg":"app_ticket invalid"}"#)
@@ -540,7 +649,18 @@ async fn disconnect_keeps_rows_pending_and_reconnect_delivers_in_order() {
         second_row.receipt_message_id.as_deref(),
         Some("om_after_reconnect")
     );
-    assert_eq!(reply_requests(&server).len(), 2);
+    let requests = reply_requests(&server);
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        reply_text(&requests[0]),
+        "first",
+        "the pump must deliver rows in the deterministic claim order (by id)"
+    );
+    assert_eq!(
+        reply_text(&requests[1]),
+        "second",
+        "the pump must deliver rows in the deterministic claim order (by id)"
+    );
 
     pump.shutdown().await;
 }

@@ -37,10 +37,14 @@ pub enum LarkError {
         /// HTTP status or Lark `code` when one was provided.
         code: Option<i64>,
     },
-    /// Malformed response, file, or frame; the peer broke the contract.
+    /// Malformed response, file, or frame; the peer broke the contract. When
+    /// the peer responded with an explicit non-success HTTP status, `code`
+    /// carries that status; `code: None` means no usable response arrived.
     ProtocolViolation {
         /// Static description of what was malformed.
         context: &'static str,
+        /// HTTP status when the peer explicitly rejected the request.
+        code: Option<i64>,
     },
     /// A configured bound was hit.
     Exhausted {
@@ -70,10 +74,13 @@ impl LarkError {
         }
     }
 
-    /// Builds a [`LarkError::ProtocolViolation`].
+    /// Builds a [`LarkError::ProtocolViolation`] with no peer status.
     #[must_use]
     pub fn protocol(context: &'static str) -> Self {
-        Self::ProtocolViolation { context }
+        Self::ProtocolViolation {
+            context,
+            code: None,
+        }
     }
 
     /// Builds a [`LarkError::Exhausted`] with the exceeded limit.
@@ -108,8 +115,9 @@ impl fmt::Display for LarkError {
                 write!(formatter, "retryable Lark failure while {context}")?;
                 *code
             }
-            Self::ProtocolViolation { context } => {
-                return write!(formatter, "Lark protocol violation: {context}");
+            Self::ProtocolViolation { context, code } => {
+                write!(formatter, "Lark protocol violation: {context}")?;
+                *code
             }
             Self::Exhausted { context, limit } => {
                 return write!(formatter, "Lark bound exhausted: {context} (limit {limit})");

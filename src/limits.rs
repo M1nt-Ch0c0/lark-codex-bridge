@@ -201,6 +201,11 @@ pub const STORE_RECOVERY_TURN_MAX_ROWS: usize = 32;
 pub const STORE_RECOVERY_TURN_MAX_BYTES: usize = 1024 * 1024;
 /// Send attempts after which an outbox row is marked terminally `failed`.
 pub const STORE_OUTBOX_MAX_ATTEMPTS: u32 = 8;
+/// Receipt-write attempts for one outbox row transition. A transient writer
+/// queue overflow or `SQLite` failure must not strand a `sending` row
+/// in-process: the pump retries this many times before warning and leaving the
+/// row `sending` for startup `recover_sending_outbox` to reconcile.
+pub const STORE_RECEIPT_WRITE_ATTEMPTS: u32 = 3;
 /// Maximum length of a stored inbound-event rejection reason; reasons are
 /// operator-facing classifications, never message content.
 pub const STORE_REJECTION_REASON_MAX_BYTES: usize = 128;
