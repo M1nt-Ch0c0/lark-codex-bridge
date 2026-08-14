@@ -148,6 +148,7 @@ fn public_types_are_send_sync() {
 #[tokio::test]
 async fn fetch_writes_content_addressed_file_and_no_temp() {
     let temp = tempdir().expect("tempdir");
+    let canonical_temp = std::fs::canonicalize(temp.path()).expect("canonical tempdir");
     let store = StoreHandle::open_in_memory().await.expect("store");
     let dl = downloader(&[("k", b"hello-content")]);
     let cache = cache(temp.path(), store.clone(), dl, AttachmentLimits::default());
@@ -162,7 +163,7 @@ async fn fetch_writes_content_addressed_file_and_no_temp() {
     assert_eq!(cached.sha256, sha);
     assert_eq!(cached.bytes, 13);
     assert_eq!(cached.kind, ResourceKind::File);
-    assert_eq!(cached.path, temp.path().join(&sha));
+    assert_eq!(cached.path, canonical_temp.join(&sha));
     assert_eq!(std::fs::read(&cached.path).expect("read"), b"hello-content");
     // Exactly one content file, no temp files remain.
     assert_eq!(file_names(temp.path()), vec![sha.clone()]);
