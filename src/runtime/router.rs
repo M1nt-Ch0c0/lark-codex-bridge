@@ -20,6 +20,7 @@ use crate::limits::{
     ROUTER_CONTROL_BYTE_BUDGET, ROUTER_CONTROL_CAPACITY, ROUTER_RETRY_BYTE_BUDGET,
     ROUTER_RETRY_CAPACITY, ROUTER_SCOPE_ACTOR_HARD_LIMIT, STORE_INBOUND_SCOPE_MAX_BYTES,
 };
+use crate::runtime::attachments::AttachmentCache;
 use crate::runtime::intake::TenantNamespace;
 use crate::runtime::policy::{AccessDecision, AccessPolicy};
 use crate::runtime::scope::{
@@ -205,6 +206,46 @@ impl Router {
         supervisor: SupervisorHandle,
         sink: Arc<dyn DurableReplySink>,
     ) -> Result<RouterHandle, RouteError> {
+        Self::start_inner(store, tenant, policy, settings, supervisor, sink, None).await
+    }
+
+    /// Starts the production router with attachment download/cache support.
+    /// The plain [`Self::start`] constructor remains available for runtimes
+    /// and tests that intentionally do not resolve message resources.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same static classifications as [`Self::start`].
+    pub async fn start_with_attachments(
+        store: StoreHandle,
+        tenant: TenantNamespace,
+        policy: AccessPolicy,
+        settings: RouterSettings,
+        supervisor: SupervisorHandle,
+        sink: Arc<dyn DurableReplySink>,
+        attachments: Arc<AttachmentCache>,
+    ) -> Result<RouterHandle, RouteError> {
+        Self::start_inner(
+            store,
+            tenant,
+            policy,
+            settings,
+            supervisor,
+            sink,
+            Some(attachments),
+        )
+        .await
+    }
+
+    async fn start_inner(
+        store: StoreHandle,
+        tenant: TenantNamespace,
+        policy: AccessPolicy,
+        settings: RouterSettings,
+        supervisor: SupervisorHandle,
+        sink: Arc<dyn DurableReplySink>,
+        attachments: Option<Arc<AttachmentCache>>,
+    ) -> Result<RouterHandle, RouteError> {
         if let Err(error) = settings.validate() {
             supervisor.shutdown().await?;
             return Err(error);
@@ -225,6 +266,7 @@ impl Router {
             Arc::clone(&active_turns),
             supervisor,
             sink,
+            attachments,
             task_snapshot,
         ));
         Ok(RouterHandle {
@@ -440,7 +482,7 @@ struct RouteFailure {
     retryable: bool,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_router(
     mut receiver: mpsc::Receiver<RouterCommand>,
     mut control_receiver: mpsc::Receiver<RouterControl>,
@@ -451,6 +493,7 @@ async fn run_router(
     active_turns: Arc<Semaphore>,
     mut supervisor: SupervisorHandle,
     sink: Arc<dyn DurableReplySink>,
+    attachments: Option<Arc<AttachmentCache>>,
     snapshot: Arc<RwLock<RouterSnapshot>>,
 ) -> Result<(), RouteError> {
     let (supervisor_tx, supervisor_rx) = watch::channel(supervisor_access(&supervisor));
@@ -497,6 +540,7 @@ async fn run_router(
                     &supervisor_rx,
                     Arc::clone(&active_turns),
                     Arc::clone(&sink),
+                    attachments.as_ref(),
                     &mut actors,
                 ).await;
                 update_runtime_snapshot(
@@ -515,6 +559,7 @@ async fn run_router(
                             &supervisor_rx,
                             Arc::clone(&active_turns),
                             Arc::clone(&sink),
+                            attachments.as_ref(),
                             &mut actors,
                             *event,
                         ).await {
@@ -562,6 +607,7 @@ async fn retry_one(
     supervisor: &watch::Receiver<SupervisorAccess>,
     active_turns: Arc<Semaphore>,
     sink: Arc<dyn DurableReplySink>,
+    attachments: Option<&Arc<AttachmentCache>>,
     actors: &mut HashMap<String, ScopeActorHandle>,
 ) {
     let Some(mut retry) = retries.pop_front() else {
@@ -575,6 +621,7 @@ async fn retry_one(
         supervisor,
         active_turns,
         sink,
+        attachments,
         actors,
         retry.event,
     )
@@ -597,6 +644,7 @@ async fn route_one(
     supervisor: &watch::Receiver<SupervisorAccess>,
     active_turns: Arc<Semaphore>,
     sink: Arc<dyn DurableReplySink>,
+    attachments: Option<&Arc<AttachmentCache>>,
     actors: &mut HashMap<String, ScopeActorHandle>,
     queued: QueuedInboundEvent,
 ) -> Result<(), RouteFailure> {
@@ -653,6 +701,7 @@ async fn route_one(
                 supervisor.clone(),
                 active_turns,
                 Arc::clone(&sink),
+                attachments.map(Arc::clone),
             ),
         );
     }

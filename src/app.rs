@@ -17,6 +17,7 @@ use crate::lark::http::LarkHttp;
 use crate::lark::token::TenantTokenProvider;
 use crate::lark::transport::TransportState;
 use crate::outbox::{OutboxPump, OutboxPumpConfig, OutboxReplySink};
+use crate::runtime::attachments::{AttachmentCache, AttachmentLimits, LarkResourceDownloader};
 use crate::runtime::intake::{DurableIntake, TenantNamespace};
 use crate::runtime::policy::AccessPolicy;
 use crate::runtime::router::{RouteAttemptError, RouteError, Router, RouterHandle, RouterSettings};
@@ -45,6 +46,9 @@ pub enum AppError {
     /// The injected durable outbound runtime failed to start.
     #[error("the durable outbound runtime failed")]
     Outbound,
+    /// The attachment cache failed to open or reconcile.
+    #[error("the attachment cache failed")]
+    Attachments,
     /// The scope router failed to start or stop.
     #[error("the scope router failed")]
     Router,
@@ -193,6 +197,7 @@ where
     let router_settings = RouterSettings::from_config(&config);
     let process_config = config.codex.process_config();
     let database_path = config.paths.database.clone();
+    let attachment_cache_path = config.paths.attachment_cache.clone();
     let tenant = TenantNamespace::from_credentials(&credentials);
     let endpoints = LarkEndpoints::for_tenant(credentials.tenant);
     let http = LarkHttp::new(endpoints.clone()).map_err(|_| AppError::Lark)?;
@@ -202,6 +207,27 @@ where
     let store = StoreHandle::open(&database_path)
         .await
         .map_err(|_| AppError::Store)?;
+    let attachment_store = store.clone();
+    let attachment_downloader = Arc::new(LarkResourceDownloader::new(api.clone()));
+    let opened_attachment_cache = tokio::task::spawn_blocking(move || {
+        AttachmentCache::open(
+            &attachment_cache_path,
+            attachment_store,
+            attachment_downloader,
+            AttachmentLimits::default(),
+        )
+    })
+    .await;
+    let Ok(Ok(attachment_cache)) = opened_attachment_cache else {
+        stop_store_after_error(store).await;
+        return Err(AppError::Attachments);
+    };
+    let attachment_cache = Arc::new(attachment_cache);
+    if attachment_cache.reconcile().await.is_err() {
+        drop(attachment_cache);
+        stop_store_after_error(store).await;
+        return Err(AppError::Attachments);
+    }
     let Ok(intake) = DurableIntake::prepare(store.clone(), &credentials).await else {
         stop_store_after_error(store).await;
         return Err(AppError::Lark);
@@ -225,13 +251,14 @@ where
         stop_store_after_error(store).await;
         return Err(AppError::Outbound);
     };
-    let Ok(router) = Router::start(
+    let Ok(router) = Router::start_with_attachments(
         store.clone(),
         tenant,
         policy,
         router_settings,
         supervisor,
         outbound.sink(),
+        Arc::clone(&attachment_cache),
     )
     .await
     else {
@@ -248,6 +275,7 @@ where
     transport.shutdown().await;
     let router_result = router.shutdown().await;
     outbound.shutdown().await;
+    drop(attachment_cache);
     let store_result = store.shutdown().await;
 
     if router_result.is_err() {

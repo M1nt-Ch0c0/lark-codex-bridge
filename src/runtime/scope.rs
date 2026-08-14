@@ -18,6 +18,7 @@ use crate::codex::types::{
     SandboxMode, ThreadResumeParams, ThreadStartParams, TurnSandboxPolicy, TurnStartParams,
     TurnStatus, UserInput,
 };
+use crate::lark::api::ResourceKind;
 use crate::lark::bridge::QueuedInboundEvent;
 use crate::lark::normalize::{InboundEvent, ScopeKey};
 use crate::limits::{
@@ -25,11 +26,12 @@ use crate::limits::{
     TURN_BATCH_MAX_MESSAGES, TURN_BATCH_TEXT_BYTE_BUDGET,
 };
 use crate::render::{ProjectedReply, ProjectorOutput, ReplyProjector};
+use crate::runtime::attachments::AttachmentCache;
 use crate::runtime::policy::AccessPolicy;
 use crate::runtime::router::RouterSettings;
 use crate::store::{
-    BeginTurnOutcome, InboundKey, InboundRejectionKind, InboundTerminal, NewOutboxRow, NewTurnRow,
-    StoreHandle, TurnResolution, TurnState,
+    BeginTurnOutcome, ClaimedInbound, InboundKey, InboundRejectionKind, InboundTerminal,
+    NewOutboxRow, NewTurnRow, StoreHandle, TurnResolution, TurnState,
 };
 
 /// Static, content-free failure from the durable reply projection boundary.
@@ -200,6 +202,7 @@ pub struct ScopeSnapshot {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScopeFailureKind {
     Store,
+    Attachment,
     Policy,
     Supervisor,
     Projection,
@@ -246,6 +249,7 @@ pub(crate) struct ScopeActorHandle {
 }
 
 impl ScopeActorHandle {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn(
         scope: ScopeKey,
         store: StoreHandle,
@@ -254,6 +258,7 @@ impl ScopeActorHandle {
         supervisor: watch::Receiver<SupervisorAccess>,
         active_turns: Arc<Semaphore>,
         sink: Arc<dyn DurableReplySink>,
+        attachments: Option<Arc<AttachmentCache>>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel(SCOPE_MAILBOX_CAPACITY);
         let state = Arc::new(RwLock::new(ScopeState::Idle));
@@ -270,6 +275,7 @@ impl ScopeActorHandle {
             supervisor.clone(),
             active_turns,
             sink,
+            attachments,
             task_state,
             task_active_turn,
             shutdown.clone(),
@@ -377,6 +383,7 @@ async fn run_scope_actor(
     supervisor: watch::Receiver<SupervisorAccess>,
     active_turns: Arc<Semaphore>,
     sink: Arc<dyn DurableReplySink>,
+    attachments: Option<Arc<AttachmentCache>>,
     state: Arc<RwLock<ScopeState>>,
     active_turn: Arc<RwLock<Option<ActiveTurn>>>,
     shutdown: CancellationToken,
@@ -435,6 +442,7 @@ async fn run_scope_actor(
                     supervisor.clone(),
                     Arc::clone(&active_turns),
                     Arc::clone(&sink),
+                    attachments.as_deref(),
                     &state,
                     &active_turn,
                     &shutdown,
@@ -463,6 +471,7 @@ async fn process_batch(
     mut supervisor: watch::Receiver<SupervisorAccess>,
     active_turns: Arc<Semaphore>,
     sink: Arc<dyn DurableReplySink>,
+    attachments: Option<&AttachmentCache>,
     state: &Arc<RwLock<ScopeState>>,
     active_turn: &RwLock<Option<ActiveTurn>>,
     shutdown: &CancellationToken,
@@ -548,10 +557,6 @@ async fn process_batch(
     else {
         return Ok(());
     };
-    let inputs = claimed
-        .iter()
-        .map(|claimed| UserInput::text(claimed.retained.event().text.clone()))
-        .collect::<Vec<_>>();
     let sources = claimed
         .iter()
         .map(|claimed| TurnSource {
@@ -561,6 +566,20 @@ async fn process_batch(
             thread_id: claimed.retained.event().thread_id.clone(),
         })
         .collect::<Vec<_>>();
+    let Ok(inputs) = assemble_turn_inputs(&claimed, attachments, turn_row_id).await else {
+        finalize_failed(
+            store,
+            sink.as_ref(),
+            settings,
+            turn_row_id,
+            scope,
+            sources,
+            shutdown,
+        )
+        .await?;
+        release_attachments(attachments, turn_row_id).await?;
+        return Ok(());
+    };
     let rpc_cwd = revalidate_workspace(policy, &cwd, &fingerprint)?;
     let mut params = TurnStartParams::new(&thread_id, inputs);
     params.client_user_message_id = Some(client_message_id);
@@ -706,6 +725,9 @@ async fn process_batch(
         .resolve_turn_and_finish_inbound_batch(turn_row_id, resolution, inbound)
         .await
         .map_err(|_| ScopeFailureKind::Store)?;
+    if resolution != TurnResolution::Uncertain {
+        release_attachments(attachments, turn_row_id).await?;
+    }
     Ok(())
 }
 
@@ -766,6 +788,75 @@ fn deduplicate_batch(batch: Vec<ActorInbound>) -> Vec<ActorInbound> {
         retained.push(item);
     }
     retained
+}
+
+async fn assemble_turn_inputs(
+    claimed: &[ClaimedInbound],
+    attachments: Option<&AttachmentCache>,
+    turn_row_id: i64,
+) -> Result<Vec<UserInput>, ()> {
+    // Resource counts are untrusted until each message passes the cache's
+    // hard limit, so reserve only the already bounded claimed-message count.
+    let mut inputs = Vec::with_capacity(claimed.len());
+    let mut turn_bytes = 0_u64;
+    let mut attachment_sequence = 0_u32;
+
+    for claimed in claimed {
+        let event = claimed.retained.event();
+        inputs.push(UserInput::text(event.text.clone()));
+        let Some(cache) = attachments else {
+            continue;
+        };
+        let limits = cache.limits();
+        limits
+            .check_resource_batch(&event.resources)
+            .map_err(|_| ())?;
+        for resource in &event.resources {
+            let cached = cache
+                .fetch(&event.message_id, resource, turn_row_id)
+                .await
+                .map_err(|_| ())?;
+            turn_bytes = turn_bytes.saturating_add(cached.bytes);
+            limits.check_turn_total(turn_bytes).map_err(|_| ())?;
+            attachment_sequence = attachment_sequence.saturating_add(1);
+            match cached.kind {
+                ResourceKind::Image => inputs.push(UserInput::LocalImage {
+                    path: cached.path,
+                    detail: None,
+                }),
+                ResourceKind::File => {
+                    let path = cached.path.to_str().ok_or(())?;
+                    let context = serde_json::to_string(&serde_json::json!({
+                        "attachment": {
+                            "kind": "file",
+                            "name": format!("attachment-{attachment_sequence}"),
+                            "path": path,
+                            "sha256": cached.sha256,
+                            "bytes": cached.bytes,
+                        }
+                    }))
+                    .map_err(|_| ())?;
+                    inputs.push(UserInput::text(context));
+                }
+            }
+        }
+    }
+    Ok(inputs)
+}
+
+async fn release_attachments(
+    attachments: Option<&AttachmentCache>,
+    turn_row_id: i64,
+) -> Result<(), ScopeFailureKind> {
+    let Some(cache) = attachments else {
+        return Ok(());
+    };
+    cache
+        .release_turn(turn_row_id)
+        .await
+        .map_err(|_| ScopeFailureKind::Attachment)?;
+    cache.gc().await.map_err(|_| ScopeFailureKind::Attachment)?;
+    Ok(())
 }
 
 fn is_stale(event: &InboundEvent, max_age: std::time::Duration) -> bool {
@@ -968,6 +1059,40 @@ fn resolution_for(status: &TurnStatus) -> (TurnResolution, InboundTerminal) {
             (TurnResolution::Uncertain, InboundTerminal::Rejected)
         }
     }
+}
+
+async fn finalize_failed(
+    store: &StoreHandle,
+    sink: &dyn DurableReplySink,
+    settings: &RouterSettings,
+    turn_row_id: i64,
+    scope: &ScopeKey,
+    sources: Vec<TurnSource>,
+    shutdown: &CancellationToken,
+) -> Result<(), ScopeFailureKind> {
+    persist_finalization(
+        sink,
+        settings,
+        TurnFinalization {
+            turn_row_id,
+            scope_key: scope.to_string(),
+            sources,
+            resolution: TurnResolution::Failed,
+            outcome: None,
+        },
+        None,
+        shutdown,
+    )
+    .await?;
+    store
+        .resolve_turn_and_finish_inbound_batch(
+            turn_row_id,
+            TurnResolution::Failed,
+            InboundTerminal::Rejected,
+        )
+        .await
+        .map_err(|_| ScopeFailureKind::Store)?;
+    Ok(())
 }
 
 async fn finalize_uncertain(

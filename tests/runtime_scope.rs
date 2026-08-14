@@ -6,18 +6,22 @@ use std::sync::{
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use futures_util::{FutureExt, future::BoxFuture};
 use lark_codex_bridge::codex::process::{CodexProcessConfig, ProcessError};
 use lark_codex_bridge::codex::supervisor::AppServerSupervisor;
 use lark_codex_bridge::config::{BridgeConfig, WorkspacePolicy};
-use lark_codex_bridge::lark::api::ChatMode;
+use lark_codex_bridge::lark::api::{ChatMode, ResourceKind};
 use lark_codex_bridge::lark::bridge::QueuedInboundEvent;
 use lark_codex_bridge::lark::config::TenantBrand;
 use lark_codex_bridge::lark::credentials::LarkCredentials;
-use lark_codex_bridge::lark::normalize::{InboundEvent, ScopeKey};
+use lark_codex_bridge::lark::normalize::{InboundEvent, ResourceDesc, ScopeKey};
 use lark_codex_bridge::limits::{
     ROUTER_ACTIVE_TURN_HARD_LIMIT, ROUTER_COMMAND_BYTE_BUDGET, ROUTER_RETRY_CAPACITY,
     ROUTER_SCOPE_ACTOR_HARD_LIMIT, SCOPE_MAILBOX_CAPACITY,
+};
+use lark_codex_bridge::runtime::attachments::{
+    AttachError, AttachmentCache, AttachmentLimits, ResourceDownloader,
 };
 use lark_codex_bridge::runtime::intake::TenantNamespace;
 use lark_codex_bridge::runtime::policy::AccessPolicy;
@@ -32,6 +36,7 @@ use lark_codex_bridge::store::{
 use secrecy::SecretString;
 use semver::Version;
 use serde_json::{Value, json};
+use tempfile::tempdir;
 use tokio::sync::{Notify, Semaphore};
 use tokio::time::{sleep, timeout};
 
@@ -42,6 +47,24 @@ struct RecordingSink {
     rejections: Mutex<Vec<InboundRejectionKind>>,
     progress: Mutex<Vec<(i64, u32, usize)>>,
     finalizations: Mutex<Vec<(i64, lark_codex_bridge::store::TurnResolution, usize)>>,
+}
+
+struct StaticAttachmentDownloader;
+
+impl ResourceDownloader for StaticAttachmentDownloader {
+    fn download(
+        &self,
+        _message_id: &str,
+        key: &str,
+        _kind: ResourceKind,
+    ) -> BoxFuture<'static, Result<Bytes, AttachError>> {
+        let bytes = match key {
+            "img_key" => Bytes::from_static(b"fake-image-bytes"),
+            "file_key" => Bytes::from_static(b"fake-file-bytes"),
+            _ => Bytes::from_static(b"fallback-attachment"),
+        };
+        async move { Ok(bytes) }.boxed()
+    }
 }
 
 impl DurableReplySink for RecordingSink {
@@ -758,6 +781,244 @@ async fn debounce_batch_claims_one_turn_and_uses_the_exact_client_message_id() {
         .expect("persisted turn");
     assert_eq!(row.client_message_id, client_message_id);
     router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn attachment_cache_inputs_are_leased_for_the_turn_and_released_at_completion() {
+    let config = validated_config();
+    let workspace = config
+        .default_workspace
+        .clone()
+        .expect("validated default workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let credentials = credentials();
+    let namespace = TenantNamespace::from_credentials(&credentials);
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RecordingSink::default());
+    let temp = tempdir().expect("tempdir");
+    let cache_root = temp.path().join("attachments");
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &cache_root,
+            store.clone(),
+            Arc::new(StaticAttachmentDownloader),
+            AttachmentLimits::default(),
+        )
+        .expect("attachment cache"),
+    );
+    let canonical_cache_root = std::fs::canonicalize(&cache_root).expect("canonical cache root");
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start_with_attachments(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink.clone(),
+        Arc::clone(&cache),
+    )
+    .await
+    .expect("router");
+
+    let mut inbound = event("event-attachments", "owner-runtime-scope");
+    inbound.resources = vec![
+        ResourceDesc {
+            kind: ResourceKind::Image,
+            key: "img_key".to_owned(),
+        },
+        ResourceDesc {
+            kind: ResourceKind::File,
+            key: "file_key".to_owned(),
+        },
+    ];
+    router
+        .route(queued_registered(&store, &namespace, inbound).await)
+        .await
+        .expect("route attachment event");
+
+    let start_thread = control.next_request().await;
+    assert_eq!(start_thread["method"], "thread/start");
+    control
+        .respond(
+            &start_thread,
+            thread_result("thread-attachments", &workspace),
+        )
+        .await;
+    let start_turn = control.next_request().await;
+    assert_eq!(start_turn["method"], "turn/start");
+    let inputs = start_turn["params"]["input"]
+        .as_array()
+        .expect("turn inputs");
+    assert_eq!(inputs.len(), 3);
+    assert_eq!(inputs[0]["type"], "text");
+    assert_eq!(inputs[0]["text"], "hello");
+    assert_eq!(inputs[1]["type"], "localImage");
+    assert_eq!(inputs[2]["type"], "text");
+    let file_context: Value =
+        serde_json::from_str(inputs[2]["text"].as_str().expect("structured file context"))
+            .expect("file context JSON");
+    assert_eq!(file_context["attachment"]["kind"], "file");
+    assert_eq!(file_context["attachment"]["name"], "attachment-2");
+    let image_path = std::path::PathBuf::from(inputs[1]["path"].as_str().expect("image path"));
+    let file_path = std::path::PathBuf::from(
+        file_context["attachment"]["path"]
+            .as_str()
+            .expect("file path"),
+    );
+    for path in [&image_path, &file_path] {
+        assert!(path.starts_with(&canonical_cache_root));
+        assert!(path.is_file());
+    }
+
+    let rows = store.list_attachments().await.expect("attachment rows");
+    assert_eq!(rows.len(), 2);
+    for row in &rows {
+        assert_eq!(
+            store
+                .attachment_leases(&row.sha256)
+                .await
+                .expect("attachment leases")
+                .len(),
+            1
+        );
+    }
+
+    respond_turn_started(&control, &start_turn, "turn-attachments").await;
+    send_turn_completed(
+        &control,
+        "thread-attachments",
+        "turn-attachments",
+        "completed",
+    )
+    .await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-attachments"],
+        InboundEventState::Completed,
+    )
+    .await;
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let mut leased = false;
+            for row in &rows {
+                leased |= !store
+                    .attachment_leases(&row.sha256)
+                    .await
+                    .expect("attachment leases")
+                    .is_empty();
+            }
+            if !leased {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("leases released after completion");
+
+    router.shutdown().await.expect("shutdown");
+    drop(cache);
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn attachment_limit_failure_is_durably_failed_before_codex_turn_start() {
+    let config = validated_config();
+    let workspace = config
+        .default_workspace
+        .clone()
+        .expect("validated default workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RecordingSink::default());
+    let temp = tempdir().expect("tempdir");
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &temp.path().join("attachments"),
+            store.clone(),
+            Arc::new(StaticAttachmentDownloader),
+            AttachmentLimits {
+                max_attachments_per_message: 1,
+                ..AttachmentLimits::default()
+            },
+        )
+        .expect("attachment cache"),
+    );
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start_with_attachments(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink.clone(),
+        Arc::clone(&cache),
+    )
+    .await
+    .expect("router");
+
+    let mut inbound = event("event-attachment-limit", "owner-runtime-scope");
+    inbound.resources = vec![
+        ResourceDesc {
+            kind: ResourceKind::Image,
+            key: "img_key".to_owned(),
+        },
+        ResourceDesc {
+            kind: ResourceKind::File,
+            key: "file_key".to_owned(),
+        },
+    ];
+    router
+        .route(queued_registered(&store, &namespace, inbound).await)
+        .await
+        .expect("route attachment event");
+    let start_thread = control.next_request().await;
+    assert_eq!(start_thread["method"], "thread/start");
+    control
+        .respond(
+            &start_thread,
+            thread_result("thread-attachment-limit", &workspace),
+        )
+        .await;
+
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-attachment-limit"],
+        InboundEventState::Rejected,
+    )
+    .await;
+    control
+        .expect_no_request_for(Duration::from_millis(100))
+        .await;
+    assert!(
+        store
+            .list_attachments()
+            .await
+            .expect("attachments")
+            .is_empty()
+    );
+    assert!(
+        store
+            .uncertain_turns()
+            .await
+            .expect("live turns")
+            .is_empty()
+    );
+    {
+        let finalizations = sink.finalizations.lock().expect("finalizations");
+        assert_eq!(finalizations.len(), 1);
+        assert_eq!(finalizations[0].1, TurnResolution::Failed);
+    }
+
+    router.shutdown().await.expect("shutdown");
+    drop(cache);
     store.shutdown().await.expect("store shutdown");
 }
 

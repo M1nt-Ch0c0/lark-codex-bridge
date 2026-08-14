@@ -552,6 +552,14 @@ impl AttachmentCache {
         })
     }
 
+    /// Returns the validated hard limits used by this cache. Turn assembly
+    /// uses the same values for per-message counts and aggregate turn bytes,
+    /// avoiding a second configuration source at the routing boundary.
+    #[must_use]
+    pub fn limits(&self) -> AttachmentLimits {
+        self.limits
+    }
+
     /// Fetches one resource into the cache and leases it for `turn_row_id`.
     ///
     /// The resource key is validated, the download is size-checked before any
