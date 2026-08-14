@@ -135,6 +135,12 @@ pub struct ReplyProjector {
     last_progress: Option<Instant>,
     emitted_progress: u32,
     streamed_content: String,
+    /// Snapshot taken immediately before the latest progress emission. The
+    /// scope actor either persists that emission or calls `restore_progress`
+    /// before feeding another event. Keeping the prior durable state separate
+    /// from the bounded text buffer means truncating a later chunk can never
+    /// erase knowledge that an earlier progress card already exists.
+    progress_checkpoint: Option<ProgressCheckpoint>,
     /// Id of the item whose deltas are currently buffered. A single slot is
     /// enough and bounded (`O(1)`): Codex delivers one agent message's deltas
     /// to completion before the next item, so the slot resets when the item id
@@ -165,6 +171,7 @@ impl ReplyProjector {
             last_progress: None,
             emitted_progress: 0,
             streamed_content: String::new(),
+            progress_checkpoint: None,
             current_item_id: None,
             current_item_buffer: String::new(),
             last_completed_item_id: None,
@@ -287,9 +294,15 @@ impl ReplyProjector {
         if elapsed >= self.config.min_interval
             && self.progress_buffer.chars().count() >= self.config.min_chars
         {
+            let text = email_mask(&self.progress_buffer);
+            self.progress_checkpoint = Some(ProgressCheckpoint {
+                streamed_content: self.streamed_content.clone(),
+                emitted_progress: self.emitted_progress,
+                last_progress: self.last_progress,
+                emitted_text: text.clone(),
+            });
             self.last_progress = Some(now);
             self.emitted_progress = self.emitted_progress.saturating_add(1);
-            let text = email_mask(&self.progress_buffer);
             self.streamed_content.push_str(&text);
             truncate_to_chars(&mut self.streamed_content, self.config.max_chars);
             self.progress_buffer.clear();
@@ -303,17 +316,19 @@ impl ReplyProjector {
     /// it. The actor calls this immediately on enqueue failure, before feeding
     /// another event, so the terminal projection can still deliver the text.
     pub fn restore_progress(&mut self, text: &str) {
-        self.emitted_progress = self.emitted_progress.saturating_sub(1);
-        if self.streamed_content.ends_with(text) {
-            self.streamed_content
-                .truncate(self.streamed_content.len().saturating_sub(text.len()));
-        } else {
-            // The actor restores immediately, so a mismatch indicates the
-            // bounded prefix truncated this chunk. Clearing is conservative:
-            // the terminal path will send the whole fallback independently.
-            self.streamed_content.clear();
-            self.emitted_progress = 0;
+        let Some(checkpoint) = self.progress_checkpoint.take() else {
+            return;
+        };
+        if checkpoint.emitted_text != text {
+            // Fail closed on a stale/mismatched acknowledgement. Retain the
+            // checkpoint and current emitted state rather than corrupting an
+            // unrelated progress emission.
+            self.progress_checkpoint = Some(checkpoint);
+            return;
         }
+        self.streamed_content = checkpoint.streamed_content;
+        self.emitted_progress = checkpoint.emitted_progress;
+        self.last_progress = checkpoint.last_progress;
         let mut restored = String::with_capacity(text.len() + self.progress_buffer.len());
         restored.push_str(text);
         restored.push_str(&self.progress_buffer);
@@ -398,6 +413,14 @@ impl ReplyProjector {
         complete.push_str(&email_mask(&self.current_item_buffer));
         self.render_progress_final(&complete)
     }
+}
+
+/// Bounded rollback state for the one progress enqueue that may be in flight.
+struct ProgressCheckpoint {
+    streamed_content: String,
+    emitted_progress: u32,
+    last_progress: Option<Instant>,
+    emitted_text: String,
 }
 
 impl fmt::Debug for ReplyProjector {

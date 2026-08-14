@@ -177,6 +177,52 @@ fn rejected_progress_is_restored_to_the_standalone_final() {
     );
 }
 
+#[test]
+fn rejected_truncated_update_preserves_an_existing_durable_progress_card() {
+    let mut projector = ReplyProjector::new(ProjectorConfig {
+        max_chars: 5,
+        max_splits: 2,
+        min_interval: Duration::ZERO,
+        min_chars: 1,
+    });
+    let now = Instant::now();
+
+    let first = projector.observe(
+        &completed("first", "12345", Some(MessagePhase::Commentary)),
+        now,
+    );
+    assert!(matches!(first, ProjectorOutput::Progress { .. }));
+    // The first output is considered durably enqueued (no restore call).
+
+    let second = projector.observe(
+        &completed("second", "67890", Some(MessagePhase::Commentary)),
+        now,
+    );
+    let rejected = match second {
+        ProjectorOutput::Progress { text } => text,
+        ProjectorOutput::Nothing => panic!("second progress should be emitted"),
+    };
+    // Appending the second chunk reaches the text cap, so the bounded streamed
+    // buffer does not end with this chunk. Rollback must nevertheless restore
+    // the exact pre-emission state, including the durable-card fact.
+    projector.restore_progress(&rejected);
+
+    let turn = outcome(
+        vec![
+            agent("first", "12345", Some(MessagePhase::Commentary)),
+            agent("second", "67890", Some(MessagePhase::Commentary)),
+        ],
+        TurnStatus::Completed,
+    );
+    assert!(
+        matches!(
+            projector.finish(&turn),
+            ProjectedReply::ProgressFinal { .. }
+        ),
+        "a failed later update must still finalize the existing progress card"
+    );
+}
+
 fn low_chars_config() -> ProjectorConfig {
     ProjectorConfig {
         max_chars: 4000,

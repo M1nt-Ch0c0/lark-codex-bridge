@@ -508,6 +508,71 @@ async fn progress_cards_are_created_updated_and_finalized_through_the_outbox() {
 }
 
 #[tokio::test]
+async fn same_scope_cross_turn_progress_anchor_is_rejected_before_patch() {
+    let server = StubServer::start(token_plus(|_| ok_message("om_progress"))).await;
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = OutboxReplySink::new(store.clone());
+    sink.progress(TurnProgress {
+        turn_row_id: 11,
+        scope_key: "im:oc_chat".to_owned(),
+        source: source("evt_1", "om_parent"),
+        sequence: 0,
+        text: "working".to_owned(),
+    })
+    .await
+    .expect("anchor");
+
+    let bad_update = OutboxOperation::UpdateProgressCard {
+        anchor_key: "11:progress".to_owned(),
+        text: "wrong turn update".to_owned(),
+    };
+    let bad_update_id = match store
+        .enqueue_outbox(NewOutboxRow {
+            idempotency_key: "12:progress:1".to_owned(),
+            scope_key: "im:oc_chat".to_owned(),
+            kind: "progress".to_owned(),
+            payload_json: bad_update.encode().expect("encode update"),
+            next_retry_ms: 0,
+        })
+        .await
+        .expect("enqueue update")
+    {
+        OutboxEnqueue::New(row) | OutboxEnqueue::Duplicate(row) => row.id,
+    };
+    let bad_final = OutboxOperation::FinalizeProgressCard {
+        anchor_key: "11:progress".to_owned(),
+        message_id: "om_parent".to_owned(),
+        thread_id: None,
+        text: "wrong turn final".to_owned(),
+    };
+    let bad_final_id = match store
+        .enqueue_outbox(NewOutboxRow {
+            idempotency_key: "12:progress:final".to_owned(),
+            scope_key: "im:oc_chat".to_owned(),
+            kind: "final".to_owned(),
+            payload_json: bad_final.encode().expect("encode final"),
+            next_retry_ms: 0,
+        })
+        .await
+        .expect("enqueue final")
+    {
+        OutboxEnqueue::New(row) | OutboxEnqueue::Duplicate(row) => row.id,
+    };
+
+    let (_, rx) = watch::channel(TransportState::Connected);
+    let pump = OutboxPump::spawn(store.clone(), api_for(&server), rx, fast_config());
+    wait_for_state(&store, 1, OutboxState::Sent).await;
+    wait_for_state(&store, bad_update_id, OutboxState::Failed).await;
+    wait_for_state(&store, bad_final_id, OutboxState::Failed).await;
+
+    let requests = reply_requests(&server);
+    assert_eq!(requests.len(), 1, "only the legitimate anchor is sent");
+    assert_eq!(requests[0].method, "POST");
+    assert_eq!(requests[0].path, REPLY_PATH);
+    pump.shutdown().await;
+}
+
+#[tokio::test]
 async fn failed_initial_progress_card_falls_back_to_a_standalone_final() {
     let server = StubServer::start(token_plus(|request| {
         let body: serde_json::Value = serde_json::from_slice(&request.body).expect("message body");

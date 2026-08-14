@@ -383,7 +383,8 @@ async fn send(
             .map(|message| message.message_id)
             .map_err(SendFailure::Delivery),
         OutboxOperation::UpdateProgressCard { anchor_key, text } => {
-            let anchor = progress_anchor(store, row, anchor_key).await?;
+            let anchor =
+                progress_anchor(store, row, anchor_key, ProgressDependency::Update).await?;
             match anchor {
                 ProgressAnchor::Delivered(message_id) => api
                     .update_card(&message_id, progress_card(text))
@@ -401,7 +402,8 @@ async fn send(
             thread_id,
             text,
         } => {
-            let anchor = progress_anchor(store, row, anchor_key).await?;
+            let anchor =
+                progress_anchor(store, row, anchor_key, ProgressDependency::Finalize).await?;
             match anchor {
                 ProgressAnchor::Delivered(receipt) => api
                     .update_card(&receipt, progress_card(text))
@@ -432,11 +434,21 @@ enum ProgressAnchor {
     Uncertain,
 }
 
+#[derive(Clone, Copy)]
+enum ProgressDependency {
+    Update,
+    Finalize,
+}
+
 async fn progress_anchor(
     store: &StoreHandle,
     dependent: &OutboxRow,
     anchor_key: &str,
+    dependency: ProgressDependency,
 ) -> Result<ProgressAnchor, SendFailure> {
+    if !valid_progress_dependency(dependent, anchor_key, dependency) {
+        return Err(SendFailure::DependencyPermanent);
+    }
     let row = store
         .outbox_row_by_key(anchor_key)
         .await
@@ -460,6 +472,34 @@ async fn progress_anchor(
         OutboxState::Pending | OutboxState::Sending => Ok(ProgressAnchor::Pending),
         OutboxState::Failed => Ok(ProgressAnchor::Failed),
         OutboxState::UncertainDelivery => Ok(ProgressAnchor::Uncertain),
+    }
+}
+
+fn valid_progress_dependency(
+    dependent: &OutboxRow,
+    anchor_key: &str,
+    dependency: ProgressDependency,
+) -> bool {
+    match dependency {
+        ProgressDependency::Update => {
+            if dependent.kind != "progress" {
+                return false;
+            }
+            let Some(sequence) = dependent
+                .idempotency_key
+                .strip_prefix(anchor_key)
+                .and_then(|suffix| suffix.strip_prefix(':'))
+            else {
+                return false;
+            };
+            let Ok(sequence_number) = sequence.parse::<u32>() else {
+                return false;
+            };
+            sequence_number > 0 && sequence_number.to_string() == sequence
+        }
+        ProgressDependency::Finalize => {
+            dependent.kind == "final" && dependent.idempotency_key == format!("{anchor_key}:final")
+        }
     }
 }
 
