@@ -210,8 +210,12 @@ async fn run(
             cursor += 1;
             if let ProcessOutcome::Deferred { next_retry_ms } = outcome {
                 // This row will be retried later: stop sending the rest of the
-                // batch so a later row cannot overtake it, parking the tail no
-                // earlier than the deferred row's retry time.
+                // batch so a later row cannot overtake it. Two classes of
+                // successors must be parked no earlier than the retry time:
+                // the already-claimed tail (released below), and any other
+                // `pending` row after this one that would otherwise be claimed
+                // first on a later poll.
+                defer_successors(&store, batch[cursor - 1].id, next_retry_ms).await;
                 release_tail_at(&store, &batch[cursor..], next_retry_ms).await;
                 break;
             }
@@ -372,6 +376,15 @@ async fn release_tail_at(store: &StoreHandle, tail: &[OutboxRow], next_retry_ms:
         if let Err(error) = store.release_outbox_claim_at(row.id, next_retry_ms).await {
             tracing::warn!(error = %error, outbox_id = row.id, "outbox claim release failed");
         }
+    }
+}
+
+/// Parks every `pending` successor of the deferred row that would otherwise be
+/// claimed before its retry, so global `id` order is preserved across poll
+/// cycles, not just within one claim batch.
+async fn defer_successors(store: &StoreHandle, after_id: i64, retry_ms: i64) {
+    if let Err(error) = store.defer_outbox_after(after_id, retry_ms).await {
+        tracing::warn!(error = %error, after_id, "outbox successor deferral failed");
     }
 }
 

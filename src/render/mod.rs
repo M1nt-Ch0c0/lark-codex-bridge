@@ -22,6 +22,11 @@
 //! streaming [`ReplyProjector::observe`] path is the deferred integration
 //! seam. The final-only durable sink uses only [`ReplyProjector::project_final`].
 //!
+//! Wiring point (out of scope here, covered by the prior report): the scope
+//! actor's `Running` phase drives [`ReplyProjector::observe`] from its
+//! `ThreadSubscription`, and each `Progress` output is enqueued as a
+//! `progress` outbox row before the terminal final is projected.
+//!
 //! Redaction: `Debug` implementations report counts and lengths only — never
 //! agent text, and the email audit mask never appears in `Debug` output.
 
@@ -124,6 +129,12 @@ pub struct ReplyProjector {
     progress_buffer: String,
     last_progress: Option<Instant>,
     streamed: bool,
+    /// Id of the item most recently streamed via `AgentMessageDelta`, used to
+    /// de-duplicate the same item's full text when `ItemCompleted` arrives.
+    streamed_item_id: Option<String>,
+    /// Bytes of delta text received so far for `streamed_item_id`, so an
+    /// `ItemCompleted` only appends the not-yet-streamed tail.
+    streamed_item_bytes: usize,
 }
 
 impl ReplyProjector {
@@ -135,6 +146,8 @@ impl ReplyProjector {
             progress_buffer: String::new(),
             last_progress: None,
             streamed: false,
+            streamed_item_id: None,
+            streamed_item_bytes: 0,
         }
     }
 
@@ -149,22 +162,35 @@ impl ReplyProjector {
     ///
     /// A `FinalAnswer`-phase agent message is never progress (contract 2);
     /// it is reserved for the terminal projection.
+    ///
+    /// Deduplication: Codex emits `AgentMessageDelta` events as an item
+    /// streams and then an `ItemCompleted` event carrying the same item's full
+    /// text. Both events carry the item id, so this method tracks the most
+    /// recently streamed item and its received delta byte count, and an
+    /// `ItemCompleted` only appends the tail the deltas did not cover (or the
+    /// whole text when no delta was seen). A single-item slot is enough and
+    /// bounded (`O(1)`): Codex delivers one agent message's deltas to
+    /// completion before the next item, so the slot resets automatically when
+    /// the item id changes.
     #[must_use]
     pub fn observe(&mut self, event: &AppServerEvent, now: Instant) -> ProjectorOutput {
-        let delta = match event {
-            AppServerEvent::AgentMessageDelta { delta, .. } => delta.as_str(),
+        let text = match event {
+            AppServerEvent::AgentMessageDelta { item_id, delta, .. } => {
+                self.begin_or_continue_delta(item_id, delta.len());
+                delta.as_str()
+            }
             AppServerEvent::ItemCompleted { item, .. } => match item {
-                ThreadItem::AgentMessage { text, phase, .. } if !is_final_phase(phase.as_ref()) => {
-                    text.as_str()
-                }
+                ThreadItem::AgentMessage {
+                    id, text, phase, ..
+                } if !is_final_phase(phase.as_ref()) => self.unstreamed_tail(id, text),
                 _ => return ProjectorOutput::Nothing,
             },
             _ => return ProjectorOutput::Nothing,
         };
-        if delta.is_empty() {
+        if text.is_empty() {
             return ProjectorOutput::Nothing;
         }
-        self.progress_buffer.push_str(delta);
+        self.progress_buffer.push_str(text);
         truncate_to_chars(&mut self.progress_buffer, self.config.max_chars);
         let elapsed = self
             .last_progress
@@ -179,6 +205,41 @@ impl ReplyProjector {
             ProjectorOutput::Progress { text }
         } else {
             ProjectorOutput::Nothing
+        }
+    }
+
+    /// Records `delta_bytes` more bytes streamed for `item_id`, resetting the
+    /// single-item slot when the item id changes.
+    fn begin_or_continue_delta(&mut self, item_id: &str, delta_bytes: usize) {
+        if self.streamed_item_id.as_deref() != Some(item_id) {
+            self.streamed_item_id = Some(item_id.to_owned());
+            self.streamed_item_bytes = 0;
+        }
+        self.streamed_item_bytes = self.streamed_item_bytes.saturating_add(delta_bytes);
+    }
+
+    /// Returns the portion of a completed item's `text` not already streamed.
+    ///
+    /// If the item streamed deltas first, only the tail beyond the received
+    /// delta bytes is appended (or nothing when the deltas already covered the
+    /// text), so the same content is never counted twice. If the item has no
+    /// recorded delta, the whole text is the deterministic fallback. The item
+    /// is then recorded as fully streamed, so a duplicate completion is a
+    /// no-op.
+    fn unstreamed_tail<'a>(&mut self, item_id: &str, text: &'a str) -> &'a str {
+        let already_streamed = if self.streamed_item_id.as_deref() == Some(item_id) {
+            self.streamed_item_bytes
+        } else {
+            0
+        };
+        self.streamed_item_id = Some(item_id.to_owned());
+        self.streamed_item_bytes = text.len();
+        if already_streamed == 0 {
+            text
+        } else if already_streamed >= text.len() || !text.is_char_boundary(already_streamed) {
+            ""
+        } else {
+            &text[already_streamed..]
         }
     }
 
@@ -244,6 +305,8 @@ impl fmt::Debug for ReplyProjector {
             .field("config", &self.config)
             .field("streamed", &self.streamed)
             .field("buffered_chars", &self.progress_buffer.chars().count())
+            .field("has_streamed_item", &self.streamed_item_id.is_some())
+            .field("streamed_item_bytes", &self.streamed_item_bytes)
             .finish_non_exhaustive()
     }
 }

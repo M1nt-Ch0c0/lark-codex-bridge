@@ -11,7 +11,8 @@ use rusqlite::params;
 
 use super::{StoreError, StoreHandle, now_ms, query_optional, request_bytes, sqlite_error};
 use crate::limits::{
-    OUTBOX_SWEEP_BATCH, STORE_OUTBOX_CLAIM_MAX_BATCH, STORE_OUTBOX_CLAIM_MAX_BYTES,
+    OUTBOX_SWEEP_BATCH, OUTBOX_TERMINAL_MAX_BYTES, OUTBOX_TERMINAL_MAX_ROWS,
+    OUTBOX_TERMINAL_RETENTION_MS, STORE_OUTBOX_CLAIM_MAX_BATCH, STORE_OUTBOX_CLAIM_MAX_BYTES,
     STORE_OUTBOX_MAX_ATTEMPTS, STORE_OUTBOX_MAX_QUEUED_BYTES, STORE_OUTBOX_MAX_ROWS,
     STORE_OUTBOX_PAYLOAD_MAX_BYTES,
 };
@@ -58,8 +59,8 @@ impl OutboxState {
 
 /// One row of the `outbox` table.
 ///
-/// `Debug` reports IDs, kind, state, and byte size only — never the payload
-/// body, which carries message content.
+/// `Debug` reports the row ID, kind, state, and byte/length values only —
+/// never the idempotency key, scope key, receipt message id, or payload body.
 #[derive(Clone, PartialEq, Eq)]
 pub struct OutboxRow {
     /// Row ID.
@@ -93,14 +94,17 @@ impl std::fmt::Debug for OutboxRow {
         formatter
             .debug_struct("OutboxRow")
             .field("id", &self.id)
-            .field("idempotency_key", &self.idempotency_key)
-            .field("scope_key", &self.scope_key)
+            .field("idempotency_key_len", &self.idempotency_key.len())
+            .field("scope_key_len", &self.scope_key.len())
             .field("kind", &self.kind)
             .field("payload_bytes", &self.payload_bytes)
             .field("state", &self.state)
             .field("attempts", &self.attempts)
             .field("next_retry_ms", &self.next_retry_ms)
-            .field("receipt_message_id", &self.receipt_message_id)
+            .field(
+                "receipt_message_id_len",
+                &self.receipt_message_id.as_ref().map(String::len),
+            )
             .field("created_ms", &self.created_ms)
             .field("updated_ms", &self.updated_ms)
             .finish_non_exhaustive()
@@ -126,8 +130,8 @@ impl std::fmt::Debug for NewOutboxRow {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("NewOutboxRow")
-            .field("idempotency_key", &self.idempotency_key)
-            .field("scope_key", &self.scope_key)
+            .field("idempotency_key_len", &self.idempotency_key.len())
+            .field("scope_key_len", &self.scope_key.len())
             .field("kind", &self.kind)
             .field("payload_bytes", &self.payload_json.len())
             .field("next_retry_ms", &self.next_retry_ms)
@@ -167,17 +171,11 @@ impl StoreHandle {
     ///
     /// Returns [`StoreError::PayloadTooLarge`] when the serialized body
     /// exceeds [`STORE_OUTBOX_PAYLOAD_MAX_BYTES`] (rejected before the row
-    /// enters the writer channel), or when the writer task or SQLite fails.
+    /// enters the writer channel), [`StoreError::CapacityExceeded`] when a
+    /// durable bound would be crossed, or an error when the writer task or
+    /// SQLite fails.
     pub async fn enqueue_outbox(&self, row: NewOutboxRow) -> Result<OutboxEnqueue, StoreError> {
-        let payload_bytes = row.payload_json.len();
-        if payload_bytes > STORE_OUTBOX_PAYLOAD_MAX_BYTES {
-            return Err(StoreError::PayloadTooLarge {
-                context: "enqueueing an outbox payload",
-                limit: STORE_OUTBOX_PAYLOAD_MAX_BYTES as u64,
-            });
-        }
-        let payload_bytes = u64::try_from(payload_bytes).unwrap_or(u64::MAX);
-        let payload_bytes_sql = i64::try_from(payload_bytes).unwrap_or(i64::MAX);
+        validate_outbox_payload(&row)?;
         let request_size = request_bytes(&[
             &row.idempotency_key,
             &row.scope_key,
@@ -185,67 +183,97 @@ impl StoreHandle {
             &row.payload_json,
         ]);
         self.run_sized(request_size, move |connection| {
-            let exists: bool = connection
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM outbox WHERE idempotency_key = ?1)",
-                    params![row.idempotency_key],
-                    |result| result.get(0),
-                )
-                .map_err(|error| sqlite_error("checking an outbox idempotency key", &error))?;
-            if !exists {
-                let (count, bytes): (i64, i64) = connection
-                    .query_row(
-                        "SELECT COUNT(*), COALESCE(SUM(payload_bytes), 0) FROM outbox
-                         WHERE state IN ('pending', 'sending')",
-                        [],
-                        |result| Ok((result.get(0)?, result.get(1)?)),
-                    )
-                    .map_err(|error| sqlite_error("checking outbox capacity", &error))?;
-                let count = u64::try_from(count).unwrap_or(u64::MAX);
-                let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
-                if count >= STORE_OUTBOX_MAX_ROWS
-                    || bytes.saturating_add(payload_bytes) > STORE_OUTBOX_MAX_QUEUED_BYTES
-                {
-                    return Err(StoreError::CapacityExceeded {
-                        context: "enqueueing an outbox row",
-                    });
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|error| sqlite_error("starting an outbox enqueue", &error))?;
+            let result = enqueue_one(&transaction, &row);
+            if result.is_ok() {
+                transaction
+                    .commit()
+                    .map_err(|error| sqlite_error("committing an outbox enqueue", &error))?;
+            }
+            result
+        })
+        .await
+    }
+
+    /// Atomically enqueues a batch of outbound messages in one transaction.
+    ///
+    /// Every row runs the same idempotency and capacity logic as
+    /// [`StoreHandle::enqueue_outbox`]; if any row fails, the whole batch is
+    /// rolled back, so a partial final answer can never be persisted and later
+    /// sent. The returned vector has exactly one [`OutboxEnqueue`] per input
+    /// row, in input order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::PayloadTooLarge`] when any serialized body
+    /// exceeds [`STORE_OUTBOX_PAYLOAD_MAX_BYTES`] (rejected before the batch
+    /// enters the writer channel), [`StoreError::CapacityExceeded`] when a
+    /// durable bound would be crossed, or an error when the writer task or
+    /// SQLite fails.
+    pub async fn enqueue_outbox_batch(
+        &self,
+        rows: &[NewOutboxRow],
+    ) -> Result<Vec<OutboxEnqueue>, StoreError> {
+        for row in rows {
+            validate_outbox_payload(row)?;
+        }
+        let request_size = rows.iter().fold(0_usize, |total, row| {
+            total.saturating_add(request_bytes(&[
+                &row.idempotency_key,
+                &row.scope_key,
+                &row.kind,
+                &row.payload_json,
+            ]))
+        });
+        let rows = rows.to_vec();
+        self.run_sized(request_size, move |connection| {
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|error| sqlite_error("starting an outbox batch enqueue", &error))?;
+            let mut results = Vec::with_capacity(rows.len());
+            for row in &rows {
+                match enqueue_one(&transaction, row) {
+                    Ok(value) => results.push(value),
+                    Err(error) => return Err(error),
                 }
             }
-            let now = now_ms();
-            let inserted = connection
+            transaction
+                .commit()
+                .map_err(|error| sqlite_error("committing an outbox batch enqueue", &error))?;
+            Ok(results)
+        })
+        .await
+    }
+
+    /// Defers every `pending` successor row after `after_id` whose retry time
+    /// is earlier than `retry_ms`, parking it until `retry_ms` in one bounded
+    /// `UPDATE`.
+    ///
+    /// This closes the cross-batch reordering hole: a failed row that will be
+    /// retried at `retry_ms` must not let already-`pending` successors (newly
+    /// enqueued, or never claimed) overtake it in the next poll. Rows with an
+    /// id `<= after_id`, and successors already parked no earlier than
+    /// `retry_ms`, are left untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the writer task or SQLite fails.
+    pub async fn defer_outbox_after(
+        &self,
+        after_id: i64,
+        retry_ms: i64,
+    ) -> Result<u64, StoreError> {
+        self.run(move |connection| {
+            let changed = connection
                 .execute(
-                    "INSERT OR IGNORE INTO outbox
-                     (idempotency_key, scope_key, kind, payload_json, payload_bytes,
-                      state, attempts, next_retry_ms, created_ms, updated_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6, ?7, ?7)",
-                    params![
-                        row.idempotency_key,
-                        row.scope_key,
-                        row.kind,
-                        row.payload_json,
-                        payload_bytes_sql,
-                        row.next_retry_ms,
-                        now,
-                    ],
+                    "UPDATE outbox SET next_retry_ms = ?2, updated_ms = ?3
+                     WHERE state = 'pending' AND id > ?1 AND next_retry_ms < ?2",
+                    params![after_id, retry_ms, now_ms()],
                 )
-                .map_err(|error| sqlite_error("enqueueing an outbox row", &error))?;
-            let existing = connection.query_row(
-                "SELECT id, idempotency_key, scope_key, kind, payload_json, payload_bytes,
-                        state, attempts, next_retry_ms, receipt_message_id, created_ms, updated_ms
-                 FROM outbox WHERE idempotency_key = ?1",
-                params![row.idempotency_key],
-                read_outbox_row,
-            );
-            let stored = query_optional(existing, "re-reading an outbox row")?.ok_or(
-                StoreError::NotFound {
-                    context: "re-reading an outbox row",
-                },
-            )?;
-            Ok(if inserted == 1 {
-                OutboxEnqueue::New(stored)
-            } else {
-                OutboxEnqueue::Duplicate(stored)
-            })
+                .map_err(|error| sqlite_error("deferring outbox successors", &error))?;
+            Ok(u64::try_from(changed).unwrap_or(u64::MAX))
         })
         .await
     }
@@ -498,22 +526,8 @@ impl StoreHandle {
         if max_rows == 0 {
             return Ok(0);
         }
-        self.run(move |connection| {
-            let deleted = connection
-                .execute(
-                    "DELETE FROM outbox
-                     WHERE id IN (
-                         SELECT id FROM outbox
-                         WHERE state IN ('sent', 'failed', 'uncertain_delivery')
-                           AND updated_ms < ?1
-                         ORDER BY updated_ms, id LIMIT ?2
-                     )",
-                    params![older_than_ms, max_rows],
-                )
-                .map_err(|error| sqlite_error("sweeping terminal outbox rows", &error))?;
-            Ok(u64::try_from(deleted).unwrap_or(u64::MAX))
-        })
-        .await
+        self.run(move |connection| sweep_terminal_rows_inline(connection, older_than_ms, max_rows))
+            .await
     }
 
     /// Reads one outbox row by ID.
@@ -581,6 +595,169 @@ impl StoreHandle {
         })
         .await
     }
+}
+
+/// Rejects an oversized serialized payload before it reaches the writer.
+fn validate_outbox_payload(row: &NewOutboxRow) -> Result<(), StoreError> {
+    if row.payload_json.len() > STORE_OUTBOX_PAYLOAD_MAX_BYTES {
+        return Err(StoreError::PayloadTooLarge {
+            context: "enqueueing an outbox payload",
+            limit: STORE_OUTBOX_PAYLOAD_MAX_BYTES as u64,
+        });
+    }
+    Ok(())
+}
+
+/// Inserts or deduplicates one outbox row on `connection`.
+///
+/// `connection` is the active `IMMEDIATE` transaction; the payload size must
+/// already have been validated by the caller. The pending/sending capacity
+/// bounds and the terminal-row hard cap (with its bounded inline sweep) are
+/// enforced here, so both the single-row and batch entry points share one code
+/// path.
+fn enqueue_one(
+    connection: &rusqlite::Connection,
+    row: &NewOutboxRow,
+) -> Result<OutboxEnqueue, StoreError> {
+    let payload_bytes = u64::try_from(row.payload_json.len()).unwrap_or(u64::MAX);
+    let payload_bytes_sql = i64::try_from(row.payload_json.len()).unwrap_or(i64::MAX);
+    let exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM outbox WHERE idempotency_key = ?1)",
+            params![row.idempotency_key],
+            |result| result.get(0),
+        )
+        .map_err(|error| sqlite_error("checking an outbox idempotency key", &error))?;
+    if !exists {
+        let (count, bytes): (i64, i64) = connection
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(payload_bytes), 0) FROM outbox
+                 WHERE state IN ('pending', 'sending')",
+                [],
+                |result| Ok((result.get(0)?, result.get(1)?)),
+            )
+            .map_err(|error| sqlite_error("checking outbox capacity", &error))?;
+        let count = u64::try_from(count).unwrap_or(u64::MAX);
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        if count >= STORE_OUTBOX_MAX_ROWS
+            || bytes.saturating_add(payload_bytes) > STORE_OUTBOX_MAX_QUEUED_BYTES
+        {
+            return Err(StoreError::CapacityExceeded {
+                context: "enqueueing an outbox row",
+            });
+        }
+        enforce_terminal_cap(connection, payload_bytes)?;
+    }
+    let now = now_ms();
+    let inserted = connection
+        .execute(
+            "INSERT OR IGNORE INTO outbox
+             (idempotency_key, scope_key, kind, payload_json, payload_bytes,
+              state, attempts, next_retry_ms, created_ms, updated_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6, ?7, ?7)",
+            params![
+                row.idempotency_key,
+                row.scope_key,
+                row.kind,
+                row.payload_json,
+                payload_bytes_sql,
+                row.next_retry_ms,
+                now,
+            ],
+        )
+        .map_err(|error| sqlite_error("enqueueing an outbox row", &error))?;
+    let existing = connection.query_row(
+        "SELECT id, idempotency_key, scope_key, kind, payload_json, payload_bytes,
+                state, attempts, next_retry_ms, receipt_message_id, created_ms, updated_ms
+         FROM outbox WHERE idempotency_key = ?1",
+        params![row.idempotency_key],
+        read_outbox_row,
+    );
+    let stored =
+        query_optional(existing, "re-reading an outbox row")?.ok_or(StoreError::NotFound {
+            context: "re-reading an outbox row",
+        })?;
+    Ok(if inserted == 1 {
+        OutboxEnqueue::New(stored)
+    } else {
+        OutboxEnqueue::Duplicate(stored)
+    })
+}
+
+/// Enforces the terminal-row hard cap before one new row is persisted.
+///
+/// The incoming row is a proxy for one future terminal row: if its addition
+/// would cross [`OUTBOX_TERMINAL_MAX_ROWS`] or [`OUTBOX_TERMINAL_MAX_BYTES`],
+/// one bounded inline sweep first frees the oldest overage rows (same SQL as
+/// [`StoreHandle::sweep_terminal_outbox`], clamped to [`OUTBOX_SWEEP_BATCH`]).
+/// Only if the cap would still be crossed does the enqueue fail closed.
+fn enforce_terminal_cap(
+    connection: &rusqlite::Connection,
+    payload_bytes: u64,
+) -> Result<(), StoreError> {
+    let (count, bytes) = terminal_count_bytes(connection)?;
+    if count.saturating_add(1) <= OUTBOX_TERMINAL_MAX_ROWS
+        && bytes.saturating_add(payload_bytes) <= OUTBOX_TERMINAL_MAX_BYTES
+    {
+        return Ok(());
+    }
+    sweep_terminal_rows_inline(
+        connection,
+        now_ms().saturating_sub(OUTBOX_TERMINAL_RETENTION_MS),
+        OUTBOX_SWEEP_BATCH,
+    )?;
+    let (count, bytes) = terminal_count_bytes(connection)?;
+    if count.saturating_add(1) > OUTBOX_TERMINAL_MAX_ROWS
+        || bytes.saturating_add(payload_bytes) > OUTBOX_TERMINAL_MAX_BYTES
+    {
+        return Err(StoreError::CapacityExceeded {
+            context: "enqueueing an outbox row",
+        });
+    }
+    Ok(())
+}
+
+/// Terminal (`sent`/`failed`/`uncertain_delivery`) row count and byte total.
+fn terminal_count_bytes(connection: &rusqlite::Connection) -> Result<(u64, u64), StoreError> {
+    let (count, bytes): (i64, i64) = connection
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(payload_bytes), 0) FROM outbox
+             WHERE state IN ('sent', 'failed', 'uncertain_delivery')",
+            [],
+            |result| Ok((result.get(0)?, result.get(1)?)),
+        )
+        .map_err(|error| sqlite_error("checking terminal outbox capacity", &error))?;
+    Ok((
+        u64::try_from(count).unwrap_or(u64::MAX),
+        u64::try_from(bytes).unwrap_or(u64::MAX),
+    ))
+}
+
+/// Deletes up to `max_rows` terminal rows last updated before `older_than_ms`,
+/// in ascending `updated_ms` order. Shared by the periodic pump sweep and the
+/// inline enqueue sweep.
+fn sweep_terminal_rows_inline(
+    connection: &rusqlite::Connection,
+    older_than_ms: i64,
+    max_rows: u32,
+) -> Result<u64, StoreError> {
+    let max_rows = max_rows.min(OUTBOX_SWEEP_BATCH);
+    if max_rows == 0 {
+        return Ok(0);
+    }
+    let deleted = connection
+        .execute(
+            "DELETE FROM outbox
+             WHERE id IN (
+                 SELECT id FROM outbox
+                 WHERE state IN ('sent', 'failed', 'uncertain_delivery')
+                   AND updated_ms < ?1
+                 ORDER BY updated_ms, id LIMIT ?2
+             )",
+            params![older_than_ms, max_rows],
+        )
+        .map_err(|error| sqlite_error("sweeping terminal outbox rows", &error))?;
+    Ok(u64::try_from(deleted).unwrap_or(u64::MAX))
 }
 
 fn require_sending(
@@ -797,5 +974,321 @@ mod tests {
             row.attempts, 0,
             "releasing a claim never counts a send attempt"
         );
+    }
+
+    fn new_row(key: &str, next_retry_ms: i64) -> NewOutboxRow {
+        NewOutboxRow {
+            idempotency_key: key.to_owned(),
+            scope_key: "im:oc".to_owned(),
+            kind: "final".to_owned(),
+            payload_json: "{}".to_owned(),
+            next_retry_ms,
+        }
+    }
+
+    async fn seed_terminal_rows(store: &StoreHandle, count: usize, updated_ms: i64) {
+        store
+            .run(move |connection| {
+                let transaction = connection
+                    .transaction()
+                    .map_err(|error| sqlite_error("seeding terminal rows", &error))?;
+                {
+                    let mut statement = transaction
+                        .prepare(
+                            "INSERT INTO outbox
+                             (idempotency_key, scope_key, kind, payload_json, payload_bytes,
+                              state, attempts, next_retry_ms, receipt_message_id, created_ms, updated_ms)
+                             VALUES (?1, 'im:oc', 'final', '{}', 2, 'sent', 1, 0, 'om_r', 1, ?2)",
+                        )
+                        .map_err(|error| sqlite_error("preparing terminal seed", &error))?;
+                    for index in 0..count {
+                        statement
+                            .execute(params![format!("term:{index}"), updated_ms])
+                            .map_err(|error| sqlite_error("inserting terminal seed", &error))?;
+                    }
+                }
+                transaction
+                    .commit()
+                    .map_err(|error| sqlite_error("committing terminal seed", &error))?;
+                Ok(())
+            })
+            .await
+            .expect("seed terminal rows");
+    }
+
+    async fn seed_pending_rows(store: &StoreHandle, count: usize) {
+        store
+            .run(move |connection| {
+                let transaction = connection
+                    .transaction()
+                    .map_err(|error| sqlite_error("seeding pending rows", &error))?;
+                {
+                    let mut statement = transaction
+                        .prepare(
+                            "INSERT INTO outbox
+                             (idempotency_key, scope_key, kind, payload_json, payload_bytes,
+                              state, attempts, next_retry_ms, receipt_message_id, created_ms, updated_ms)
+                             VALUES (?1, 'im:oc', 'final', '{}', 2, 'pending', 0, 0, NULL, 1, 1)",
+                        )
+                        .map_err(|error| sqlite_error("preparing pending seed", &error))?;
+                    for index in 0..count {
+                        statement
+                            .execute(params![format!("seed:{index}")])
+                            .map_err(|error| sqlite_error("inserting pending seed", &error))?;
+                    }
+                }
+                transaction
+                    .commit()
+                    .map_err(|error| sqlite_error("committing pending seed", &error))?;
+                Ok(())
+            })
+            .await
+            .expect("seed pending rows");
+    }
+
+    async fn terminal_rows(store: &StoreHandle) -> u64 {
+        store
+            .run(|connection| {
+                let (count, _bytes) = terminal_count_bytes(connection)?;
+                Ok(count)
+            })
+            .await
+            .expect("terminal row count")
+    }
+
+    #[tokio::test]
+    async fn defer_outbox_after_parks_only_pending_successors_before_retry() {
+        let store = StoreHandle::open_in_memory().await.expect("store");
+        store.enqueue_outbox(new_row("a", 0)).await.expect("a");
+        store.enqueue_outbox(new_row("b", 0)).await.expect("b");
+        store.enqueue_outbox(new_row("c", 0)).await.expect("c");
+        let retry_ms = now_ms() + 60_000;
+        store
+            .enqueue_outbox(new_row("d", retry_ms + 5_000))
+            .await
+            .expect("d");
+
+        // Claim a + b; a fails retryably and is re-parked at retry_ms.
+        let claimed = store.claim_outbox_batch(now_ms(), 2).await.expect("claim");
+        assert_eq!(claimed.len(), 2);
+        let after_id = claimed[0].id;
+        store
+            .fail_outbox(after_id, 1, retry_ms, false)
+            .await
+            .expect("fail a");
+
+        // Only c is a `pending` successor earlier than retry_ms; b is still
+        // `sending` (the in-batch tail) and d is already parked later.
+        let changed = store
+            .defer_outbox_after(after_id, retry_ms)
+            .await
+            .expect("defer");
+        assert_eq!(changed, 1, "exactly c is deferred");
+
+        // The pump then releases the claimed tail at retry_ms.
+        store
+            .release_outbox_claim_at(claimed[1].id, retry_ms)
+            .await
+            .expect("release b");
+
+        assert!(
+            store
+                .claim_outbox_batch(now_ms(), 8)
+                .await
+                .expect("claim")
+                .is_empty(),
+            "nothing may be claimed before the deferred row's retry"
+        );
+        let next = store.claim_outbox_batch(retry_ms, 8).await.expect("claim");
+        assert_eq!(
+            next.iter()
+                .map(|row| row.idempotency_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "c"],
+            "global id order is restored once the deferred row is due"
+        );
+    }
+
+    #[tokio::test]
+    async fn enqueue_sweeps_old_terminal_rows_inline_when_at_hard_cap() {
+        let store = StoreHandle::open_in_memory().await.expect("store");
+        let cap = usize::try_from(OUTBOX_TERMINAL_MAX_ROWS).unwrap();
+        seed_terminal_rows(&store, cap, 1_000).await;
+
+        let result = store
+            .enqueue_outbox(new_row("fresh", 0))
+            .await
+            .expect("enqueue");
+        assert!(matches!(result, OutboxEnqueue::New(_)));
+
+        assert_eq!(
+            terminal_rows(&store).await,
+            u64::try_from(cap - usize::try_from(OUTBOX_SWEEP_BATCH).unwrap()).unwrap(),
+            "one bounded inline sweep frees the oldest terminal rows"
+        );
+        assert_eq!(store.outbox_depth().await.expect("depth").pending, 1);
+    }
+
+    #[tokio::test]
+    async fn enqueue_fails_closed_when_terminal_rows_are_recent_and_at_hard_cap() {
+        let store = StoreHandle::open_in_memory().await.expect("store");
+        store
+            .enqueue_outbox(new_row("pending_before", 0))
+            .await
+            .expect("pending seed");
+        let cap = usize::try_from(OUTBOX_TERMINAL_MAX_ROWS).unwrap();
+        seed_terminal_rows(&store, cap, now_ms()).await;
+
+        let result = store.enqueue_outbox(new_row("blocked", 0)).await;
+        assert!(
+            matches!(result, Err(StoreError::CapacityExceeded { .. })),
+            "{result:?}"
+        );
+        assert_eq!(
+            terminal_rows(&store).await,
+            u64::try_from(cap).unwrap(),
+            "recent terminal rows within retention are never swept"
+        );
+        // The pending/sending path is unaffected: the pre-existing pending row
+        // is still claimable and the rejected row was never persisted.
+        let depth = store.outbox_depth().await.expect("depth");
+        assert_eq!(depth.pending, 1);
+        let claimed = store.claim_outbox_batch(now_ms(), 1).await.expect("claim");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].idempotency_key, "pending_before");
+    }
+
+    #[tokio::test]
+    async fn enqueue_within_terminal_cap_is_unaffected() {
+        let store = StoreHandle::open_in_memory().await.expect("store");
+        seed_terminal_rows(&store, 3, now_ms()).await;
+
+        let result = store
+            .enqueue_outbox(new_row("normal", 0))
+            .await
+            .expect("enqueue");
+        assert!(matches!(result, OutboxEnqueue::New(_)));
+        assert_eq!(
+            terminal_rows(&store).await,
+            3,
+            "terminal rows are untouched"
+        );
+        assert_eq!(store.outbox_depth().await.expect("depth").pending, 1);
+    }
+
+    #[tokio::test]
+    async fn batch_enqueue_is_atomic_on_capacity_failure() {
+        let store = StoreHandle::open_in_memory().await.expect("store");
+        // Fill to two rows below the pending/sending cap, so the third row of
+        // the batch is the one that crosses it.
+        let seed = usize::try_from(STORE_OUTBOX_MAX_ROWS).unwrap() - 2;
+        seed_pending_rows(&store, seed).await;
+
+        let rows = vec![
+            new_row("batch:0", 0),
+            new_row("batch:1", 0),
+            new_row("batch:2", 0),
+        ];
+        let result = store.enqueue_outbox_batch(&rows).await;
+        assert!(
+            matches!(result, Err(StoreError::CapacityExceeded { .. })),
+            "{result:?}"
+        );
+        for key in ["batch:0", "batch:1", "batch:2"] {
+            let owned = key.to_owned();
+            let exists: bool = store
+                .run(move |connection| {
+                    connection
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM outbox WHERE idempotency_key = ?1)",
+                            params![owned],
+                            |row| row.get(0),
+                        )
+                        .map_err(|error| sqlite_error("checking batch row", &error))
+                })
+                .await
+                .expect("batch row existence");
+            assert!(!exists, "{key} must have been rolled back");
+        }
+        assert_eq!(
+            store.outbox_depth().await.expect("depth").pending,
+            u64::try_from(seed).unwrap(),
+            "only the seeded rows survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_enqueue_is_idempotent_on_retry() {
+        let store = StoreHandle::open_in_memory().await.expect("store");
+        let rows = vec![new_row("k0", 0), new_row("k1", 0)];
+
+        let first = store.enqueue_outbox_batch(&rows).await.expect("first");
+        assert!(matches!(first[0], OutboxEnqueue::New(_)));
+        assert!(matches!(first[1], OutboxEnqueue::New(_)));
+
+        let second = store.enqueue_outbox_batch(&rows).await.expect("second");
+        assert!(matches!(second[0], OutboxEnqueue::Duplicate(_)));
+        assert!(matches!(second[1], OutboxEnqueue::Duplicate(_)));
+        assert_eq!(store.outbox_depth().await.expect("depth").pending, 2);
+    }
+
+    #[tokio::test]
+    async fn batch_enqueue_matches_single_enqueue_semantics() {
+        let store = StoreHandle::open_in_memory().await.expect("store");
+        let a = new_row("a", 0);
+        let b = new_row("b", 0);
+
+        let single = store.enqueue_outbox(a.clone()).await.expect("single");
+        let single_id = match &single {
+            OutboxEnqueue::New(row) | OutboxEnqueue::Duplicate(row) => row.id,
+        };
+
+        let batch = store.enqueue_outbox_batch(&[a, b]).await.expect("batch");
+        assert!(matches!(batch[0], OutboxEnqueue::Duplicate(_)));
+        assert!(matches!(batch[1], OutboxEnqueue::New(_)));
+        if let OutboxEnqueue::Duplicate(row) = &batch[0] {
+            assert_eq!(row.id, single_id);
+        } else {
+            unreachable!("batch[0] must be a duplicate");
+        }
+        assert_eq!(store.outbox_depth().await.expect("depth").pending, 2);
+    }
+
+    #[test]
+    fn debug_output_redacts_sensitive_outbox_fields() {
+        let row = OutboxRow {
+            id: 7,
+            idempotency_key: "secret-key".to_owned(),
+            scope_key: "im:secret-scope".to_owned(),
+            kind: "final".to_owned(),
+            payload_json: "{}".to_owned(),
+            payload_bytes: 2,
+            state: OutboxState::Pending,
+            attempts: 0,
+            next_retry_ms: 0,
+            receipt_message_id: Some("om_secret_receipt".to_owned()),
+            created_ms: 1,
+            updated_ms: 1,
+        };
+        let rendered = format!("{row:?}");
+        assert!(!rendered.contains("secret-key"));
+        assert!(!rendered.contains("im:secret-scope"));
+        assert!(!rendered.contains("om_secret_receipt"));
+        assert!(rendered.contains("idempotency_key_len"));
+        assert!(rendered.contains("scope_key_len"));
+        assert!(rendered.contains("receipt_message_id_len"));
+
+        let new_row = NewOutboxRow {
+            idempotency_key: "secret-key".to_owned(),
+            scope_key: "im:secret-scope".to_owned(),
+            kind: "final".to_owned(),
+            payload_json: "{}".to_owned(),
+            next_retry_ms: 0,
+        };
+        let rendered = format!("{new_row:?}");
+        assert!(!rendered.contains("secret-key"));
+        assert!(!rendered.contains("im:secret-scope"));
+        assert!(rendered.contains("idempotency_key_len"));
+        assert!(rendered.contains("scope_key_len"));
     }
 }

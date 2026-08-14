@@ -41,6 +41,21 @@ fn delta(text: &str) -> AppServerEvent {
     }
 }
 
+fn delta_for(item_id: &str, text: &str) -> AppServerEvent {
+    AppServerEvent::AgentMessageDelta {
+        turn_id: TurnId::from("turn_1"),
+        item_id: item_id.to_owned(),
+        delta: text.to_owned(),
+    }
+}
+
+fn completed(item_id: &str, text: &str, phase: Option<MessagePhase>) -> AppServerEvent {
+    AppServerEvent::ItemCompleted {
+        turn_id: TurnId::from("turn_1"),
+        item: agent(item_id, text, phase),
+    }
+}
+
 #[test]
 fn standalone_final_is_the_final_answer() {
     let projector = ReplyProjector::with_defaults();
@@ -135,6 +150,17 @@ fn low_chars_config() -> ProjectorConfig {
         max_chars: 4000,
         max_splits: 8,
         min_interval: Duration::from_millis(1500),
+        min_chars: 3,
+    }
+}
+
+/// Emits immediately once the character threshold is crossed, so dedup tests
+/// can observe every buffered accumulation without advancing the clock.
+fn eager_config() -> ProjectorConfig {
+    ProjectorConfig {
+        max_chars: 4000,
+        max_splits: 8,
+        min_interval: Duration::ZERO,
         min_chars: 3,
     }
 }
@@ -313,6 +339,106 @@ fn observe_throttles_by_interval_and_char_count() {
             assert!(text.contains("xyz") || text.contains("more"));
         }
         ProjectorOutput::Nothing => panic!("expected a progress update after the interval"),
+    }
+}
+
+#[test]
+fn same_item_delta_then_completed_is_not_double_counted() {
+    // Codex streams an item as deltas and then completes it with the same full
+    // text. The completed event must not append text the deltas already
+    // covered, or the same answer would be counted twice.
+    let mut projector = ReplyProjector::new(eager_config());
+    let now = Instant::now();
+
+    match projector.observe(&delta_for("item_1", "hello"), now) {
+        ProjectorOutput::Progress { text } => assert_eq!(text, "hello"),
+        ProjectorOutput::Nothing => panic!("the streamed delta must emit"),
+    }
+    assert!(matches!(
+        projector.observe(
+            &completed("item_1", "hello", Some(MessagePhase::Commentary)),
+            now
+        ),
+        ProjectorOutput::Nothing,
+    ));
+
+    let turn = outcome(
+        vec![agent("item_1", "hello", Some(MessagePhase::Commentary))],
+        TurnStatus::Completed,
+    );
+    assert_eq!(
+        projector.finish(&turn),
+        ProjectedReply::Empty,
+        "no duplicate tail may remain buffered"
+    );
+}
+
+#[test]
+fn completed_without_prior_delta_is_counted_in_full() {
+    // An item that arrives only as `ItemCompleted` (never streamed) is the
+    // deterministic fallback: the whole text is counted once.
+    let mut projector = ReplyProjector::new(eager_config());
+    let now = Instant::now();
+
+    match projector.observe(
+        &completed("item_9", "full text", Some(MessagePhase::Commentary)),
+        now,
+    ) {
+        ProjectorOutput::Progress { text } => assert_eq!(text, "full text"),
+        ProjectorOutput::Nothing => panic!("a delta-less completed item must be counted whole"),
+    }
+}
+
+#[test]
+fn completed_appends_only_the_delta_uncovered_tail() {
+    // Deltas may stream a prefix and the completed item then carries a longer
+    // text: only the tail beyond the received delta bytes is appended, never
+    // the whole (already-seen) text again.
+    let mut projector = ReplyProjector::new(eager_config());
+    let now = Instant::now();
+
+    assert!(matches!(
+        projector.observe(&delta_for("item_1", "he"), now),
+        ProjectorOutput::Nothing,
+    ));
+    match projector.observe(
+        &completed("item_1", "hello", Some(MessagePhase::Commentary)),
+        now,
+    ) {
+        ProjectorOutput::Progress { text } => assert_eq!(text, "hello"),
+        ProjectorOutput::Nothing => panic!("the merged prefix + tail must emit"),
+    }
+}
+
+#[test]
+fn multiple_items_stream_and_complete_without_duplication() {
+    // Sequential items with mixed delta/completed arrival keep their own text:
+    // each is counted once, and the single streaming slot resets per item id.
+    let mut projector = ReplyProjector::new(eager_config());
+    let now = Instant::now();
+
+    match projector.observe(&delta_for("a", "abc"), now) {
+        ProjectorOutput::Progress { text } => assert_eq!(text, "abc"),
+        ProjectorOutput::Nothing => panic!("item a must emit"),
+    }
+    assert!(matches!(
+        projector.observe(&completed("a", "abc", Some(MessagePhase::Commentary)), now),
+        ProjectorOutput::Nothing,
+    ));
+    match projector.observe(
+        &completed("b", "world", Some(MessagePhase::Commentary)),
+        now,
+    ) {
+        ProjectorOutput::Progress { text } => assert_eq!(text, "world"),
+        ProjectorOutput::Nothing => panic!("item b must emit"),
+    }
+    assert!(matches!(
+        projector.observe(&delta_for("c", "xy"), now),
+        ProjectorOutput::Nothing,
+    ));
+    match projector.observe(&completed("c", "xyz", Some(MessagePhase::Commentary)), now) {
+        ProjectorOutput::Progress { text } => assert_eq!(text, "xyz"),
+        ProjectorOutput::Nothing => panic!("item c must emit the merged tail"),
     }
 }
 

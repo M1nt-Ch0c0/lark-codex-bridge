@@ -3,6 +3,11 @@
 //! This is the final-only adapter: it projects the terminal reply and enqueues
 //! deterministic outbox rows *before* the scope actor resolves the turn. Real
 //! progress is not wired here — see the module note in [`crate::render`].
+//!
+//! Wiring point (out of scope here, covered by the prior report): the scope
+//! actor's `Running` phase drives [`crate::render::ReplyProjector::observe`]
+//! from its thread subscription and enqueues each `Progress` output as a
+//! `progress` outbox row; `finalize` then enqueues the terminal rows.
 
 #![allow(clippy::doc_markdown)]
 
@@ -63,10 +68,11 @@ impl DurableReplySink for OutboxReplySink {
         Box::pin(async move {
             let projector = ReplyProjector::with_defaults();
             let rows = build_finalization_rows(&turn, &projector)?;
-            for row in rows {
-                if let Err(error) = store.enqueue_outbox(row).await {
-                    return Err(map_store_error(&error));
-                }
+            // The whole final answer is enqueued in one transaction: a partial
+            // final (some parts persisted, later parts rejected) must never be
+            // sent while the turn stays unresolved.
+            if let Err(error) = store.enqueue_outbox_batch(&rows).await {
+                return Err(map_store_error(&error));
             }
             Ok(())
         })

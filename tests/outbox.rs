@@ -108,6 +108,17 @@ fn fast_config() -> OutboxPumpConfig {
     }
 }
 
+/// Claims one row per poll and backs off long enough that a deferred row stays
+/// parked across several poll cycles, exposing cross-batch reordering.
+fn slow_retry_config() -> OutboxPumpConfig {
+    OutboxPumpConfig {
+        retry_base: Duration::from_millis(200),
+        retry_max: Duration::from_millis(500),
+        poll_interval: Duration::from_millis(5),
+        claim_batch: 1,
+    }
+}
+
 fn now_ms() -> i64 {
     i64::try_from(
         SystemTime::now()
@@ -887,6 +898,63 @@ async fn retryable_failure_does_not_reorder_the_batch() {
         reply_text(&requests[2]),
         "second",
         "part2 is never sent before part1 succeeds"
+    );
+
+    pump.shutdown().await;
+}
+
+#[tokio::test]
+async fn retryable_failure_defers_pending_successors_across_poll_cycles() {
+    // The first row fails retryably and is parked for a long retry; the two
+    // successors stay `pending` (never claimed in the same one-row batch). The
+    // cross-batch fix must defer those successors too, so the failed row is
+    // retried before any later row is sent.
+    let replies = Arc::new(AtomicUsize::new(0));
+    let server = StubServer::start(token_plus({
+        let replies = Arc::clone(&replies);
+        move |_| {
+            if replies.fetch_add(1, Ordering::SeqCst) == 0 {
+                StubResponse::json(200, r#"{"code":230001,"msg":"busy"}"#)
+            } else {
+                ok_message("om_delivered")
+            }
+        }
+    }))
+    .await;
+    let api = api_for(&server);
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let first = enqueue_reply(&store, "1:final:evt_1", "om_parent", None, "first").await;
+    let second = enqueue_reply(&store, "2:final:evt_2", "om_parent", None, "second").await;
+    let third = enqueue_reply(&store, "3:final:evt_3", "om_parent", None, "third").await;
+    let (_, rx) = watch::channel(TransportState::Connected);
+    let pump = OutboxPump::spawn(store.clone(), api, rx, slow_retry_config());
+
+    let first_row = wait_for_state(&store, first, OutboxState::Sent).await;
+    let second_row = wait_for_state(&store, second, OutboxState::Sent).await;
+    let third_row = wait_for_state(&store, third, OutboxState::Sent).await;
+    assert_eq!(
+        first_row.receipt_message_id.as_deref(),
+        Some("om_delivered")
+    );
+    assert_eq!(
+        second_row.receipt_message_id.as_deref(),
+        Some("om_delivered")
+    );
+    assert_eq!(
+        third_row.receipt_message_id.as_deref(),
+        Some("om_delivered")
+    );
+
+    let texts: Vec<String> = reply_requests(&server).iter().map(reply_text).collect();
+    assert_eq!(
+        texts,
+        vec![
+            "first".to_owned(),
+            "first".to_owned(),
+            "second".to_owned(),
+            "third".to_owned(),
+        ],
+        "the failed row must be retried before any pending successor is claimed"
     );
 
     pump.shutdown().await;
