@@ -723,3 +723,134 @@ async fn startup_recovers_stranded_sending_rows_as_uncertain() {
 
     pump.shutdown().await;
 }
+
+#[tokio::test]
+async fn retryable_failure_does_not_reorder_the_batch() {
+    let replies = Arc::new(AtomicUsize::new(0));
+    let server = StubServer::start(token_plus({
+        let replies = Arc::clone(&replies);
+        move |request| {
+            if request.path == REPLY_PATH && replies.fetch_add(1, Ordering::SeqCst) == 0 {
+                StubResponse::json(200, r#"{"code":230001,"msg":"busy"}"#)
+            } else {
+                ok_message("om_delivered")
+            }
+        }
+    }))
+    .await;
+    let api = api_for(&server);
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let first = enqueue_reply(&store, "1:final:evt_1", "om_parent", None, "first").await;
+    let second = enqueue_reply(&store, "2:final:evt_2", "om_parent", None, "second").await;
+    let (_, rx) = watch::channel(TransportState::Connected);
+    let pump = OutboxPump::spawn(store.clone(), api, rx, fast_config());
+
+    let first_row = wait_for_state(&store, first, OutboxState::Sent).await;
+    let second_row = wait_for_state(&store, second, OutboxState::Sent).await;
+    assert_eq!(
+        first_row.receipt_message_id.as_deref(),
+        Some("om_delivered")
+    );
+    assert_eq!(
+        second_row.receipt_message_id.as_deref(),
+        Some("om_delivered")
+    );
+
+    let requests = reply_requests(&server);
+    assert_eq!(
+        requests.len(),
+        3,
+        "part1 fails once, is retried to success, then part2 follows"
+    );
+    assert_eq!(reply_text(&requests[0]), "first");
+    assert_eq!(
+        reply_text(&requests[1]),
+        "first",
+        "the retry of part1 precedes part2"
+    );
+    assert_eq!(
+        reply_text(&requests[2]),
+        "second",
+        "part2 is never sent before part1 succeeds"
+    );
+
+    pump.shutdown().await;
+}
+
+#[tokio::test]
+async fn shutdown_releases_the_claimed_tail_without_counting_attempts() {
+    let replies = Arc::new(AtomicUsize::new(0));
+    let server = StubServer::start(token_plus({
+        let replies = Arc::clone(&replies);
+        move |request| {
+            if request.path == REPLY_PATH && replies.fetch_add(1, Ordering::SeqCst) == 0 {
+                ok_message("om_first").with_delay(Duration::from_millis(800))
+            } else {
+                ok_message("om_delivered")
+            }
+        }
+    }))
+    .await;
+    let api = api_for(&server);
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let first = enqueue_reply(&store, "1:final:evt_1", "om_parent", None, "first").await;
+    let second = enqueue_reply(&store, "2:final:evt_2", "om_parent", None, "second").await;
+    let third = enqueue_reply(&store, "3:final:evt_3", "om_parent", None, "third").await;
+    let (_, rx) = watch::channel(TransportState::Connected);
+    let pump = OutboxPump::spawn(store.clone(), api, rx, fast_config());
+
+    // The whole batch is claimed atomically; wait for the first send to be in
+    // flight (delayed) so the tail rows are provably claimed but unsent.
+    wait_for_state(&store, second, OutboxState::Sending).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while reply_requests(&server).is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "the first send never reached the stub"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(reply_requests(&server).len(), 1);
+
+    let shutdown = tokio::spawn(async move { pump.shutdown().await });
+    // Give the shutdown token a moment to cancel before the in-flight send
+    // returns, so the tail is observed as claimed and released un-sent.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    shutdown.await.expect("shutdown");
+
+    let first_row = store.outbox_row(first).await.expect("row").expect("exists");
+    let second_row = store
+        .outbox_row(second)
+        .await
+        .expect("row")
+        .expect("exists");
+    let third_row = store.outbox_row(third).await.expect("row").expect("exists");
+    assert_eq!(
+        first_row.state,
+        OutboxState::Sent,
+        "the in-flight send is completed"
+    );
+    assert_eq!(
+        second_row.state,
+        OutboxState::Pending,
+        "the tail is re-parked"
+    );
+    assert_eq!(
+        third_row.state,
+        OutboxState::Pending,
+        "the tail is re-parked"
+    );
+    assert_eq!(
+        second_row.attempts, 0,
+        "re-parking must not count a send attempt"
+    );
+    assert_eq!(
+        third_row.attempts, 0,
+        "re-parking must not count a send attempt"
+    );
+    assert_eq!(
+        reply_requests(&server).len(),
+        1,
+        "the tail is never sent after shutdown"
+    );
+}

@@ -21,8 +21,9 @@ use crate::lark::api::LarkApi;
 use crate::lark::error::LarkError;
 use crate::lark::transport::TransportState;
 use crate::limits::{
-    OUTBOX_POLL_INTERVAL, OUTBOX_RETRY_BASE, OUTBOX_RETRY_MAX, STORE_OUTBOX_CLAIM_MAX_BATCH,
-    STORE_RECEIPT_WRITE_ATTEMPTS,
+    OUTBOX_POLL_INTERVAL, OUTBOX_RETRY_BASE, OUTBOX_RETRY_MAX, OUTBOX_SWEEP_BATCH,
+    OUTBOX_SWEEP_INTERVAL, OUTBOX_TERMINAL_RETENTION_MS, STORE_OUTBOX_CLAIM_MAX_BATCH,
+    STORE_OUTBOX_MAX_ATTEMPTS, STORE_RECEIPT_WRITE_ATTEMPTS,
 };
 use crate::store::{OutboxDepth, OutboxRow, StoreError, StoreHandle, now_ms};
 
@@ -61,6 +62,18 @@ pub fn classify_delivery(error: &LarkError) -> DeliveryClass {
         LarkError::Retryable { code: None, .. }
         | LarkError::ProtocolViolation { code: None, .. } => DeliveryClass::Uncertain,
     }
+}
+
+/// Result of processing one claimed row, telling the batch loop whether it may
+/// advance to the next row or must stop to preserve in-order delivery.
+enum ProcessOutcome {
+    /// The row reached a terminal state (delivered, terminal failure, or
+    /// explicit uncertainty): no later retry can overtake it, so the batch
+    /// may advance.
+    Resolved,
+    /// The row will be retried later: stop this batch and re-park the tail
+    /// with a retry time no earlier than `next_retry_ms`.
+    Deferred { next_retry_ms: i64 },
 }
 
 /// Tunables for the outbox pump; defaults match the production limits.
@@ -150,7 +163,16 @@ async fn run(
     if let Err(error) = store.recover_sending_outbox().await {
         tracing::warn!(error = %error, "outbox startup recovery failed");
     }
+    let sweep_interval_ms = i64::try_from(OUTBOX_SWEEP_INTERVAL.as_millis()).unwrap_or(i64::MAX);
+    let mut next_sweep_ms = 0_i64;
     loop {
+        if shutdown.is_cancelled() {
+            break;
+        }
+        if now_ms() >= next_sweep_ms {
+            sweep_terminal_rows(&store).await;
+            next_sweep_ms = now_ms().saturating_add(sweep_interval_ms);
+        }
         if !wait_until_connected(&mut transport, &shutdown).await {
             break;
         }
@@ -172,18 +194,30 @@ async fn run(
         }
         let mut cursor = 0;
         while cursor < batch.len() {
+            if shutdown.is_cancelled() {
+                // Shutdown landed after the claim but before this row: re-park
+                // the un-sent tail without counting attempts and exit.
+                release_tail(&store, &batch[cursor..]).await;
+                break;
+            }
             if !is_connected(&transport) {
                 // Disconnected after the claim but before any send: re-park the
                 // un-sent tail without counting attempts, then wait to resume.
-                for row in &batch[cursor..] {
-                    if let Err(error) = store.release_outbox_claim(row.id).await {
-                        tracing::warn!(error = %error, outbox_id = row.id, "outbox claim release failed");
-                    }
-                }
+                release_tail(&store, &batch[cursor..]).await;
                 break;
             }
-            process_row(&store, &api, &batch[cursor], config, &shutdown).await;
+            let outcome = process_row(&store, &api, &batch[cursor], config, &shutdown).await;
             cursor += 1;
+            if let ProcessOutcome::Deferred { next_retry_ms } = outcome {
+                // This row will be retried later: stop sending the rest of the
+                // batch so a later row cannot overtake it, parking the tail no
+                // earlier than the deferred row's retry time.
+                release_tail_at(&store, &batch[cursor..], next_retry_ms).await;
+                break;
+            }
+        }
+        if shutdown.is_cancelled() {
+            break;
         }
     }
 }
@@ -194,7 +228,7 @@ async fn process_row(
     row: &OutboxRow,
     config: OutboxPumpConfig,
     shutdown: &CancellationToken,
-) {
+) -> ProcessOutcome {
     let operation = match OutboxOperation::decode(&row.payload_json) {
         Ok(operation) => operation,
         Err(error) => {
@@ -214,7 +248,7 @@ async fn process_row(
                     "outbox payload is undeliverable and the terminal receipt could not be recorded"
                 );
             }
-            return;
+            return ProcessOutcome::Resolved;
         }
     };
     match send(api, &operation).await {
@@ -230,7 +264,7 @@ async fn process_row(
                 {
                     tracing::warn!(error = %error, outbox_id = row.id, "outbox receipt failure");
                 }
-                return;
+                return ProcessOutcome::Resolved;
             }
             if let Err(error) = write_receipt(shutdown, config.poll_interval, || {
                 store.complete_outbox(row.id, &message_id)
@@ -239,10 +273,11 @@ async fn process_row(
             {
                 tracing::warn!(error = %error, outbox_id = row.id, "outbox receipt failed");
             }
+            ProcessOutcome::Resolved
         }
         Err(error) => {
             let class = classify_delivery(&error);
-            record_failure(store, row, class, config, &error, shutdown).await;
+            record_failure(store, row, class, config, &error, shutdown).await
         }
     }
 }
@@ -275,13 +310,17 @@ async fn record_failure(
     config: OutboxPumpConfig,
     error: &LarkError,
     shutdown: &CancellationToken,
-) {
+) -> ProcessOutcome {
     let attempts = row.attempts.saturating_add(1);
+    // A retryable failure is deferred only while it still has attempts left;
+    // once the budget is exhausted the row becomes terminal `failed` and no
+    // later retry can reorder the queue.
+    let deferred = class == DeliveryClass::Retryable && attempts < STORE_OUTBOX_MAX_ATTEMPTS;
+    let retry_at = now_ms().saturating_add(retry_delay_ms(attempts, config));
     let result = match class {
         DeliveryClass::Retryable => {
-            let next = now_ms().saturating_add(retry_delay_ms(attempts, config));
             write_receipt(shutdown, config.poll_interval, || {
-                store.fail_outbox(row.id, attempts, next, false)
+                store.fail_outbox(row.id, attempts, retry_at, false)
             })
             .await
         }
@@ -309,6 +348,44 @@ async fn record_failure(
             class = ?class,
             "outbox send failed and the receipt could not be recorded"
         );
+        return ProcessOutcome::Resolved;
+    }
+    if deferred {
+        ProcessOutcome::Deferred {
+            next_retry_ms: retry_at,
+        }
+    } else {
+        ProcessOutcome::Resolved
+    }
+}
+
+async fn release_tail(store: &StoreHandle, tail: &[OutboxRow]) {
+    for row in tail {
+        if let Err(error) = store.release_outbox_claim(row.id).await {
+            tracing::warn!(error = %error, outbox_id = row.id, "outbox claim release failed");
+        }
+    }
+}
+
+async fn release_tail_at(store: &StoreHandle, tail: &[OutboxRow], next_retry_ms: i64) {
+    for row in tail {
+        if let Err(error) = store.release_outbox_claim_at(row.id, next_retry_ms).await {
+            tracing::warn!(error = %error, outbox_id = row.id, "outbox claim release failed");
+        }
+    }
+}
+
+/// One bounded, cancellation-aware terminal sweep. Failures are logged and
+/// dropped: a sweep that cannot run must never stall the send loop.
+async fn sweep_terminal_rows(store: &StoreHandle) {
+    let older_than_ms = now_ms().saturating_sub(OUTBOX_TERMINAL_RETENTION_MS);
+    match store
+        .sweep_terminal_outbox(older_than_ms, OUTBOX_SWEEP_BATCH)
+        .await
+    {
+        Ok(0) => {}
+        Ok(deleted) => tracing::debug!(deleted, "swept terminal outbox rows"),
+        Err(error) => tracing::warn!(error = %error, "outbox terminal sweep failed"),
     }
 }
 
@@ -444,5 +521,47 @@ mod tests {
             1,
             "a cancelled shutdown must abort before the next attempt"
         );
+    }
+
+    #[tokio::test]
+    async fn sweep_terminal_rows_prunes_overage_terminals_only() {
+        use crate::store::sqlite_error;
+
+        let store = StoreHandle::open_in_memory().await.expect("store");
+        store
+            .run(|connection| {
+                connection
+                    .execute(
+                        "INSERT INTO outbox
+                         (idempotency_key, scope_key, kind, payload_json, payload_bytes,
+                          state, attempts, next_retry_ms, receipt_message_id, created_ms, updated_ms)
+                         VALUES
+                         ('sent_old', 'im:oc', 'final', '{}', 2, 'sent', 1, 0, 'om_r', 1, 1),
+                         ('pending_old', 'im:oc', 'final', '{}', 2, 'pending', 0, 0, NULL, 1, 1)",
+                        [],
+                    )
+                    .map_err(|error| sqlite_error("seeding sweep rows", &error))?;
+                Ok(())
+            })
+            .await
+            .expect("seed rows");
+
+        sweep_terminal_rows(&store).await;
+
+        let depth = store.outbox_depth().await.expect("depth");
+        assert_eq!(depth.pending, 1, "pending rows are never swept");
+        let sent: i64 = store
+            .run(|connection| {
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM outbox WHERE state = 'sent'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| sqlite_error("counting sent rows", &error))
+            })
+            .await
+            .expect("sent count");
+        assert_eq!(sent, 0, "the over-age terminal row is swept");
     }
 }

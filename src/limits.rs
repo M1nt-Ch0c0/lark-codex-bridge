@@ -266,3 +266,12 @@ pub const OUTBOX_RETRY_MAX: Duration = Duration::from_secs(30);
 /// Poll cadence for discovering newly enqueued rows while the transport is
 /// connected and no rows are due yet.
 pub const OUTBOX_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// Retention window for terminal (`sent`/`failed`/`uncertain_delivery`) outbox
+/// rows, in milliseconds. Terminal rows last updated before this many
+/// milliseconds ago are pruned by the bounded sweep so the durable table
+/// cannot grow without bound.
+pub const OUTBOX_TERMINAL_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+/// Maximum terminal outbox rows deleted by one bounded sweep.
+pub const OUTBOX_SWEEP_BATCH: u32 = 256;
+/// Interval between bounded outbox terminal sweeps.
+pub const OUTBOX_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);

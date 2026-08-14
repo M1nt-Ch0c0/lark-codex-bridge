@@ -11,8 +11,9 @@ use rusqlite::params;
 
 use super::{StoreError, StoreHandle, now_ms, query_optional, request_bytes, sqlite_error};
 use crate::limits::{
-    STORE_OUTBOX_CLAIM_MAX_BATCH, STORE_OUTBOX_CLAIM_MAX_BYTES, STORE_OUTBOX_MAX_ATTEMPTS,
-    STORE_OUTBOX_MAX_QUEUED_BYTES, STORE_OUTBOX_MAX_ROWS, STORE_OUTBOX_PAYLOAD_MAX_BYTES,
+    OUTBOX_SWEEP_BATCH, STORE_OUTBOX_CLAIM_MAX_BATCH, STORE_OUTBOX_CLAIM_MAX_BYTES,
+    STORE_OUTBOX_MAX_ATTEMPTS, STORE_OUTBOX_MAX_QUEUED_BYTES, STORE_OUTBOX_MAX_ROWS,
+    STORE_OUTBOX_PAYLOAD_MAX_BYTES,
 };
 
 /// Outbox row lifecycle states.
@@ -426,14 +427,32 @@ impl StoreHandle {
     /// Returns [`StoreError::NotFound`] for an unknown row and
     /// [`StoreError::InvalidTransition`] when the row is not `sending`.
     pub async fn release_outbox_claim(&self, id: i64) -> Result<(), StoreError> {
+        self.release_outbox_claim_at(id, now_ms()).await
+    }
+
+    /// Returns a claimed `sending` row to `pending` without counting a send
+    /// attempt, parked until the given retry time.
+    ///
+    /// The pump uses this to re-park a batch tail after an earlier row defers
+    /// its retry: the tail is released with a retry time no earlier than the
+    /// deferred row's, so a later row can never overtake it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::NotFound`] for an unknown row and
+    /// [`StoreError::InvalidTransition`] when the row is not `sending`.
+    pub async fn release_outbox_claim_at(
+        &self,
+        id: i64,
+        next_retry_ms: i64,
+    ) -> Result<(), StoreError> {
         self.run(move |connection| {
             require_sending(connection, id, "releasing an outbox claim")?;
-            let now = now_ms();
             connection
                 .execute(
-                    "UPDATE outbox SET state = 'pending', next_retry_ms = ?2, updated_ms = ?2
+                    "UPDATE outbox SET state = 'pending', next_retry_ms = ?2, updated_ms = ?3
                      WHERE id = ?1",
-                    params![id, now],
+                    params![id, next_retry_ms, now_ms()],
                 )
                 .map_err(|error| sqlite_error("releasing an outbox claim", &error))?;
             Ok(())
@@ -458,6 +477,41 @@ impl StoreHandle {
                 )
                 .map_err(|error| sqlite_error("recovering sending outbox rows", &error))?;
             Ok(u64::try_from(changed).unwrap_or(u64::MAX))
+        })
+        .await
+    }
+
+    /// Deletes terminal (`sent`/`failed`/`uncertain_delivery`) outbox rows
+    /// last updated before `older_than_ms`, in ascending `updated_ms` order,
+    /// returning the number of pruned rows. `max_rows` is clamped to
+    /// [`OUTBOX_SWEEP_BATCH`]; `pending` and `sending` rows are never swept.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the writer task or SQLite fails.
+    pub async fn sweep_terminal_outbox(
+        &self,
+        older_than_ms: i64,
+        max_rows: u32,
+    ) -> Result<u64, StoreError> {
+        let max_rows = max_rows.min(OUTBOX_SWEEP_BATCH);
+        if max_rows == 0 {
+            return Ok(0);
+        }
+        self.run(move |connection| {
+            let deleted = connection
+                .execute(
+                    "DELETE FROM outbox
+                     WHERE id IN (
+                         SELECT id FROM outbox
+                         WHERE state IN ('sent', 'failed', 'uncertain_delivery')
+                           AND updated_ms < ?1
+                         ORDER BY updated_ms, id LIMIT ?2
+                     )",
+                    params![older_than_ms, max_rows],
+                )
+                .map_err(|error| sqlite_error("sweeping terminal outbox rows", &error))?;
+            Ok(u64::try_from(deleted).unwrap_or(u64::MAX))
         })
         .await
     }
@@ -568,4 +622,180 @@ fn read_outbox_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxRow> {
         created_ms: row.get(10)?,
         updated_ms: row.get(11)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn seed_row(store: &StoreHandle, key: &str, state: OutboxState, updated_ms: i64) {
+        let key = key.to_owned();
+        store
+            .run(move |connection| {
+                connection
+                    .execute(
+                        "INSERT INTO outbox
+                         (idempotency_key, scope_key, kind, payload_json, payload_bytes,
+                          state, attempts, next_retry_ms, receipt_message_id, created_ms, updated_ms)
+                         VALUES (?1, 'im:oc', 'final', '{}', 2, ?2, 0, 0, NULL, 1, ?3)",
+                        params![key, state.as_str(), updated_ms],
+                    )
+                    .map_err(|error| sqlite_error("seeding an outbox sweep row", &error))?;
+                Ok(())
+            })
+            .await
+            .expect("seed row");
+    }
+
+    async fn remaining_keys(store: &StoreHandle) -> Vec<String> {
+        store
+            .run(|connection| {
+                let mut statement = connection
+                    .prepare("SELECT idempotency_key FROM outbox ORDER BY idempotency_key")
+                    .map_err(|error| sqlite_error("reading remaining outbox rows", &error))?;
+                let keys = statement
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .map_err(|error| sqlite_error("mapping remaining outbox rows", &error))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| sqlite_error("collecting remaining outbox rows", &error))?;
+                Ok(keys)
+            })
+            .await
+            .expect("remaining keys")
+    }
+
+    #[tokio::test]
+    async fn sweep_deletes_only_overage_terminal_rows() {
+        let store = StoreHandle::open_in_memory().await.expect("store");
+        seed_row(&store, "sent_old", OutboxState::Sent, 1_000).await;
+        seed_row(&store, "failed_old", OutboxState::Failed, 1_000).await;
+        seed_row(
+            &store,
+            "uncertain_old",
+            OutboxState::UncertainDelivery,
+            1_000,
+        )
+        .await;
+        seed_row(&store, "sent_recent", OutboxState::Sent, 1_000_000).await;
+        seed_row(&store, "pending_old", OutboxState::Pending, 1_000).await;
+        seed_row(&store, "sending_old", OutboxState::Sending, 1_000).await;
+
+        let deleted = store
+            .sweep_terminal_outbox(5_000, 256)
+            .await
+            .expect("sweep");
+        assert_eq!(deleted, 3, "the three over-age terminal rows are deleted");
+
+        let depth = store.outbox_depth().await.expect("depth");
+        assert_eq!(depth.failed, 0);
+        assert_eq!(depth.uncertain, 0);
+        assert_eq!(depth.pending, 1, "pending rows are never swept");
+        assert_eq!(depth.sending, 1, "sending rows are never swept");
+        assert_eq!(
+            remaining_keys(&store).await,
+            vec![
+                "pending_old".to_owned(),
+                "sending_old".to_owned(),
+                "sent_recent".to_owned(),
+            ],
+            "only the over-age terminal rows are deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_is_bounded_and_ordered_by_updated_ms() {
+        let store = StoreHandle::open_in_memory().await.expect("store");
+        seed_row(&store, "a", OutboxState::Sent, 1_000).await;
+        seed_row(&store, "b", OutboxState::Sent, 1_001).await;
+        seed_row(&store, "c", OutboxState::Sent, 1_002).await;
+        seed_row(&store, "d", OutboxState::Sent, 1_003).await;
+        seed_row(&store, "e", OutboxState::Sent, 1_004).await;
+
+        let deleted = store.sweep_terminal_outbox(2_000, 3).await.expect("sweep");
+        assert_eq!(deleted, 3, "at most max_rows are deleted in one sweep");
+        assert_eq!(
+            remaining_keys(&store).await,
+            vec!["d".to_owned(), "e".to_owned()],
+            "the newest rows survive, so deletion follows ascending updated_ms"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_clamps_to_the_global_batch_bound() {
+        let store = StoreHandle::open_in_memory().await.expect("store");
+        for index in 0..OUTBOX_SWEEP_BATCH + 2 {
+            seed_row(&store, &format!("row-{index}"), OutboxState::Sent, 1_000).await;
+        }
+
+        let deleted = store
+            .sweep_terminal_outbox(2_000, u32::MAX)
+            .await
+            .expect("sweep");
+        assert_eq!(
+            deleted,
+            u64::from(OUTBOX_SWEEP_BATCH),
+            "an oversized request is clamped to OUTBOX_SWEEP_BATCH"
+        );
+        assert_eq!(
+            remaining_keys(&store).await.len(),
+            2,
+            "the two newest rows survive the clamped sweep"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_is_idempotent() {
+        let store = StoreHandle::open_in_memory().await.expect("store");
+        seed_row(&store, "a", OutboxState::Sent, 1_000).await;
+        seed_row(&store, "b", OutboxState::Failed, 1_000).await;
+
+        let first = store
+            .sweep_terminal_outbox(2_000, 256)
+            .await
+            .expect("first sweep");
+        assert_eq!(first, 2);
+        let second = store
+            .sweep_terminal_outbox(2_000, 256)
+            .await
+            .expect("second sweep");
+        assert_eq!(second, 0, "a repeated sweep deletes nothing further");
+    }
+
+    #[tokio::test]
+    async fn release_outbox_claim_at_parks_until_the_given_retry_time() {
+        let store = StoreHandle::open_in_memory().await.expect("store");
+        store
+            .enqueue_outbox(NewOutboxRow {
+                idempotency_key: "1:final:evt_1".to_owned(),
+                scope_key: "im:oc".to_owned(),
+                kind: "final".to_owned(),
+                payload_json: r#"{"version":1,"op":"reply_text","message_id":"m","text":"t"}"#
+                    .to_owned(),
+                next_retry_ms: 0,
+            })
+            .await
+            .expect("enqueue");
+        let claimed = store.claim_outbox_batch(now_ms(), 1).await.expect("claim");
+        assert_eq!(claimed.len(), 1);
+
+        store
+            .release_outbox_claim_at(claimed[0].id, 123_456)
+            .await
+            .expect("release");
+
+        let row = store
+            .outbox_row(claimed[0].id)
+            .await
+            .expect("read")
+            .expect("exists");
+        assert_eq!(row.state, OutboxState::Pending);
+        assert_eq!(
+            row.next_retry_ms, 123_456,
+            "the tail is parked until the retry time"
+        );
+        assert_eq!(
+            row.attempts, 0,
+            "releasing a claim never counts a send attempt"
+        );
+    }
 }
