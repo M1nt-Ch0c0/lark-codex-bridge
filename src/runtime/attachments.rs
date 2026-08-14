@@ -16,23 +16,28 @@
 //! Redaction: no `Debug`, tracing, or error carries attachment bytes, message
 //! text, user file names, or absolute paths outside the cache root.
 //!
-//! Single-instance constraint: the cache root and its backing store are
-//! private to one bridge instance; sharing one cache root across processes is
-//! unsupported. Within one process the per-cache [`tokio::sync::Mutex`] and
-//! the single-writer WAL `SQLite` store serialize `fetch`/`gc`/`reconcile`, so a
-//! valid lease can never point at a missing file. `gc`'s "delete row then
-//! delete file" window cannot be closed across processes without a
-//! cross-process lock, which is deliberately not introduced (no `flock`, no
-//! Unix-only primitives); `gc` re-checks the row before unlinking as best
-//! effort only, which narrows but does not close that window.
+//! Single-instance enforcement: the cache root and its backing store are
+//! private to one bridge instance. [`AttachmentCache::open`] fails closed on a
+//! second live instance via a best-effort lock file
+//! ([`ATTACHMENT_INSTANCE_LOCK`], pure `std::fs`, no `flock`): a fresh lock
+//! file means another instance is using the root and is refused; a lock older
+//! than [`ATTACHMENT_INSTANCE_LOCK_STALE`] is treated as a crash leftover and
+//! replaced. Within one process the per-cache [`tokio::sync::Mutex`] and the
+//! single-writer WAL `SQLite` store serialize `fetch`/`gc`/`reconcile`, so a
+//! valid lease can never point at a missing file. The lock file is only a
+//! liveness guard, not a mutual-exclusion primitive, so `gc` still re-checks
+//! the row before unlinking as best effort only (see [`Self::gc`]).
 //!
-//! Reconciliation is a single streaming `read_dir` pass: directory entries are
-//! never materialized into a sorted vector, so scan memory is O(1) in the
-//! directory size. Destructive cleanup (orphan temp/content files and
-//! size-mismatched files) is capped at [`AttachmentLimits::reconcile_batch`]
-//! deletions per pass; the scan itself is never truncated, so each pass walks
-//! the whole directory and orphan cleanup converges because the entry count
-//! strictly decreases by at most `reconcile_batch` files per pass.
+//! Reconciliation runs its blocking directory scan off the Tokio worker in
+//! [`tokio::task::spawn_blocking`]. The scan is a single streaming `read_dir`
+//! pass that never materializes directory entries into a sorted vector, so
+//! scan memory is O(1) in the directory size; it only *records* bounded
+//! deletion candidates, and the actual deletions are re-verified and applied
+//! under the per-cache lock afterwards (see [`Self::reconcile`]). Destructive
+//! cleanup is capped at [`AttachmentLimits::reconcile_batch`] deletions per
+//! pass, clamped to at least one, so orphan cleanup converges: each pass walks
+//! the whole directory and the entry count strictly decreases by at most
+//! `reconcile_batch` files per pass.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -51,7 +56,8 @@ use crate::lark::error::LarkError;
 use crate::lark::normalize::ResourceDesc;
 use crate::limits::{
     ATTACHMENT_CACHE_MARKER, ATTACHMENT_CACHE_MAX_BYTES, ATTACHMENT_CACHE_MAX_FILES,
-    ATTACHMENT_FILE_NAME_MAX_BYTES, ATTACHMENT_GC_AGE, ATTACHMENT_GC_BATCH, ATTACHMENT_MAX_BYTES,
+    ATTACHMENT_FILE_NAME_MAX_BYTES, ATTACHMENT_GC_AGE, ATTACHMENT_GC_BATCH,
+    ATTACHMENT_INSTANCE_LOCK, ATTACHMENT_INSTANCE_LOCK_STALE, ATTACHMENT_MAX_BYTES,
     ATTACHMENT_MAX_PER_MESSAGE, ATTACHMENT_MIME_MAX_BYTES, ATTACHMENT_RECONCILE_BATCH,
     ATTACHMENT_RESOURCE_KEY_MAX_BYTES, ATTACHMENT_TEMP_PREFIX, ATTACHMENT_TURN_TOTAL_BYTES,
 };
@@ -110,6 +116,20 @@ impl Default for AttachmentLimits {
 }
 
 impl AttachmentLimits {
+    /// Returns a copy with destructive-cleanup batch sizes clamped to a
+    /// positive minimum. A zero [`Self::reconcile_batch`] would make
+    /// reconciliation delete zero files per pass and therefore never converge;
+    /// [`AttachmentCache::open`] stores the clamped copy so every caller —
+    /// including tests that build [`AttachmentLimits`] by struct literal —
+    /// gets a converging batch. All other fields are preserved verbatim.
+    #[must_use]
+    pub fn clamped(self) -> Self {
+        Self {
+            reconcile_batch: self.reconcile_batch.max(1),
+            ..self
+        }
+    }
+
     /// Validates one resource key (length plus a URL-safe character set), so a
     /// hostile key can never influence a path or request target.
     ///
@@ -468,6 +488,9 @@ pub struct AttachmentCache {
     /// re-verify), `gc` (delete row, delete file), and `reconcile` against one
     /// another so a valid lease can never point at a missing file (B2).
     lock: tokio::sync::Mutex<()>,
+    /// RAII owner of the cross-instance lock file; dropping the cache removes
+    /// the file (best-effort) so a later instance can open the same root.
+    _instance_lock: InstanceLockGuard,
 }
 
 impl fmt::Debug for AttachmentCache {
@@ -483,27 +506,37 @@ impl AttachmentCache {
     /// Creates (if needed) and canonicalizes the cache directory, then builds
     /// the cache. The directory must be a dedicated attachment cache: on first
     /// open an empty directory gets a valid [`ATTACHMENT_CACHE_MARKER`] marker
-    /// written to prove ownership, and a non-empty directory is accepted only
-    /// when its marker validates (fail-closed, so a misconfigured root such as
-    /// `$HOME` is refused rather than scanned). Only after the marker
-    /// validates is the directory tightened to owner-only permissions (0700)
-    /// on Unix — a refused directory is never chmod'd — and a chmod failure is
-    /// a non-fatal warning, never an error.
+    /// written to prove ownership (0600 on Unix), and a non-empty directory is
+    /// accepted only when its marker validates (fail-closed, so a misconfigured
+    /// root such as `$HOME` is refused rather than scanned). Only after the
+    /// marker validates is the directory tightened to owner-only permissions
+    /// (0700) on Unix — a refused directory is never chmod'd — and a chmod
+    /// failure is fail-closed: a validated dedicated directory that cannot be
+    /// tightened is refused rather than left readable with plaintext cache
+    /// content on disk.
     ///
-    /// Single-instance constraint: the cache root and store are private to one
-    /// bridge instance; sharing one root across processes is unsupported (see
-    /// the module docs).
+    /// Single-instance enforcement: after the marker validates (and the mode
+    /// is tightened), a lock file ([`ATTACHMENT_INSTANCE_LOCK`], 0600 on Unix)
+    /// is created with `create_new`. A pre-existing fresh lock file means
+    /// another bridge instance owns the root and `open` fails closed; a lock
+    /// older than [`ATTACHMENT_INSTANCE_LOCK_STALE`] is a crash leftover and is
+    /// replaced. The lock is released (removed, best-effort) when the returned
+    /// cache is dropped. The lock is a liveness guard, not a mutual-exclusion
+    /// primitive, so it does not make cross-process `fetch`/`gc`/`reconcile`
+    /// serialization complete (see the module docs).
     ///
     /// # Errors
     ///
     /// Returns an error when the directory cannot be created, canonicalized,
-    /// is not a directory, is a symlink, or fails marker validation.
+    /// is not a directory, is a symlink, fails marker validation, cannot be
+    /// tightened to 0700, or is already owned by a live instance.
     pub fn open(
         root: &Path,
         store: StoreHandle,
         downloader: Arc<dyn ResourceDownloader>,
         limits: AttachmentLimits,
     ) -> Result<Self, AttachError> {
+        let limits = limits.clamped();
         ensure_cache_directory(root)?;
         let root = std::fs::canonicalize(root).map_err(|_| AttachError::Io {
             context: "resolving the cache directory",
@@ -511,13 +544,15 @@ impl AttachmentCache {
         validate_cache_marker(&root)?;
         // Only a validated dedicated directory may have its mode tightened; a
         // misconfigured root must be refused without mutating its permissions.
-        tighten_permissions(&root);
+        tighten_permissions(&root)?;
+        let instance_lock = acquire_instance_lock(&root)?;
         Ok(Self {
             root,
             store,
             downloader,
             limits,
             lock: tokio::sync::Mutex::new(()),
+            _instance_lock: instance_lock,
         })
     }
 
@@ -694,23 +729,67 @@ impl AttachmentCache {
     /// Reconciles the cache directory with the store at startup. Handles
     /// residual temp files, files without a store row, store rows without a
     /// file, size-mismatched files, stale leases, and over-capacity caches.
-    /// The directory scan is one complete streaming pass (never truncated);
-    /// destructive file cleanup is capped at
-    /// [`AttachmentLimits::reconcile_batch`] deletions per pass, so repeated
-    /// passes converge. Bounded, idempotent, and repeatable: a single bad
-    /// entry is skipped, never fatal.
+    ///
+    /// The blocking directory scan runs on the blocking thread pool via
+    /// [`tokio::task::spawn_blocking`], so it never blocks a Tokio worker. The
+    /// scan is one complete streaming pass (never truncated) that only records
+    /// a bounded set of deletion candidates; the actual deletions are applied
+    /// afterwards under the per-cache lock and re-verified against fresh store
+    /// rows, so moving the scan off the async lock opens no race with a
+    /// concurrent `fetch`/`gc`. Destructive file cleanup is capped at
+    /// [`AttachmentLimits::reconcile_batch`] deletions per pass (clamped to at
+    /// least one), so repeated passes converge. Bounded, idempotent, and
+    /// repeatable: a single bad entry is skipped, never fatal.
     ///
     /// # Errors
     ///
     /// Returns a classified store or I/O failure. Per-entry inspection
     /// failures are recorded in [`ReconcileStats::errors`] instead of aborting.
     pub async fn reconcile(&self) -> Result<ReconcileStats, AttachError> {
+        // Phase A — snapshot valid rows to seed the scan's classification.
+        // This is a pure store read (serialized by the store's own writer) and
+        // only a hint: every destructive decision is re-verified against a
+        // fresh read under the lock in phase C, so a `fetch`/`gc` that commits
+        // or removes rows while the scan runs cannot be harmed.
+        let rows = self
+            .store
+            .list_attachments()
+            .await
+            .map_err(|error| store_err("listing attachments for reconciliation", error))?;
+        let mut snapshot: HashMap<String, u64> = HashMap::new();
+        for row in &rows {
+            if is_valid_sha256_name(&row.sha256) {
+                snapshot.insert(row.sha256.clone(), row.bytes);
+            }
+        }
+
+        // Phase B — blocking directory scan off the Tokio worker. The
+        // `tokio::sync::MutexGuard` borrows `self` and therefore cannot cross
+        // the `'static` `spawn_blocking` boundary, so no async lock is held
+        // here; the scan is deliberately read-only for exactly that reason.
+        let root = self.root.clone();
+        let batch = self.limits.reconcile_batch;
+        let candidates =
+            tokio::task::spawn_blocking(move || scan_directory(&root, &snapshot, batch))
+                .await
+                .map_err(|_| AttachError::Io {
+                    context: "scanning the cache directory",
+                })??;
+
+        // Phase C — apply the candidates under the per-cache lock, re-verified
+        // against fresh store rows.
         let _guard = self.lock.lock().await;
-        self.reconcile_locked().await
+        self.reconcile_locked(candidates).await
     }
 
-    /// Reconciliation pass without the per-cache lock; callers hold it.
-    async fn reconcile_locked(&self) -> Result<ReconcileStats, AttachError> {
+    /// Destructive half of reconciliation; the caller holds the per-cache
+    /// lock. Every candidate from the off-lock scan is re-verified against a
+    /// fresh row snapshot before being unlinked, and row drops / stale-lease
+    /// cleanup / GC run exactly as before under the same lock.
+    async fn reconcile_locked(
+        &self,
+        candidates: ScanCandidates,
+    ) -> Result<ReconcileStats, AttachError> {
         let mut stats = ReconcileStats::default();
         let rows = self
             .store
@@ -728,7 +807,69 @@ impl AttachmentCache {
             }
         }
 
-        self.scan_entries(&rows_by_sha, &mut drop_rows, &mut stats)?;
+        let batch = self.limits.reconcile_batch;
+        let mut deletions = 0_usize;
+
+        // Orphan temp files: `fetch` creates each temp under the per-cache
+        // lock with a fresh UUID name, so any `.tmp-*` still present under the
+        // lock is a crash leftover — never an in-flight fetch's file.
+        for path in candidates.temp {
+            if deletions >= batch {
+                break;
+            }
+            if self.remove_file(&path, "removing an orphan temp file")? {
+                stats.temp_files = stats.temp_files.saturating_add(1);
+                deletions = deletions.saturating_add(1);
+            }
+        }
+        // Orphan content files: valid hash names with no row. Re-check the
+        // fresh snapshot so a fetch that installed the same hash during the
+        // off-lock scan is preserved (its file now has a row).
+        for sha in candidates.orphan {
+            if deletions >= batch {
+                break;
+            }
+            if rows_by_sha.contains_key(&sha) {
+                continue;
+            }
+            if self.remove_file(&self.root.join(&sha), "removing an orphan cached file")? {
+                stats.orphan_files = stats.orphan_files.saturating_add(1);
+                deletions = deletions.saturating_add(1);
+            }
+        }
+        // Corrupt content files: size mismatched the snapshot row. Re-check
+        // the fresh row and current size; a repair by a concurrent fetch (same
+        // hash → same bytes) or a row removed by `gc` during the scan leaves
+        // nothing to do.
+        for sha in candidates.corrupt {
+            if deletions >= batch {
+                break;
+            }
+            let Some(&expected) = rows_by_sha.get(&sha) else {
+                continue;
+            };
+            let path = self.root.join(&sha);
+            let actual = std::fs::metadata(&path).map_or(u64::MAX, |m| m.len());
+            if actual == expected {
+                continue;
+            }
+            if self.remove_file(&path, "removing a corrupt cached file")? {
+                stats.corrupt_files = stats.corrupt_files.saturating_add(1);
+                deletions = deletions.saturating_add(1);
+            }
+            drop_rows.insert(sha);
+        }
+        // Unrecognized regular files: never a valid hash name and not
+        // marker/lock/temp, so nothing legitimately recreates them.
+        for path in candidates.unrecognized {
+            if deletions >= batch {
+                break;
+            }
+            if self.remove_file(&path, "removing an unrecognized cache file")? {
+                stats.orphan_files = stats.orphan_files.saturating_add(1);
+                deletions = deletions.saturating_add(1);
+            }
+        }
 
         for sha in &drop_rows {
             if self
@@ -767,97 +908,6 @@ impl AttachmentCache {
             .map_err(|error| store_err("deleting stale attachment leases", error))?;
         stats.gc = self.gc_inner().await?;
         Ok(stats)
-    }
-
-    /// Streams one complete `read_dir` pass over the cache root, deleting
-    /// orphan temp files, orphan/unrecognized content files, and
-    /// size-mismatched files. Entries are inspected one at a time and never
-    /// materialized into a sorted vector, so memory is O(1) in the directory
-    /// size (the `rows_by_sha`/`drop_rows` working set is bounded by the
-    /// store's attachment-row cap, not by directory size). Destructive cleanup
-    /// is capped at [`AttachmentLimits::reconcile_batch`] deletions per pass;
-    /// the scan itself is never truncated, so each pass walks the whole
-    /// directory and orphan cleanup converges because the entry count strictly
-    /// decreases by at most `reconcile_batch` files per pass.
-    fn scan_entries(
-        &self,
-        rows_by_sha: &HashMap<String, u64>,
-        drop_rows: &mut HashSet<String>,
-        stats: &mut ReconcileStats,
-    ) -> Result<(), AttachError> {
-        let dir = std::fs::read_dir(&self.root).map_err(|_| AttachError::Io {
-            context: "reading the cache directory",
-        })?;
-        let batch = self.limits.reconcile_batch;
-        let mut deletions = 0_usize;
-
-        for entry in dir {
-            let Ok(entry) = entry else {
-                stats.errors = stats.errors.saturating_add(1);
-                continue;
-            };
-            let path = entry.path();
-            let file_name = entry.file_name();
-            if file_name.to_string_lossy() == ATTACHMENT_CACHE_MARKER {
-                continue;
-            }
-            let file_type = if let Ok(metadata) = std::fs::symlink_metadata(&path) {
-                metadata.file_type()
-            } else {
-                stats.errors = stats.errors.saturating_add(1);
-                continue;
-            };
-            if file_type.is_dir() {
-                stats.skipped_dirs = stats.skipped_dirs.saturating_add(1);
-                continue;
-            }
-            if !file_type.is_file() {
-                // Symlinks and special files are never followed or deleted.
-                continue;
-            }
-            // A regular file that is a deletion candidate: apply the per-pass
-            // deletion cap. Candidates beyond the cap are left for the next
-            // pass (the scan restarts from the directory head, so they are
-            // not lost).
-            if deletions >= batch {
-                continue;
-            }
-            let Some(name) = file_name.to_str() else {
-                if self.remove_file(&path, "removing an unrecognized cache file")? {
-                    stats.orphan_files = stats.orphan_files.saturating_add(1);
-                    deletions = deletions.saturating_add(1);
-                }
-                continue;
-            };
-            if name.starts_with(ATTACHMENT_TEMP_PREFIX) {
-                if self.remove_file(&path, "removing an orphan temp file")? {
-                    stats.temp_files = stats.temp_files.saturating_add(1);
-                    deletions = deletions.saturating_add(1);
-                }
-                continue;
-            }
-            if is_valid_sha256_name(name) {
-                if let Some(&expected) = rows_by_sha.get(name) {
-                    let actual = std::fs::metadata(&path).map_or(u64::MAX, |m| m.len());
-                    if actual != expected {
-                        if self.remove_file(&path, "removing a corrupt cached file")? {
-                            stats.corrupt_files = stats.corrupt_files.saturating_add(1);
-                            deletions = deletions.saturating_add(1);
-                        }
-                        drop_rows.insert(name.to_owned());
-                    }
-                } else if self.remove_file(&path, "removing an orphan cached file")? {
-                    stats.orphan_files = stats.orphan_files.saturating_add(1);
-                    deletions = deletions.saturating_add(1);
-                }
-                continue;
-            }
-            if self.remove_file(&path, "removing an unrecognized cache file")? {
-                stats.orphan_files = stats.orphan_files.saturating_add(1);
-                deletions = deletions.saturating_add(1);
-            }
-        }
-        Ok(())
     }
 
     /// Writes `bytes` to a same-directory temp file, `fsync`s, and atomically
@@ -900,19 +950,23 @@ impl AttachmentCache {
         })
     }
 
-    /// Writes bytes to a freshly created temp file and `fsync`s it. The
+    /// Writes bytes to a freshly created temp file (0600 on Unix, so the
+    /// content file it is renamed into is owner-only) and `fsync`s it. The
     /// returned guard removes the file on any error path.
     fn write_temp(&self, bytes: &[u8]) -> Result<TempFile, AttachError> {
         let path = self
             .root
             .join(format!("{ATTACHMENT_TEMP_PREFIX}{}", Uuid::new_v4()));
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|_| AttachError::Io {
-                context: "creating a temp file",
-            })?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path).map_err(|_| AttachError::Io {
+            context: "creating a temp file",
+        })?;
         let guard = TempFile { path };
         let write = (|| -> Result<(), AttachError> {
             file.write_all(bytes).map_err(|_| AttachError::Io {
@@ -946,6 +1000,184 @@ impl AttachmentCache {
     }
 }
 
+/// Deletion candidates produced by one read-only directory scan, bounded by
+/// the per-pass deletion cap. The scan performs no deletion and no store I/O;
+/// [`AttachmentCache::reconcile_locked`] applies each candidate under the
+/// per-cache lock after re-verifying it against the *current* store rows, so a
+/// scan that runs outside the async lock cannot race a concurrent `fetch`
+/// (which installs under that same lock) into deleting an in-flight file.
+#[derive(Default)]
+struct ScanCandidates {
+    /// Orphan `.tmp-*` files (paths, whose names may be non-UTF-8).
+    temp: Vec<PathBuf>,
+    /// Orphan content files (valid SHA-256 names with no snapshot row).
+    orphan: Vec<String>,
+    /// Size-mismatched content files (valid SHA-256 names).
+    corrupt: Vec<String>,
+    /// Unrecognized regular files (paths; names may be non-UTF-8).
+    unrecognized: Vec<PathBuf>,
+    /// Directory entries that could not be inspected.
+    errors: u64,
+    /// Directories skipped (never recursed into).
+    skipped_dirs: u64,
+}
+
+/// Streams one complete `read_dir` pass over `root`, recording a bounded set
+/// of deletion candidates (never materializing directory entries into a sorted
+/// vector, so memory is O(1) in the directory size). The scan is read-only and
+/// performs no `std::fs::remove_file`; the per-pass deletion cap
+/// (`batch >= 1`) bounds the candidate lists, and the scan itself is never
+/// truncated so repeated passes converge. The marker and the instance lock
+/// file are skipped, never treated as deletion candidates.
+fn scan_directory(
+    root: &Path,
+    rows_by_sha: &HashMap<String, u64>,
+    batch: usize,
+) -> Result<ScanCandidates, AttachError> {
+    let dir = std::fs::read_dir(root).map_err(|_| AttachError::Io {
+        context: "reading the cache directory",
+    })?;
+    let mut candidates = ScanCandidates::default();
+    let mut recorded = 0_usize;
+
+    for entry in dir {
+        let Ok(entry) = entry else {
+            candidates.errors = candidates.errors.saturating_add(1);
+            continue;
+        };
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let lossy = file_name.to_string_lossy();
+        if lossy == ATTACHMENT_CACHE_MARKER || lossy == ATTACHMENT_INSTANCE_LOCK {
+            continue;
+        }
+        let file_type = if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+            metadata.file_type()
+        } else {
+            candidates.errors = candidates.errors.saturating_add(1);
+            continue;
+        };
+        if file_type.is_dir() {
+            candidates.skipped_dirs = candidates.skipped_dirs.saturating_add(1);
+            continue;
+        }
+        if !file_type.is_file() {
+            // Symlinks and special files are never followed or deleted.
+            continue;
+        }
+        // A regular file that is a deletion candidate: apply the per-pass
+        // deletion cap. Candidates beyond the cap are left for the next pass
+        // (the scan restarts from the directory head, so they are not lost).
+        if recorded >= batch {
+            continue;
+        }
+        let Some(name) = file_name.to_str() else {
+            candidates.unrecognized.push(path);
+            recorded = recorded.saturating_add(1);
+            continue;
+        };
+        if name.starts_with(ATTACHMENT_TEMP_PREFIX) {
+            candidates.temp.push(path);
+            recorded = recorded.saturating_add(1);
+            continue;
+        }
+        if is_valid_sha256_name(name) {
+            if let Some(&expected) = rows_by_sha.get(name) {
+                let actual = std::fs::metadata(&path).map_or(u64::MAX, |m| m.len());
+                if actual != expected {
+                    candidates.corrupt.push(name.to_owned());
+                    recorded = recorded.saturating_add(1);
+                }
+            } else {
+                candidates.orphan.push(name.to_owned());
+                recorded = recorded.saturating_add(1);
+            }
+            continue;
+        }
+        candidates.unrecognized.push(path);
+        recorded = recorded.saturating_add(1);
+    }
+    Ok(candidates)
+}
+
+/// RAII owner of the cross-instance lock file. Dropping it removes the file
+/// (best-effort), releasing the directory for a later instance after this one
+/// exits normally.
+struct InstanceLockGuard {
+    path: PathBuf,
+}
+
+impl Drop for InstanceLockGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Acquires the single-instance lock file, failing closed when a live second
+/// instance already owns the cache root. A pre-existing lock older than
+/// [`ATTACHMENT_INSTANCE_LOCK_STALE`] is treated as a crash leftover: it is
+/// removed and creation retried once (a concurrent creator then wins the
+/// retry, which is also refused). Pure `std::fs` — no `flock`.
+fn acquire_instance_lock(root: &Path) -> Result<InstanceLockGuard, AttachError> {
+    let path = root.join(ATTACHMENT_INSTANCE_LOCK);
+    match create_instance_lock(&path) {
+        Ok(()) => Ok(InstanceLockGuard { path }),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if !is_stale_lock(&path) {
+                return Err(AttachError::InvalidPath {
+                    context: "another bridge instance is using this cache",
+                });
+            }
+            std::fs::remove_file(&path).map_err(|_| AttachError::Io {
+                context: "removing a stale instance lock",
+            })?;
+            create_instance_lock(&path).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    AttachError::InvalidPath {
+                        context: "another bridge instance is using this cache",
+                    }
+                } else {
+                    AttachError::Io {
+                        context: "creating the instance lock",
+                    }
+                }
+            })?;
+            Ok(InstanceLockGuard { path })
+        }
+        Err(_) => Err(AttachError::Io {
+            context: "creating the instance lock",
+        }),
+    }
+}
+
+/// Creates the instance lock file (0600 on Unix) with `create_new`, leaving it
+/// empty. The file's existence is the only signal; its content is unused.
+fn create_instance_lock(path: &Path) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path).map(|_file| ())
+}
+
+/// Whether a pre-existing lock file is old enough to be a crash leftover. An
+/// unreadable or future-dated file is treated as fresh (fail-closed).
+fn is_stale_lock(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return false;
+    };
+    let age = SystemTime::now()
+        .duration_since(modified)
+        .unwrap_or_default();
+    age > ATTACHMENT_INSTANCE_LOCK_STALE
+}
+
 /// Ensures `root` exists as a real (non-symlink) directory, creating it when
 /// absent. A symlink or a non-directory is refused fail-closed.
 fn ensure_cache_directory(root: &Path) -> Result<(), AttachError> {
@@ -977,22 +1209,25 @@ fn ensure_cache_directory(root: &Path) -> Result<(), AttachError> {
 }
 
 /// Tightens a validated cache directory to owner-only permissions (0700) on
-/// Unix. Failure is a non-fatal `tracing::warn` — never an error, never a
-/// panic — because the directory already passed marker validation and the
-/// cache must still open. No-op on non-Unix platforms.
-fn tighten_permissions(root: &Path) {
+/// Unix. Fail-closed: a directory that already passed marker validation but
+/// cannot be tightened is refused rather than left world-readable with
+/// plaintext cache content on disk. No-op on non-Unix platforms (which have
+/// no portable owner-only mode primitive here).
+fn tighten_permissions(root: &Path) -> Result<(), AttachError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Err(error) = std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)) {
-            tracing::warn!(
-                error = %error,
-                "failed to tighten attachment cache directory permissions to 0700"
-            );
-        }
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).map_err(|_| {
+            AttachError::Io {
+                context: "tightening cache directory permissions to 0700",
+            }
+        })
     }
     #[cfg(not(unix))]
-    let _ = root;
+    {
+        let _ = root;
+        Ok(())
+    }
 }
 
 /// Validates the dedicated-directory marker, writing one into a fresh empty
@@ -1188,4 +1423,25 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis());
     i64::try_from(millis).unwrap_or(i64::MAX)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// The chmod failure path is hard to reach through `AttachmentCache::open`
+    /// (the directory must first pass marker validation before the chmod, and
+    /// a validated directory we own almost never fails `set_permissions`), so
+    /// it is asserted at the unit boundary: `tighten_permissions` must return
+    /// `Err` rather than swallow the failure. The success path (0700) is
+    /// asserted in the integration test `open_tightens_permissions_only_after_marker_validation`.
+    #[test]
+    fn tighten_permissions_failure_is_fail_closed() {
+        let missing = Path::new("/definitely/not/a/real/attachment-cache-dir");
+        let result = tighten_permissions(missing);
+        assert!(
+            matches!(result, Err(AttachError::Io { .. })),
+            "a chmod failure must be an error, not a warning: {result:?}"
+        );
+    }
 }

@@ -10,7 +10,7 @@ use bytes::Bytes;
 use futures_util::future::BoxFuture;
 use lark_codex_bridge::lark::api::ResourceKind;
 use lark_codex_bridge::lark::normalize::ResourceDesc;
-use lark_codex_bridge::limits::ATTACHMENT_CACHE_MARKER;
+use lark_codex_bridge::limits::{ATTACHMENT_CACHE_MARKER, ATTACHMENT_INSTANCE_LOCK};
 use lark_codex_bridge::runtime::attachments::{
     AttachError, AttachmentCache, AttachmentLimits, CachedAttachment, DownloadKind,
     ResourceDownloader,
@@ -125,7 +125,7 @@ fn file_names(dir: &Path) -> Vec<String> {
         .filter_map(std::result::Result::ok)
         .filter(|entry| entry.file_type().is_ok_and(|t| t.is_file()))
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| name != ATTACHMENT_CACHE_MARKER)
+        .filter(|name| name != ATTACHMENT_CACHE_MARKER && name != ATTACHMENT_INSTANCE_LOCK)
         .collect();
     names.sort();
     names
@@ -1179,5 +1179,211 @@ async fn install_syncs_the_parent_directory_on_unix() {
         .await
         .expect("fetch");
     assert!(temp.path().join(sha_hex(b"sync-me")).is_file());
+    let _ = store.shutdown().await;
+}
+
+// --- B1b: reconcile batch clamp + off-worker scan ----------------------------------
+
+#[test]
+fn reconcile_batch_zero_is_clamped_to_at_least_one() {
+    let limits = AttachmentLimits {
+        reconcile_batch: 0,
+        ..AttachmentLimits::default()
+    }
+    .clamped();
+    assert!(
+        limits.reconcile_batch >= 1,
+        "a zero reconcile_batch must be clamped to a positive minimum"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_batch_zero_still_converges() {
+    let temp = tempdir().expect("tempdir");
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let dl = downloader(&[]);
+    let limits = AttachmentLimits {
+        reconcile_batch: 0,
+        ..AttachmentLimits::default()
+    };
+    let cache = cache(temp.path(), store.clone(), dl, limits);
+
+    // Three orphan files must still be fully cleaned even though the caller
+    // configured a zero batch: `open` clamps it to >= 1, so each pass deletes
+    // at least one file and reconciliation converges monotonically.
+    for index in 0..3 {
+        std::fs::write(temp.path().join(format!(".tmp-{index}")), b"x").expect("temp");
+    }
+    for _ in 0..4 {
+        let stats = cache.reconcile().await.expect("reconcile");
+        assert!(
+            stats.temp_files <= 1,
+            "a clamped batch must delete at most one file per pass"
+        );
+        if file_names(temp.path()).is_empty() {
+            break;
+        }
+    }
+    assert!(file_names(temp.path()).is_empty(), "orphans cleared");
+    let _ = store.shutdown().await;
+}
+
+// --- B2b: cross-instance fail-closed lock ------------------------------------------
+
+#[tokio::test]
+async fn second_open_in_the_same_directory_fails_closed() {
+    let temp = tempdir().expect("tempdir");
+    let root = temp.path().join("cache");
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let dl = downloader(&[]);
+
+    let _first = AttachmentCache::open(
+        &root,
+        store.clone(),
+        dl.clone(),
+        AttachmentLimits::default(),
+    )
+    .expect("first open");
+    assert!(
+        root.join(ATTACHMENT_INSTANCE_LOCK).is_file(),
+        "first open must create the instance lock"
+    );
+
+    let second = AttachmentCache::open(&root, store.clone(), dl, AttachmentLimits::default());
+    assert!(
+        matches!(second, Err(AttachError::InvalidPath { .. })),
+        "a live second instance must be refused fail-closed"
+    );
+    let _ = store.shutdown().await;
+}
+
+#[tokio::test]
+async fn removing_the_lock_lets_a_later_instance_reopen() {
+    let temp = tempdir().expect("tempdir");
+    let root = temp.path().join("cache");
+    let store = StoreHandle::open_in_memory().await.expect("store");
+
+    let first = AttachmentCache::open(
+        &root,
+        store.clone(),
+        downloader(&[]),
+        AttachmentLimits::default(),
+    )
+    .expect("first open");
+    let lock = root.join(ATTACHMENT_INSTANCE_LOCK);
+    assert!(lock.is_file());
+    drop(first);
+    assert!(!lock.exists(), "dropping the cache must release the lock");
+
+    let _second = AttachmentCache::open(
+        &root,
+        store.clone(),
+        downloader(&[]),
+        AttachmentLimits::default(),
+    )
+    .expect("reopen after lock release");
+    let _ = store.shutdown().await;
+}
+
+#[tokio::test]
+async fn stale_lock_is_replaced_and_reopen_succeeds() {
+    let temp = tempdir().expect("tempdir");
+    let root = temp.path().join("cache");
+    let store = StoreHandle::open_in_memory().await.expect("store");
+
+    // First life creates a valid marker + lock, then exits cleanly (the guard
+    // removes the lock). We then plant a backdated lock file to simulate a
+    // crash that left one behind past the stale threshold.
+    {
+        let _first = AttachmentCache::open(
+            &root,
+            store.clone(),
+            downloader(&[]),
+            AttachmentLimits::default(),
+        )
+        .expect("first open");
+    }
+    let lock = root.join(ATTACHMENT_INSTANCE_LOCK);
+    assert!(!lock.exists(), "clean exit must have removed the lock");
+    {
+        let file = std::fs::File::options()
+            .write(true)
+            .create_new(true)
+            .open(&lock)
+            .expect("recreate lock");
+        file.set_modified(SystemTime::now() - Duration::from_secs(48 * 60 * 60))
+            .expect("backdate lock");
+    }
+
+    // The backdated lock is stale, so open must replace it and succeed.
+    let _reopened = AttachmentCache::open(
+        &root,
+        store.clone(),
+        downloader(&[]),
+        AttachmentLimits::default(),
+    )
+    .expect("stale lock must be replaced");
+    assert!(
+        lock.is_file(),
+        "a fresh lock is created in place of the stale one"
+    );
+    let _ = store.shutdown().await;
+}
+
+#[tokio::test]
+async fn reconcile_never_deletes_the_instance_lock_or_marker() {
+    let temp = tempdir().expect("tempdir");
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let cache = cache(
+        temp.path(),
+        store.clone(),
+        downloader(&[]),
+        AttachmentLimits::default(),
+    );
+
+    let _ = cache.reconcile().await.expect("reconcile");
+    assert!(
+        temp.path().join(ATTACHMENT_INSTANCE_LOCK).is_file(),
+        "the instance lock must survive reconciliation"
+    );
+    assert!(
+        temp.path().join(ATTACHMENT_CACHE_MARKER).is_file(),
+        "the marker must survive reconciliation"
+    );
+    let _ = store.shutdown().await;
+}
+
+// --- B3b: fail-closed chmod + owner-only marker/lock ---------------------------------
+
+#[cfg(unix)]
+#[tokio::test]
+async fn marker_and_lock_files_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().expect("tempdir");
+    let root = temp.path().join("cache");
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let _cache = cache(
+        &root,
+        store.clone(),
+        downloader(&[]),
+        AttachmentLimits::default(),
+    );
+
+    let marker_mode = std::fs::metadata(root.join(ATTACHMENT_CACHE_MARKER))
+        .expect("marker metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    let lock_mode = std::fs::metadata(root.join(ATTACHMENT_INSTANCE_LOCK))
+        .expect("lock metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(marker_mode, 0o600, "the marker must be owner-only (0600)");
+    assert_eq!(
+        lock_mode, 0o600,
+        "the instance lock must be owner-only (0600)"
+    );
     let _ = store.shutdown().await;
 }

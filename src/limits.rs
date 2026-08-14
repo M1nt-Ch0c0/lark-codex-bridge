@@ -230,6 +230,16 @@ pub const ATTACHMENT_TEMP_PREFIX: &str = ".tmp-";
 /// attachment cache. Never a valid SHA-256 name, and the reconciliation
 /// scanner deliberately skips it.
 pub const ATTACHMENT_CACHE_MARKER: &str = ".attachment-cache";
+/// Cache-directory instance lock file name proving a single live bridge
+/// instance owns the cache root. Never a valid SHA-256 name, and the
+/// reconciliation scanner deliberately skips it. A second instance that finds
+/// a fresh lock file is refused fail-closed; a crash leaves it behind, and the
+/// next open replaces it once it is older than
+/// [`ATTACHMENT_INSTANCE_LOCK_STALE`].
+pub const ATTACHMENT_INSTANCE_LOCK: &str = ".attachment-instance.lock";
+/// Age after which an orphaned instance lock file is treated as a crash
+/// leftover and replaced instead of being refused as a live second instance.
+pub const ATTACHMENT_INSTANCE_LOCK_STALE: Duration = Duration::from_secs(24 * 60 * 60);
 /// Maximum live (`starting`/`running`/`uncertain`) turns retained for crash
 /// recovery. Terminal turns are historical rows and do not occupy this set.
 pub const STORE_RECOVERY_TURN_MAX_ROWS: usize = 32;
