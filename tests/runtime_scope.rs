@@ -51,6 +51,20 @@ struct RecordingSink {
 
 struct StaticAttachmentDownloader;
 
+struct PendingAttachmentDownloader {
+    started: Arc<AtomicUsize>,
+    started_notify: Arc<Notify>,
+}
+
+struct RemovingWorkspaceDownloader {
+    workspace: std::path::PathBuf,
+}
+
+#[derive(Default)]
+struct YieldingRecordingSink {
+    finalizations: Arc<Mutex<Vec<(i64, TurnResolution)>>>,
+}
+
 impl ResourceDownloader for StaticAttachmentDownloader {
     fn download(
         &self,
@@ -64,6 +78,40 @@ impl ResourceDownloader for StaticAttachmentDownloader {
             _ => Bytes::from_static(b"fallback-attachment"),
         };
         async move { Ok(bytes) }.boxed()
+    }
+}
+
+impl ResourceDownloader for PendingAttachmentDownloader {
+    fn download(
+        &self,
+        _message_id: &str,
+        _key: &str,
+        _kind: ResourceKind,
+    ) -> BoxFuture<'static, Result<Bytes, AttachError>> {
+        let started = Arc::clone(&self.started);
+        let started_notify = Arc::clone(&self.started_notify);
+        async move {
+            started.fetch_add(1, Ordering::SeqCst);
+            started_notify.notify_waiters();
+            std::future::pending::<Result<Bytes, AttachError>>().await
+        }
+        .boxed()
+    }
+}
+
+impl ResourceDownloader for RemovingWorkspaceDownloader {
+    fn download(
+        &self,
+        _message_id: &str,
+        _key: &str,
+        _kind: ResourceKind,
+    ) -> BoxFuture<'static, Result<Bytes, AttachError>> {
+        let workspace = self.workspace.clone();
+        async move {
+            std::fs::remove_dir(&workspace).expect("remove empty workspace during download");
+            Ok(Bytes::from_static(b"workspace-race-attachment"))
+        }
+        .boxed()
     }
 }
 
@@ -99,6 +147,35 @@ impl DurableReplySink for RecordingSink {
             progress.text.chars().count(),
         ));
         async { Ok(()) }.boxed()
+    }
+}
+
+impl DurableReplySink for YieldingRecordingSink {
+    fn rejection_notice(
+        &self,
+        event: &InboundEvent,
+        _reason: InboundRejectionKind,
+    ) -> Result<NewOutboxRow, ReplySinkError> {
+        Ok(NewOutboxRow {
+            idempotency_key: format!("{}:yielding-rejection", event.event_id),
+            scope_key: event.scope.to_string(),
+            kind: "notice".to_owned(),
+            payload_json: "{\"text\":\"rejected\"}".to_owned(),
+            next_retry_ms: 0,
+        })
+    }
+
+    fn finalize(&self, turn: TurnFinalization) -> BoxFuture<'static, Result<(), ReplySinkError>> {
+        let finalizations = Arc::clone(&self.finalizations);
+        async move {
+            tokio::task::yield_now().await;
+            finalizations
+                .lock()
+                .expect("yielding finalization lock")
+                .push((turn.turn_row_id, turn.resolution));
+            Ok(())
+        }
+        .boxed()
     }
 }
 
@@ -1023,6 +1100,364 @@ async fn attachment_limit_failure_is_durably_failed_before_codex_turn_start() {
 }
 
 #[tokio::test]
+async fn workspace_revalidation_failure_finalizes_the_turn_and_releases_attachments() {
+    let repository = std::env::current_dir().expect("repository");
+    let workspace_parent = tempfile::Builder::new()
+        .prefix("workspace-race-")
+        .tempdir_in(&repository)
+        .expect("workspace parent");
+    let workspace = workspace_parent.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let mut config = BridgeConfig {
+        owners: vec!["owner-runtime-scope".to_owned()],
+        default_workspace: Some(workspace.clone()),
+        workspace: WorkspacePolicy {
+            allow_roots: vec![repository],
+            ..WorkspacePolicy::default()
+        },
+        ..BridgeConfig::default()
+    };
+    config.validate().expect("valid workspace race config");
+    let workspace = config
+        .default_workspace
+        .clone()
+        .expect("canonical workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RecordingSink::default());
+    let cache_temp = tempdir().expect("cache tempdir");
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &cache_temp.path().join("attachments"),
+            store.clone(),
+            Arc::new(RemovingWorkspaceDownloader {
+                workspace: workspace.clone(),
+            }),
+            AttachmentLimits::default(),
+        )
+        .expect("attachment cache"),
+    );
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start_with_attachments(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink.clone(),
+        Arc::clone(&cache),
+    )
+    .await
+    .expect("router");
+    let mut inbound = event("event-workspace-race", "owner-runtime-scope");
+    inbound.resources.push(ResourceDesc {
+        kind: ResourceKind::File,
+        key: "file_key".to_owned(),
+    });
+    router
+        .route(queued_registered(&store, &namespace, inbound).await)
+        .await
+        .expect("route attachment event");
+    let start_thread = control.next_request().await;
+    control
+        .respond(
+            &start_thread,
+            thread_result("thread-workspace-race", &workspace),
+        )
+        .await;
+
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-workspace-race"],
+        InboundEventState::Rejected,
+    )
+    .await;
+    control
+        .expect_no_request_for(Duration::from_millis(100))
+        .await;
+    let turn_row_id = sink.finalizations.lock().expect("finalizations")[0].0;
+    assert_eq!(
+        store
+            .turn_row(turn_row_id)
+            .await
+            .expect("turn row")
+            .expect("turn")
+            .state,
+        TurnState::Failed
+    );
+    let attachment_rows = store.list_attachments().await.expect("attachments");
+    assert_eq!(attachment_rows.len(), 1);
+    for row in attachment_rows {
+        assert!(
+            store
+                .attachment_leases(&row.sha256)
+                .await
+                .expect("attachment leases")
+                .is_empty()
+        );
+    }
+    router.shutdown().await.expect("shutdown");
+    drop(cache);
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn shutdown_cancels_attachment_download_without_waiting_for_later_resources() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RecordingSink::default());
+    let started = Arc::new(AtomicUsize::new(0));
+    let started_notify = Arc::new(Notify::new());
+    let cache_temp = tempdir().expect("cache tempdir");
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &cache_temp.path().join("attachments"),
+            store.clone(),
+            Arc::new(PendingAttachmentDownloader {
+                started: Arc::clone(&started),
+                started_notify: Arc::clone(&started_notify),
+            }),
+            AttachmentLimits::default(),
+        )
+        .expect("attachment cache"),
+    );
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start_with_attachments(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink.clone(),
+        Arc::clone(&cache),
+    )
+    .await
+    .expect("router");
+    let mut inbound = event("event-download-shutdown", "owner-runtime-scope");
+    inbound.resources = (0..8)
+        .map(|index| ResourceDesc {
+            kind: ResourceKind::File,
+            key: format!("file_key_{index}"),
+        })
+        .collect();
+    router
+        .route(queued_registered(&store, &namespace, inbound).await)
+        .await
+        .expect("route attachment event");
+    let start_thread = control.next_request().await;
+    control
+        .respond(
+            &start_thread,
+            thread_result("thread-download-shutdown", &workspace),
+        )
+        .await;
+    timeout(Duration::from_secs(2), async {
+        while started.load(Ordering::SeqCst) == 0 {
+            started_notify.notified().await;
+        }
+    })
+    .await
+    .expect("first attachment download started");
+
+    timeout(Duration::from_millis(500), router.shutdown())
+        .await
+        .expect("download-aware shutdown deadline")
+        .expect("router shutdown");
+    assert_eq!(started.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        store
+            .inbound_state(&namespace, "event-download-shutdown")
+            .await
+            .expect("inbound state"),
+        Some(InboundEventState::Rejected)
+    );
+    assert!(
+        store
+            .list_attachments()
+            .await
+            .expect("attachments")
+            .is_empty()
+    );
+    assert!(
+        store
+            .uncertain_turns()
+            .await
+            .expect("live turns")
+            .is_empty()
+    );
+    assert_eq!(
+        sink.finalizations.lock().expect("finalizations")[0].1,
+        TurnResolution::Failed
+    );
+    drop(cache);
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn supervisor_epoch_loss_releases_uncertain_attachment_leases_in_process() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RecordingSink::default());
+    let cache_temp = tempdir().expect("cache tempdir");
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &cache_temp.path().join("attachments"),
+            store.clone(),
+            Arc::new(StaticAttachmentDownloader),
+            AttachmentLimits::default(),
+        )
+        .expect("attachment cache"),
+    );
+    let (supervisor, first_control, _second_control) = restarting_supervisor().await;
+    let router = Router::start_with_attachments(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink,
+        Arc::clone(&cache),
+    )
+    .await
+    .expect("router");
+    let mut inbound = event("event-attachment-epoch-loss", "owner-runtime-scope");
+    inbound.resources.push(ResourceDesc {
+        kind: ResourceKind::Image,
+        key: "img_key".to_owned(),
+    });
+    router
+        .route(queued_registered(&store, &namespace, inbound).await)
+        .await
+        .expect("route attachment event");
+    let start_thread = first_control.next_request().await;
+    first_control
+        .respond(
+            &start_thread,
+            thread_result("thread-attachment-epoch-loss", &workspace),
+        )
+        .await;
+    let start_turn = first_control.next_request().await;
+    respond_turn_started(&first_control, &start_turn, "turn-attachment-epoch-loss").await;
+    wait_for_running_turn(&store, "turn-attachment-epoch-loss").await;
+    let rows = store.list_attachments().await.expect("attachments");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        store
+            .attachment_leases(&rows[0].sha256)
+            .await
+            .expect("attachment leases")
+            .len(),
+        1
+    );
+
+    first_control.unexpected_exit();
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-attachment-epoch-loss"],
+        InboundEventState::Rejected,
+    )
+    .await;
+    timeout(Duration::from_secs(2), async {
+        while !store
+            .attachment_leases(&rows[0].sha256)
+            .await
+            .expect("attachment leases")
+            .is_empty()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("old epoch attachment leases released");
+    router.shutdown().await.expect("shutdown");
+    drop(cache);
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn shutdown_reconciles_uncertain_attachment_leases_after_the_process_stops() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let cache_temp = tempdir().expect("cache tempdir");
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &cache_temp.path().join("attachments"),
+            store.clone(),
+            Arc::new(StaticAttachmentDownloader),
+            AttachmentLimits::default(),
+        )
+        .expect("attachment cache"),
+    );
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start_with_attachments(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        Arc::new(YieldingRecordingSink::default()),
+        Arc::clone(&cache),
+    )
+    .await
+    .expect("router");
+    let mut inbound = event("event-attachment-shutdown", "owner-runtime-scope");
+    inbound.resources.push(ResourceDesc {
+        kind: ResourceKind::File,
+        key: "file_key".to_owned(),
+    });
+    router
+        .route(queued_registered(&store, &namespace, inbound).await)
+        .await
+        .expect("route attachment event");
+    let start_thread = control.next_request().await;
+    control
+        .respond(
+            &start_thread,
+            thread_result("thread-attachment-shutdown", &workspace),
+        )
+        .await;
+    let start_turn = control.next_request().await;
+    respond_turn_started(&control, &start_turn, "turn-attachment-shutdown").await;
+    wait_for_running_turn(&store, "turn-attachment-shutdown").await;
+    let rows = store.list_attachments().await.expect("attachments");
+    assert_eq!(rows.len(), 1);
+
+    router.shutdown().await.expect("shutdown");
+    assert_eq!(
+        store
+            .inbound_state(&namespace, "event-attachment-shutdown")
+            .await
+            .expect("inbound state"),
+        Some(InboundEventState::Rejected)
+    );
+    assert!(
+        store
+            .attachment_leases(&rows[0].sha256)
+            .await
+            .expect("attachment leases")
+            .is_empty()
+    );
+    drop(cache);
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
 async fn permit_recheck_atomically_rejects_a_stale_event_before_any_rpc() {
     let config = validated_config();
     let policy = AccessPolicy::from_config(&config).expect("policy");
@@ -1250,6 +1685,74 @@ async fn shutdown_durably_resolves_a_running_turn_as_uncertain() {
 }
 
 #[tokio::test]
+async fn shutdown_uses_a_fresh_deadline_for_an_async_uncertain_finalization() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(YieldingRecordingSink::default());
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink.clone(),
+    )
+    .await
+    .expect("router");
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("event-async-running-shutdown", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("route event");
+    let start_thread = control.next_request().await;
+    control
+        .respond(
+            &start_thread,
+            thread_result("thread-async-running-shutdown", &workspace),
+        )
+        .await;
+    let start_turn = control.next_request().await;
+    respond_turn_started(&control, &start_turn, "turn-async-running-shutdown").await;
+    wait_for_running_turn(&store, "turn-async-running-shutdown").await;
+
+    timeout(Duration::from_millis(500), router.shutdown())
+        .await
+        .expect("router shutdown deadline")
+        .expect("router shutdown");
+    assert_eq!(
+        store
+            .inbound_state(&namespace, "event-async-running-shutdown")
+            .await
+            .expect("inbound state"),
+        Some(InboundEventState::Rejected)
+    );
+    {
+        let finalizations = sink.finalizations.lock().expect("yielding finalizations");
+        assert_eq!(finalizations.len(), 1);
+        assert_eq!(finalizations[0].1, TurnResolution::Uncertain);
+    }
+    assert!(
+        store
+            .uncertain_turns()
+            .await
+            .expect("live turns")
+            .is_empty()
+    );
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
 async fn message_while_running_waits_then_resumes_the_same_thread() {
     let config = validated_config();
     let workspace = config.default_workspace.clone().expect("workspace");
@@ -1360,7 +1863,8 @@ async fn shutdown_cancels_unavailable_finalization_without_clearing_accepted_pay
     let config = validated_config();
     let workspace = config.default_workspace.clone().expect("workspace");
     let policy = AccessPolicy::from_config(&config).expect("policy");
-    let settings = RouterSettings::from_config(&config);
+    let settings = RouterSettings::from_config(&config)
+        .with_test_shutdown_cleanup_timeout(Duration::from_millis(100));
     let namespace = TenantNamespace::from_credentials(&credentials());
     let store = StoreHandle::open_in_memory().await.expect("store");
     let sink = Arc::new(UnavailableSink::default());

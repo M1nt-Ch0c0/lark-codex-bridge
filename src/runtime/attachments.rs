@@ -44,6 +44,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use futures_util::future::BoxFuture;
 use sha2::{Digest, Sha256};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::lark::api::{LarkApi, ResourceKind};
@@ -263,6 +264,12 @@ pub enum DownloadKind {
 /// absolute paths.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AttachError {
+    /// The caller cancelled before the attachment became usable.
+    #[error("attachment fetch was cancelled while {context}")]
+    Cancelled {
+        /// Static description of the interrupted phase.
+        context: &'static str,
+    },
     /// The downloader failed.
     #[error("attachment download failed ({kind:?})")]
     Download {
@@ -596,11 +603,46 @@ impl AttachmentCache {
         desc: &ResourceDesc,
         turn_row_id: i64,
     ) -> Result<CachedAttachment, AttachError> {
+        self.fetch_inner(message_id, desc, turn_row_id, None).await
+    }
+
+    /// Fetches one resource while observing actor shutdown without abandoning
+    /// a partially committed lease. Network work is cancelled immediately;
+    /// once local mutation begins, the bounded phase is allowed to settle so
+    /// the caller can reliably release any resulting turn lease.
+    pub(crate) async fn fetch_cancellable(
+        &self,
+        message_id: &str,
+        desc: &ResourceDesc,
+        turn_row_id: i64,
+        shutdown: &CancellationToken,
+    ) -> Result<CachedAttachment, AttachError> {
+        self.fetch_inner(message_id, desc, turn_row_id, Some(shutdown))
+            .await
+    }
+
+    async fn fetch_inner(
+        &self,
+        message_id: &str,
+        desc: &ResourceDesc,
+        turn_row_id: i64,
+        shutdown: Option<&CancellationToken>,
+    ) -> Result<CachedAttachment, AttachError> {
         self.limits.check_resource_key(&desc.key)?;
-        let bytes = self
-            .downloader
-            .download(message_id, &desc.key, desc.kind)
-            .await?;
+        let download = self.downloader.download(message_id, &desc.key, desc.kind);
+        let bytes = if let Some(shutdown) = shutdown {
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => {
+                    return Err(AttachError::Cancelled {
+                        context: "downloading an attachment",
+                    });
+                }
+                result = download => result?,
+            }
+        } else {
+            download.await?
+        };
         self.limits.check_attachment_bytes(bytes.len())?;
         let hash_bytes = bytes.clone();
         let sha = tokio::task::spawn_blocking(move || sha256_hex(hash_bytes.as_ref()))
@@ -608,6 +650,11 @@ impl AttachmentCache {
             .map_err(|_| AttachError::Io {
                 context: "hashing a downloaded attachment",
             })?;
+        if shutdown.is_some_and(CancellationToken::is_cancelled) {
+            return Err(AttachError::Cancelled {
+                context: "hashing a downloaded attachment",
+            });
+        }
         let final_path = self.root.join(&sha);
         let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         // Install + commit + re-verify run under the per-cache lock so GC's
@@ -616,6 +663,11 @@ impl AttachmentCache {
         // valid lease pointing at a file GC then removed (B2). The network
         // download stays outside the lock.
         let mut guard = Some(Arc::clone(&self.lock).lock_owned().await);
+        if shutdown.is_some_and(CancellationToken::is_cancelled) {
+            return Err(AttachError::Cancelled {
+                context: "waiting to install an attachment",
+            });
+        }
         let root = self.root.clone();
         let install_sha = sha.clone();
         let install_bytes = bytes.clone();
@@ -626,6 +678,11 @@ impl AttachmentCache {
             move || install_file(&root, &install_sha, install_bytes.as_ref()),
         )
         .await?;
+        if shutdown.is_some_and(CancellationToken::is_cancelled) {
+            return Err(AttachError::Cancelled {
+                context: "installing a downloaded attachment",
+            });
+        }
         // Row and lease commit in one transaction (design §10, Task 7 Step 1),
         // so GC can never observe an unleased row and evict it mid-fetch.
         self.store
@@ -651,6 +708,11 @@ impl AttachmentCache {
             },
         )
         .await?;
+        if shutdown.is_some_and(CancellationToken::is_cancelled) {
+            return Err(AttachError::Cancelled {
+                context: "verifying an installed attachment",
+            });
+        }
         Ok(CachedAttachment {
             sha256: sha,
             path: final_path,

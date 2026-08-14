@@ -42,6 +42,7 @@ pub struct RouterSettings {
     pub(crate) debounce: Duration,
     pub(crate) message_max_age: Duration,
     pub(crate) finalization_retry: Duration,
+    pub(crate) shutdown_cleanup_timeout: Duration,
 }
 
 impl RouterSettings {
@@ -59,6 +60,7 @@ impl RouterSettings {
             debounce: Duration::from_millis(600),
             message_max_age: Duration::from_secs(15 * 60),
             finalization_retry: Duration::from_secs(1),
+            shutdown_cleanup_timeout: Duration::from_secs(5),
         }
     }
 
@@ -80,6 +82,15 @@ impl RouterSettings {
         self
     }
 
+    /// Overrides the bounded best-effort finalization window used after an
+    /// actor's normal cancellation token has already fired.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_test_shutdown_cleanup_timeout(mut self, timeout: Duration) -> Self {
+        self.shutdown_cleanup_timeout = timeout;
+        self
+    }
+
     fn validate(&self) -> Result<(), RouteError> {
         if self.active_turn_permits == 0
             || self.active_turn_permits > ROUTER_ACTIVE_TURN_HARD_LIMIT
@@ -88,6 +99,7 @@ impl RouterSettings {
             || self.debounce.is_zero()
             || self.message_max_age.is_zero()
             || self.finalization_retry.is_zero()
+            || self.shutdown_cleanup_timeout.is_zero()
         {
             return Err(RouteError::InvalidSettings);
         }
@@ -116,6 +128,7 @@ impl fmt::Debug for RouterSettings {
             .field("debounce", &self.debounce)
             .field("message_max_age", &self.message_max_age)
             .field("finalization_retry", &self.finalization_retry)
+            .field("shutdown_cleanup_timeout", &self.shutdown_cleanup_timeout)
             .finish()
     }
 }
@@ -137,6 +150,8 @@ pub enum RouteError {
     Supervisor,
     #[error("scope actor routing is not available")]
     ActorUnavailable,
+    #[error("attachment cache cleanup failed")]
+    Attachment,
 }
 
 impl From<StoreError> for RouteError {
@@ -585,6 +600,7 @@ async fn run_router(
                     RouterCommand::Shutdown { respond } => {
                         shutdown_actors(actors).await;
                         supervisor.shutdown().await?;
+                        reconcile_terminal_attachments(attachments.as_deref()).await?;
                         let _ = respond.send(());
                         return Ok(());
                     }
@@ -594,7 +610,21 @@ async fn run_router(
     }
     shutdown_actors(actors).await;
     supervisor.shutdown().await?;
+    reconcile_terminal_attachments(attachments.as_deref()).await?;
     Ok(())
+}
+
+async fn reconcile_terminal_attachments(
+    attachments: Option<&AttachmentCache>,
+) -> Result<(), RouteError> {
+    let Some(cache) = attachments else {
+        return Ok(());
+    };
+    cache
+        .reconcile()
+        .await
+        .map(|_| ())
+        .map_err(|_| RouteError::Attachment)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -9,7 +9,7 @@ use std::time::{Instant as StdInstant, SystemTime, UNIX_EPOCH};
 use futures_util::future::BoxFuture;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
-use tokio::time::{Instant, sleep, sleep_until};
+use tokio::time::{Instant, sleep, sleep_until, timeout};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -26,7 +26,7 @@ use crate::limits::{
     TURN_BATCH_MAX_MESSAGES, TURN_BATCH_TEXT_BYTE_BUDGET,
 };
 use crate::render::{ProjectedReply, ProjectorOutput, ReplyProjector};
-use crate::runtime::attachments::AttachmentCache;
+use crate::runtime::attachments::{AttachError, AttachmentCache};
 use crate::runtime::policy::AccessPolicy;
 use crate::runtime::router::RouterSettings;
 use crate::store::{
@@ -74,6 +74,7 @@ impl fmt::Debug for TurnSource {
 }
 
 /// Authoritative turn result whose outbound effects must become durable first.
+#[derive(Clone)]
 pub struct TurnFinalization {
     /// Store row resolved only after the sink succeeds.
     pub turn_row_id: i64,
@@ -516,7 +517,7 @@ async fn process_batch(
         }
         Err(kind) => return Err(kind),
     };
-    let client = wait_for_client(&mut supervisor, shutdown).await?;
+    let (turn_epoch, client) = wait_for_client(&mut supervisor, shutdown).await?;
     set_state(state, ScopeState::StartingTurn);
     let thread_id = tokio::select! {
         biased;
@@ -566,7 +567,24 @@ async fn process_batch(
             thread_id: claimed.retained.event().thread_id.clone(),
         })
         .collect::<Vec<_>>();
-    let Ok(inputs) = assemble_turn_inputs(&claimed, attachments, turn_row_id).await else {
+    let inputs = match assemble_turn_inputs(&claimed, attachments, turn_row_id, shutdown).await {
+        Ok(inputs) => inputs,
+        Err(AttachmentAssemblyError::Failed | AttachmentAssemblyError::Cancelled) => {
+            finalize_failed(
+                store,
+                sink.as_ref(),
+                settings,
+                turn_row_id,
+                scope,
+                sources,
+                shutdown,
+            )
+            .await?;
+            release_attachments(attachments, turn_row_id).await?;
+            return Ok(());
+        }
+    };
+    let Ok(rpc_cwd) = revalidate_workspace(policy, &cwd, &fingerprint) else {
         finalize_failed(
             store,
             sink.as_ref(),
@@ -580,43 +598,65 @@ async fn process_batch(
         release_attachments(attachments, turn_row_id).await?;
         return Ok(());
     };
-    let rpc_cwd = revalidate_workspace(policy, &cwd, &fingerprint)?;
     let mut params = TurnStartParams::new(&thread_id, inputs);
     params.client_user_message_id = Some(client_message_id);
     params.cwd = Some(rpc_cwd.clone());
     params.approval_policy = Some(settings.approval_policy.clone());
     params.model.clone_from(&settings.model);
     params.sandbox_policy = Some(turn_sandbox(settings, rpc_cwd));
-    let started = tokio::select! {
+    let start_result = tokio::select! {
         biased;
         () = shutdown.cancelled() => None,
-        result = client.start_turn(params) => result.ok(),
+        result = client.start_turn(params) => Some(result),
     };
-    let Some(started) = started else {
-        finalize_uncertain(
-            store,
-            sink.as_ref(),
-            settings,
-            turn_row_id,
-            scope,
-            sources,
-            shutdown,
-        )
-        .await?;
-        return Ok(());
+    let started = match start_result {
+        Some(Ok(started)) => started,
+        Some(Err(error)) if error.turn_start_definitely_not_applied() => {
+            finalize_failed(
+                store,
+                sink.as_ref(),
+                settings,
+                turn_row_id,
+                scope,
+                sources,
+                shutdown,
+            )
+            .await?;
+            release_attachments(attachments, turn_row_id).await?;
+            return Ok(());
+        }
+        None | Some(Err(_)) => {
+            finalize_uncertain_and_settle_attachments(
+                store,
+                sink.as_ref(),
+                settings,
+                turn_row_id,
+                scope,
+                sources,
+                attachments,
+                &mut supervisor,
+                turn_epoch,
+                shutdown,
+            )
+            .await?;
+            return Ok(());
+        }
     };
     if store
         .set_turn_state(turn_row_id, TurnState::Running, Some(&started.id))
         .await
         .is_err()
     {
-        finalize_uncertain(
+        finalize_uncertain_and_settle_attachments(
             store,
             sink.as_ref(),
             settings,
             turn_row_id,
             scope,
             sources,
+            attachments,
+            &mut supervisor,
+            turn_epoch,
             shutdown,
         )
         .await?;
@@ -693,13 +733,16 @@ async fn process_batch(
     set_active_turn(active_turn, None)?;
     set_state(state, ScopeState::Finalizing { turn_row_id });
     let Some(outcome) = outcome else {
-        finalize_uncertain(
+        finalize_uncertain_and_settle_attachments(
             store,
             sink.as_ref(),
             settings,
             turn_row_id,
             scope,
             sources,
+            attachments,
+            &mut supervisor,
+            turn_epoch,
             shutdown,
         )
         .await?;
@@ -794,7 +837,8 @@ async fn assemble_turn_inputs(
     claimed: &[ClaimedInbound],
     attachments: Option<&AttachmentCache>,
     turn_row_id: i64,
-) -> Result<Vec<UserInput>, ()> {
+    shutdown: &CancellationToken,
+) -> Result<Vec<UserInput>, AttachmentAssemblyError> {
     // Resource counts are untrusted until each message passes the cache's
     // hard limit, so reserve only the already bounded claimed-message count.
     let mut inputs = Vec::with_capacity(claimed.len());
@@ -802,6 +846,9 @@ async fn assemble_turn_inputs(
     let mut attachment_sequence = 0_u32;
 
     for claimed in claimed {
+        if shutdown.is_cancelled() {
+            return Err(AttachmentAssemblyError::Cancelled);
+        }
         let event = claimed.retained.event();
         inputs.push(UserInput::text(event.text.clone()));
         let Some(cache) = attachments else {
@@ -810,14 +857,19 @@ async fn assemble_turn_inputs(
         let limits = cache.limits();
         limits
             .check_resource_batch(&event.resources)
-            .map_err(|_| ())?;
+            .map_err(|_| AttachmentAssemblyError::Failed)?;
         for resource in &event.resources {
             let cached = cache
-                .fetch(&event.message_id, resource, turn_row_id)
+                .fetch_cancellable(&event.message_id, resource, turn_row_id, shutdown)
                 .await
-                .map_err(|_| ())?;
+                .map_err(|error| match error {
+                    AttachError::Cancelled { .. } => AttachmentAssemblyError::Cancelled,
+                    _ => AttachmentAssemblyError::Failed,
+                })?;
             turn_bytes = turn_bytes.saturating_add(cached.bytes);
-            limits.check_turn_total(turn_bytes).map_err(|_| ())?;
+            limits
+                .check_turn_total(turn_bytes)
+                .map_err(|_| AttachmentAssemblyError::Failed)?;
             attachment_sequence = attachment_sequence.saturating_add(1);
             match cached.kind {
                 ResourceKind::Image => inputs.push(UserInput::LocalImage {
@@ -825,7 +877,10 @@ async fn assemble_turn_inputs(
                     detail: None,
                 }),
                 ResourceKind::File => {
-                    let path = cached.path.to_str().ok_or(())?;
+                    let path = cached
+                        .path
+                        .to_str()
+                        .ok_or(AttachmentAssemblyError::Failed)?;
                     let context = serde_json::to_string(&serde_json::json!({
                         "attachment": {
                             "kind": "file",
@@ -835,13 +890,19 @@ async fn assemble_turn_inputs(
                             "bytes": cached.bytes,
                         }
                     }))
-                    .map_err(|_| ())?;
+                    .map_err(|_| AttachmentAssemblyError::Failed)?;
                     inputs.push(UserInput::text(context));
                 }
             }
         }
     }
     Ok(inputs)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AttachmentAssemblyError {
+    Failed,
+    Cancelled,
 }
 
 async fn release_attachments(
@@ -939,10 +1000,11 @@ async fn prepare_workspace(
 async fn wait_for_client(
     supervisor: &mut watch::Receiver<SupervisorAccess>,
     shutdown: &CancellationToken,
-) -> Result<Arc<AppServerClient>, ScopeFailureKind> {
+) -> Result<(u64, Arc<AppServerClient>), ScopeFailureKind> {
     loop {
-        if let Some(client) = supervisor.borrow().client.clone() {
-            return Ok(client);
+        let access = supervisor.borrow().clone();
+        if let Some(client) = access.client {
+            return Ok((access.epoch, client));
         }
         tokio::select! {
             biased;
@@ -1129,7 +1191,77 @@ async fn finalize_uncertain(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn finalize_uncertain_and_settle_attachments(
+    store: &StoreHandle,
+    sink: &dyn DurableReplySink,
+    settings: &RouterSettings,
+    turn_row_id: i64,
+    scope: &ScopeKey,
+    sources: Vec<TurnSource>,
+    attachments: Option<&AttachmentCache>,
+    supervisor: &mut watch::Receiver<SupervisorAccess>,
+    turn_epoch: u64,
+    shutdown: &CancellationToken,
+) -> Result<(), ScopeFailureKind> {
+    finalize_uncertain(store, sink, settings, turn_row_id, scope, sources, shutdown).await?;
+    let Some(_) = attachments else {
+        return Ok(());
+    };
+    if wait_for_epoch_end(supervisor, turn_epoch, shutdown).await? {
+        release_attachments(attachments, turn_row_id).await?;
+    }
+    Ok(())
+}
+
+async fn wait_for_epoch_end(
+    supervisor: &mut watch::Receiver<SupervisorAccess>,
+    turn_epoch: u64,
+    shutdown: &CancellationToken,
+) -> Result<bool, ScopeFailureKind> {
+    loop {
+        let access = supervisor.borrow().clone();
+        if access.epoch != turn_epoch || access.client.is_none() {
+            return Ok(true);
+        }
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return Ok(false),
+            changed = supervisor.changed() => {
+                changed.map_err(|_| ScopeFailureKind::Supervisor)?;
+            }
+        }
+    }
+}
+
 async fn persist_finalization(
+    sink: &dyn DurableReplySink,
+    settings: &RouterSettings,
+    finalization: TurnFinalization,
+    projected_reply: Option<ProjectedReply>,
+    shutdown: &CancellationToken,
+) -> Result<(), ScopeFailureKind> {
+    let retry = finalization.clone();
+    let retry_reply = projected_reply.clone();
+    if !shutdown.is_cancelled() {
+        let result =
+            persist_finalization_inner(sink, settings, finalization, projected_reply, shutdown)
+                .await;
+        if !matches!(result, Err(ScopeFailureKind::Supervisor)) || !shutdown.is_cancelled() {
+            return result;
+        }
+    }
+
+    let cleanup = CancellationToken::new();
+    timeout(
+        settings.shutdown_cleanup_timeout,
+        persist_finalization_inner(sink, settings, retry, retry_reply, &cleanup),
+    )
+    .await
+    .map_err(|_| ScopeFailureKind::Supervisor)?
+}
+
+async fn persist_finalization_inner(
     sink: &dyn DurableReplySink,
     settings: &RouterSettings,
     finalization: TurnFinalization,

@@ -1,9 +1,14 @@
 # lark-codex-bridge 设计规格
 
 - 日期：2026-08-12
-- 状态：已批准
+- 状态：已批准的目标规格（不是当前实现完成清单）
 - 参考基线：`zarazhangrui/lark-coding-agent-bridge@e5d3ce5`
 - 首个支持的 Codex 版本：`codex-cli 0.146.x`
+
+> 实现快照（2026-08-14）：常驻 `run`、文本/图片/普通文件 turn、持久 inbox/outbox、
+> 进度/终答投影和附件 lease 已接通，可进入最小人工试用。slash command handler、审批、
+> 服务管理、周期性 `Received` 重扫、完整故障注入/soak 与真实飞书端到端验收尚未完成。
+> 具体运行方法和当前缺口以仓库根目录 `README.md` 为准；本文件继续描述批准的目标架构。
 
 ## 1. 目的
 
