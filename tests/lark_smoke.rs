@@ -14,13 +14,14 @@
 //! echo" round trip can never complete (confirmed against the real tenant). A
 //! group message event also only fires when the bot is `@`-mentioned. This
 //! smoke is therefore honest operator-assisted: it starts the bridge, waits
-//! for the transport to reach `Connected`, prints a unique nonce, and asks a
-//! human to send that nonce from a *human* account into the target chat
-//! (`@`-mentioning the bot only when the chat is a group). It then verifies
-//! the normalized event carries the right `chat_id` and contains the nonce,
-//! replies `pong` over `OpenAPI`, and shuts the transport down on every path.
-//! Because it requires a human, it is `#[ignore]`d and gated on `LARK_E2E=1`;
-//! it is never a CI test.
+//! for the transport to reach `Connected`, sends a beacon message to the
+//! target chat so the operator can find the right conversation, prints a
+//! unique nonce, and asks a human to send that nonce from a *human* account
+//! into the target chat (`@`-mentioning the bot only when the chat is a
+//! group). It then verifies the normalized event carries the right `chat_id`
+//! and contains the nonce, replies `pong` over `OpenAPI`, and shuts the
+//! transport down on every path. Because it requires a human, it is
+//! `#[ignore]`d and gated on `LARK_E2E=1`; it is never a CI test.
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
@@ -50,6 +51,10 @@ mod larkstub;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const OPERATOR_TIMEOUT: Duration = Duration::from_secs(300);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Fixed beacon text sent to the target chat so the operator can locate the
+/// right conversation. Deliberately nonce-free so a hypothetical self-send
+/// echo of the beacon can never satisfy the nonce match.
+const BEACON_TEXT: &str = "lark-codex-bridge smoke beacon (ignore)";
 
 #[tokio::test]
 #[ignore = "requires real Feishu/Lark app credentials and a human operator"]
@@ -93,7 +98,7 @@ async fn run_smoke() -> Result<()> {
 
     let outcome = timeout(
         OPERATOR_TIMEOUT,
-        run_operator_round_trip(&mut handle, &mut events, &chat_id),
+        run_operator_round_trip(&api, &mut handle, &mut events, &chat_id),
     )
     .await;
 
@@ -147,19 +152,34 @@ async fn run_smoke() -> Result<()> {
     Ok(())
 }
 
-/// Connects, prints the operator prompt, and waits for the operator's nonce to
-/// round-trip. Returns the matched event and the nonce so the caller can
-/// validate them after shutdown.
+/// Connects, sends a beacon to the target chat so the operator can find the
+/// right conversation, prints the operator prompt, and waits for the operator's
+/// nonce to round-trip. Returns the matched event and the nonce so the caller
+/// can validate them after shutdown.
 async fn run_operator_round_trip(
+    api: &LarkApi,
     handle: &mut TransportHandle,
     events: &mut mpsc::Receiver<QueuedInboundEvent>,
     chat_id: &str,
 ) -> Result<(InboundEvent, String)> {
     wait_for_connected(handle, CONNECT_TIMEOUT).await?;
     let nonce = generate_nonce();
+    // Beacon BEFORE the prompt: the operator opens the conversation that just
+    // received this message and sends the nonce there, removing any ambiguity
+    // about which chat is the target.
+    let beacon = api.send_text(chat_id, BEACON_TEXT).await.context(
+        "unable to send the smoke beacon; verify the credentials and that the bot is a member \
+             of LARK_E2E_CHAT_ID",
+    )?;
+    println!(
+        "beacon sent to the target chat (beacon message_id {})",
+        beacon.message_id
+    );
     println!(
         "\n===== Lark operator-assisted smoke =====\n\
-         Send the following nonce from a HUMAN account:\n\
+         The bot just sent a beacon message to the target chat. Open the\n\
+         conversation where the bot (TEST) posted that new message, then send\n\
+         the following nonce from a HUMAN account in THAT conversation:\n\
          \n    {nonce}\n\
          \n  - If the target chat is a p2p (single) chat with the bot: send the\n\
          nonce as-is.\n\
@@ -236,19 +256,18 @@ async fn await_operator_nonce(
                     return Err(anyhow!("inbound event channel closed before the smoke message arrived"));
                 };
                 let event = queued.into_event();
+                // Opt-in, human-assisted smoke: print the full chat_id for
+                // every event. chat_id is a chat identifier, not a secret (the
+                // target is already documented), and it is what distinguishes
+                // the target chat from a same-length wrong chat.
                 eprintln!(
-                    "normalized inbound: message_id={} chat_id_len={} text_len={} type={}",
-                    event.message_id,
-                    event.chat_id.len(),
-                    event.text.len(),
-                    event.message_type,
+                    "normalized inbound: message_id={} chat_id={} text_len={} type={}",
+                    event.message_id, event.chat_id, event.text.len(), event.message_type,
                 );
-                // This is an opt-in, human-assisted smoke against a chat the
-                // operator controls. When the event is from the target chat,
-                // echo the received text (escaped) so a nonce that was
-                // mistyped or transformed by the client is visible instead of
-                // surfacing as an anonymous length mismatch. Every other chat
-                // stays length-only.
+                // Echo the received text (escaped) only for the target chat so
+                // a mistyped or client-transformed nonce is visible instead of
+                // an anonymous length mismatch; every other chat stays
+                // text-hidden.
                 if event.chat_id == chat_id {
                     println!(
                         "operator message text (target chat): message_id={} text={:?}",
