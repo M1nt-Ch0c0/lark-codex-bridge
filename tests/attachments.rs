@@ -10,6 +10,7 @@ use bytes::Bytes;
 use futures_util::future::BoxFuture;
 use lark_codex_bridge::lark::api::ResourceKind;
 use lark_codex_bridge::lark::normalize::ResourceDesc;
+use lark_codex_bridge::limits::ATTACHMENT_CACHE_MARKER;
 use lark_codex_bridge::runtime::attachments::{
     AttachError, AttachmentCache, AttachmentLimits, CachedAttachment, DownloadKind,
     ResourceDownloader,
@@ -52,6 +53,32 @@ fn downloader_with_error(key: &str, error: AttachError) -> Arc<dyn ResourceDownl
     let mut responses = HashMap::new();
     responses.insert(key.to_owned(), Err(error));
     Arc::new(MapDownloader { responses })
+}
+
+/// A downloader that parks inside `download` until released, so tests can hold
+/// a fetch in the pre-lock download phase and interleave it with GC.
+struct GateDownloader {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    bytes: Bytes,
+}
+
+impl ResourceDownloader for GateDownloader {
+    fn download(
+        &self,
+        _message_id: &str,
+        _key: &str,
+        _kind: ResourceKind,
+    ) -> BoxFuture<'static, Result<Bytes, AttachError>> {
+        let entered = Arc::clone(&self.entered);
+        let release = Arc::clone(&self.release);
+        let bytes = self.bytes.clone();
+        Box::pin(async move {
+            entered.notify_one();
+            release.notified().await;
+            Ok(bytes)
+        })
+    }
 }
 
 fn desc(key: &str, kind: ResourceKind) -> ResourceDesc {
@@ -98,6 +125,7 @@ fn file_names(dir: &Path) -> Vec<String> {
         .filter_map(std::result::Result::ok)
         .filter(|entry| entry.file_type().is_ok_and(|t| t.is_file()))
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name != ATTACHMENT_CACHE_MARKER)
         .collect();
     names.sort();
     names
@@ -814,4 +842,387 @@ fn debug_output_never_leaks_content_or_paths() {
         context: "cached file content",
     };
     assert!(format!("{error:?}").contains("HashMismatch"));
+}
+
+// --- B1: dedicated-directory marker -------------------------------------------------
+
+#[tokio::test]
+async fn open_refuses_non_empty_directory_without_marker_and_preserves_files() {
+    let temp = tempdir().expect("tempdir");
+    let root = temp.path().join("cache");
+    std::fs::create_dir_all(&root).expect("create dir");
+    // A stray file the cache must never delete.
+    std::fs::write(root.join("user-data.txt"), b"precious").expect("write stray");
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let dl = downloader(&[]);
+
+    let result = AttachmentCache::open(&root, store.clone(), dl, AttachmentLimits::default());
+    assert!(
+        matches!(result, Err(AttachError::InvalidPath { .. })),
+        "a non-empty unmarked directory must be refused fail-closed"
+    );
+    // The stray file is untouched and no marker was created.
+    assert_eq!(
+        std::fs::read(root.join("user-data.txt")).expect("read"),
+        b"precious"
+    );
+    assert!(!root.join(ATTACHMENT_CACHE_MARKER).exists());
+    let _ = store.shutdown().await;
+}
+
+#[tokio::test]
+async fn open_creates_marker_in_empty_directory_and_reopens() {
+    let temp = tempdir().expect("tempdir");
+    let root = temp.path().join("cache");
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let dl = downloader(&[]);
+
+    let cache = AttachmentCache::open(&root, store.clone(), dl, AttachmentLimits::default())
+        .expect("first open");
+    let marker = root.join(ATTACHMENT_CACHE_MARKER);
+    assert!(marker.is_file(), "first open must write the marker");
+
+    // Reopen the same (now non-empty, marked) directory: must succeed.
+    drop(cache);
+    let _reopened = AttachmentCache::open(
+        &root,
+        store.clone(),
+        downloader(&[]),
+        AttachmentLimits::default(),
+    )
+    .expect("reopen of a valid marked cache");
+    let _ = store.shutdown().await;
+}
+
+#[tokio::test]
+async fn open_refuses_directory_with_wrong_marker_contents() {
+    let temp = tempdir().expect("tempdir");
+    let root = temp.path().join("cache");
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let _ = AttachmentCache::open(
+        &root,
+        store.clone(),
+        downloader(&[]),
+        AttachmentLimits::default(),
+    )
+    .expect("first open writes the marker");
+    // Corrupt the marker in place.
+    std::fs::write(root.join(ATTACHMENT_CACHE_MARKER), b"not the magic").expect("corrupt marker");
+
+    let result = AttachmentCache::open(
+        &root,
+        store.clone(),
+        downloader(&[]),
+        AttachmentLimits::default(),
+    );
+    assert!(
+        matches!(result, Err(AttachError::InvalidPath { .. })),
+        "a wrong marker must be refused fail-closed"
+    );
+    let _ = store.shutdown().await;
+}
+
+#[tokio::test]
+async fn open_refuses_a_non_directory_root() {
+    let temp = tempdir().expect("tempdir");
+    let root = temp.path().join("cache-file");
+    std::fs::write(&root, b"i am a file").expect("write file");
+    let store = StoreHandle::open_in_memory().await.expect("store");
+
+    let result = AttachmentCache::open(
+        &root,
+        store.clone(),
+        downloader(&[]),
+        AttachmentLimits::default(),
+    );
+    assert!(matches!(result, Err(AttachError::InvalidPath { .. })));
+    let _ = store.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn open_refuses_a_symlink_root() {
+    let temp = tempdir().expect("tempdir");
+    let target = temp.path().join("real-cache");
+    std::fs::create_dir_all(&target).expect("create target");
+    let link = temp.path().join("cache-link");
+    std::os::unix::fs::symlink(&target, &link).expect("symlink");
+    let store = StoreHandle::open_in_memory().await.expect("store");
+
+    let result = AttachmentCache::open(
+        &link,
+        store.clone(),
+        downloader(&[]),
+        AttachmentLimits::default(),
+    );
+    assert!(matches!(result, Err(AttachError::InvalidPath { .. })));
+    let _ = store.shutdown().await;
+}
+
+// --- B2: GC vs. fetch serialization ------------------------------------------------
+
+#[tokio::test]
+async fn fetch_download_is_outside_the_gc_lock() {
+    let temp = tempdir().expect("tempdir");
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let dl: Arc<dyn ResourceDownloader> = Arc::new(GateDownloader {
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+        bytes: Bytes::from_static(b"gated"),
+    });
+    let cache = Arc::new(cache(
+        temp.path(),
+        store.clone(),
+        dl,
+        AttachmentLimits::default(),
+    ));
+    let turn = record_turn(&store, "gate-turn").await;
+
+    let fetch = tokio::spawn({
+        let cache = Arc::clone(&cache);
+        async move {
+            cache
+                .fetch("om_test", &desc("k", ResourceKind::File), turn)
+                .await
+        }
+    });
+
+    // Park the fetch inside `download` (before it takes the per-cache lock).
+    entered.notified().await;
+    // GC must complete while the fetch is still downloading: if the lock were
+    // held across the download, this would deadlock.
+    let gc = tokio::time::timeout(std::time::Duration::from_secs(5), cache.gc()).await;
+    assert!(gc.is_ok(), "gc must not wait on a fetch still downloading");
+
+    release.notify_one();
+    let fetched = fetch.await.expect("join").expect("fetch");
+    assert_eq!(fetched.bytes, 5);
+    assert!(temp.path().join(sha_hex(b"gated")).is_file());
+    let _ = store.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_fetch_gc_never_leaves_a_leased_row_without_file() {
+    let temp = tempdir().expect("tempdir");
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let dl = downloader(&[("k", b"race-content")]);
+    let limits = AttachmentLimits {
+        gc_age: Duration::ZERO,
+        max_cache_files: 0,
+        max_cache_bytes: 0,
+        gc_batch: 64,
+        ..AttachmentLimits::default()
+    };
+    let cache = Arc::new(cache(temp.path(), store.clone(), dl, limits));
+
+    for round in 0..60 {
+        // Seed an unleased victim so GC has something to evict, then free the
+        // live-turn slot (Starting -> Failed keeps the row but no lease).
+        let seed = record_turn(&store, &format!("seed-{round}")).await;
+        cache
+            .fetch("om_test", &desc("k", ResourceKind::File), seed)
+            .await
+            .expect("seed fetch");
+        cache.release_turn(seed).await.expect("release seed");
+        store
+            .set_turn_state(seed, TurnState::Failed, None)
+            .await
+            .expect("terminalize seed");
+
+        let mut fetch_tasks = Vec::new();
+        for index in 0..4 {
+            let cache = Arc::clone(&cache);
+            let store = store.clone();
+            fetch_tasks.push(tokio::spawn(async move {
+                let turn = record_turn(&store, &format!("f-{round}-{index}")).await;
+                cache
+                    .fetch("om_test", &desc("k", ResourceKind::File), turn)
+                    .await
+                    .expect("fetch");
+                // Free the live-turn slot while keeping the lease so the
+                // invariant check still sees a leased row.
+                store
+                    .set_turn_state(turn, TurnState::Failed, None)
+                    .await
+                    .expect("terminalize fetch");
+                turn
+            }));
+        }
+        let mut gc_tasks = Vec::new();
+        for _ in 0..4 {
+            let cache = Arc::clone(&cache);
+            gc_tasks.push(tokio::spawn(async move {
+                let _ = cache.gc().await;
+            }));
+        }
+
+        let mut fetch_turns = Vec::new();
+        for task in fetch_tasks {
+            fetch_turns.push(task.await.expect("join"));
+        }
+        for task in gc_tasks {
+            task.await.expect("join");
+        }
+
+        // Invariant: any row still holding a lease must have its file on disk.
+        let rows = store.list_attachments().await.expect("list");
+        for row in rows {
+            let leased = !store
+                .attachment_leases(&row.sha256)
+                .await
+                .expect("leases")
+                .is_empty();
+            if leased {
+                assert!(
+                    temp.path().join(&row.sha256).is_file(),
+                    "leased row lost its file after round {round}: {row:?}"
+                );
+            }
+        }
+
+        // Release this round's leases so the next round seeds a fresh
+        // unleased victim again.
+        for turn in fetch_turns {
+            cache.release_turn(turn).await.expect("release fetch lease");
+        }
+    }
+    let _ = store.shutdown().await;
+}
+
+// --- B3: reconciliation convergence via persisted cursor ---------------------------
+
+#[tokio::test]
+async fn reconcile_cursor_converges_across_restart() {
+    let temp = tempdir().expect("tempdir");
+    let db = temp.path().join("store.sqlite");
+    let cache_dir = temp.path().join("cache");
+    let limits = AttachmentLimits {
+        reconcile_batch: 2,
+        ..AttachmentLimits::default()
+    };
+
+    let sha = {
+        let store = StoreHandle::open(&db).await.expect("open");
+        let cache = cache(
+            &cache_dir,
+            store.clone(),
+            downloader(&[("k", b"keeper")]),
+            limits,
+        );
+        let turn = record_turn(&store, "restart-turn").await;
+        let sha = sha_hex(b"keeper");
+        cache
+            .fetch("om_test", &desc("k", ResourceKind::File), turn)
+            .await
+            .expect("fetch");
+        for index in 0..6 {
+            std::fs::write(cache_dir.join(format!(".tmp-{index}")), b"x").expect("temp");
+        }
+        store.shutdown().await.expect("shutdown");
+        sha
+    };
+
+    // Repeatedly reopen + reconcile (each reopen simulates a restart). The
+    // persisted cursor must advance the tail orphans to deletion.
+    let mut remaining = 6_u64;
+    for _ in 0..20 {
+        let store = StoreHandle::open(&db).await.expect("reopen");
+        let cache = cache(
+            &cache_dir,
+            store.clone(),
+            downloader(&[("k", b"keeper")]),
+            limits,
+        );
+        let stats = cache.reconcile().await.expect("reconcile");
+        remaining = remaining.saturating_sub(stats.temp_files);
+        store.shutdown().await.expect("shutdown");
+        if remaining == 0 && file_names(&cache_dir) == vec![sha.clone()] {
+            break;
+        }
+    }
+
+    assert_eq!(file_names(&cache_dir), vec![sha.clone()]);
+    let store = StoreHandle::open(&db).await.expect("reopen verify");
+    let rows = store.list_attachments().await.expect("list");
+    assert_eq!(rows.len(), 1, "valid row survives every restart");
+    assert_eq!(rows[0].sha256, sha);
+    assert_eq!(
+        store.attachment_leases(&sha).await.expect("leases").len(),
+        1,
+        "valid lease survives every restart"
+    );
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn reconcile_stale_cursor_resets_without_misdeletion() {
+    let temp = tempdir().expect("tempdir");
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let cache = cache(
+        temp.path(),
+        store.clone(),
+        downloader(&[("k", b"survivor")]),
+        AttachmentLimits::default(),
+    );
+    let turn = record_turn(&store, "stale-cursor").await;
+    let sha = sha_hex(b"survivor");
+    cache
+        .fetch("om_test", &desc("k", ResourceKind::File), turn)
+        .await
+        .expect("fetch");
+
+    // A cursor that sorts after every real entry, as if it pointed at a
+    // deleted entry. It must be cleared, never cause a deletion.
+    store
+        .set_attachment_scan_cursor(
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        )
+        .await
+        .expect("stale cursor");
+
+    let stats = cache.reconcile().await.expect("reconcile");
+    assert_eq!(stats.dropped_rows, 0, "a stale cursor must not drop rows");
+    assert!(
+        store
+            .attachment_scan_cursor()
+            .await
+            .expect("cursor")
+            .is_none(),
+        "a full pass must clear the stale cursor"
+    );
+    assert!(temp.path().join(&sha).is_file(), "valid file survives");
+    assert_eq!(
+        store.attachment_leases(&sha).await.expect("leases").len(),
+        1,
+        "valid lease survives"
+    );
+    let _ = store.shutdown().await;
+}
+
+// --- B4: rename durability ---------------------------------------------------------
+
+#[cfg(unix)]
+#[tokio::test]
+async fn install_syncs_the_parent_directory_on_unix() {
+    let temp = tempdir().expect("tempdir");
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let cache = cache(
+        temp.path(),
+        store.clone(),
+        downloader(&[("k", b"sync-me")]),
+        AttachmentLimits::default(),
+    );
+    let turn = record_turn(&store, "dir-sync").await;
+    // The install path (temp write -> rename -> parent-dir fsync) must run
+    // cleanly on a real directory. The `fsync` syscall itself is not
+    // observable from here, so this asserts the code path executes without
+    // error; power-loss durability is not directly assertable.
+    cache
+        .fetch("om_test", &desc("k", ResourceKind::File), turn)
+        .await
+        .expect("fetch");
+    assert!(temp.path().join(sha_hex(b"sync-me")).is_file());
+    let _ = store.shutdown().await;
 }

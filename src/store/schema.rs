@@ -182,4 +182,14 @@ BEGIN
 END;
 ",
     },
+    Migration {
+        version: 3,
+        name: "attachment scan cursor",
+        sql: "
+CREATE TABLE attachment_scan_cursor (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    entry_name TEXT NOT NULL
+);
+",
+    },
 ];

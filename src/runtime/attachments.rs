@@ -32,12 +32,16 @@ use crate::lark::api::{LarkApi, ResourceKind};
 use crate::lark::error::LarkError;
 use crate::lark::normalize::ResourceDesc;
 use crate::limits::{
-    ATTACHMENT_CACHE_MAX_BYTES, ATTACHMENT_CACHE_MAX_FILES, ATTACHMENT_FILE_NAME_MAX_BYTES,
-    ATTACHMENT_GC_AGE, ATTACHMENT_GC_BATCH, ATTACHMENT_MAX_BYTES, ATTACHMENT_MAX_PER_MESSAGE,
-    ATTACHMENT_MIME_MAX_BYTES, ATTACHMENT_RECONCILE_BATCH, ATTACHMENT_RESOURCE_KEY_MAX_BYTES,
-    ATTACHMENT_TEMP_PREFIX, ATTACHMENT_TURN_TOTAL_BYTES,
+    ATTACHMENT_CACHE_MARKER, ATTACHMENT_CACHE_MAX_BYTES, ATTACHMENT_CACHE_MAX_FILES,
+    ATTACHMENT_FILE_NAME_MAX_BYTES, ATTACHMENT_GC_AGE, ATTACHMENT_GC_BATCH, ATTACHMENT_MAX_BYTES,
+    ATTACHMENT_MAX_PER_MESSAGE, ATTACHMENT_MIME_MAX_BYTES, ATTACHMENT_RECONCILE_BATCH,
+    ATTACHMENT_RESOURCE_KEY_MAX_BYTES, ATTACHMENT_TEMP_PREFIX, ATTACHMENT_TURN_TOTAL_BYTES,
 };
 use crate::store::{AttachmentRow, StoreError, StoreHandle};
+
+/// Fixed marker-file contents proving a directory is a dedicated attachment
+/// cache. Any other contents are rejected fail-closed at [`AttachmentCache::open`].
+const CACHE_MARKER_CONTENTS: &[u8] = b"lark-codex-bridge attachment cache v1\n";
 
 /// Bounded cache configuration. The [`Default`] values mirror the explicit
 /// constants in [`crate::limits`]; tests may shrink them to exercise GC and
@@ -441,6 +445,10 @@ pub struct AttachmentCache {
     store: StoreHandle,
     downloader: Arc<dyn ResourceDownloader>,
     limits: AttachmentLimits,
+    /// Serializes the destructive file/row pairs of `fetch` (install, commit,
+    /// re-verify), `gc` (delete row, delete file), and `reconcile` against one
+    /// another so a valid lease can never point at a missing file (B2).
+    lock: tokio::sync::Mutex<()>,
 }
 
 impl fmt::Debug for AttachmentCache {
@@ -455,21 +463,22 @@ impl fmt::Debug for AttachmentCache {
 impl AttachmentCache {
     /// Creates (if needed) and canonicalizes the cache directory, then builds
     /// the cache. The directory is tightened to owner-only permissions on
-    /// Unix.
+    /// Unix and must carry a valid [`ATTACHMENT_CACHE_MARKER`] marker file:
+    /// an empty directory gets one written on first open; a non-empty
+    /// directory is accepted only when its marker validates (fail-closed, so a
+    /// misconfigured root such as `$HOME` is refused rather than scanned).
     ///
     /// # Errors
     ///
     /// Returns an error when the directory cannot be created, canonicalized,
-    /// or is not a directory.
+    /// is not a directory, is a symlink, or fails marker validation.
     pub fn open(
         root: &Path,
         store: StoreHandle,
         downloader: Arc<dyn ResourceDownloader>,
         limits: AttachmentLimits,
     ) -> Result<Self, AttachError> {
-        std::fs::create_dir_all(root).map_err(|_| AttachError::Io {
-            context: "creating the cache directory",
-        })?;
+        ensure_cache_directory(root)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -478,19 +487,13 @@ impl AttachmentCache {
         let root = std::fs::canonicalize(root).map_err(|_| AttachError::Io {
             context: "resolving the cache directory",
         })?;
-        let metadata = std::fs::metadata(&root).map_err(|_| AttachError::Io {
-            context: "reading the cache directory",
-        })?;
-        if !metadata.is_dir() {
-            return Err(AttachError::InvalidPath {
-                context: "cache root is not a directory",
-            });
-        }
+        validate_cache_marker(&root)?;
         Ok(Self {
             root,
             store,
             downloader,
             limits,
+            lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -532,8 +535,14 @@ impl AttachmentCache {
         self.limits.check_attachment_bytes(bytes.len())?;
         let sha = sha256_hex(bytes.as_ref());
         let final_path = self.root.join(&sha);
-        self.install_file(&sha, bytes.as_ref())?;
         let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        // Install + commit + re-verify run under the per-cache lock so GC's
+        // "delete row then delete file" pair can never interleave between the
+        // file write and the row/lease commit, which would otherwise leave a
+        // valid lease pointing at a file GC then removed (B2). The network
+        // download stays outside the lock.
+        let _guard = self.lock.lock().await;
+        self.install_file(&sha, bytes.as_ref())?;
         // Row and lease commit in one transaction (design §10, Task 7 Step 1),
         // so GC can never observe an unleased row and evict it mid-fetch.
         self.store
@@ -576,6 +585,14 @@ impl AttachmentCache {
     ///
     /// Returns a classified store or I/O failure.
     pub async fn gc(&self) -> Result<GcStats, AttachError> {
+        let _guard = self.lock.lock().await;
+        self.gc_inner().await
+    }
+
+    /// Eviction pass without the per-cache lock; callers hold it (so
+    /// `reconcile` can run GC inside its own critical section without
+    /// re-acquiring the lock and deadlocking).
+    async fn gc_inner(&self) -> Result<GcStats, AttachError> {
         let rows = self
             .store
             .list_attachments()
@@ -637,6 +654,12 @@ impl AttachmentCache {
     /// Returns a classified store or I/O failure. Per-entry inspection
     /// failures are recorded in [`ReconcileStats::errors`] instead of aborting.
     pub async fn reconcile(&self) -> Result<ReconcileStats, AttachError> {
+        let _guard = self.lock.lock().await;
+        self.reconcile_locked().await
+    }
+
+    /// Reconciliation pass without the per-cache lock; callers hold it.
+    async fn reconcile_locked(&self) -> Result<ReconcileStats, AttachError> {
         let mut stats = ReconcileStats::default();
         let rows = self
             .store
@@ -654,8 +677,8 @@ impl AttachmentCache {
             }
         }
 
-        let (present_on_disk, truncated) =
-            self.scan_entries(&rows, &rows_by_sha, &mut drop_rows, &mut stats)?;
+        self.scan_entries(&rows, &rows_by_sha, &mut drop_rows, &mut stats)
+            .await?;
 
         for sha in &drop_rows {
             if self
@@ -667,24 +690,22 @@ impl AttachmentCache {
                 stats.dropped_rows = stats.dropped_rows.saturating_add(1);
             }
         }
-        // A truncated scan means entries beyond the batch were never observed,
-        // so `present_on_disk` is incomplete. Treating them as missing would
-        // force-delete valid rows (cascading their leases and turning their
-        // files into orphans deleted on the next pass). Skip the missing-row
-        // cleanup until a full scan runs; over-batch orphans/temp files still
-        // converge across repeated passes, so reconciliation stays idempotent.
-        if !truncated {
-            for sha in rows_by_sha.keys() {
-                if !present_on_disk.contains(sha)
-                    && !drop_rows.contains(sha)
-                    && self
-                        .store
-                        .delete_attachment_force(sha)
-                        .await
-                        .map_err(|error| store_err("dropping a missing attachment row", error))?
-                {
-                    stats.dropped_rows = stats.dropped_rows.saturating_add(1);
-                }
+        // Missing-file detection is per-row and independent of the directory
+        // scan cursor: a store row whose backing file is not a regular file on
+        // disk is dangling and dropped (leases cascade). This is always
+        // complete, so it never confuses "unscanned" with "missing".
+        for sha in rows_by_sha.keys() {
+            if drop_rows.contains(sha) {
+                continue;
+            }
+            if !regular_file_exists(&self.root.join(sha))
+                && self
+                    .store
+                    .delete_attachment_force(sha)
+                    .await
+                    .map_err(|error| store_err("dropping a missing attachment row", error))?
+            {
+                stats.dropped_rows = stats.dropped_rows.saturating_add(1);
             }
         }
 
@@ -693,43 +714,72 @@ impl AttachmentCache {
             .delete_stale_attachment_leases()
             .await
             .map_err(|error| store_err("deleting stale attachment leases", error))?;
-        stats.gc = self.gc().await?;
+        stats.gc = self.gc_inner().await?;
         Ok(stats)
     }
 
     /// Scans direct children of the cache root (bounded by
-    /// [`AttachmentLimits::reconcile_batch`]), deleting orphan temp files,
-    /// orphan/unrecognized content files, and size-mismatched files. Returns
-    /// the set of valid SHA-256 names present on disk plus a flag reporting
-    /// whether the directory held more entries than the batch could scan (so
-    /// the caller must not treat unscanned entries as missing).
-    fn scan_entries(
+    /// [`AttachmentLimits::reconcile_batch`] per pass), deleting orphan temp
+    /// files, orphan/unrecognized content files, and size-mismatched files. A
+    /// persisted cursor records the last entry name fully processed so that
+    /// repeated truncated passes advance monotonically through the directory
+    /// and converge across restarts, instead of re-scanning the same head
+    /// entries forever (B3).
+    ///
+    /// Entries are sorted by name so the cursor's "after" relation is
+    /// deterministic regardless of filesystem `readdir` order. A cursor that
+    /// points at a deleted or stale name simply resumes after that name; it
+    /// can never cause a deletion.
+    async fn scan_entries(
         &self,
         rows: &[AttachmentRow],
         rows_by_sha: &HashMap<String, usize>,
         drop_rows: &mut HashSet<String>,
         stats: &mut ReconcileStats,
-    ) -> Result<(HashSet<String>, bool), AttachError> {
-        let mut present_on_disk = HashSet::new();
-        let mut entries = std::fs::read_dir(&self.root).map_err(|_| AttachError::Io {
+    ) -> Result<(), AttachError> {
+        let mut entries: Vec<(PathBuf, String)> = Vec::new();
+        let dir = std::fs::read_dir(&self.root).map_err(|_| AttachError::Io {
             context: "reading the cache directory",
         })?;
-        let mut scanned = 0_usize;
-        let mut truncated = false;
-        loop {
-            if scanned >= self.limits.reconcile_batch {
-                truncated = entries.next().is_some();
-                break;
-            }
-            let Some(entry) = entries.next() else {
-                break;
-            };
+        for entry in dir {
             let Ok(entry) = entry else {
                 stats.errors = stats.errors.saturating_add(1);
                 continue;
             };
-            scanned = scanned.saturating_add(1);
-            let Ok(file_type) = entry.file_type() else {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            entries.push((entry.path(), name));
+        }
+        entries.sort_by(|left, right| left.1.cmp(&right.1));
+
+        let cursor = self
+            .store
+            .attachment_scan_cursor()
+            .await
+            .map_err(|error| store_err("reading the attachment scan cursor", error))?;
+        let start = match &cursor {
+            Some(name) => {
+                entries.partition_point(|(_, entry_name)| entry_name.as_str() <= name.as_str())
+            }
+            None => 0,
+        };
+
+        let mut processed = 0_usize;
+        let mut last_name: Option<String> = None;
+        let mut truncated = false;
+
+        for (path, sort_key) in entries.iter().skip(start) {
+            if processed >= self.limits.reconcile_batch {
+                truncated = true;
+                break;
+            }
+            processed = processed.saturating_add(1);
+            last_name = Some(sort_key.clone());
+            if sort_key == ATTACHMENT_CACHE_MARKER {
+                continue;
+            }
+            let file_type = if let Ok(metadata) = std::fs::symlink_metadata(path) {
+                metadata.file_type()
+            } else {
                 stats.errors = stats.errors.saturating_add(1);
                 continue;
             };
@@ -741,38 +791,51 @@ impl AttachmentCache {
                 // Symlinks and special files are never followed or deleted.
                 continue;
             }
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                if self.remove_file(&entry.path(), "removing an unrecognized cache file")? {
+            let Some(name) = path.file_name().and_then(|os| os.to_str()) else {
+                if self.remove_file(path, "removing an unrecognized cache file")? {
                     stats.orphan_files = stats.orphan_files.saturating_add(1);
                 }
                 continue;
             };
             if name.starts_with(ATTACHMENT_TEMP_PREFIX) {
-                if self.remove_file(&entry.path(), "removing an orphan temp file")? {
+                if self.remove_file(path, "removing an orphan temp file")? {
                     stats.temp_files = stats.temp_files.saturating_add(1);
                 }
                 continue;
             }
-            if is_valid_sha256_name(&name) {
-                present_on_disk.insert(name.clone());
-                if let Some(&index) = rows_by_sha.get(&name) {
-                    let actual = std::fs::metadata(entry.path()).map_or(u64::MAX, |m| m.len());
+            if is_valid_sha256_name(name) {
+                if let Some(&index) = rows_by_sha.get(name) {
+                    let actual = std::fs::metadata(path).map_or(u64::MAX, |m| m.len());
                     if actual != rows[index].bytes {
-                        if self.remove_file(&entry.path(), "removing a corrupt cached file")? {
+                        if self.remove_file(path, "removing a corrupt cached file")? {
                             stats.corrupt_files = stats.corrupt_files.saturating_add(1);
                         }
-                        drop_rows.insert(name);
+                        drop_rows.insert(name.to_owned());
                     }
-                } else if self.remove_file(&entry.path(), "removing an orphan cached file")? {
+                } else if self.remove_file(path, "removing an orphan cached file")? {
                     stats.orphan_files = stats.orphan_files.saturating_add(1);
                 }
                 continue;
             }
-            if self.remove_file(&entry.path(), "removing an unrecognized cache file")? {
+            if self.remove_file(path, "removing an unrecognized cache file")? {
                 stats.orphan_files = stats.orphan_files.saturating_add(1);
             }
         }
-        Ok((present_on_disk, truncated))
+
+        if truncated {
+            if let Some(name) = last_name {
+                self.store
+                    .set_attachment_scan_cursor(&name)
+                    .await
+                    .map_err(|error| store_err("saving the attachment scan cursor", error))?;
+            }
+        } else {
+            self.store
+                .clear_attachment_scan_cursor()
+                .await
+                .map_err(|error| store_err("clearing the attachment scan cursor", error))?;
+        }
+        Ok(())
     }
 
     /// Writes `bytes` to a same-directory temp file, `fsync`s, and atomically
@@ -790,7 +853,13 @@ impl AttachmentCache {
                 self.remove_file(&final_path, "removing a corrupt cached file")?;
             }
             match std::fs::rename(&temp.path, &final_path) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    // Make the rename durable before the row is committed:
+                    // without syncing the parent directory, a power loss could
+                    // commit the store row while losing the rename (B4).
+                    sync_parent_dir(&self.root)?;
+                    return Ok(());
+                }
                 Err(_) if final_path.exists() => {
                     if verify_existing(&final_path, sha, bytes.len()).is_ok() {
                         return Ok(());
@@ -853,6 +922,133 @@ impl AttachmentCache {
             Err(_) => Err(AttachError::Io { context }),
         }
     }
+}
+
+/// Ensures `root` exists as a real (non-symlink) directory, creating it when
+/// absent. A symlink or a non-directory is refused fail-closed.
+fn ensure_cache_directory(root: &Path) -> Result<(), AttachError> {
+    match std::fs::symlink_metadata(root) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(AttachError::InvalidPath {
+                    context: "cache root must not be a symlink",
+                });
+            }
+            if !metadata.is_dir() {
+                return Err(AttachError::InvalidPath {
+                    context: "cache root is not a directory",
+                });
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(root).map_err(|_| AttachError::Io {
+                context: "creating the cache directory",
+            })?;
+        }
+        Err(_) => {
+            return Err(AttachError::Io {
+                context: "reading the cache directory",
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Validates the dedicated-directory marker, writing one into a fresh empty
+/// directory. A non-empty directory without a valid marker is refused
+/// fail-closed without creating or deleting anything.
+fn validate_cache_marker(root: &Path) -> Result<(), AttachError> {
+    let marker = root.join(ATTACHMENT_CACHE_MARKER);
+    let mut entries = std::fs::read_dir(root).map_err(|_| AttachError::Io {
+        context: "reading the cache directory",
+    })?;
+    if entries.next().is_none() {
+        return write_marker(&marker);
+    }
+    // Non-empty directory: the marker must already exist and validate. A
+    // missing or wrong marker is a misconfigured directory, never an I/O
+    // error, so the caller gets a clear fail-closed `InvalidPath`.
+    if !marker.exists() {
+        return Err(AttachError::InvalidPath {
+            context: "cache directory is not a dedicated attachment cache",
+        });
+    }
+    if verify_marker(&marker)? {
+        Ok(())
+    } else {
+        Err(AttachError::InvalidPath {
+            context: "cache directory is not a dedicated attachment cache",
+        })
+    }
+}
+
+/// Reads and validates the marker file contents. `false` means the contents
+/// are present but wrong; an unreadable marker surfaces as an I/O error.
+fn verify_marker(path: &Path) -> Result<bool, AttachError> {
+    let contents = std::fs::read(path).map_err(|_| AttachError::Io {
+        context: "reading the cache marker",
+    })?;
+    Ok(contents == CACHE_MARKER_CONTENTS)
+}
+
+/// Writes the marker file (0600 on Unix) without ever overwriting an existing
+/// one; a concurrent first-open that lost the `create_new` race re-validates.
+fn write_marker(path: &Path) -> Result<(), AttachError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Ok(mut file) => {
+            file.write_all(CACHE_MARKER_CONTENTS)
+                .map_err(|_| AttachError::Io {
+                    context: "writing the cache marker",
+                })?;
+            file.sync_all().map_err(|_| AttachError::Io {
+                context: "syncing the cache marker",
+            })?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if verify_marker(path)? {
+                Ok(())
+            } else {
+                Err(AttachError::InvalidPath {
+                    context: "cache directory is not a dedicated attachment cache",
+                })
+            }
+        }
+        Err(_) => Err(AttachError::Io {
+            context: "creating the cache marker",
+        }),
+    }
+}
+
+/// Best-effort durability of a directory entry after a rename. On Unix this
+/// `fsync`s the parent directory so the rename survives a power loss; Windows
+/// has no portable directory-handle sync, so it is a no-op there.
+fn sync_parent_dir(root: &Path) -> Result<(), AttachError> {
+    #[cfg(unix)]
+    {
+        let dir = std::fs::File::open(root).map_err(|_| AttachError::Io {
+            context: "opening the cache directory for sync",
+        })?;
+        dir.sync_all().map_err(|_| AttachError::Io {
+            context: "syncing the cache directory",
+        })?;
+    }
+    #[cfg(not(unix))]
+    let _ = root;
+    Ok(())
+}
+
+/// Whether a non-symlink regular file exists at `path` (matches the scanner's
+/// `file_type().is_file()` semantics, so symlinks never count as present).
+fn regular_file_exists(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
 }
 
 /// RAII removal of a temp file on any error path.

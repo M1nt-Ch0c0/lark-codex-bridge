@@ -226,6 +226,10 @@ pub const ATTACHMENT_GC_BATCH: usize = 256;
 pub const ATTACHMENT_RECONCILE_BATCH: usize = 4096;
 /// In-cache temp-file name prefix (never a valid SHA-256 name).
 pub const ATTACHMENT_TEMP_PREFIX: &str = ".tmp-";
+/// Cache-directory marker file name proving the directory is a dedicated
+/// attachment cache. Never a valid SHA-256 name, and the reconciliation
+/// scanner deliberately skips it.
+pub const ATTACHMENT_CACHE_MARKER: &str = ".attachment-cache";
 /// Maximum live (`starting`/`running`/`uncertain`) turns retained for crash
 /// recovery. Terminal turns are historical rows and do not occupy this set.
 pub const STORE_RECOVERY_TURN_MAX_ROWS: usize = 32;
