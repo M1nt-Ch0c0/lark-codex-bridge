@@ -509,10 +509,12 @@ impl StoreHandle {
         .await
     }
 
-    /// Deletes terminal (`sent`/`failed`/`uncertain_delivery`) outbox rows
-    /// last updated before `older_than_ms`, in ascending `updated_ms` order,
-    /// returning the number of pruned rows. `max_rows` is clamped to
-    /// [`OUTBOX_SWEEP_BATCH`]; `pending` and `sending` rows are never swept.
+    /// Deletes `sent`/`failed` outbox rows last updated before
+    /// `older_than_ms`, in ascending `updated_ms` order, returning the number
+    /// of pruned rows. `max_rows` is clamped to [`OUTBOX_SWEEP_BATCH`];
+    /// `pending`, `sending`, and `uncertain_delivery` rows are never swept
+    /// (an uncertain row stays parked and visible in `/status` until an
+    /// operator resolves it manually).
     ///
     /// # Errors
     ///
@@ -612,9 +614,9 @@ fn validate_outbox_payload(row: &NewOutboxRow) -> Result<(), StoreError> {
 ///
 /// `connection` is the active `IMMEDIATE` transaction; the payload size must
 /// already have been validated by the caller. The pending/sending capacity
-/// bounds and the terminal-row hard cap (with its bounded inline sweep) are
-/// enforced here, so both the single-row and batch entry points share one code
-/// path.
+/// bounds, the all-states hard cap (with its bounded inline sweep), and the
+/// retry watermark are enforced here, so both the single-row and batch entry
+/// points share one code path.
 fn enqueue_one(
     connection: &rusqlite::Connection,
     row: &NewOutboxRow,
@@ -628,6 +630,7 @@ fn enqueue_one(
             |result| result.get(0),
         )
         .map_err(|error| sqlite_error("checking an outbox idempotency key", &error))?;
+    let mut next_retry_ms = row.next_retry_ms;
     if !exists {
         let (count, bytes): (i64, i64) = connection
             .query_row(
@@ -646,7 +649,24 @@ fn enqueue_one(
                 context: "enqueueing an outbox row",
             });
         }
-        enforce_terminal_cap(connection, payload_bytes)?;
+        enforce_total_cap(connection, payload_bytes)?;
+        // Sequence watermark: a newly enqueued row must never be claimable
+        // before a row that is already parked for retry. The highest retry
+        // time among live (`pending`/`sending`) rows is the watermark; a new
+        // row inherits it so no later enqueue can overtake a failed row whose
+        // retry was already scheduled (global FIFO across poll cycles). A `0`
+        // ("now") next-retry time is preserved: only a positive watermark
+        // raises it, and the watermark is monotonically non-increasing over
+        // time as parked rows are claimed and resolved.
+        let watermark: i64 = connection
+            .query_row(
+                "SELECT COALESCE(MAX(next_retry_ms), 0) FROM outbox
+                 WHERE state IN ('pending', 'sending')",
+                [],
+                |result| result.get(0),
+            )
+            .map_err(|error| sqlite_error("reading the outbox retry watermark", &error))?;
+        next_retry_ms = next_retry_ms.max(watermark);
     }
     let now = now_ms();
     let inserted = connection
@@ -661,7 +681,7 @@ fn enqueue_one(
                 row.kind,
                 row.payload_json,
                 payload_bytes_sql,
-                row.next_retry_ms,
+                next_retry_ms,
                 now,
             ],
         )
@@ -684,18 +704,21 @@ fn enqueue_one(
     })
 }
 
-/// Enforces the terminal-row hard cap before one new row is persisted.
+/// Enforces the all-states hard cap before one new row is persisted.
 ///
-/// The incoming row is a proxy for one future terminal row: if its addition
-/// would cross [`OUTBOX_TERMINAL_MAX_ROWS`] or [`OUTBOX_TERMINAL_MAX_BYTES`],
-/// one bounded inline sweep first frees the oldest overage rows (same SQL as
+/// The cap counts every outbox row regardless of state, so no state transition
+/// can ever push the table past the bound: a row only moves between states and
+/// never changes the total. The incoming row is the proxy for the post-insert
+/// total; if its addition would cross [`OUTBOX_TERMINAL_MAX_ROWS`] or
+/// [`OUTBOX_TERMINAL_MAX_BYTES`], one bounded inline sweep first frees the
+/// oldest overage `sent`/`failed` rows (same SQL as
 /// [`StoreHandle::sweep_terminal_outbox`], clamped to [`OUTBOX_SWEEP_BATCH`]).
 /// Only if the cap would still be crossed does the enqueue fail closed.
-fn enforce_terminal_cap(
+fn enforce_total_cap(
     connection: &rusqlite::Connection,
     payload_bytes: u64,
 ) -> Result<(), StoreError> {
-    let (count, bytes) = terminal_count_bytes(connection)?;
+    let (count, bytes) = total_outbox_count_bytes(connection)?;
     if count.saturating_add(1) <= OUTBOX_TERMINAL_MAX_ROWS
         && bytes.saturating_add(payload_bytes) <= OUTBOX_TERMINAL_MAX_BYTES
     {
@@ -706,7 +729,7 @@ fn enforce_terminal_cap(
         now_ms().saturating_sub(OUTBOX_TERMINAL_RETENTION_MS),
         OUTBOX_SWEEP_BATCH,
     )?;
-    let (count, bytes) = terminal_count_bytes(connection)?;
+    let (count, bytes) = total_outbox_count_bytes(connection)?;
     if count.saturating_add(1) > OUTBOX_TERMINAL_MAX_ROWS
         || bytes.saturating_add(payload_bytes) > OUTBOX_TERMINAL_MAX_BYTES
     {
@@ -717,25 +740,29 @@ fn enforce_terminal_cap(
     Ok(())
 }
 
-/// Terminal (`sent`/`failed`/`uncertain_delivery`) row count and byte total.
-fn terminal_count_bytes(connection: &rusqlite::Connection) -> Result<(u64, u64), StoreError> {
+/// Total outbox row count and payload byte total across all states.
+fn total_outbox_count_bytes(connection: &rusqlite::Connection) -> Result<(u64, u64), StoreError> {
     let (count, bytes): (i64, i64) = connection
         .query_row(
-            "SELECT COUNT(*), COALESCE(SUM(payload_bytes), 0) FROM outbox
-             WHERE state IN ('sent', 'failed', 'uncertain_delivery')",
+            "SELECT COUNT(*), COALESCE(SUM(payload_bytes), 0) FROM outbox",
             [],
             |result| Ok((result.get(0)?, result.get(1)?)),
         )
-        .map_err(|error| sqlite_error("checking terminal outbox capacity", &error))?;
+        .map_err(|error| sqlite_error("checking total outbox capacity", &error))?;
     Ok((
         u64::try_from(count).unwrap_or(u64::MAX),
         u64::try_from(bytes).unwrap_or(u64::MAX),
     ))
 }
 
-/// Deletes up to `max_rows` terminal rows last updated before `older_than_ms`,
-/// in ascending `updated_ms` order. Shared by the periodic pump sweep and the
-/// inline enqueue sweep.
+/// Deletes up to `max_rows` `sent`/`failed` rows last updated before
+/// `older_than_ms`, in ascending `updated_ms` order. Shared by the periodic
+/// pump sweep and the inline enqueue sweep.
+///
+/// `uncertain_delivery` rows are deliberately excluded: they are parked and
+/// must stay visible in `/status` until an operator resolves them manually
+/// (design §9, handoff §2 rule 6), so an automatic sweep must never delete
+/// the evidence of an unknown delivery outcome.
 fn sweep_terminal_rows_inline(
     connection: &rusqlite::Connection,
     older_than_ms: i64,
@@ -750,7 +777,7 @@ fn sweep_terminal_rows_inline(
             "DELETE FROM outbox
              WHERE id IN (
                  SELECT id FROM outbox
-                 WHERE state IN ('sent', 'failed', 'uncertain_delivery')
+                 WHERE state IN ('sent', 'failed')
                    AND updated_ms < ?1
                  ORDER BY updated_ms, id LIMIT ?2
              )",
@@ -842,7 +869,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sweep_deletes_only_overage_terminal_rows() {
+    async fn sweep_deletes_only_overage_sent_and_failed_rows() {
         let store = StoreHandle::open_in_memory().await.expect("store");
         seed_row(&store, "sent_old", OutboxState::Sent, 1_000).await;
         seed_row(&store, "failed_old", OutboxState::Failed, 1_000).await;
@@ -861,11 +888,14 @@ mod tests {
             .sweep_terminal_outbox(5_000, 256)
             .await
             .expect("sweep");
-        assert_eq!(deleted, 3, "the three over-age terminal rows are deleted");
+        assert_eq!(
+            deleted, 2,
+            "only the over-age sent and failed rows are deleted"
+        );
 
         let depth = store.outbox_depth().await.expect("depth");
         assert_eq!(depth.failed, 0);
-        assert_eq!(depth.uncertain, 0);
+        assert_eq!(depth.uncertain, 1, "uncertain rows are never auto-swept");
         assert_eq!(depth.pending, 1, "pending rows are never swept");
         assert_eq!(depth.sending, 1, "sending rows are never swept");
         assert_eq!(
@@ -874,8 +904,9 @@ mod tests {
                 "pending_old".to_owned(),
                 "sending_old".to_owned(),
                 "sent_recent".to_owned(),
+                "uncertain_old".to_owned(),
             ],
-            "only the over-age terminal rows are deleted"
+            "only the over-age sent/failed rows are deleted"
         );
     }
 
@@ -1046,14 +1077,14 @@ mod tests {
             .expect("seed pending rows");
     }
 
-    async fn terminal_rows(store: &StoreHandle) -> u64 {
+    async fn total_rows(store: &StoreHandle) -> u64 {
         store
             .run(|connection| {
-                let (count, _bytes) = terminal_count_bytes(connection)?;
+                let (count, _bytes) = total_outbox_count_bytes(connection)?;
                 Ok(count)
             })
             .await
-            .expect("terminal row count")
+            .expect("total outbox row count")
     }
 
     #[tokio::test]
@@ -1110,7 +1141,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enqueue_sweeps_old_terminal_rows_inline_when_at_hard_cap() {
+    async fn enqueue_sweeps_old_rows_inline_when_at_total_hard_cap() {
         let store = StoreHandle::open_in_memory().await.expect("store");
         let cap = usize::try_from(OUTBOX_TERMINAL_MAX_ROWS).unwrap();
         seed_terminal_rows(&store, cap, 1_000).await;
@@ -1122,20 +1153,16 @@ mod tests {
         assert!(matches!(result, OutboxEnqueue::New(_)));
 
         assert_eq!(
-            terminal_rows(&store).await,
-            u64::try_from(cap - usize::try_from(OUTBOX_SWEEP_BATCH).unwrap()).unwrap(),
-            "one bounded inline sweep frees the oldest terminal rows"
+            total_rows(&store).await,
+            u64::try_from(cap).unwrap() - u64::from(OUTBOX_SWEEP_BATCH) + 1,
+            "one bounded inline sweep frees the oldest sent/failed rows before the new row lands"
         );
         assert_eq!(store.outbox_depth().await.expect("depth").pending, 1);
     }
 
     #[tokio::test]
-    async fn enqueue_fails_closed_when_terminal_rows_are_recent_and_at_hard_cap() {
+    async fn enqueue_fails_closed_when_rows_are_recent_and_at_total_hard_cap() {
         let store = StoreHandle::open_in_memory().await.expect("store");
-        store
-            .enqueue_outbox(new_row("pending_before", 0))
-            .await
-            .expect("pending seed");
         let cap = usize::try_from(OUTBOX_TERMINAL_MAX_ROWS).unwrap();
         seed_terminal_rows(&store, cap, now_ms()).await;
 
@@ -1145,21 +1172,19 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(
-            terminal_rows(&store).await,
+            total_rows(&store).await,
             u64::try_from(cap).unwrap(),
-            "recent terminal rows within retention are never swept"
+            "recent rows within retention are never swept"
         );
-        // The pending/sending path is unaffected: the pre-existing pending row
-        // is still claimable and the rejected row was never persisted.
-        let depth = store.outbox_depth().await.expect("depth");
-        assert_eq!(depth.pending, 1);
-        let claimed = store.claim_outbox_batch(now_ms(), 1).await.expect("claim");
-        assert_eq!(claimed.len(), 1);
-        assert_eq!(claimed[0].idempotency_key, "pending_before");
+        assert_eq!(
+            store.outbox_depth().await.expect("depth").pending,
+            0,
+            "the rejected row was never persisted"
+        );
     }
 
     #[tokio::test]
-    async fn enqueue_within_terminal_cap_is_unaffected() {
+    async fn enqueue_within_total_hard_cap_is_unaffected() {
         let store = StoreHandle::open_in_memory().await.expect("store");
         seed_terminal_rows(&store, 3, now_ms()).await;
 
@@ -1169,11 +1194,139 @@ mod tests {
             .expect("enqueue");
         assert!(matches!(result, OutboxEnqueue::New(_)));
         assert_eq!(
-            terminal_rows(&store).await,
-            3,
-            "terminal rows are untouched"
+            total_rows(&store).await,
+            4,
+            "the new row adds exactly one to the total"
         );
         assert_eq!(store.outbox_depth().await.expect("depth").pending, 1);
+    }
+
+    #[tokio::test]
+    async fn pending_to_sent_transition_stays_within_the_total_hard_cap() {
+        let store = StoreHandle::open_in_memory().await.expect("store");
+        let cap = usize::try_from(OUTBOX_TERMINAL_MAX_ROWS).unwrap();
+        seed_terminal_rows(&store, cap - 1, now_ms()).await;
+
+        let enqueued = store
+            .enqueue_outbox(new_row("p", 0))
+            .await
+            .expect("enqueue");
+        assert!(matches!(enqueued, OutboxEnqueue::New(_)));
+        assert_eq!(
+            total_rows(&store).await,
+            u64::try_from(cap).unwrap(),
+            "the table is exactly at the hard cap"
+        );
+
+        // pending -> sending -> sent: the transition preserves the total, so it
+        // can never push the table past the hard cap (the cap counts all states).
+        let claimed = store.claim_outbox_batch(now_ms(), 1).await.expect("claim");
+        assert_eq!(claimed.len(), 1);
+        store
+            .complete_outbox(claimed[0].id, "om_r")
+            .await
+            .expect("complete");
+        assert_eq!(
+            total_rows(&store).await,
+            u64::try_from(cap).unwrap(),
+            "a state transition preserves the total count"
+        );
+
+        // A further enqueue is now over the cap and fails closed.
+        let result = store.enqueue_outbox(new_row("over", 0)).await;
+        assert!(matches!(result, Err(StoreError::CapacityExceeded { .. })));
+    }
+
+    #[tokio::test]
+    async fn enqueue_applies_the_retry_watermark_to_new_rows() {
+        let store = StoreHandle::open_in_memory().await.expect("store");
+        let retry_ms = now_ms() + 60_000;
+        let first = store
+            .enqueue_outbox(new_row("first", 0))
+            .await
+            .expect("first");
+        let first_id = match &first {
+            OutboxEnqueue::New(row) | OutboxEnqueue::Duplicate(row) => row.id,
+        };
+        let claimed = store.claim_outbox_batch(now_ms(), 1).await.expect("claim");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].id, first_id);
+        store
+            .fail_outbox(first_id, 1, retry_ms, false)
+            .await
+            .expect("fail first");
+
+        // A row enqueued after the deferral snapshot inherits the watermark, so
+        // it can never be claimed before the retrying row.
+        let second = store
+            .enqueue_outbox(new_row("second", 0))
+            .await
+            .expect("second");
+        let second_row = match &second {
+            OutboxEnqueue::New(row) | OutboxEnqueue::Duplicate(row) => row.clone(),
+        };
+        assert!(
+            second_row.next_retry_ms >= retry_ms,
+            "new rows must be parked no earlier than the retrying row ({} >= {})",
+            second_row.next_retry_ms,
+            retry_ms
+        );
+
+        // The failed row claims first once due, preserving global id order.
+        let due = store.claim_outbox_batch(retry_ms, 8).await.expect("claim");
+        assert_eq!(
+            due.iter()
+                .map(|row| row.idempotency_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"],
+            "the retrying row must be claimable before its later successor"
+        );
+    }
+
+    #[tokio::test]
+    async fn enqueue_without_retry_keeps_next_retry_zero() {
+        let store = StoreHandle::open_in_memory().await.expect("store");
+        store.enqueue_outbox(new_row("a", 0)).await.expect("a");
+        let second = store.enqueue_outbox(new_row("b", 0)).await.expect("b");
+        let row = match second {
+            OutboxEnqueue::New(row) | OutboxEnqueue::Duplicate(row) => row,
+        };
+        assert_eq!(
+            row.next_retry_ms, 0,
+            "with no parked retry the watermark is 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_watermark_ignores_terminal_rows() {
+        let store = StoreHandle::open_in_memory().await.expect("store");
+        // A terminal row parked far in the future must not raise the watermark.
+        store
+            .run(|connection| {
+                connection
+                    .execute(
+                        "INSERT INTO outbox
+                         (idempotency_key, scope_key, kind, payload_json, payload_bytes,
+                          state, attempts, next_retry_ms, receipt_message_id, created_ms, updated_ms)
+                         VALUES ('done', 'im:oc', 'final', '{}', 2, 'sent', 1, ?1, 'om_r', 1, 1)",
+                        params![now_ms() + 9_999_999],
+                    )
+                    .map_err(|error| sqlite_error("seeding a sent row", &error))?;
+                Ok(())
+            })
+            .await
+            .expect("seed sent row");
+        let enqueued = store
+            .enqueue_outbox(new_row("new", 0))
+            .await
+            .expect("enqueue");
+        let row = match enqueued {
+            OutboxEnqueue::New(row) | OutboxEnqueue::Duplicate(row) => row,
+        };
+        assert_eq!(
+            row.next_retry_ms, 0,
+            "terminal next_retry_ms must not raise the watermark"
+        );
     }
 
     #[tokio::test]

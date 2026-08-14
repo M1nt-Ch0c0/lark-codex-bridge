@@ -275,11 +275,15 @@ pub const OUTBOX_TERMINAL_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 pub const OUTBOX_SWEEP_BATCH: u32 = 256;
 /// Interval between bounded outbox terminal sweeps.
 pub const OUTBOX_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
-/// Hard upper bound on terminal (`sent`/`failed`/`uncertain_delivery`) outbox
-/// rows. The periodic sweep only frees rows past the retention window, so a
-/// burst of terminal rows can outrun it; enqueue fails closed (after one
-/// bounded inline sweep) once this cap is reached instead of letting the table
-/// grow without bound.
+/// Hard upper bound on the total outbox row count across **all** states
+/// (`pending`, `sending`, `sent`, `failed`, `uncertain_delivery`). Counting
+/// every state means no state transition can ever push the table past the
+/// bound (a row only moves between states, never changing the total). The
+/// periodic sweep only frees `sent`/`failed` rows past the retention window,
+/// so a burst of rows can outrun it; enqueue fails closed (after one bounded
+/// inline sweep) once this cap is reached instead of letting the table grow
+/// without bound.
 pub const OUTBOX_TERMINAL_MAX_ROWS: u64 = 65_536;
-/// Hard upper bound on payload bytes retained by terminal outbox rows.
+/// Hard upper bound on payload bytes retained by the outbox table across all
+/// states (see [`OUTBOX_TERMINAL_MAX_ROWS`]).
 pub const OUTBOX_TERMINAL_MAX_BYTES: u64 = 256 * 1024 * 1024;

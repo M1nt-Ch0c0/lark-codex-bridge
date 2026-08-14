@@ -243,6 +243,29 @@ async fn wait_for_state(
     }
 }
 
+async fn wait_for_attempts(
+    store: &StoreHandle,
+    id: i64,
+    want: u32,
+) -> lark_codex_bridge::store::OutboxRow {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let row = store
+            .outbox_row(id)
+            .await
+            .expect("row read")
+            .expect("row must exist");
+        if row.attempts == want {
+            return row;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for attempts=={want}; last {row:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // A2: versioned, strict payload codec.
 // ---------------------------------------------------------------------------
@@ -955,6 +978,67 @@ async fn retryable_failure_defers_pending_successors_across_poll_cycles() {
             "third".to_owned(),
         ],
         "the failed row must be retried before any pending successor is claimed"
+    );
+
+    pump.shutdown().await;
+}
+
+#[tokio::test]
+async fn concurrent_enqueue_after_retry_does_not_overtake_the_failed_row() {
+    let replies = Arc::new(AtomicUsize::new(0));
+    let server = StubServer::start(token_plus({
+        let replies = Arc::clone(&replies);
+        move |_| {
+            if replies.fetch_add(1, Ordering::SeqCst) == 0 {
+                StubResponse::json(200, r#"{"code":230001,"msg":"busy"}"#)
+            } else {
+                ok_message("om_delivered")
+            }
+        }
+    }))
+    .await;
+    let api = api_for(&server);
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let first = enqueue_reply(&store, "1:final:evt_1", "om_parent", None, "first").await;
+    let (_, rx) = watch::channel(TransportState::Connected);
+    let pump = OutboxPump::spawn(store.clone(), api, rx, slow_retry_config());
+
+    // The first row fails once and is parked for its retry; the deferral
+    // snapshot has already been taken by now.
+    let failed = wait_for_attempts(&store, first, 1).await;
+    assert_eq!(failed.state, OutboxState::Pending);
+
+    // A row enqueued after the snapshot must inherit the retry watermark and
+    // therefore can never be claimed before the failed row.
+    let second = enqueue_reply(&store, "2:final:evt_2", "om_parent", None, "second").await;
+    let second_row = store
+        .outbox_row(second)
+        .await
+        .expect("row")
+        .expect("exists");
+    assert!(
+        second_row.next_retry_ms >= failed.next_retry_ms,
+        "the concurrent successor must be parked no earlier than the failed row ({} >= {})",
+        second_row.next_retry_ms,
+        failed.next_retry_ms
+    );
+
+    let first_row = wait_for_state(&store, first, OutboxState::Sent).await;
+    let second_row = wait_for_state(&store, second, OutboxState::Sent).await;
+    assert_eq!(
+        first_row.receipt_message_id.as_deref(),
+        Some("om_delivered")
+    );
+    assert_eq!(
+        second_row.receipt_message_id.as_deref(),
+        Some("om_delivered")
+    );
+
+    let texts: Vec<String> = reply_requests(&server).iter().map(reply_text).collect();
+    assert_eq!(
+        texts,
+        vec!["first".to_owned(), "first".to_owned(), "second".to_owned(),],
+        "the failed row must be retried before the concurrent successor"
     );
 
     pump.shutdown().await;

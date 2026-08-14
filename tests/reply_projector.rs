@@ -187,15 +187,50 @@ fn short_streamed_answer_below_threshold_is_delivered_as_final() {
 }
 
 #[test]
-fn streamed_emitted_content_is_not_resent_as_final() {
-    // Once Progress is actually emitted, the shown content is finalized in
-    // place (contract 5) and must not be re-sent as the final.
+fn final_answer_delta_never_emits_progress_and_buffer_is_dropped() {
+    // An AgentMessageDelta carries no phase, so a FinalAnswer item's delta must
+    // not leak out as progress while it streams; once the item completes as
+    // FinalAnswer, its buffered delta is dropped (the content belongs to the
+    // terminal projection, never the progress view — contract 2).
+    let mut projector = ReplyProjector::new(eager_config());
+    let now = Instant::now();
+
+    assert!(matches!(
+        projector.observe(&delta_for("a1", "the final answer"), now),
+        ProjectorOutput::Nothing,
+    ));
+    assert!(matches!(
+        projector.observe(
+            &completed("a1", "the final answer", Some(MessagePhase::FinalAnswer)),
+            now
+        ),
+        ProjectorOutput::Nothing,
+    ));
+
+    let turn = outcome(
+        vec![agent(
+            "a1",
+            "the final answer",
+            Some(MessagePhase::FinalAnswer),
+        )],
+        TurnStatus::Completed,
+    );
+    match projector.finish(&turn) {
+        ProjectedReply::Final { parts } => assert_eq!(parts, vec!["the final answer"]),
+        ProjectedReply::Empty => panic!("expected the standalone final"),
+    }
+}
+
+#[test]
+fn emitted_content_is_not_resent_as_final() {
+    // Once Progress is actually emitted (at completion), the shown content is
+    // finalized in place (contract 5) and must not be re-sent as the final.
     let mut projector = ReplyProjector::new(low_chars_config());
     let now = Instant::now();
-    assert!(matches!(
-        projector.observe(&delta("abc"), now),
-        ProjectorOutput::Progress { .. }
-    ));
+    match projector.observe(&completed("a1", "abc", Some(MessagePhase::Commentary)), now) {
+        ProjectorOutput::Progress { .. } => {}
+        ProjectorOutput::Nothing => panic!("the completed item must emit"),
+    }
     let turn = outcome(
         vec![agent("a1", "abc", Some(MessagePhase::Commentary))],
         TurnStatus::Completed,
@@ -204,26 +239,59 @@ fn streamed_emitted_content_is_not_resent_as_final() {
 }
 
 #[test]
-fn partial_stream_emits_only_the_unshown_remainder_as_final() {
+fn unshown_buffered_text_after_emit_is_delivered_as_final() {
     // After one Progress emission, the not-yet-displayed buffer tail is the
     // only content left to deliver as the final.
     let mut projector = ReplyProjector::new(low_chars_config());
     let now = Instant::now();
     assert!(matches!(
-        projector.observe(&delta("abc"), now),
+        projector.observe(&completed("a1", "abc", Some(MessagePhase::Commentary)), now),
         ProjectorOutput::Progress { .. }
     ));
     assert!(matches!(
-        projector.observe(&delta("de"), now),
-        ProjectorOutput::Nothing
+        projector.observe(&completed("a2", "de", Some(MessagePhase::Commentary)), now),
+        ProjectorOutput::Nothing,
     ));
     let turn = outcome(
-        vec![agent("a1", "abcde", Some(MessagePhase::Commentary))],
+        vec![
+            agent("a1", "abc", Some(MessagePhase::Commentary)),
+            agent("a2", "de", Some(MessagePhase::Commentary)),
+        ],
         TurnStatus::Completed,
     );
     match projector.finish(&turn) {
         ProjectedReply::Final { parts } => assert_eq!(parts, vec!["de"]),
-        ProjectedReply::Empty => panic!("the unstreamed remainder must be delivered"),
+        ProjectedReply::Empty => panic!("the unshown remainder must be delivered"),
+    }
+}
+
+#[test]
+fn unshown_residual_delta_after_emit_is_delivered_as_final() {
+    // A later item that streamed deltas but never completed is un-shown
+    // residual content: after an earlier item emitted progress, the residual
+    // delta buffer is delivered as the final instead of being re-sent or lost.
+    let mut projector = ReplyProjector::new(low_chars_config());
+    let now = Instant::now();
+    assert!(matches!(
+        projector.observe(&delta_for("a1", "abc"), now),
+        ProjectorOutput::Nothing,
+    ));
+    assert!(matches!(
+        projector.observe(&completed("a1", "abc", Some(MessagePhase::Commentary)), now),
+        ProjectorOutput::Progress { .. }
+    ));
+    assert!(matches!(
+        projector.observe(&delta_for("a2", "de"), now),
+        ProjectorOutput::Nothing,
+    ));
+
+    let turn = outcome(
+        vec![agent("a1", "abc", Some(MessagePhase::Commentary))],
+        TurnStatus::Completed,
+    );
+    match projector.finish(&turn) {
+        ProjectedReply::Final { parts } => assert_eq!(parts, vec!["de"]),
+        ProjectedReply::Empty => panic!("the un-shown residual must be delivered"),
     }
 }
 
@@ -316,25 +384,25 @@ fn observe_throttles_by_interval_and_char_count() {
 
     // Below the character threshold: no progress yet.
     assert!(matches!(
-        projector.observe(&delta("ab"), t0),
+        projector.observe(&completed("a", "ab", Some(MessagePhase::Commentary)), t0),
         ProjectorOutput::Nothing
     ));
     // Crossing the character threshold emits the accumulated text.
-    assert!(matches!(
-        projector.observe(&delta("cde"), t0),
-        ProjectorOutput::Progress { .. }
-    ));
+    match projector.observe(&completed("b", "cde", Some(MessagePhase::Commentary)), t0) {
+        ProjectorOutput::Progress { text } => assert_eq!(text, "abcde"),
+        ProjectorOutput::Nothing => panic!("crossing the threshold must emit"),
+    }
 
     // Inside the interval: further text is not emitted.
     let t1 = t0 + Duration::from_secs(1);
     assert!(matches!(
-        projector.observe(&delta("xyz"), t1),
+        projector.observe(&completed("c", "xyz", Some(MessagePhase::Commentary)), t1),
         ProjectorOutput::Nothing
     ));
 
     // After the interval, new text is emitted again.
     let t2 = t1 + Duration::from_millis(600);
-    match projector.observe(&delta("more"), t2) {
+    match projector.observe(&completed("d", "more", Some(MessagePhase::Commentary)), t2) {
         ProjectorOutput::Progress { text } => {
             assert!(text.contains("xyz") || text.contains("more"));
         }
@@ -343,24 +411,24 @@ fn observe_throttles_by_interval_and_char_count() {
 }
 
 #[test]
-fn same_item_delta_then_completed_is_not_double_counted() {
+fn same_item_delta_then_completed_is_emitted_once_at_completion() {
     // Codex streams an item as deltas and then completes it with the same full
-    // text. The completed event must not append text the deltas already
-    // covered, or the same answer would be counted twice.
+    // text. Deltas are never emitted on their own; the completed event emits
+    // the merged text exactly once.
     let mut projector = ReplyProjector::new(eager_config());
     let now = Instant::now();
 
-    match projector.observe(&delta_for("item_1", "hello"), now) {
-        ProjectorOutput::Progress { text } => assert_eq!(text, "hello"),
-        ProjectorOutput::Nothing => panic!("the streamed delta must emit"),
-    }
     assert!(matches!(
-        projector.observe(
-            &completed("item_1", "hello", Some(MessagePhase::Commentary)),
-            now
-        ),
+        projector.observe(&delta_for("item_1", "hello"), now),
         ProjectorOutput::Nothing,
     ));
+    match projector.observe(
+        &completed("item_1", "hello", Some(MessagePhase::Commentary)),
+        now,
+    ) {
+        ProjectorOutput::Progress { text } => assert_eq!(text, "hello"),
+        ProjectorOutput::Nothing => panic!("the completed item must emit once"),
+    }
 
     let turn = outcome(
         vec![agent("item_1", "hello", Some(MessagePhase::Commentary))],
@@ -417,14 +485,19 @@ fn multiple_items_stream_and_complete_without_duplication() {
     let mut projector = ReplyProjector::new(eager_config());
     let now = Instant::now();
 
-    match projector.observe(&delta_for("a", "abc"), now) {
-        ProjectorOutput::Progress { text } => assert_eq!(text, "abc"),
-        ProjectorOutput::Nothing => panic!("item a must emit"),
-    }
+    // Item a: deltas accumulate without emitting; completion emits once.
     assert!(matches!(
-        projector.observe(&completed("a", "abc", Some(MessagePhase::Commentary)), now),
+        projector.observe(&delta_for("a", "ab"), now),
         ProjectorOutput::Nothing,
     ));
+    assert!(matches!(
+        projector.observe(&delta_for("a", "c"), now),
+        ProjectorOutput::Nothing,
+    ));
+    match projector.observe(&completed("a", "abc", Some(MessagePhase::Commentary)), now) {
+        ProjectorOutput::Progress { text } => assert_eq!(text, "abc"),
+        ProjectorOutput::Nothing => panic!("item a must emit once at completion"),
+    }
     match projector.observe(
         &completed("b", "world", Some(MessagePhase::Commentary)),
         now,
@@ -439,6 +512,31 @@ fn multiple_items_stream_and_complete_without_duplication() {
     match projector.observe(&completed("c", "xyz", Some(MessagePhase::Commentary)), now) {
         ProjectorOutput::Progress { text } => assert_eq!(text, "xyz"),
         ProjectorOutput::Nothing => panic!("item c must emit the merged tail"),
+    }
+}
+
+#[test]
+fn interleaved_item_deltas_and_completions_do_not_duplicate() {
+    // Even when two items' deltas interleave (violating the single-item
+    // assumption), each item's completion emits its full text exactly once.
+    let mut projector = ReplyProjector::new(eager_config());
+    let now = Instant::now();
+
+    assert!(matches!(
+        projector.observe(&delta_for("a", "ab"), now),
+        ProjectorOutput::Nothing,
+    ));
+    assert!(matches!(
+        projector.observe(&delta_for("b", "xy"), now),
+        ProjectorOutput::Nothing,
+    ));
+    match projector.observe(&completed("a", "abc", Some(MessagePhase::Commentary)), now) {
+        ProjectorOutput::Progress { text } => assert_eq!(text, "abc"),
+        ProjectorOutput::Nothing => panic!("item a must emit once"),
+    }
+    match projector.observe(&completed("b", "xyz", Some(MessagePhase::Commentary)), now) {
+        ProjectorOutput::Progress { text } => assert_eq!(text, "xyz"),
+        ProjectorOutput::Nothing => panic!("item b must emit once"),
     }
 }
 
