@@ -139,6 +139,14 @@ pub struct ReplyProjector {
     /// phase, so the item's role (final answer vs. progress) is only known when
     /// its `ItemCompleted` arrives.
     current_item_buffer: String,
+    /// Id of the most recently completed progress item. A single slot is
+    /// enough and bounded (`O(1)`): Codex delivers one agent message to
+    /// completion before the next item, so a duplicate `ItemCompleted` for the
+    /// same item is recognized and dropped. A later item overwrites the slot,
+    /// matching the existing single-slot delta buffer; an out-of-order
+    /// duplicate of an earlier item is rare and the slot keeps no unbounded
+    /// per-item memory.
+    last_completed_item_id: Option<String>,
 }
 
 impl ReplyProjector {
@@ -152,6 +160,7 @@ impl ReplyProjector {
             streamed: false,
             current_item_id: None,
             current_item_buffer: String::new(),
+            last_completed_item_id: None,
         }
     }
 
@@ -204,6 +213,14 @@ impl ReplyProjector {
                     self.drop_item_buffer(id);
                     return ProjectorOutput::Nothing;
                 }
+                if self.last_completed_item_id.as_deref() == Some(id.as_str()) {
+                    // A duplicate `ItemCompleted` for the item already emitted:
+                    // its full text was appended once, and the single-item
+                    // delta buffer is now cleared, so replaying it would
+                    // re-append the whole text (`tail_beyond(text, 0)`).
+                    return ProjectorOutput::Nothing;
+                }
+                self.last_completed_item_id = Some(id.to_owned());
                 // A non-final item's whole text becomes progress. Move the
                 // not-yet-emitted delta prefix into the progress buffer and
                 // append only the tail the deltas did not cover.
@@ -342,6 +359,10 @@ impl fmt::Debug for ReplyProjector {
             .field(
                 "current_item_buffer_chars",
                 &self.current_item_buffer.chars().count(),
+            )
+            .field(
+                "has_last_completed_item",
+                &self.last_completed_item_id.is_some(),
             )
             .finish_non_exhaustive()
     }

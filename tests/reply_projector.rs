@@ -541,6 +541,75 @@ fn interleaved_item_deltas_and_completions_do_not_duplicate() {
 }
 
 #[test]
+fn duplicate_item_completed_is_not_replayed() {
+    // A duplicate `ItemCompleted` for an item already emitted must be a no-op:
+    // the single-item delta buffer is already cleared, so re-appending the full
+    // text would double-count the same content.
+    let mut projector = ReplyProjector::new(eager_config());
+    let now = Instant::now();
+
+    match projector.observe(
+        &completed("item_1", "hello", Some(MessagePhase::Commentary)),
+        now,
+    ) {
+        ProjectorOutput::Progress { text } => assert_eq!(text, "hello"),
+        ProjectorOutput::Nothing => panic!("the first completed must emit once"),
+    }
+    assert!(matches!(
+        projector.observe(
+            &completed("item_1", "hello", Some(MessagePhase::Commentary)),
+            now
+        ),
+        ProjectorOutput::Nothing
+    ));
+}
+
+#[test]
+fn distinct_items_still_emit_independently_after_dedup() {
+    // The single dedup slot overwrites per item, so a genuinely new item must
+    // still emit even after a prior item completed.
+    let mut projector = ReplyProjector::new(eager_config());
+    let now = Instant::now();
+
+    match projector.observe(&completed("a", "abc", Some(MessagePhase::Commentary)), now) {
+        ProjectorOutput::Progress { text } => assert_eq!(text, "abc"),
+        ProjectorOutput::Nothing => panic!("item a must emit"),
+    }
+    match projector.observe(&completed("b", "def", Some(MessagePhase::Commentary)), now) {
+        ProjectorOutput::Progress { text } => assert_eq!(text, "def"),
+        ProjectorOutput::Nothing => panic!("item b must emit"),
+    }
+}
+
+#[test]
+fn duplicate_final_item_completed_stays_dropped() {
+    // A repeated `ItemCompleted` for a FinalAnswer item is still dropped, never
+    // replayed as progress; the terminal projection is unaffected.
+    let mut projector = ReplyProjector::new(eager_config());
+    let now = Instant::now();
+    for _ in 0..2 {
+        assert!(matches!(
+            projector.observe(
+                &completed("a1", "final", Some(MessagePhase::FinalAnswer)),
+                now
+            ),
+            ProjectorOutput::Nothing
+        ));
+    }
+    let turn = outcome(
+        vec![agent("a1", "final", Some(MessagePhase::FinalAnswer))],
+        TurnStatus::Completed,
+    );
+    assert_eq!(
+        projector.finish(&turn),
+        ProjectedReply::Final {
+            parts: vec!["final".to_owned()]
+        },
+        "the final must still be delivered"
+    );
+}
+
+#[test]
 fn debug_output_never_leaks_agent_text() {
     let projector = ReplyProjector::with_defaults();
     let rendered = format!("{projector:?}");

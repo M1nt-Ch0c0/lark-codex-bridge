@@ -7,9 +7,9 @@ use lark_codex_bridge::lark::config::TenantBrand;
 use lark_codex_bridge::lark::credentials::LarkCredentials;
 use lark_codex_bridge::lark::normalize::{InboundEvent, ScopeKey};
 use lark_codex_bridge::limits::{
-    STORE_OUTBOX_CLAIM_MAX_BYTES, STORE_OUTBOX_MAX_QUEUED_BYTES, STORE_OUTBOX_PAYLOAD_MAX_BYTES,
-    STORE_RECOVERY_TURN_MAX_BYTES, STORE_RECOVERY_TURN_MAX_ROWS, STORE_REQUEST_MAX_BYTES,
-    STORE_WRITER_BYTE_BUDGET, STORE_WRITER_CAPACITY,
+    OUTBOX_TERMINAL_MAX_ROWS, STORE_OUTBOX_CLAIM_MAX_BYTES, STORE_OUTBOX_MAX_QUEUED_BYTES,
+    STORE_OUTBOX_PAYLOAD_MAX_BYTES, STORE_RECOVERY_TURN_MAX_BYTES, STORE_RECOVERY_TURN_MAX_ROWS,
+    STORE_REQUEST_MAX_BYTES, STORE_WRITER_BYTE_BUDGET, STORE_WRITER_CAPACITY,
 };
 use lark_codex_bridge::runtime::intake::DurableIntake;
 use lark_codex_bridge::runtime::intake::TenantNamespace;
@@ -1508,6 +1508,133 @@ async fn atomic_rejection_notice_rolls_back_at_real_outbox_byte_capacity() {
             .await
             .expect("rollback state"),
         Some(InboundEventState::Received)
+    );
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn rejection_notice_inherits_the_retry_watermark() {
+    let store = StoreHandle::open_in_memory().await.expect("open");
+    // Park a row for retry: enqueue, claim, then fail it retryably so it goes
+    // back to `pending` with a future retry time.
+    store
+        .enqueue_outbox(outbox("watermark-first", "first"))
+        .await
+        .expect("enqueue first");
+    let retry_ms = 60_000_000;
+    let claimed = store.claim_outbox_batch(i64::MAX, 1).await.expect("claim");
+    assert_eq!(claimed.len(), 1);
+    store
+        .fail_outbox(claimed[0].id, 1, retry_ms, false)
+        .await
+        .expect("fail first");
+
+    let tenant = tenant_namespace("cli_notice_watermark");
+    let inbound = event("event-notice-watermark", "message-notice-watermark");
+    store
+        .register_inbound(&tenant, &inbound)
+        .await
+        .expect("register");
+    let notice = outbox("watermark-notice", "body");
+    assert_eq!(
+        store
+            .reject_received_and_enqueue_notice(
+                &InboundKey::new(tenant, inbound.event_id),
+                InboundRejectionKind::Policy,
+                notice.clone(),
+            )
+            .await
+            .expect("atomic reject+notice"),
+        InboundDisposition::Rejected
+    );
+
+    let claimed = store
+        .claim_outbox_batch(i64::MAX, 8)
+        .await
+        .expect("claim all");
+    assert_eq!(
+        claimed
+            .iter()
+            .map(|row| row.idempotency_key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["watermark-first", "watermark-notice"],
+        "the parked row claims before the notice (global id order)"
+    );
+    let notice_row = claimed
+        .iter()
+        .find(|row| row.idempotency_key == notice.idempotency_key)
+        .expect("notice row");
+    assert_eq!(
+        notice_row.next_retry_ms, retry_ms,
+        "the notice inherits the parked row's retry watermark"
+    );
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn rejection_notice_respects_the_all_states_total_hard_cap() {
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("notice-total-cap.sqlite");
+    // Open once to migrate the schema, then shut down so a raw connection can
+    // seed terminal rows putting the table exactly at the all-states hard cap.
+    let seed_store = StoreHandle::open(&path).await.expect("open seed store");
+    seed_store.shutdown().await.expect("shutdown seed store");
+
+    let mut connection = rusqlite::Connection::open(&path).expect("raw seed connection");
+    let transaction = connection.transaction().expect("seed transaction");
+    {
+        let mut statement = transaction
+            .prepare(
+                "INSERT INTO outbox
+                 (idempotency_key, scope_key, kind, payload_json, payload_bytes,
+                  state, attempts, next_retry_ms, receipt_message_id, created_ms, updated_ms)
+                 VALUES (?1, 'im:oc_test', 'final', '', 0, 'sent', 1, 0, 'om_r', 1, 1)",
+            )
+            .expect("prepare terminal seed");
+        let cap = usize::try_from(OUTBOX_TERMINAL_MAX_ROWS).unwrap();
+        for index in 0..cap {
+            statement
+                .execute(rusqlite::params![format!("term:{index}")])
+                .expect("insert terminal row");
+        }
+    }
+    transaction.commit().expect("commit seed");
+    drop(connection);
+
+    let store = StoreHandle::open(&path).await.expect("reopen store");
+    let tenant = tenant_namespace("cli_notice_total_cap");
+    let inbound = event("event-notice-total-cap", "message-notice-total-cap");
+    store
+        .register_inbound(&tenant, &inbound)
+        .await
+        .expect("register");
+    assert!(matches!(
+        store
+            .reject_received_and_enqueue_notice(
+                &InboundKey::new(tenant.clone(), inbound.event_id.clone()),
+                InboundRejectionKind::Overloaded,
+                outbox("total-cap-notice", "x"),
+            )
+            .await,
+        Err(StoreError::CapacityExceeded { .. })
+    ));
+    assert_eq!(
+        store
+            .inbound_state(&tenant, &inbound.event_id)
+            .await
+            .expect("state"),
+        Some(InboundEventState::Received),
+        "the rejection must roll back, leaving the inbound row received"
+    );
+    assert_eq!(
+        store.recover_received(&tenant).await.expect("replay").len(),
+        1,
+        "the received row is retained for the existing retry path"
+    );
+    assert_eq!(
+        store.outbox_depth().await.expect("depth").pending,
+        0,
+        "the notice must roll back, leaving no pending row"
     );
     store.shutdown().await.expect("shutdown");
 }
