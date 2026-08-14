@@ -331,6 +331,40 @@ async fn lease_protects_file_from_gc_until_released() {
 }
 
 #[tokio::test]
+async fn gc_batch_bounds_rows_inspected_even_when_every_row_is_leased() {
+    let temp = tempdir().expect("tempdir");
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let limits = AttachmentLimits {
+        gc_age: Duration::ZERO,
+        max_cache_files: 0,
+        max_cache_bytes: 0,
+        gc_batch: 2,
+        ..AttachmentLimits::default()
+    };
+    let cache = cache(
+        temp.path(),
+        store.clone(),
+        downloader(&[("a", b"one"), ("b", b"two"), ("c", b"three")]),
+        limits,
+    );
+
+    for (index, key) in ["a", "b", "c"].into_iter().enumerate() {
+        let turn = record_turn(&store, &format!("leased-{index}")).await;
+        cache
+            .fetch("om_test", &desc(key, ResourceKind::File), turn)
+            .await
+            .expect("fetch");
+    }
+
+    let stats = cache.gc().await.expect("gc");
+    assert_eq!(stats.inspected, 2, "the pass must stop at its row budget");
+    assert_eq!(stats.skipped_leased, 2);
+    assert_eq!(stats.evicted, 0);
+    assert_eq!(store.list_attachments().await.expect("list").len(), 3);
+    let _ = store.shutdown().await;
+}
+
+#[tokio::test]
 async fn gc_evicts_oldest_unleased_first_by_last_used() {
     let temp = tempdir().expect("tempdir");
     let store = StoreHandle::open_in_memory().await.expect("store");
@@ -581,6 +615,7 @@ async fn reconcile_streams_bounded_deletions_and_preserves_valid_entries() {
     let mut max_deletions = 0_u64;
     for _ in 0..(total + 2) {
         let stats = cache.reconcile().await.expect("reconcile");
+        assert!(stats.scanned_entries <= batch_cap);
         let deletions = stats.temp_files + stats.orphan_files + stats.corrupt_files;
         assert!(
             deletions <= batch_cap,
@@ -1195,6 +1230,10 @@ fn reconcile_batch_zero_is_clamped_to_at_least_one() {
         limits.reconcile_batch >= 1,
         "a zero reconcile_batch must be clamped to a positive minimum"
     );
+    assert!(
+        limits.reconcile_batch <= lark_codex_bridge::limits::ATTACHMENT_RECONCILE_BATCH,
+        "reconcile_batch must not exceed the global scan bound"
+    );
 }
 
 #[tokio::test]
@@ -1214,8 +1253,9 @@ async fn reconcile_batch_zero_still_converges() {
     for index in 0..3 {
         std::fs::write(temp.path().join(format!(".tmp-{index}")), b"x").expect("temp");
     }
-    for _ in 0..4 {
+    for _ in 0..8 {
         let stats = cache.reconcile().await.expect("reconcile");
+        assert!(stats.scanned_entries <= 1);
         assert!(
             stats.temp_files <= 1,
             "a clamped batch must delete at most one file per pass"
@@ -1258,7 +1298,7 @@ async fn second_open_in_the_same_directory_fails_closed() {
 }
 
 #[tokio::test]
-async fn removing_the_lock_lets_a_later_instance_reopen() {
+async fn dropping_the_file_lock_lets_a_later_instance_reopen() {
     let temp = tempdir().expect("tempdir");
     let root = temp.path().join("cache");
     let store = StoreHandle::open_in_memory().await.expect("store");
@@ -1273,7 +1313,10 @@ async fn removing_the_lock_lets_a_later_instance_reopen() {
     let lock = root.join(ATTACHMENT_INSTANCE_LOCK);
     assert!(lock.is_file());
     drop(first);
-    assert!(!lock.exists(), "dropping the cache must release the lock");
+    assert!(
+        lock.is_file(),
+        "the stable lock path remains while the kernel lock is released"
+    );
 
     let _second = AttachmentCache::open(
         &root,
@@ -1286,14 +1329,13 @@ async fn removing_the_lock_lets_a_later_instance_reopen() {
 }
 
 #[tokio::test]
-async fn stale_lock_is_replaced_and_reopen_succeeds() {
+async fn an_existing_unlocked_lock_file_can_be_reused() {
     let temp = tempdir().expect("tempdir");
     let root = temp.path().join("cache");
     let store = StoreHandle::open_in_memory().await.expect("store");
 
-    // First life creates a valid marker + lock, then exits cleanly (the guard
-    // removes the lock). We then plant a backdated lock file to simulate a
-    // crash that left one behind past the stale threshold.
+    // First life creates the stable lock path, then exits. The next owner must
+    // lock the same inode without deleting or replacing it.
     {
         let _first = AttachmentCache::open(
             &root,
@@ -1304,29 +1346,16 @@ async fn stale_lock_is_replaced_and_reopen_succeeds() {
         .expect("first open");
     }
     let lock = root.join(ATTACHMENT_INSTANCE_LOCK);
-    assert!(!lock.exists(), "clean exit must have removed the lock");
-    {
-        let file = std::fs::File::options()
-            .write(true)
-            .create_new(true)
-            .open(&lock)
-            .expect("recreate lock");
-        file.set_modified(SystemTime::now() - Duration::from_secs(48 * 60 * 60))
-            .expect("backdate lock");
-    }
+    assert!(lock.is_file(), "the stable lock file remains after drop");
 
-    // The backdated lock is stale, so open must replace it and succeed.
     let _reopened = AttachmentCache::open(
         &root,
         store.clone(),
         downloader(&[]),
         AttachmentLimits::default(),
     )
-    .expect("stale lock must be replaced");
-    assert!(
-        lock.is_file(),
-        "a fresh lock is created in place of the stale one"
-    );
+    .expect("the unlocked stable file can be acquired");
+    assert!(lock.is_file());
     let _ = store.shutdown().await;
 }
 

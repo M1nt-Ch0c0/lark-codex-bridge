@@ -17,6 +17,7 @@ bytes = "1.12.1"
 clap = { version = "4.6.6", features = ["derive"] }
 flate2 = "1.1.9"
 futures-util = "0.3.34"
+fs2 = "0.4.3"
 prost = { version = "0.14.4", default-features = false, features = ["derive", "std"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "multipart", "form"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }

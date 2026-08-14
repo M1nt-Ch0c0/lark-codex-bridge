@@ -192,4 +192,9 @@ CREATE TABLE attachment_scan_cursor (
 );
 ",
     },
+    Migration {
+        version: 4,
+        name: "remove obsolete attachment scan cursor",
+        sql: "DROP TABLE attachment_scan_cursor;",
+    },
 ];
