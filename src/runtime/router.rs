@@ -156,6 +156,30 @@ impl From<SupervisorError> for RouteError {
     }
 }
 
+/// One route failure together with the event only when the router never
+/// accepted ownership of it.
+pub(crate) struct RouteAttemptError {
+    error: RouteError,
+    event: Option<Box<QueuedInboundEvent>>,
+}
+
+impl RouteAttemptError {
+    pub(crate) fn into_parts(self) -> (RouteError, Option<Box<QueuedInboundEvent>>) {
+        (self.error, self.event)
+    }
+
+    fn retained(error: RouteError, event: Box<QueuedInboundEvent>) -> Self {
+        Self {
+            error,
+            event: Some(event),
+        }
+    }
+
+    fn consumed(error: RouteError) -> Self {
+        Self { error, event: None }
+    }
+}
+
 /// Bounded structural router diagnostics.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RouterSnapshot {
@@ -236,22 +260,45 @@ impl RouterHandle {
     /// Returns a static classification when the bounded queue, store, or sink
     /// cannot accept the event.
     pub async fn route(&self, event: QueuedInboundEvent) -> Result<(), RouteError> {
+        self.route_recoverable(event)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    /// Routes one durable event while returning it only if this handle never
+    /// transferred ownership to the router task.
+    pub(crate) async fn route_recoverable(
+        &self,
+        event: QueuedInboundEvent,
+    ) -> Result<(), RouteAttemptError> {
+        let event = Box::new(event);
         let bytes = event.permit.num_permits();
-        let bytes = u32::try_from(bytes).map_err(|_| RouteError::Capacity)?;
-        let queue_permit = self
-            .byte_budget
-            .clone()
-            .try_acquire_many_owned(bytes)
-            .map_err(|_| RouteError::Capacity)?;
+        let Ok(bytes) = u32::try_from(bytes) else {
+            return Err(RouteAttemptError::retained(RouteError::Capacity, event));
+        };
+        let Ok(queue_permit) = self.byte_budget.clone().try_acquire_many_owned(bytes) else {
+            return Err(RouteAttemptError::retained(RouteError::Capacity, event));
+        };
         let (respond, wait) = oneshot::channel();
-        self.sender
-            .try_send(RouterCommand::Route {
-                event: Box::new(event),
-                _queue_permit: queue_permit,
-                respond,
-            })
-            .map_err(|_| RouteError::Capacity)?;
-        wait.await.map_err(|_| RouteError::Closed)?
+        let command = RouterCommand::Route {
+            event,
+            _queue_permit: queue_permit,
+            respond,
+        };
+        match self.sender.try_send(command) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(command)) => {
+                return Err(retained_command_failure(RouteError::Capacity, command));
+            }
+            Err(mpsc::error::TrySendError::Closed(command)) => {
+                return Err(retained_command_failure(RouteError::Closed, command));
+            }
+        }
+        match wait.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(RouteAttemptError::consumed(error)),
+            Err(_) => Err(RouteAttemptError::consumed(RouteError::Closed)),
+        }
     }
 
     /// Returns the latest bounded structural snapshot.
@@ -349,6 +396,13 @@ impl RouterHandle {
             None => Ok(()),
         }
     }
+}
+
+fn retained_command_failure(error: RouteError, command: RouterCommand) -> RouteAttemptError {
+    let RouterCommand::Route { event, .. } = command else {
+        unreachable!("route submission only constructs route commands");
+    };
+    RouteAttemptError::retained(error, event)
 }
 
 enum RouterCommand {
@@ -718,4 +772,83 @@ fn update_runtime_snapshot(
             .active_turn_permits
             .saturating_sub(active_turns.available_permits()),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lark::api::ChatMode;
+    use crate::lark::normalize::{InboundEvent, ScopeKey};
+
+    fn handle(sender: mpsc::Sender<RouterCommand>, byte_budget: usize) -> RouterHandle {
+        let (control_sender, _control_receiver) = mpsc::channel(1);
+        RouterHandle {
+            sender,
+            control_sender,
+            byte_budget: Arc::new(Semaphore::new(byte_budget)),
+            control_byte_budget: Arc::new(Semaphore::new(1)),
+            snapshot: Arc::new(RwLock::new(RouterSnapshot::default())),
+            active_turns: Arc::new(Semaphore::new(1)),
+            active_turn_capacity: 1,
+            task: None,
+        }
+    }
+
+    async fn queued(event_id: &str) -> QueuedInboundEvent {
+        let permit = Arc::new(Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .expect("permit");
+        QueuedInboundEvent {
+            event: InboundEvent {
+                event_id: event_id.to_owned(),
+                message_id: format!("message-{event_id}"),
+                chat_id: "chat-router-attempt".to_owned(),
+                sender_id: "owner-router-attempt".to_owned(),
+                chat_type: ChatMode::P2p,
+                thread_id: None,
+                root_id: None,
+                reply_to_message_id: None,
+                text: "hello".to_owned(),
+                mentions_bot: false,
+                mention_all: false,
+                resources: Vec::new(),
+                message_type: "text".to_owned(),
+                create_time_ms: 1,
+                scope: ScopeKey::Chat("chat-router-attempt".to_owned()),
+            },
+            permit,
+        }
+    }
+
+    #[tokio::test]
+    async fn recoverable_route_returns_event_when_byte_budget_is_full() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let handle = handle(sender, 0);
+
+        let failure = handle
+            .route_recoverable(queued("capacity").await)
+            .await
+            .expect_err("capacity");
+        let (error, event) = failure.into_parts();
+
+        assert!(matches!(error, RouteError::Capacity));
+        assert_eq!(event.expect("retained event").event.event_id, "capacity");
+    }
+
+    #[tokio::test]
+    async fn recoverable_route_returns_event_when_router_channel_is_closed() {
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let handle = handle(sender, 1);
+
+        let failure = handle
+            .route_recoverable(queued("closed").await)
+            .await
+            .expect_err("closed");
+        let (error, event) = failure.into_parts();
+
+        assert!(matches!(error, RouteError::Closed));
+        assert_eq!(event.expect("retained event").event.event_id, "closed");
+    }
 }

@@ -4,6 +4,7 @@ use std::fmt;
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::{FutureExt, future::BoxFuture};
 use tokio::sync::{mpsc, watch};
@@ -17,7 +18,7 @@ use crate::lark::token::TenantTokenProvider;
 use crate::lark::transport::TransportState;
 use crate::runtime::intake::{DurableIntake, TenantNamespace};
 use crate::runtime::policy::AccessPolicy;
-use crate::runtime::router::{RouteError, Router, RouterHandle, RouterSettings};
+use crate::runtime::router::{RouteAttemptError, RouteError, Router, RouterHandle, RouterSettings};
 use crate::runtime::scope::DurableReplySink;
 use crate::store::StoreHandle;
 use crate::{codex::supervisor::AppServerSupervisor, config::BridgeConfig};
@@ -222,10 +223,11 @@ where
     if store_result.is_err() {
         return Err(AppError::Store);
     }
-    if summary.exit == DriveExit::InboundClosed {
-        return Err(AppError::InboundClosed);
+    match summary.exit {
+        DriveExit::Shutdown => Ok(summary),
+        DriveExit::InboundClosed => Err(AppError::InboundClosed),
+        DriveExit::RouterFailed => Err(AppError::Router),
     }
-    Ok(summary)
 }
 
 async fn stop_supervisor_after_error(supervisor: crate::codex::supervisor::SupervisorHandle) {
@@ -247,6 +249,8 @@ pub enum DriveExit {
     Shutdown,
     /// Every durable inbound producer disappeared unexpectedly.
     InboundClosed,
+    /// The router consumed an event and failed, or stopped accepting work.
+    RouterFailed,
 }
 
 /// Bounded, content-free observations from one driver run.
@@ -260,14 +264,48 @@ pub struct DriveSummary {
     pub route_failures: u64,
 }
 
+enum EventRouteError {
+    Retry {
+        error: RouteError,
+        event: Box<QueuedInboundEvent>,
+    },
+    Fatal(RouteError),
+}
+
 trait EventRouter: Send + Sync {
-    fn route(&self, event: QueuedInboundEvent) -> BoxFuture<'_, Result<(), RouteError>>;
+    fn route(&self, event: QueuedInboundEvent) -> BoxFuture<'_, Result<(), EventRouteError>>;
 }
 
 impl EventRouter for RouterHandle {
-    fn route(&self, event: QueuedInboundEvent) -> BoxFuture<'_, Result<(), RouteError>> {
-        async move { self.route(event).await }.boxed()
+    fn route(&self, event: QueuedInboundEvent) -> BoxFuture<'_, Result<(), EventRouteError>> {
+        async move {
+            self.route_recoverable(event)
+                .await
+                .map_err(classify_route_failure)
+        }
+        .boxed()
     }
+}
+
+fn classify_route_failure(failure: RouteAttemptError) -> EventRouteError {
+    let (error, event) = failure.into_parts();
+    match (error, event) {
+        (RouteError::Capacity, Some(event)) => EventRouteError::Retry {
+            error: RouteError::Capacity,
+            event,
+        },
+        (error, _) => EventRouteError::Fatal(error),
+    }
+}
+
+const ROUTE_RETRY_BASE: Duration = Duration::from_millis(25);
+const ROUTE_RETRY_MAX: Duration = Duration::from_secs(1);
+
+fn route_retry_delay(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(6);
+    ROUTE_RETRY_BASE
+        .saturating_mul(1_u32 << shift)
+        .min(ROUTE_RETRY_MAX)
 }
 
 async fn drive_inbound<R, S>(
@@ -283,7 +321,7 @@ where
     let mut routed_count = 0_u64;
     let mut route_failures = 0_u64;
 
-    let exit = loop {
+    let exit = 'driver: loop {
         let event = tokio::select! {
             biased;
             () = &mut shutdown => break DriveExit::Shutdown,
@@ -292,11 +330,38 @@ where
         let Some(event) = event else {
             break DriveExit::InboundClosed;
         };
-        match router.route(event).await {
-            Ok(()) => routed_count = routed_count.saturating_add(1),
-            Err(error) => {
-                route_failures = route_failures.saturating_add(1);
-                tracing::warn!(error = %error, "durable inbound routing failed");
+        let mut event = event;
+        let mut retry_attempt = 0_u32;
+        loop {
+            match router.route(event).await {
+                Ok(()) => {
+                    routed_count = routed_count.saturating_add(1);
+                    break;
+                }
+                Err(EventRouteError::Retry {
+                    error,
+                    event: retry_event,
+                }) => {
+                    route_failures = route_failures.saturating_add(1);
+                    retry_attempt = retry_attempt.saturating_add(1);
+                    let delay = route_retry_delay(retry_attempt);
+                    tracing::warn!(
+                        error = %error,
+                        retry_attempt,
+                        delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                        "durable inbound routing will retry"
+                    );
+                    tokio::select! {
+                        biased;
+                        () = &mut shutdown => break 'driver DriveExit::Shutdown,
+                        () = tokio::time::sleep(delay) => event = *retry_event,
+                    }
+                }
+                Err(EventRouteError::Fatal(error)) => {
+                    route_failures = route_failures.saturating_add(1);
+                    tracing::error!(error = %error, "durable inbound router failed");
+                    break 'driver DriveExit::RouterFailed;
+                }
             }
         }
     };
@@ -310,6 +375,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::future::pending;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -317,7 +383,7 @@ mod tests {
     use futures_util::{FutureExt, future::BoxFuture};
     use tokio::sync::{Semaphore, mpsc};
 
-    use super::{DriveExit, EventRouter, OutboundRuntime, drive_inbound};
+    use super::{DriveExit, EventRouteError, EventRouter, OutboundRuntime, drive_inbound};
     use crate::lark::api::ChatMode;
     use crate::lark::bridge::QueuedInboundEvent;
     use crate::lark::normalize::{InboundEvent, ScopeKey};
@@ -327,21 +393,21 @@ mod tests {
 
     struct FakeRouter {
         event_ids: Mutex<Vec<String>>,
-        fail_event: Option<&'static str>,
+        failures: Mutex<VecDeque<RouteError>>,
     }
 
     impl EventRouter for FakeRouter {
-        fn route(&self, event: QueuedInboundEvent) -> BoxFuture<'_, Result<(), RouteError>> {
+        fn route(&self, event: QueuedInboundEvent) -> BoxFuture<'_, Result<(), EventRouteError>> {
             async move {
-                let event_id = event.event.event_id;
-                self.event_ids
-                    .lock()
-                    .expect("event ids")
-                    .push(event_id.clone());
-                if self.fail_event == Some(event_id.as_str()) {
-                    Err(RouteError::Capacity)
-                } else {
-                    Ok(())
+                let event_id = event.event.event_id.clone();
+                self.event_ids.lock().expect("event ids").push(event_id);
+                match self.failures.lock().expect("failures").pop_front() {
+                    Some(RouteError::Capacity) => Err(EventRouteError::Retry {
+                        error: RouteError::Capacity,
+                        event: Box::new(event),
+                    }),
+                    Some(error) => Err(EventRouteError::Fatal(error)),
+                    None => Ok(()),
                 }
             }
             .boxed()
@@ -379,7 +445,7 @@ mod tests {
     async fn driver_routes_in_order_until_the_durable_channel_closes() {
         let router = FakeRouter {
             event_ids: Mutex::new(Vec::new()),
-            fail_event: None,
+            failures: Mutex::new(VecDeque::new()),
         };
         let (sender, receiver) = mpsc::channel(2);
         sender.send(queued("first").await).await.expect("first");
@@ -398,10 +464,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_route_failure_does_not_stop_later_durable_work() {
+    async fn transient_route_failure_retries_the_same_event_before_later_work() {
         let router = FakeRouter {
             event_ids: Mutex::new(Vec::new()),
-            fail_event: Some("first"),
+            failures: Mutex::new(VecDeque::from([RouteError::Capacity])),
         };
         let (sender, receiver) = mpsc::channel(2);
         sender.send(queued("first").await).await.expect("first");
@@ -410,19 +476,37 @@ mod tests {
 
         let summary = drive_inbound(&router, receiver, pending::<()>()).await;
 
-        assert_eq!(summary.routed, 1);
+        assert_eq!(summary.routed, 2);
         assert_eq!(summary.route_failures, 1);
         assert_eq!(
             *router.event_ids.lock().expect("event ids"),
-            vec!["first", "second"]
+            vec!["first", "first", "second"]
         );
+    }
+
+    #[tokio::test]
+    async fn closed_router_stops_the_driver_instead_of_parking_more_work() {
+        let router = FakeRouter {
+            event_ids: Mutex::new(Vec::new()),
+            failures: Mutex::new(VecDeque::from([RouteError::Closed])),
+        };
+        let (sender, receiver) = mpsc::channel(2);
+        sender.send(queued("first").await).await.expect("first");
+        sender.send(queued("second").await).await.expect("second");
+
+        let summary = drive_inbound(&router, receiver, pending::<()>()).await;
+
+        assert_eq!(summary.exit, DriveExit::RouterFailed);
+        assert_eq!(summary.routed, 0);
+        assert_eq!(summary.route_failures, 1);
+        assert_eq!(*router.event_ids.lock().expect("event ids"), vec!["first"]);
     }
 
     #[tokio::test]
     async fn shutdown_signal_stops_before_waiting_for_more_input() {
         let router = FakeRouter {
             event_ids: Mutex::new(Vec::new()),
-            fail_event: None,
+            failures: Mutex::new(VecDeque::new()),
         };
         let (_sender, receiver) = mpsc::channel(1);
 
