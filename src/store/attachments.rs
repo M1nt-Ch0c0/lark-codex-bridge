@@ -94,6 +94,85 @@ impl StoreHandle {
         .await
     }
 
+    /// Inserts (or refreshes) an attachment row and leases it for one turn in
+    /// a single writer transaction, so no other request — GC's
+    /// [`delete_attachment`](Self::delete_attachment) in particular — can
+    /// observe an unleased row between the two writes. `fetch` relies on this
+    /// atomicity: a failure (for example, a missing `turn_row_id` violating
+    /// the lease foreign key) rolls the attachment row back too.
+    ///
+    /// The capacity check, the upsert, and the lease insert all share one
+    /// transaction. The lease insert is `INSERT OR IGNORE` so re-leasing an
+    /// already-leased pair stays idempotent; foreign-key violations are not
+    /// suppressed by `OR IGNORE` and abort the transaction as errors.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the turn row does not exist, the attachment
+    /// capacity is exhausted, or the writer task/SQLite fails.
+    pub async fn put_attachment_and_lease(
+        &self,
+        sha256: &str,
+        bytes: u64,
+        kind: &str,
+        turn_row_id: i64,
+    ) -> Result<(), StoreError> {
+        let sha256 = sha256.to_owned();
+        let kind = kind.to_owned();
+        let bytes = i64::try_from(bytes).unwrap_or(i64::MAX);
+        let request_size = request_bytes(&[&sha256, &kind]);
+        self.run_sized(request_size, move |connection| {
+            let transaction = connection
+                .transaction()
+                .map_err(|error| sqlite_error("starting an attachment transaction", &error))?;
+            let exists: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM attachments WHERE sha256 = ?1)",
+                    params![sha256],
+                    |row| row.get(0),
+                )
+                .map_err(|error| sqlite_error("checking an attachment", &error))?;
+            if !exists {
+                let (count, stored_bytes): (i64, i64) = transaction
+                    .query_row(
+                        "SELECT COUNT(*), COALESCE(SUM(bytes), 0) FROM attachments",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(|error| sqlite_error("checking attachment capacity", &error))?;
+                if u64::try_from(count).unwrap_or(u64::MAX) >= STORE_ATTACHMENT_MAX_ROWS
+                    || u64::try_from(stored_bytes)
+                        .unwrap_or(u64::MAX)
+                        .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX))
+                        > STORE_ATTACHMENT_MAX_BYTES
+                {
+                    return Err(StoreError::CapacityExceeded {
+                        context: "recording an attachment",
+                    });
+                }
+            }
+            transaction
+                .execute(
+                    "INSERT INTO attachments (sha256, bytes, kind, created_ms, last_used_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?4)
+                     ON CONFLICT (sha256) DO UPDATE SET last_used_ms = excluded.last_used_ms",
+                    params![sha256, bytes, kind, now_ms()],
+                )
+                .map_err(|error| sqlite_error("recording an attachment", &error))?;
+            transaction
+                .execute(
+                    "INSERT OR IGNORE INTO attachment_leases (sha256, turn_row_id, created_ms)
+                     VALUES (?1, ?2, ?3)",
+                    params![sha256, turn_row_id, now_ms()],
+                )
+                .map_err(|error| sqlite_error("adding an attachment lease", &error))?;
+            transaction
+                .commit()
+                .map_err(|error| sqlite_error("committing an attachment transaction", &error))
+        })
+        .await
+    }
+
     /// Reads one attachment row by hash.
     ///
     /// # Errors

@@ -511,6 +511,173 @@ async fn reconcile_is_idempotent() {
 }
 
 #[tokio::test]
+async fn reconcile_truncated_scan_preserves_valid_rows_and_leases() {
+    let temp = tempdir().expect("tempdir");
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let dl = downloader(&[("k", b"survivor")]);
+    let limits = AttachmentLimits {
+        reconcile_batch: 0,
+        ..AttachmentLimits::default()
+    };
+    let cache = cache(temp.path(), store.clone(), dl, limits);
+    let turn_id = record_turn(&store, "turn-1").await;
+    let sha = sha_hex(b"survivor");
+    cache
+        .fetch("om_test", &desc("k", ResourceKind::File), turn_id)
+        .await
+        .expect("fetch");
+
+    // A zero batch forces a truncated scan: the directory entry is never
+    // scanned, so it must not be mistaken for a missing file. The store row
+    // and its lease must both survive (the lease cascades away if the row is
+    // force-deleted).
+    let stats = cache.reconcile().await.expect("reconcile");
+    assert_eq!(stats.dropped_rows, 0, "truncated scan must not drop rows");
+
+    let rows = store.list_attachments().await.expect("list");
+    assert_eq!(rows.len(), 1, "valid store row survives");
+    assert_eq!(rows[0].sha256, sha);
+    assert_eq!(
+        store.attachment_leases(&sha).await.expect("leases").len(),
+        1,
+        "valid lease survives"
+    );
+    assert!(temp.path().join(&sha).exists(), "valid file survives");
+    let _ = store.shutdown().await;
+}
+
+#[tokio::test]
+async fn reconcile_converges_orphans_across_repeated_truncated_passes() {
+    let temp = tempdir().expect("tempdir");
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let dl = downloader(&[("k", b"keep")]);
+    let limits = AttachmentLimits {
+        reconcile_batch: 2,
+        ..AttachmentLimits::default()
+    };
+    let cache = cache(temp.path(), store.clone(), dl, limits);
+    let turn_id = record_turn(&store, "turn-1").await;
+    let sha = sha_hex(b"keep");
+    cache
+        .fetch("om_test", &desc("k", ResourceKind::File), turn_id)
+        .await
+        .expect("fetch");
+
+    // More directory entries than one pass can scan: a valid file plus five
+    // orphan temp files. Reconcile must converge to only the valid file, and
+    // must never drop the valid row/lease even while scans are truncated.
+    for index in 0..5 {
+        std::fs::write(temp.path().join(format!(".tmp-{index}")), b"x").expect("temp");
+    }
+
+    let mut temp_removed = 0_u64;
+    for _ in 0..10 {
+        let stats = cache.reconcile().await.expect("reconcile");
+        temp_removed = temp_removed.saturating_add(stats.temp_files);
+        if file_names(temp.path()) == vec![sha.clone()] {
+            break;
+        }
+    }
+
+    assert_eq!(file_names(temp.path()), vec![sha.clone()]);
+    assert_eq!(temp_removed, 5, "every orphan temp file is removed");
+    let rows = store.list_attachments().await.expect("list");
+    assert_eq!(rows.len(), 1, "valid row survives every pass");
+    assert_eq!(rows[0].sha256, sha);
+    assert_eq!(
+        store.attachment_leases(&sha).await.expect("leases").len(),
+        1,
+        "valid lease survives every pass"
+    );
+    let _ = store.shutdown().await;
+}
+
+#[tokio::test]
+async fn fetch_rejects_oversized_resource_key_before_download() {
+    let temp = tempdir().expect("tempdir");
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let bad_key = "x".repeat(AttachmentLimits::default().max_resource_key_bytes + 1);
+    // The downloader maps the bad key to a Download error, so surfacing
+    // `InvalidResourceKey` proves the key was rejected *before* any download.
+    let dl = downloader_with_error(
+        &bad_key,
+        AttachError::Download {
+            kind: DownloadKind::Retryable,
+        },
+    );
+    let cache = cache(temp.path(), store.clone(), dl, AttachmentLimits::default());
+    let turn_id = record_turn(&store, "turn-1").await;
+
+    let result = cache
+        .fetch("om_test", &desc(&bad_key, ResourceKind::File), turn_id)
+        .await;
+    assert!(matches!(
+        result,
+        Err(AttachError::InvalidResourceKey { .. })
+    ));
+    // Nothing reached disk and no row/lease was produced.
+    assert!(file_names(temp.path()).is_empty());
+    assert!(store.list_attachments().await.expect("list").is_empty());
+    let _ = store.shutdown().await;
+}
+
+#[tokio::test]
+async fn put_attachment_and_lease_is_atomic() {
+    let store = StoreHandle::open_in_memory().await.expect("store");
+
+    // A nonexistent turn must fail the whole operation and leave no row (the
+    // lease FK aborts the transaction, rolling the attachment row back too).
+    let missing_turn = store
+        .put_attachment_and_lease(&sha_hex(b"x"), 1, "file", 99)
+        .await;
+    assert!(missing_turn.is_err(), "missing turn must fail");
+    assert!(
+        store.list_attachments().await.expect("list").is_empty(),
+        "no attachment row may survive a failed lease"
+    );
+
+    // With a real turn, the row and lease commit together: GC's
+    // `delete_attachment` can never observe an unleased window, so it refuses
+    // to delete the row while the lease exists.
+    let turn_id = record_turn(&store, "turn-atomic").await;
+    let sha = sha_hex(b"atomic-content");
+    store
+        .put_attachment_and_lease(&sha, 15, "file", turn_id)
+        .await
+        .expect("put + lease");
+    assert_eq!(store.list_attachments().await.expect("list").len(), 1);
+    assert_eq!(
+        store.attachment_leases(&sha).await.expect("leases").len(),
+        1
+    );
+    assert!(!store.delete_attachment(&sha).await.expect("protected"));
+    let _ = store.shutdown().await;
+}
+
+#[tokio::test]
+async fn fetch_with_missing_turn_leaves_no_row_or_lease() {
+    let temp = tempdir().expect("tempdir");
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let dl = downloader(&[("k", b"orphan-on-failure")]);
+    let cache = cache(temp.path(), store.clone(), dl, AttachmentLimits::default());
+
+    let result = cache
+        .fetch("om_test", &desc("k", ResourceKind::File), 99)
+        .await;
+    assert!(result.is_err(), "fetch with a missing turn must fail");
+
+    // The installed content file is an orphan (design ordering: file before
+    // row), but there must be no dangling row or lease left behind.
+    assert!(store.list_attachments().await.expect("list").is_empty());
+    assert_eq!(
+        file_names(temp.path()).len(),
+        1,
+        "the content file becomes an orphan, reconciled later"
+    );
+    let _ = store.shutdown().await;
+}
+
+#[tokio::test]
 async fn restart_reconciliation_heals_every_dirty_state() {
     let temp = tempdir().expect("tempdir");
     let cache_dir = temp.path().join("cache");

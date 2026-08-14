@@ -502,6 +502,18 @@ impl AttachmentCache {
     /// file exists. A file already present for the same hash is re-verified
     /// and reused rather than rewritten.
     ///
+    /// Enforcement boundary: `fetch` handles exactly one resource, so the
+    /// individually-checkable bounds are the resource key length/safety
+    /// ([`AttachmentLimits::check_resource_key`]) and the single-object byte
+    /// cap ([`AttachmentLimits::check_attachment_bytes`]). The per-message
+    /// count ([`AttachmentLimits::check_resource_batch`]) and the per-turn
+    /// byte total ([`AttachmentLimits::check_turn_total`]) are turn-assembly
+    /// responsibilities (plan Task 8 / B8), not fetch's; the display file-name
+    /// and MIME checkers ([`AttachmentLimits::check_file_name`] and
+    /// [`AttachmentLimits::check_mime`]) apply to metadata that
+    /// [`ResourceDesc`] does not carry (only `kind` + `key`), so they remain
+    /// public for the scope-actor wiring point that does carry that metadata.
+    ///
     /// # Errors
     ///
     /// Returns a classified [`AttachError`] on validation, download, I/O, or
@@ -522,17 +534,15 @@ impl AttachmentCache {
         let final_path = self.root.join(&sha);
         self.install_file(&sha, bytes.as_ref())?;
         let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        // Row and lease commit in one transaction (design §10, Task 7 Step 1),
+        // so GC can never observe an unleased row and evict it mid-fetch.
         self.store
-            .put_attachment(&sha, size, resource_kind_str(desc.kind))
+            .put_attachment_and_lease(&sha, size, resource_kind_str(desc.kind), turn_row_id)
             .await
-            .map_err(|error| store_err("recording an attachment", error))?;
-        self.store
-            .add_attachment_lease(&sha, turn_row_id)
-            .await
-            .map_err(|error| store_err("leasing an attachment", error))?;
-        // Close the GC race: once the lease exists, GC will not evict the
-        // row, so re-establish the file if it vanished between install and
-        // lease (bytes are still in hand).
+            .map_err(|error| store_err("recording and leasing an attachment", error))?;
+        // Close the file race: a concurrent reconcile may have removed the
+        // still-rowless file as an orphan before the transaction committed, so
+        // re-establish it now that the row+lease exist (bytes are in hand).
         if verify_existing(&final_path, &sha, bytes.len()).is_err() {
             self.install_file(&sha, bytes.as_ref())?;
         }
@@ -644,7 +654,8 @@ impl AttachmentCache {
             }
         }
 
-        let present_on_disk = self.scan_entries(&rows, &rows_by_sha, &mut drop_rows, &mut stats)?;
+        let (present_on_disk, truncated) =
+            self.scan_entries(&rows, &rows_by_sha, &mut drop_rows, &mut stats)?;
 
         for sha in &drop_rows {
             if self
@@ -656,16 +667,24 @@ impl AttachmentCache {
                 stats.dropped_rows = stats.dropped_rows.saturating_add(1);
             }
         }
-        for sha in rows_by_sha.keys() {
-            if !present_on_disk.contains(sha)
-                && !drop_rows.contains(sha)
-                && self
-                    .store
-                    .delete_attachment_force(sha)
-                    .await
-                    .map_err(|error| store_err("dropping a missing attachment row", error))?
-            {
-                stats.dropped_rows = stats.dropped_rows.saturating_add(1);
+        // A truncated scan means entries beyond the batch were never observed,
+        // so `present_on_disk` is incomplete. Treating them as missing would
+        // force-delete valid rows (cascading their leases and turning their
+        // files into orphans deleted on the next pass). Skip the missing-row
+        // cleanup until a full scan runs; over-batch orphans/temp files still
+        // converge across repeated passes, so reconciliation stays idempotent.
+        if !truncated {
+            for sha in rows_by_sha.keys() {
+                if !present_on_disk.contains(sha)
+                    && !drop_rows.contains(sha)
+                    && self
+                        .store
+                        .delete_attachment_force(sha)
+                        .await
+                        .map_err(|error| store_err("dropping a missing attachment row", error))?
+                {
+                    stats.dropped_rows = stats.dropped_rows.saturating_add(1);
+                }
             }
         }
 
@@ -681,23 +700,30 @@ impl AttachmentCache {
     /// Scans direct children of the cache root (bounded by
     /// [`AttachmentLimits::reconcile_batch`]), deleting orphan temp files,
     /// orphan/unrecognized content files, and size-mismatched files. Returns
-    /// the set of valid SHA-256 names present on disk.
+    /// the set of valid SHA-256 names present on disk plus a flag reporting
+    /// whether the directory held more entries than the batch could scan (so
+    /// the caller must not treat unscanned entries as missing).
     fn scan_entries(
         &self,
         rows: &[AttachmentRow],
         rows_by_sha: &HashMap<String, usize>,
         drop_rows: &mut HashSet<String>,
         stats: &mut ReconcileStats,
-    ) -> Result<HashSet<String>, AttachError> {
+    ) -> Result<(HashSet<String>, bool), AttachError> {
         let mut present_on_disk = HashSet::new();
-        let entries = std::fs::read_dir(&self.root).map_err(|_| AttachError::Io {
+        let mut entries = std::fs::read_dir(&self.root).map_err(|_| AttachError::Io {
             context: "reading the cache directory",
         })?;
         let mut scanned = 0_usize;
-        for entry in entries {
+        let mut truncated = false;
+        loop {
             if scanned >= self.limits.reconcile_batch {
+                truncated = entries.next().is_some();
                 break;
             }
+            let Some(entry) = entries.next() else {
+                break;
+            };
             let Ok(entry) = entry else {
                 stats.errors = stats.errors.saturating_add(1);
                 continue;
@@ -746,7 +772,7 @@ impl AttachmentCache {
                 stats.orphan_files = stats.orphan_files.saturating_add(1);
             }
         }
-        Ok(present_on_disk)
+        Ok((present_on_disk, truncated))
     }
 
     /// Writes `bytes` to a same-directory temp file, `fsync`s, and atomically
