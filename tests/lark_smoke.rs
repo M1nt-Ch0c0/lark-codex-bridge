@@ -26,7 +26,7 @@ use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use lark_codex_bridge::lark::api::LarkApi;
@@ -265,15 +265,16 @@ async fn await_operator_nonce(
 }
 
 /// A unique, non-secret nonce for a single operator round trip.
+///
+/// The nonce is deliberately short (`smoke-` + 8 lowercase hex = 14 chars) so
+/// a human can hand-type it without transcription errors. Its 32 bits of
+/// entropy are ample for an opt-in smoke whose acceptance also requires an
+/// exact `chat_id` match against the target chat, so a coincidental collision
+/// with an unrelated message is negligible. `RandomState` seeds from OS
+/// entropy where available.
 fn generate_nonce() -> String {
-    let epoch_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or_default();
-    // `RandomState` seeds from OS entropy where available; the epoch seconds
-    // keep the nonce unique even where the OS source is unavailable.
     let entropy = RandomState::new().build_hasher().finish();
-    format!("lark-smoke-{epoch_secs:08x}-{entropy:08x}")
+    format!("smoke-{:08x}", entropy & 0xffff_ffff)
 }
 
 /// Reports whether the normalized `text` carries the operator's nonce.
@@ -293,7 +294,7 @@ fn text_contains_nonce(text: &str, nonce: &str) -> bool {
 mod nonce_matching {
     use super::text_contains_nonce;
 
-    const NONCE: &str = "lark-smoke-00000001-deadbeef";
+    const NONCE: &str = "smoke-deadbeef";
 
     #[test]
     fn matches_a_pure_nonce() {
@@ -331,7 +332,7 @@ mod nonce_matching {
 
     #[test]
     fn rejects_a_partial_nonce_and_empty_text() {
-        assert!(!text_contains_nonce("lark-smoke-00000001", NONCE));
+        assert!(!text_contains_nonce("smoke-deadbe", NONCE));
         assert!(!text_contains_nonce("", NONCE));
     }
 }
