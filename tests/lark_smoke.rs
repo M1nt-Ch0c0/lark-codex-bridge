@@ -11,14 +11,15 @@
 //!
 //! A bot does not receive its own `OpenAPI`-sent message back as an
 //! `im.message.receive_v1` event, so the original "send then wait for the
-//! echo" round trip can never complete (confirmed against the real tenant).
-//! This smoke is therefore honest operator-assisted: it starts the bridge,
-//! waits for the transport to reach `Connected`, prints a unique nonce, and
-//! asks a human to send that nonce from a *human* account into the target
-//! group. It then verifies the normalized event carries the right `chat_id`
-//! and nonce, replies `pong` over `OpenAPI`, and shuts the transport down on
-//! every path. Because it requires a human, it is `#[ignore]`d and gated on
-//! `LARK_E2E=1`; it is never a CI test.
+//! echo" round trip can never complete (confirmed against the real tenant). A
+//! group message event also only fires when the bot is `@`-mentioned. This
+//! smoke is therefore honest operator-assisted: it starts the bridge, waits
+//! for the transport to reach `Connected`, prints a unique nonce, and asks a
+//! human to send that nonce from a *human* account into the target group while
+//! `@`-mentioning the bot. It then verifies the normalized event carries the
+//! right `chat_id` and contains the nonce, replies `pong` over `OpenAPI`, and
+//! shuts the transport down on every path. Because it requires a human, it is
+//! `#[ignore]`d and gated on `LARK_E2E=1`; it is never a CI test.
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
@@ -110,7 +111,12 @@ async fn run_smoke() -> Result<()> {
     };
 
     assert_eq!(event.chat_id, chat_id, "smoke event chat_id");
-    assert_eq!(event.text, nonce, "smoke event text");
+    assert!(
+        text_contains_nonce(&event.text, &nonce),
+        "smoke event text must contain the nonce (text_len={}, nonce_len={})",
+        event.text.len(),
+        nonce.len()
+    );
     match &event.scope {
         ScopeKey::Chat(scope_chat) => assert_eq!(scope_chat, &chat_id, "smoke event scope"),
         ScopeKey::Thread(scope_chat, _) => {
@@ -152,7 +158,9 @@ async fn run_operator_round_trip(
     let nonce = generate_nonce();
     println!(
         "\n===== Lark operator-assisted smoke =====\n\
-         Send EXACTLY the following text from a HUMAN account to the target group:\n\
+         From a HUMAN account, send the following nonce to the target group and\n\
+         @-mention the bot (TEST) in the SAME message. The nonce may come before\n\
+         or after the mention:\n\
          \n    {nonce}\n\
          \nTarget chat_id: {chat_id}\n\
          Waiting up to {}s for the round trip…\n\
@@ -232,7 +240,7 @@ async fn await_operator_nonce(
                     event.text.len(),
                     event.message_type,
                 );
-                if event.chat_id == chat_id && event.text == nonce {
+                if event.chat_id == chat_id && text_contains_nonce(&event.text, nonce) {
                     return Ok(event);
                 }
             }
@@ -250,6 +258,66 @@ fn generate_nonce() -> String {
     // keep the nonce unique even where the OS source is unavailable.
     let entropy = RandomState::new().build_hasher().finish();
     format!("lark-smoke-{epoch_secs:08x}-{entropy:08x}")
+}
+
+/// Reports whether the normalized `text` carries the operator's nonce.
+///
+/// Real receive events leave a `@_user_N` mention placeholder inline in the
+/// normalized text (a genuine `@`-mention is not an `<at>` tag), and the
+/// operator may place the nonce before or after the mention. A substring match
+/// is therefore the honest criterion: the nonce is unique and non-secret, so
+/// any text containing it is the operator's message regardless of mention
+/// position, count, or surrounding whitespace. Exact equality would reject
+/// every mentioned message, and stripping the placeholder would hard-code
+/// Feishu's mention grammar into the test.
+fn text_contains_nonce(text: &str, nonce: &str) -> bool {
+    text.contains(nonce)
+}
+
+mod nonce_matching {
+    use super::text_contains_nonce;
+
+    const NONCE: &str = "lark-smoke-00000001-deadbeef";
+
+    #[test]
+    fn matches_a_pure_nonce() {
+        assert!(text_contains_nonce(NONCE, NONCE));
+    }
+
+    #[test]
+    fn matches_a_nonce_at_the_start_before_a_mention() {
+        let text = format!("{NONCE} @_user_1");
+        assert!(text_contains_nonce(&text, NONCE));
+    }
+
+    #[test]
+    fn matches_a_nonce_at_the_end_after_a_mention() {
+        let text = format!("@_user_1 {NONCE}");
+        assert!(text_contains_nonce(&text, NONCE));
+    }
+
+    #[test]
+    fn matches_a_nonce_in_the_middle() {
+        let text = format!("please verify {NONCE} thanks");
+        assert!(text_contains_nonce(&text, NONCE));
+    }
+
+    #[test]
+    fn matches_with_multiple_mentions() {
+        let text = format!("@_user_1 @_user_2 {NONCE} @_user_3");
+        assert!(text_contains_nonce(&text, NONCE));
+    }
+
+    #[test]
+    fn rejects_unrelated_text() {
+        assert!(!text_contains_nonce("@_user_1 nothing to see here", NONCE));
+    }
+
+    #[test]
+    fn rejects_a_partial_nonce_and_empty_text() {
+        assert!(!text_contains_nonce("lark-smoke-00000001", NONCE));
+        assert!(!text_contains_nonce("", NONCE));
+    }
 }
 
 // ---------------------------------------------------------------------------
