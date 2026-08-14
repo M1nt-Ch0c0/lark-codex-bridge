@@ -75,6 +75,7 @@ fn standalone_final_is_the_final_answer() {
         ProjectedReply::Final { parts } => {
             assert_eq!(parts, vec!["the actual answer user[at]example.com"]);
         }
+        ProjectedReply::ProgressFinal { .. } => panic!("no progress card exists"),
         ProjectedReply::Empty => panic!("expected a standalone final"),
     }
 }
@@ -100,6 +101,7 @@ fn final_only_turn_produces_no_progress() {
     );
     match projector.finish(&turn) {
         ProjectedReply::Final { parts } => assert_eq!(parts, vec!["the answer"]),
+        ProjectedReply::ProgressFinal { .. } => panic!("no progress card exists"),
         ProjectedReply::Empty => panic!("expected a final"),
     }
 }
@@ -141,8 +143,38 @@ fn progress_failure_does_not_swallow_the_final() {
 
     match projector.finish(&turn) {
         ProjectedReply::Final { parts } => assert_eq!(parts, vec!["independent final"]),
+        ProjectedReply::ProgressFinal { .. } => panic!("the final is independent"),
         ProjectedReply::Empty => panic!("the final must survive progress loss"),
     }
+}
+
+#[test]
+fn rejected_progress_is_restored_to_the_standalone_final() {
+    let mut projector = ReplyProjector::new(eager_config());
+    let now = Instant::now();
+    let text = match projector.observe(
+        &completed("progress", "must survive", Some(MessagePhase::Commentary)),
+        now,
+    ) {
+        ProjectorOutput::Progress { text } => text,
+        ProjectorOutput::Nothing => panic!("progress should be emitted"),
+    };
+    projector.restore_progress(&text);
+
+    let turn = outcome(
+        vec![agent(
+            "progress",
+            "must survive",
+            Some(MessagePhase::Commentary),
+        )],
+        TurnStatus::Completed,
+    );
+    assert_eq!(
+        projector.finish(&turn),
+        ProjectedReply::Final {
+            parts: vec!["must survive".to_owned()]
+        }
+    );
 }
 
 fn low_chars_config() -> ProjectorConfig {
@@ -182,6 +214,7 @@ fn short_streamed_answer_below_threshold_is_delivered_as_final() {
     );
     match projector.finish(&turn) {
         ProjectedReply::Final { parts } => assert_eq!(parts, vec!["ab"]),
+        ProjectedReply::ProgressFinal { .. } => panic!("no progress card exists"),
         ProjectedReply::Empty => panic!("the unstreamed short answer must be delivered"),
     }
 }
@@ -217,7 +250,33 @@ fn final_answer_delta_never_emits_progress_and_buffer_is_dropped() {
     );
     match projector.finish(&turn) {
         ProjectedReply::Final { parts } => assert_eq!(parts, vec!["the final answer"]),
+        ProjectedReply::ProgressFinal { .. } => panic!("no progress card exists"),
         ProjectedReply::Empty => panic!("expected the standalone final"),
+    }
+}
+
+#[test]
+fn phase_less_fallback_final_never_emits_progress() {
+    let mut projector = ReplyProjector::new(eager_config());
+    let now = Instant::now();
+
+    assert!(matches!(
+        projector.observe(&delta_for("fallback", "fallback answer"), now),
+        ProjectorOutput::Nothing,
+    ));
+    assert!(matches!(
+        projector.observe(&completed("fallback", "fallback answer", None), now),
+        ProjectorOutput::Nothing,
+    ));
+
+    let turn = outcome(
+        vec![agent("fallback", "fallback answer", None)],
+        TurnStatus::Completed,
+    );
+    match projector.finish(&turn) {
+        ProjectedReply::Final { parts } => assert_eq!(parts, vec!["fallback answer"]),
+        ProjectedReply::ProgressFinal { .. } => panic!("phase-less final is standalone"),
+        ProjectedReply::Empty => panic!("the fallback final must remain terminal output"),
     }
 }
 
@@ -235,13 +294,18 @@ fn emitted_content_is_not_resent_as_final() {
         vec![agent("a1", "abc", Some(MessagePhase::Commentary))],
         TurnStatus::Completed,
     );
-    assert_eq!(projector.finish(&turn), ProjectedReply::Empty);
+    assert_eq!(
+        projector.finish(&turn),
+        ProjectedReply::ProgressFinal {
+            text: "abc".to_owned()
+        }
+    );
 }
 
 #[test]
 fn unshown_buffered_text_after_emit_is_delivered_as_final() {
-    // After one Progress emission, the not-yet-displayed buffer tail is the
-    // only content left to deliver as the final.
+    // The final card update contains both shown and buffered content, while
+    // creating no standalone duplicate message.
     let mut projector = ReplyProjector::new(low_chars_config());
     let now = Instant::now();
     assert!(matches!(
@@ -260,7 +324,8 @@ fn unshown_buffered_text_after_emit_is_delivered_as_final() {
         TurnStatus::Completed,
     );
     match projector.finish(&turn) {
-        ProjectedReply::Final { parts } => assert_eq!(parts, vec!["de"]),
+        ProjectedReply::ProgressFinal { text } => assert_eq!(text, "abcde"),
+        ProjectedReply::Final { .. } => panic!("the existing card must be finalized in place"),
         ProjectedReply::Empty => panic!("the unshown remainder must be delivered"),
     }
 }
@@ -290,7 +355,8 @@ fn unshown_residual_delta_after_emit_is_delivered_as_final() {
         TurnStatus::Completed,
     );
     match projector.finish(&turn) {
-        ProjectedReply::Final { parts } => assert_eq!(parts, vec!["de"]),
+        ProjectedReply::ProgressFinal { text } => assert_eq!(text, "abcde"),
+        ProjectedReply::Final { .. } => panic!("the existing card must be finalized in place"),
         ProjectedReply::Empty => panic!("the un-shown residual must be delivered"),
     }
 }
@@ -308,6 +374,7 @@ fn project_final_path_ignores_streaming_state() {
     );
     match projector.project_final(&turn) {
         ProjectedReply::Final { parts } => assert_eq!(parts, vec!["abcde"]),
+        ProjectedReply::ProgressFinal { .. } => panic!("project_final ignores progress"),
         ProjectedReply::Empty => panic!("project_final must deliver the whole trailing message"),
     }
 }
@@ -436,8 +503,10 @@ fn same_item_delta_then_completed_is_emitted_once_at_completion() {
     );
     assert_eq!(
         projector.finish(&turn),
-        ProjectedReply::Empty,
-        "no duplicate tail may remain buffered"
+        ProjectedReply::ProgressFinal {
+            text: "hello".to_owned()
+        },
+        "the existing card is finalized in place without a duplicate message"
     );
 }
 

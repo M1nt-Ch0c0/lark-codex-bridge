@@ -1,13 +1,7 @@
 //! The [`DurableReplySink`] adapter over the durable outbox.
 //!
-//! This is the final-only adapter: it projects the terminal reply and enqueues
-//! deterministic outbox rows *before* the scope actor resolves the turn. Real
-//! progress is not wired here — see the module note in [`crate::render`].
-//!
-//! Wiring point (out of scope here, covered by the prior report): the scope
-//! actor's `Running` phase drives [`crate::render::ReplyProjector::observe`]
-//! from its thread subscription and enqueues each `Progress` output as a
-//! `progress` outbox row; `finalize` then enqueues the terminal rows.
+//! Progress snapshots and terminal replies are encoded as deterministic rows
+//! before the scope actor advances durable turn state.
 
 #![allow(clippy::doc_markdown)]
 
@@ -18,7 +12,9 @@ use futures_util::future::BoxFuture;
 use super::payload::OutboxOperation;
 use crate::lark::normalize::InboundEvent;
 use crate::render::{ProjectedReply, ReplyProjector};
-use crate::runtime::scope::{DurableReplySink, ReplySinkError, TurnFinalization, TurnSource};
+use crate::runtime::scope::{
+    DurableReplySink, ReplySinkError, TurnFinalization, TurnProgress, TurnSource,
+};
 use crate::store::{InboundRejectionKind, NewOutboxRow, StoreError, StoreHandle, TurnResolution};
 
 /// Durable outbound boundary backed by the shared store.
@@ -63,6 +59,43 @@ impl DurableReplySink for OutboxReplySink {
         })
     }
 
+    fn progress(&self, progress: TurnProgress) -> BoxFuture<'static, Result<(), ReplySinkError>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let anchor_key = format!("{}:progress", progress.turn_row_id);
+            let (idempotency_key, operation) = if progress.sequence == 0 {
+                (
+                    anchor_key.clone(),
+                    OutboxOperation::ReplyProgressCard {
+                        message_id: progress.source.message_id,
+                        thread_id: progress.source.thread_id,
+                        text: progress.text,
+                    },
+                )
+            } else {
+                (
+                    format!("{}:{}", anchor_key, progress.sequence),
+                    OutboxOperation::UpdateProgressCard {
+                        anchor_key,
+                        text: progress.text,
+                    },
+                )
+            };
+            let payload_json = operation.encode().map_err(|_| ReplySinkError::Invariant)?;
+            store
+                .enqueue_outbox(NewOutboxRow {
+                    idempotency_key,
+                    scope_key: progress.scope_key,
+                    kind: "progress".to_owned(),
+                    payload_json,
+                    next_retry_ms: 0,
+                })
+                .await
+                .map_err(|error| map_store_error(&error))?;
+            Ok(())
+        })
+    }
+
     fn finalize(&self, turn: TurnFinalization) -> BoxFuture<'static, Result<(), ReplySinkError>> {
         let store = self.store.clone();
         Box::pin(async move {
@@ -76,6 +109,38 @@ impl DurableReplySink for OutboxReplySink {
             }
             Ok(())
         })
+    }
+
+    fn finalize_projected(
+        &self,
+        turn: TurnFinalization,
+        reply: ProjectedReply,
+    ) -> BoxFuture<'static, Result<(), ReplySinkError>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let rows = build_projected_finalization_rows(&turn, reply)?;
+            store
+                .enqueue_outbox_batch(&rows)
+                .await
+                .map_err(|error| map_store_error(&error))?;
+            Ok(())
+        })
+    }
+}
+
+fn build_projected_finalization_rows(
+    turn: &TurnFinalization,
+    reply: ProjectedReply,
+) -> Result<Vec<NewOutboxRow>, ReplySinkError> {
+    match turn.resolution {
+        TurnResolution::Completed => match reply {
+            ProjectedReply::Final { parts } => final_rows(turn, &parts),
+            ProjectedReply::ProgressFinal { text } => progress_final_rows(turn, &text),
+            ProjectedReply::Empty => Ok(Vec::new()),
+        },
+        TurnResolution::Failed => notice_rows(turn, FAILED_TEXT),
+        TurnResolution::Interrupted => notice_rows(turn, INTERRUPTED_TEXT),
+        TurnResolution::Uncertain => notice_rows(turn, UNCERTAIN_TEXT),
     }
 }
 
@@ -99,6 +164,7 @@ fn build_finalization_rows(
             };
             match projector.project_final(outcome) {
                 ProjectedReply::Final { parts } => final_rows(turn, &parts),
+                ProjectedReply::ProgressFinal { .. } => Err(ReplySinkError::Invariant),
                 ProjectedReply::Empty => Ok(Vec::new()),
             }
         }
@@ -106,6 +172,29 @@ fn build_finalization_rows(
         TurnResolution::Interrupted => notice_rows(turn, INTERRUPTED_TEXT),
         TurnResolution::Uncertain => notice_rows(turn, UNCERTAIN_TEXT),
     }
+}
+
+fn progress_final_rows(
+    turn: &TurnFinalization,
+    text: &str,
+) -> Result<Vec<NewOutboxRow>, ReplySinkError> {
+    let Some(source) = turn.sources.last() else {
+        return Ok(Vec::new());
+    };
+    let anchor_key = format!("{}:progress", turn.turn_row_id);
+    let operation = OutboxOperation::FinalizeProgressCard {
+        anchor_key: anchor_key.clone(),
+        message_id: source.message_id.clone(),
+        thread_id: source.thread_id.clone(),
+        text: text.to_owned(),
+    };
+    Ok(vec![NewOutboxRow {
+        idempotency_key: format!("{anchor_key}:final"),
+        scope_key: turn.scope_key.clone(),
+        kind: "final".to_owned(),
+        payload_json: operation.encode().map_err(|_| ReplySinkError::Invariant)?,
+        next_retry_ms: 0,
+    }])
 }
 
 fn final_rows(

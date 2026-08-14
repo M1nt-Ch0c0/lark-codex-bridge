@@ -16,7 +16,9 @@ use lark_codex_bridge::limits::{ROUTER_ACTIVE_TURN_HARD_LIMIT, ROUTER_SCOPE_ACTO
 use lark_codex_bridge::runtime::intake::TenantNamespace;
 use lark_codex_bridge::runtime::policy::AccessPolicy;
 use lark_codex_bridge::runtime::router::{RouteError, Router, RouterSettings};
-use lark_codex_bridge::runtime::scope::{DurableReplySink, ReplySinkError, TurnFinalization};
+use lark_codex_bridge::runtime::scope::{
+    DurableReplySink, ReplySinkError, TurnFinalization, TurnProgress,
+};
 use lark_codex_bridge::store::{
     DedupOutcome, InboundEventState, InboundRejectionKind, NewOutboxRow, StoreHandle,
     TurnResolution,
@@ -32,6 +34,7 @@ use fakecodex::{FakeFactory, FakeOutcome, test_settings};
 #[derive(Default)]
 struct RecordingSink {
     rejections: Mutex<Vec<InboundRejectionKind>>,
+    progress: Mutex<Vec<(i64, u32, usize)>>,
     finalizations: Mutex<Vec<(i64, lark_codex_bridge::store::TurnResolution, usize)>>,
 }
 
@@ -56,6 +59,15 @@ impl DurableReplySink for RecordingSink {
             turn.turn_row_id,
             turn.resolution,
             turn.sources.len(),
+        ));
+        async { Ok(()) }.boxed()
+    }
+
+    fn progress(&self, progress: TurnProgress) -> BoxFuture<'static, Result<(), ReplySinkError>> {
+        self.progress.lock().expect("progress lock").push((
+            progress.turn_row_id,
+            progress.sequence,
+            progress.text.chars().count(),
         ));
         async { Ok(()) }.boxed()
     }
@@ -302,6 +314,7 @@ async fn router_rejects_non_owner_with_one_atomic_durable_notice() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn debounce_batch_claims_one_turn_and_uses_the_exact_client_message_id() {
     let config = validated_config();
     let workspace = config
@@ -368,12 +381,38 @@ async fn debounce_batch_claims_one_turn_and_uses_the_exact_client_message_id() {
             json!({"turn": turn("turn-runtime", "inProgress")}),
         )
         .await;
+    let progress_text = "p".repeat(200);
+    control
+        .send_json(json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-runtime",
+                "turnId": "turn-runtime",
+                "completedAtMs": 1_786_478_402_500_i64,
+                "item": {
+                    "id": "item-progress",
+                    "type": "agentMessage",
+                    "text": progress_text,
+                    "phase": "commentary",
+                    "memoryCitation": null
+                }
+            }
+        }))
+        .await;
+    let mut completed_turn = turn("turn-runtime", "completed");
+    completed_turn["items"] = json!([{
+        "id": "item-final",
+        "type": "agentMessage",
+        "text": "done",
+        "phase": "final_answer",
+        "memoryCitation": null
+    }]);
     control
         .send_json(json!({
             "method": "turn/completed",
             "params": {
                 "threadId": "thread-runtime",
-                "turn": turn("turn-runtime", "completed")
+                "turn": completed_turn
             }
         }))
         .await;
@@ -398,6 +437,11 @@ async fn debounce_batch_claims_one_turn_and_uses_the_exact_client_message_id() {
         assert_eq!(finalizations[0].2, 2);
         finalizations[0].0
     };
+    assert_eq!(
+        *sink.progress.lock().expect("progress"),
+        vec![(turn_row_id, 0, 200)],
+        "the running actor must durably project the commentary event"
+    );
     let row = store
         .turn_row(turn_row_id)
         .await

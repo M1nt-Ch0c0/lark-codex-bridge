@@ -30,6 +30,34 @@ pub enum OutboxOperation {
         /// Already-masked reply text.
         text: String,
     },
+    /// Creates the first visible progress card for a turn.
+    ReplyProgressCard {
+        /// Target parent message ID.
+        message_id: String,
+        /// Topic thread ID when the reply belongs to a thread.
+        thread_id: Option<String>,
+        /// Already-masked cumulative progress text.
+        text: String,
+    },
+    /// Updates the first progress card in place.
+    UpdateProgressCard {
+        /// Idempotency key of the first progress-card outbox row.
+        anchor_key: String,
+        /// Already-masked cumulative progress text.
+        text: String,
+    },
+    /// Finalizes a progress card in place, with a standalone fallback target
+    /// when the initial card definitively failed before delivery.
+    FinalizeProgressCard {
+        /// Idempotency key of the first progress-card outbox row.
+        anchor_key: String,
+        /// Original parent message used only after definitive anchor failure.
+        message_id: String,
+        /// Topic thread for the definitive-failure fallback.
+        thread_id: Option<String>,
+        /// Complete, already-masked fallback answer.
+        text: String,
+    },
 }
 
 impl fmt::Debug for OutboxOperation {
@@ -41,6 +69,33 @@ impl fmt::Debug for OutboxOperation {
                 text,
             } => formatter
                 .debug_struct("ReplyText")
+                .field("message_id_len", &message_id.len())
+                .field("in_thread", &thread_id.is_some())
+                .field("text_chars", &text.chars().count())
+                .finish_non_exhaustive(),
+            Self::ReplyProgressCard {
+                message_id,
+                thread_id,
+                text,
+            } => formatter
+                .debug_struct("ReplyProgressCard")
+                .field("message_id_len", &message_id.len())
+                .field("in_thread", &thread_id.is_some())
+                .field("text_chars", &text.chars().count())
+                .finish_non_exhaustive(),
+            Self::UpdateProgressCard { anchor_key, text } => formatter
+                .debug_struct("UpdateProgressCard")
+                .field("anchor_key_len", &anchor_key.len())
+                .field("text_chars", &text.chars().count())
+                .finish_non_exhaustive(),
+            Self::FinalizeProgressCard {
+                anchor_key,
+                message_id,
+                thread_id,
+                text,
+            } => formatter
+                .debug_struct("FinalizeProgressCard")
+                .field("anchor_key_len", &anchor_key.len())
                 .field("message_id_len", &message_id.len())
                 .field("in_thread", &thread_id.is_some())
                 .field("text_chars", &text.chars().count())
@@ -135,10 +190,15 @@ impl OutboxOperation {
             });
         }
         match dto.op.as_str() {
-            "reply_text" => {
-                if dto.message_id.is_empty() {
+            "reply_text" | "reply_progress_card" => {
+                let Some(message_id) = dto.message_id else {
                     return Err(OutboxError::Invalid {
                         context: "empty reply message_id",
+                    });
+                };
+                if message_id.is_empty() || dto.anchor_key.is_some() {
+                    return Err(OutboxError::Invalid {
+                        context: "invalid reply target",
                     });
                 }
                 if dto.text.is_empty() {
@@ -151,8 +211,59 @@ impl OutboxOperation {
                         context: "empty reply thread_id",
                     });
                 }
-                Ok(Self::ReplyText {
-                    message_id: dto.message_id,
+                if dto.op == "reply_text" {
+                    Ok(Self::ReplyText {
+                        message_id,
+                        thread_id: dto.thread_id,
+                        text: dto.text,
+                    })
+                } else {
+                    Ok(Self::ReplyProgressCard {
+                        message_id,
+                        thread_id: dto.thread_id,
+                        text: dto.text,
+                    })
+                }
+            }
+            "update_progress_card" => {
+                let Some(anchor_key) = dto.anchor_key else {
+                    return Err(OutboxError::Invalid {
+                        context: "empty progress anchor_key",
+                    });
+                };
+                if anchor_key.is_empty()
+                    || dto.message_id.is_some()
+                    || dto.thread_id.is_some()
+                    || dto.text.is_empty()
+                {
+                    return Err(OutboxError::Invalid {
+                        context: "invalid progress update",
+                    });
+                }
+                Ok(Self::UpdateProgressCard {
+                    anchor_key,
+                    text: dto.text,
+                })
+            }
+            "finalize_progress_card" => {
+                let (Some(anchor_key), Some(message_id)) = (dto.anchor_key, dto.message_id) else {
+                    return Err(OutboxError::Invalid {
+                        context: "missing progress finalization target",
+                    });
+                };
+                if anchor_key.is_empty() || message_id.is_empty() || dto.text.is_empty() {
+                    return Err(OutboxError::Invalid {
+                        context: "invalid progress finalization",
+                    });
+                }
+                if dto.thread_id.as_deref().is_some_and(str::is_empty) {
+                    return Err(OutboxError::Invalid {
+                        context: "empty reply thread_id",
+                    });
+                }
+                Ok(Self::FinalizeProgressCard {
+                    anchor_key,
+                    message_id,
                     thread_id: dto.thread_id,
                     text: dto.text,
                 })
@@ -169,9 +280,12 @@ impl OutboxOperation {
 struct PayloadDto {
     version: u32,
     op: String,
-    message_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    message_id: Option<String>,
     #[serde(default)]
     thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    anchor_key: Option<String>,
     text: String,
 }
 
@@ -185,8 +299,42 @@ impl From<&OutboxOperation> for PayloadDto {
             } => Self {
                 version: OUTBOX_PAYLOAD_VERSION,
                 op: "reply_text".to_owned(),
-                message_id: message_id.clone(),
+                message_id: Some(message_id.clone()),
                 thread_id: thread_id.clone(),
+                anchor_key: None,
+                text: text.clone(),
+            },
+            OutboxOperation::ReplyProgressCard {
+                message_id,
+                thread_id,
+                text,
+            } => Self {
+                version: OUTBOX_PAYLOAD_VERSION,
+                op: "reply_progress_card".to_owned(),
+                message_id: Some(message_id.clone()),
+                thread_id: thread_id.clone(),
+                anchor_key: None,
+                text: text.clone(),
+            },
+            OutboxOperation::UpdateProgressCard { anchor_key, text } => Self {
+                version: OUTBOX_PAYLOAD_VERSION,
+                op: "update_progress_card".to_owned(),
+                message_id: None,
+                thread_id: None,
+                anchor_key: Some(anchor_key.clone()),
+                text: text.clone(),
+            },
+            OutboxOperation::FinalizeProgressCard {
+                anchor_key,
+                message_id,
+                thread_id,
+                text,
+            } => Self {
+                version: OUTBOX_PAYLOAD_VERSION,
+                op: "finalize_progress_card".to_owned(),
+                message_id: Some(message_id.clone()),
+                thread_id: thread_id.clone(),
+                anchor_key: Some(anchor_key.clone()),
                 text: text.clone(),
             },
         }

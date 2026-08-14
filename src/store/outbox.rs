@@ -216,6 +216,11 @@ impl StoreHandle {
         &self,
         rows: &[NewOutboxRow],
     ) -> Result<Vec<OutboxEnqueue>, StoreError> {
+        if u64::try_from(rows.len()).unwrap_or(u64::MAX) > STORE_OUTBOX_MAX_ROWS {
+            return Err(StoreError::CapacityExceeded {
+                context: "enqueueing an outbox batch",
+            });
+        }
         for row in rows {
             validate_outbox_payload(row)?;
         }
@@ -418,6 +423,84 @@ impl StoreHandle {
         .await
     }
 
+    /// Atomically records a retryable failure and parks every later live row
+    /// behind the failed row's retry window.
+    ///
+    /// Updating the failed row and deferring its successors in separate
+    /// transactions would leave a crash window in which a later row could be
+    /// claimed first after restart. Later rows already claimed by the single
+    /// pump are returned to `pending`; rows not yet claimed move forward only
+    /// when necessary.
+    ///
+    /// Returns `true` when the failed row remains retryable, or `false` when
+    /// the attempt budget made it terminal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::NotFound`] for an unknown row,
+    /// [`StoreError::InvalidTransition`] when the row is not `sending` or the
+    /// attempt is non-monotonic, and an error when SQLite fails.
+    pub async fn fail_outbox_and_defer_successors(
+        &self,
+        id: i64,
+        attempts: u32,
+        next_retry_ms: i64,
+    ) -> Result<bool, StoreError> {
+        self.run(move |connection| {
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|error| sqlite_error("starting an ordered outbox retry", &error))?;
+            let stored_attempts =
+                require_sending(&transaction, id, "retrying an ordered outbox row")?;
+            if attempts != stored_attempts.saturating_add(1) {
+                return Err(StoreError::InvalidTransition {
+                    context: "recording a non-monotonic outbox attempt",
+                });
+            }
+            let deferred = attempts < STORE_OUTBOX_MAX_ATTEMPTS;
+            let state = if deferred {
+                OutboxState::Pending
+            } else {
+                OutboxState::Failed
+            };
+            transaction
+                .execute(
+                    "UPDATE outbox
+                     SET state = ?2, attempts = ?3, next_retry_ms = ?4, updated_ms = ?5
+                     WHERE id = ?1",
+                    params![
+                        id,
+                        state.as_str(),
+                        i64::from(attempts),
+                        next_retry_ms,
+                        now_ms()
+                    ],
+                )
+                .map_err(|error| sqlite_error("retrying an ordered outbox row", &error))?;
+            if deferred {
+                transaction
+                    .execute(
+                        "UPDATE outbox
+                         SET state = 'pending',
+                             next_retry_ms = CASE
+                                 WHEN next_retry_ms < ?2 THEN ?2
+                                 ELSE next_retry_ms
+                             END,
+                             updated_ms = ?3
+                         WHERE id > ?1
+                           AND state IN ('pending', 'sending')",
+                        params![id, next_retry_ms, now_ms()],
+                    )
+                    .map_err(|error| sqlite_error("deferring ordered outbox successors", &error))?;
+            }
+            transaction
+                .commit()
+                .map_err(|error| sqlite_error("committing an ordered outbox retry", &error))?;
+            Ok(deferred)
+        })
+        .await
+    }
+
     /// Marks a claimed row terminally `failed` without further attempts.
     ///
     /// Used for definitive failures — permanent authentication rejection, an
@@ -547,6 +630,31 @@ impl StoreHandle {
                 read_outbox_row,
             );
             query_optional(row, "reading an outbox row")
+        })
+        .await
+    }
+
+    /// Reads one outbox row by its deterministic idempotency key.
+    ///
+    /// Progress-card update operations use this to resolve the receipt of the
+    /// first progress row without persisting a server-issued message ID in a
+    /// later payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the writer task or SQLite fails.
+    pub async fn outbox_row_by_key(&self, key: &str) -> Result<Option<OutboxRow>, StoreError> {
+        let key = key.to_owned();
+        let request_size = request_bytes(&[&key]);
+        self.run_sized(request_size, move |connection| {
+            let row = connection.query_row(
+                "SELECT id, idempotency_key, scope_key, kind, payload_json, payload_bytes,
+                        state, attempts, next_retry_ms, receipt_message_id, created_ms, updated_ms
+                 FROM outbox WHERE idempotency_key = ?1",
+                params![key],
+                read_outbox_row,
+            );
+            query_optional(row, "reading an outbox row by key")
         })
         .await
     }
@@ -776,10 +884,20 @@ fn sweep_terminal_rows_inline(
         .execute(
             "DELETE FROM outbox
              WHERE id IN (
-                 SELECT id FROM outbox
-                 WHERE state IN ('sent', 'failed')
-                   AND updated_ms < ?1
-                 ORDER BY updated_ms, id LIMIT ?2
+                 SELECT candidate.id FROM outbox AS candidate
+                 WHERE candidate.state IN ('sent', 'failed')
+                   AND candidate.updated_ms < ?1
+                   AND NOT (
+                       candidate.kind = 'progress'
+                       AND EXISTS (
+                           SELECT 1 FROM outbox AS dependent
+                           WHERE dependent.state IN ('pending', 'sending')
+                             AND json_valid(dependent.payload_json)
+                             AND json_extract(dependent.payload_json, '$.anchor_key')
+                                 = candidate.idempotency_key
+                       )
+                   )
+                 ORDER BY candidate.updated_ms, candidate.id LIMIT ?2
              )",
             params![older_than_ms, max_rows],
         )
@@ -970,6 +1088,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sweep_retains_a_progress_anchor_while_a_live_update_depends_on_it() {
+        let store = StoreHandle::open_in_memory().await.expect("store");
+        store
+            .enqueue_outbox(NewOutboxRow {
+                idempotency_key: "turn:progress".to_owned(),
+                scope_key: "im:oc".to_owned(),
+                kind: "progress".to_owned(),
+                payload_json: r#"{"version":1,"op":"reply_progress_card","message_id":"om_parent","thread_id":null,"text":"work"}"#.to_owned(),
+                next_retry_ms: 0,
+            })
+            .await
+            .expect("anchor");
+        let anchor = store.claim_outbox_batch(now_ms(), 1).await.expect("claim");
+        store
+            .complete_outbox(anchor[0].id, "om_progress")
+            .await
+            .expect("complete anchor");
+        store
+            .enqueue_outbox(NewOutboxRow {
+                idempotency_key: "turn:progress:1".to_owned(),
+                scope_key: "im:oc".to_owned(),
+                kind: "progress".to_owned(),
+                payload_json: r#"{"version":1,"op":"update_progress_card","thread_id":null,"anchor_key":"turn:progress","text":"more"}"#.to_owned(),
+                next_retry_ms: i64::MAX,
+            })
+            .await
+            .expect("dependent");
+        let anchor_id = anchor[0].id;
+        store
+            .run(move |connection| {
+                connection
+                    .execute(
+                        "UPDATE outbox SET updated_ms = 1 WHERE id = ?1",
+                        params![anchor_id],
+                    )
+                    .map_err(|error| sqlite_error("aging progress anchor", &error))?;
+                Ok(())
+            })
+            .await
+            .expect("age anchor");
+
+        assert_eq!(
+            store
+                .sweep_terminal_outbox(2, OUTBOX_SWEEP_BATCH)
+                .await
+                .expect("sweep"),
+            0,
+            "a live dependent must keep the anchor receipt addressable"
+        );
+        assert!(
+            store
+                .outbox_row(anchor_id)
+                .await
+                .expect("read anchor")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
     async fn release_outbox_claim_at_parks_until_the_given_retry_time() {
         let store = StoreHandle::open_in_memory().await.expect("store");
         store
@@ -1088,7 +1265,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn defer_outbox_after_parks_only_pending_successors_before_retry() {
+    async fn retry_failure_and_successor_deferral_are_one_atomic_transition() {
         let store = StoreHandle::open_in_memory().await.expect("store");
         store.enqueue_outbox(new_row("a", 0)).await.expect("a");
         store.enqueue_outbox(new_row("b", 0)).await.expect("b");
@@ -1099,28 +1276,24 @@ mod tests {
             .await
             .expect("d");
 
-        // Claim a + b; a fails retryably and is re-parked at retry_ms.
+        // Claim a + b. The retry transaction must re-park a and the already
+        // claimed b, while also deferring pending c. Row d is already later.
         let claimed = store.claim_outbox_batch(now_ms(), 2).await.expect("claim");
         assert_eq!(claimed.len(), 2);
         let after_id = claimed[0].id;
-        store
-            .fail_outbox(after_id, 1, retry_ms, false)
+        let deferred = store
+            .fail_outbox_and_defer_successors(after_id, 1, retry_ms)
             .await
             .expect("fail a");
+        assert!(deferred);
 
-        // Only c is a `pending` successor earlier than retry_ms; b is still
-        // `sending` (the in-batch tail) and d is already parked later.
-        let changed = store
-            .defer_outbox_after(after_id, retry_ms)
+        let tail = store
+            .outbox_row(claimed[1].id)
             .await
-            .expect("defer");
-        assert_eq!(changed, 1, "exactly c is deferred");
-
-        // The pump then releases the claimed tail at retry_ms.
-        store
-            .release_outbox_claim_at(claimed[1].id, retry_ms)
-            .await
-            .expect("release b");
+            .expect("read b")
+            .expect("b exists");
+        assert_eq!(tail.state, OutboxState::Pending);
+        assert_eq!(tail.next_retry_ms, retry_ms);
 
         assert!(
             store
@@ -1383,6 +1556,24 @@ mod tests {
         assert!(matches!(second[0], OutboxEnqueue::Duplicate(_)));
         assert!(matches!(second[1], OutboxEnqueue::Duplicate(_)));
         assert_eq!(store.outbox_depth().await.expect("depth").pending, 2);
+    }
+
+    #[tokio::test]
+    async fn batch_enqueue_rejects_an_unbounded_row_count_before_cloning() {
+        let store = StoreHandle::open_in_memory().await.expect("store");
+        let count = usize::try_from(STORE_OUTBOX_MAX_ROWS).expect("row cap fits") + 1;
+        let rows = (0..count)
+            .map(|index| new_row(&format!("oversized:{index}"), 0))
+            .collect::<Vec<_>>();
+
+        let result = store.enqueue_outbox_batch(&rows).await;
+        assert!(matches!(
+            result,
+            Err(StoreError::CapacityExceeded {
+                context: "enqueueing an outbox batch"
+            })
+        ));
+        assert_eq!(total_rows(&store).await, 0);
     }
 
     #[tokio::test]

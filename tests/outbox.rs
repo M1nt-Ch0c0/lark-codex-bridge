@@ -25,7 +25,10 @@ use lark_codex_bridge::outbox::{
     DeliveryClass, OutboxError, OutboxOperation, OutboxPump, OutboxPumpConfig, OutboxReplySink,
     classify_delivery,
 };
-use lark_codex_bridge::runtime::scope::{DurableReplySink, TurnFinalization, TurnSource};
+use lark_codex_bridge::render::ProjectedReply;
+use lark_codex_bridge::runtime::scope::{
+    DurableReplySink, TurnFinalization, TurnProgress, TurnSource,
+};
 use lark_codex_bridge::store::{
     InboundRejectionKind, NewOutboxRow, OutboxEnqueue, OutboxState, StoreHandle, TurnResolution,
 };
@@ -406,6 +409,7 @@ async fn finalize_enqueues_the_final_row() {
             assert_eq!(message_id, "om_parent");
             assert_eq!(text, "user[at]example.com");
         }
+        _ => panic!("expected a text final"),
     }
 }
 
@@ -425,6 +429,130 @@ async fn finalize_is_idempotent_across_retries() {
 
     let depth = store.outbox_depth().await.expect("depth");
     assert_eq!(depth.pending, 1, "a re-enqueue must reuse the same row");
+}
+
+#[tokio::test]
+async fn progress_cards_are_created_updated_and_finalized_through_the_outbox() {
+    let server = StubServer::start(token_plus(|request| {
+        if request.path.ends_with("/reply") {
+            ok_message("om_progress")
+        } else {
+            StubResponse::json(200, r#"{"code":0,"data":{}}"#)
+        }
+    }))
+    .await;
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = OutboxReplySink::new(store.clone());
+    let progress_source = source("evt_1", "om_parent");
+
+    sink.progress(TurnProgress {
+        turn_row_id: 9,
+        scope_key: "im:oc_chat".to_owned(),
+        source: progress_source.clone(),
+        sequence: 0,
+        text: "working".to_owned(),
+    })
+    .await
+    .expect("first progress");
+    sink.progress(TurnProgress {
+        turn_row_id: 9,
+        scope_key: "im:oc_chat".to_owned(),
+        source: progress_source,
+        sequence: 1,
+        text: "working more".to_owned(),
+    })
+    .await
+    .expect("progress update");
+    sink.finalize_projected(
+        completed_finalization(9, "ignored final-only projection"),
+        ProjectedReply::ProgressFinal {
+            text: "working more done".to_owned(),
+        },
+    )
+    .await
+    .expect("progress finalization");
+
+    let first = store.outbox_row(1).await.expect("row").expect("first");
+    let second = store.outbox_row(2).await.expect("row").expect("second");
+    let third = store.outbox_row(3).await.expect("row").expect("third");
+    assert_eq!(first.idempotency_key, "9:progress");
+    assert_eq!(second.idempotency_key, "9:progress:1");
+    assert_eq!(third.idempotency_key, "9:progress:final");
+    assert!(matches!(
+        OutboxOperation::decode(&first.payload_json).expect("decode first"),
+        OutboxOperation::ReplyProgressCard { .. }
+    ));
+    assert!(matches!(
+        OutboxOperation::decode(&second.payload_json).expect("decode second"),
+        OutboxOperation::UpdateProgressCard { .. }
+    ));
+    assert!(matches!(
+        OutboxOperation::decode(&third.payload_json).expect("decode third"),
+        OutboxOperation::FinalizeProgressCard { .. }
+    ));
+
+    let (_, rx) = watch::channel(TransportState::Connected);
+    let pump = OutboxPump::spawn(store.clone(), api_for(&server), rx, fast_config());
+    wait_for_state(&store, third.id, OutboxState::Sent).await;
+
+    let requests = reply_requests(&server);
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].method, "POST");
+    assert_eq!(requests[0].path, REPLY_PATH);
+    assert_eq!(requests[1].method, "PATCH");
+    assert_eq!(requests[1].path, "/open-apis/im/v1/messages/om_progress");
+    assert_eq!(requests[2].method, "PATCH");
+    assert_eq!(requests[2].path, "/open-apis/im/v1/messages/om_progress");
+
+    pump.shutdown().await;
+}
+
+#[tokio::test]
+async fn failed_initial_progress_card_falls_back_to_a_standalone_final() {
+    let server = StubServer::start(token_plus(|request| {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).expect("message body");
+        if body["msg_type"] == "interactive" {
+            StubResponse::json(200, r#"{"code":99991661,"msg":"invalid token"}"#)
+        } else {
+            ok_message("om_final_fallback")
+        }
+    }))
+    .await;
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = OutboxReplySink::new(store.clone());
+    sink.progress(TurnProgress {
+        turn_row_id: 10,
+        scope_key: "im:oc_chat".to_owned(),
+        source: source("evt_1", "om_parent"),
+        sequence: 0,
+        text: "working".to_owned(),
+    })
+    .await
+    .expect("progress");
+    sink.finalize_projected(
+        completed_finalization(10, "ignored"),
+        ProjectedReply::ProgressFinal {
+            text: "complete fallback".to_owned(),
+        },
+    )
+    .await
+    .expect("finalize");
+
+    let (_, rx) = watch::channel(TransportState::Connected);
+    let pump = OutboxPump::spawn(store.clone(), api_for(&server), rx, fast_config());
+    let first = wait_for_state(&store, 1, OutboxState::Failed).await;
+    let final_row = wait_for_state(&store, 2, OutboxState::Sent).await;
+    assert!(first.receipt_message_id.is_none());
+    assert_eq!(
+        final_row.receipt_message_id.as_deref(),
+        Some("om_final_fallback")
+    );
+    let requests = reply_requests(&server);
+    assert_eq!(
+        reply_text(requests.last().expect("fallback request")),
+        "complete fallback"
+    );
+    pump.shutdown().await;
 }
 
 #[tokio::test]
@@ -465,6 +593,7 @@ async fn rejection_notice_is_deterministic() {
             assert_eq!(message_id, "om_parent");
             assert!(!text.is_empty());
         }
+        _ => panic!("expected a text notice"),
     }
 }
 
@@ -511,6 +640,7 @@ async fn final_rows_reply_only_to_the_last_source_bounded_by_parts() {
         OutboxOperation::ReplyText { message_id, .. } => {
             assert_eq!(message_id, "om_63", "the reply targets the last source");
         }
+        _ => panic!("expected a text final"),
     }
 
     let last = store.outbox_row(8).await.expect("row").expect("exists");
@@ -574,6 +704,7 @@ async fn notice_rows_reply_only_to_the_last_source() {
         OutboxOperation::ReplyText { message_id, .. } => {
             assert_eq!(message_id, "om_63", "the notice targets the last source");
         }
+        _ => panic!("expected a text notice"),
     }
 }
 

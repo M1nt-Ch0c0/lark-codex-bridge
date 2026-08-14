@@ -12,6 +12,7 @@
 use std::future::Future;
 use std::time::Duration;
 
+use serde_json::{Value, json};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -23,9 +24,9 @@ use crate::lark::transport::TransportState;
 use crate::limits::{
     OUTBOX_POLL_INTERVAL, OUTBOX_RETRY_BASE, OUTBOX_RETRY_MAX, OUTBOX_SWEEP_BATCH,
     OUTBOX_SWEEP_INTERVAL, OUTBOX_TERMINAL_RETENTION_MS, STORE_OUTBOX_CLAIM_MAX_BATCH,
-    STORE_OUTBOX_MAX_ATTEMPTS, STORE_RECEIPT_WRITE_ATTEMPTS,
+    STORE_RECEIPT_WRITE_ATTEMPTS,
 };
-use crate::store::{OutboxDepth, OutboxRow, StoreError, StoreHandle, now_ms};
+use crate::store::{OutboxDepth, OutboxRow, OutboxState, StoreError, StoreHandle, now_ms};
 
 /// How one failed send must be handled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,9 +72,17 @@ enum ProcessOutcome {
     /// explicit uncertainty): no later retry can overtake it, so the batch
     /// may advance.
     Resolved,
-    /// The row will be retried later: stop this batch and re-park the tail
-    /// with a retry time no earlier than `next_retry_ms`.
-    Deferred { next_retry_ms: i64 },
+    /// The row will be retried later. Its receipt transaction has already
+    /// parked every later live row behind it, so the batch must stop.
+    Deferred,
+}
+
+enum SendFailure {
+    Delivery(LarkError),
+    Store(StoreError),
+    DependencyPending,
+    DependencyPermanent,
+    DependencyUncertain,
 }
 
 /// Tunables for the outbox pump; defaults match the production limits.
@@ -208,15 +217,10 @@ async fn run(
             }
             let outcome = process_row(&store, &api, &batch[cursor], config, &shutdown).await;
             cursor += 1;
-            if let ProcessOutcome::Deferred { next_retry_ms } = outcome {
-                // This row will be retried later: stop sending the rest of the
-                // batch so a later row cannot overtake it. Two classes of
-                // successors must be parked no earlier than the retry time:
-                // the already-claimed tail (released below), and any other
-                // `pending` row after this one that would otherwise be claimed
-                // first on a later poll.
-                defer_successors(&store, batch[cursor - 1].id, next_retry_ms).await;
-                release_tail_at(&store, &batch[cursor..], next_retry_ms).await;
+            if matches!(outcome, ProcessOutcome::Deferred) {
+                // The retry receipt transaction already returned the claimed
+                // tail to `pending` and deferred all later live rows. A second
+                // write here would recreate the crash window it closes.
                 break;
             }
         }
@@ -255,7 +259,7 @@ async fn process_row(
             return ProcessOutcome::Resolved;
         }
     };
-    match send(api, &operation).await {
+    match send(store, api, row, &operation).await {
         Ok(message_id) => {
             if message_id.is_empty() {
                 // The receipt contract (design §9) requires a non-empty
@@ -279,14 +283,68 @@ async fn process_row(
             }
             ProcessOutcome::Resolved
         }
-        Err(error) => {
+        Err(SendFailure::Delivery(error)) => {
             let class = classify_delivery(&error);
             record_failure(store, row, class, config, &error, shutdown).await
+        }
+        Err(SendFailure::Store(store_error)) => {
+            tracing::warn!(
+                error = %store_error,
+                outbox_id = row.id,
+                "progress dependency lookup failed"
+            );
+            record_failure(
+                store,
+                row,
+                DeliveryClass::Retryable,
+                config,
+                &LarkError::retryable("resolving a progress dependency"),
+                shutdown,
+            )
+            .await
+        }
+        Err(SendFailure::DependencyPending) => {
+            record_failure(
+                store,
+                row,
+                DeliveryClass::Retryable,
+                config,
+                &LarkError::retryable("waiting for a progress dependency"),
+                shutdown,
+            )
+            .await
+        }
+        Err(SendFailure::DependencyPermanent) => {
+            record_failure(
+                store,
+                row,
+                DeliveryClass::Permanent,
+                config,
+                &LarkError::exhausted("progress dependency is unavailable", 0),
+                shutdown,
+            )
+            .await
+        }
+        Err(SendFailure::DependencyUncertain) => {
+            record_failure(
+                store,
+                row,
+                DeliveryClass::Uncertain,
+                config,
+                &LarkError::protocol("progress dependency delivery is uncertain"),
+                shutdown,
+            )
+            .await
         }
     }
 }
 
-async fn send(api: &LarkApi, operation: &OutboxOperation) -> Result<String, LarkError> {
+async fn send(
+    store: &StoreHandle,
+    api: &LarkApi,
+    row: &OutboxRow,
+    operation: &OutboxOperation,
+) -> Result<String, SendFailure> {
     match operation {
         OutboxOperation::ReplyText {
             message_id,
@@ -295,7 +353,8 @@ async fn send(api: &LarkApi, operation: &OutboxOperation) -> Result<String, Lark
         } => api
             .reply_text_in_thread(message_id.as_str(), text.as_str())
             .await
-            .map(|message| message.message_id),
+            .map(|message| message.message_id)
+            .map_err(SendFailure::Delivery),
         OutboxOperation::ReplyText {
             message_id,
             thread_id: None,
@@ -303,8 +362,117 @@ async fn send(api: &LarkApi, operation: &OutboxOperation) -> Result<String, Lark
         } => api
             .reply_text(message_id.as_str(), text.as_str())
             .await
-            .map(|message| message.message_id),
+            .map(|message| message.message_id)
+            .map_err(SendFailure::Delivery),
+        OutboxOperation::ReplyProgressCard {
+            message_id,
+            thread_id: Some(_),
+            text,
+        } => api
+            .reply_card_in_thread(message_id, progress_card(text))
+            .await
+            .map(|message| message.message_id)
+            .map_err(SendFailure::Delivery),
+        OutboxOperation::ReplyProgressCard {
+            message_id,
+            thread_id: None,
+            text,
+        } => api
+            .reply_card(message_id, progress_card(text))
+            .await
+            .map(|message| message.message_id)
+            .map_err(SendFailure::Delivery),
+        OutboxOperation::UpdateProgressCard { anchor_key, text } => {
+            let anchor = progress_anchor(store, row, anchor_key).await?;
+            match anchor {
+                ProgressAnchor::Delivered(message_id) => api
+                    .update_card(&message_id, progress_card(text))
+                    .await
+                    .map(|()| message_id)
+                    .map_err(SendFailure::Delivery),
+                ProgressAnchor::Pending => Err(SendFailure::DependencyPending),
+                ProgressAnchor::Failed => Err(SendFailure::DependencyPermanent),
+                ProgressAnchor::Uncertain => Err(SendFailure::DependencyUncertain),
+            }
+        }
+        OutboxOperation::FinalizeProgressCard {
+            anchor_key,
+            message_id,
+            thread_id,
+            text,
+        } => {
+            let anchor = progress_anchor(store, row, anchor_key).await?;
+            match anchor {
+                ProgressAnchor::Delivered(receipt) => api
+                    .update_card(&receipt, progress_card(text))
+                    .await
+                    .map(|()| receipt)
+                    .map_err(SendFailure::Delivery),
+                ProgressAnchor::Failed if thread_id.is_some() => api
+                    .reply_text_in_thread(message_id, text)
+                    .await
+                    .map(|message| message.message_id)
+                    .map_err(SendFailure::Delivery),
+                ProgressAnchor::Failed => api
+                    .reply_text(message_id, text)
+                    .await
+                    .map(|message| message.message_id)
+                    .map_err(SendFailure::Delivery),
+                ProgressAnchor::Pending => Err(SendFailure::DependencyPending),
+                ProgressAnchor::Uncertain => Err(SendFailure::DependencyUncertain),
+            }
+        }
     }
+}
+
+enum ProgressAnchor {
+    Delivered(String),
+    Pending,
+    Failed,
+    Uncertain,
+}
+
+async fn progress_anchor(
+    store: &StoreHandle,
+    dependent: &OutboxRow,
+    anchor_key: &str,
+) -> Result<ProgressAnchor, SendFailure> {
+    let row = store
+        .outbox_row_by_key(anchor_key)
+        .await
+        .map_err(SendFailure::Store)?
+        .ok_or(SendFailure::DependencyPermanent)?;
+    if row.id >= dependent.id || row.scope_key != dependent.scope_key || row.kind != "progress" {
+        return Err(SendFailure::DependencyPermanent);
+    }
+    if !matches!(
+        OutboxOperation::decode(&row.payload_json),
+        Ok(OutboxOperation::ReplyProgressCard { .. })
+    ) {
+        return Err(SendFailure::DependencyPermanent);
+    }
+    match row.state {
+        OutboxState::Sent => row
+            .receipt_message_id
+            .filter(|receipt| !receipt.is_empty())
+            .map(ProgressAnchor::Delivered)
+            .ok_or(SendFailure::DependencyPermanent),
+        OutboxState::Pending | OutboxState::Sending => Ok(ProgressAnchor::Pending),
+        OutboxState::Failed => Ok(ProgressAnchor::Failed),
+        OutboxState::UncertainDelivery => Ok(ProgressAnchor::Uncertain),
+    }
+}
+
+fn progress_card(text: &str) -> Value {
+    json!({
+        "schema": "2.0",
+        "body": {
+            "elements": [{
+                "tag": "markdown",
+                "content": text,
+            }],
+        },
+    })
 }
 
 async fn record_failure(
@@ -316,48 +484,43 @@ async fn record_failure(
     shutdown: &CancellationToken,
 ) -> ProcessOutcome {
     let attempts = row.attempts.saturating_add(1);
-    // A retryable failure is deferred only while it still has attempts left;
-    // once the budget is exhausted the row becomes terminal `failed` and no
-    // later retry can reorder the queue.
-    let deferred = class == DeliveryClass::Retryable && attempts < STORE_OUTBOX_MAX_ATTEMPTS;
     let retry_at = now_ms().saturating_add(retry_delay_ms(attempts, config));
     let result = match class {
-        DeliveryClass::Retryable => {
-            write_receipt(shutdown, config.poll_interval, || {
-                store.fail_outbox(row.id, attempts, retry_at, false)
-            })
-            .await
-        }
-        DeliveryClass::Uncertain => {
-            write_receipt(shutdown, config.poll_interval, || {
-                store.fail_outbox(row.id, attempts, now_ms(), true)
-            })
-            .await
-        }
-        DeliveryClass::Permanent => {
-            write_receipt(shutdown, config.poll_interval, || {
-                store.fail_outbox_terminal(row.id)
-            })
-            .await
+        DeliveryClass::Retryable => write_receipt(shutdown, config.poll_interval, || {
+            store.fail_outbox_and_defer_successors(row.id, attempts, retry_at)
+        })
+        .await
+        .map(Some),
+        DeliveryClass::Uncertain => write_receipt(shutdown, config.poll_interval, || {
+            store.fail_outbox(row.id, attempts, now_ms(), true)
+        })
+        .await
+        .map(|()| None),
+        DeliveryClass::Permanent => write_receipt(shutdown, config.poll_interval, || {
+            store.fail_outbox_terminal(row.id)
+        })
+        .await
+        .map(|()| None),
+    };
+    let deferred = match result {
+        Ok(Some(deferred)) => deferred,
+        Ok(None) => false,
+        Err(store_error) => {
+            // The row stays `sending`; startup `recover_sending_outbox` will
+            // mark it explicitly uncertain, so a transient store failure can
+            // never silently drop an attempted send.
+            tracing::warn!(
+                error = %error,
+                store_error = %store_error,
+                outbox_id = row.id,
+                class = ?class,
+                "outbox send failed and the receipt could not be recorded"
+            );
+            return ProcessOutcome::Resolved;
         }
     };
-    if let Err(store_error) = result {
-        // The row stays `sending`; startup `recover_sending_outbox` will mark
-        // it explicitly uncertain, so a transient store failure can never be
-        // silently dropped from the terminal answer.
-        tracing::warn!(
-            error = %error,
-            store_error = %store_error,
-            outbox_id = row.id,
-            class = ?class,
-            "outbox send failed and the receipt could not be recorded"
-        );
-        return ProcessOutcome::Resolved;
-    }
     if deferred {
-        ProcessOutcome::Deferred {
-            next_retry_ms: retry_at,
-        }
+        ProcessOutcome::Deferred
     } else {
         ProcessOutcome::Resolved
     }
@@ -368,23 +531,6 @@ async fn release_tail(store: &StoreHandle, tail: &[OutboxRow]) {
         if let Err(error) = store.release_outbox_claim(row.id).await {
             tracing::warn!(error = %error, outbox_id = row.id, "outbox claim release failed");
         }
-    }
-}
-
-async fn release_tail_at(store: &StoreHandle, tail: &[OutboxRow], next_retry_ms: i64) {
-    for row in tail {
-        if let Err(error) = store.release_outbox_claim_at(row.id, next_retry_ms).await {
-            tracing::warn!(error = %error, outbox_id = row.id, "outbox claim release failed");
-        }
-    }
-}
-
-/// Parks every `pending` successor of the deferred row that would otherwise be
-/// claimed before its retry, so global `id` order is preserved across poll
-/// cycles, not just within one claim batch.
-async fn defer_successors(store: &StoreHandle, after_id: i64, retry_ms: i64) {
-    if let Err(error) = store.defer_outbox_after(after_id, retry_ms).await {
-        tracing::warn!(error = %error, after_id, "outbox successor deferral failed");
     }
 }
 

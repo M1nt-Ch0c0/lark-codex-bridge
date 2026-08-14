@@ -18,14 +18,10 @@
 //! 6. A final reply counts as delivered only once Lark returns a non-empty
 //!    `message_id` (enforced at the outbox boundary, not here).
 //!
-//! Real-time progress is not wired into the scope runtime in this task; the
-//! streaming [`ReplyProjector::observe`] path is the deferred integration
-//! seam. The final-only durable sink uses only [`ReplyProjector::project_final`].
-//!
-//! Wiring point (out of scope here, covered by the prior report): the scope
-//! actor's `Running` phase drives [`ReplyProjector::observe`] from its
-//! `ThreadSubscription`, and each `Progress` output is enqueued as a
-//! `progress` outbox row before the terminal final is projected.
+//! The scope actor drives [`ReplyProjector::observe`] from its live thread
+//! subscription. Each accepted progress snapshot becomes a durable card
+//! create/update row, and fallback terminal content finalizes that card in
+//! place.
 //!
 //! Redaction: `Debug` implementations report counts and lengths only — never
 //! agent text, and the email audit mask never appears in `Debug` output.
@@ -74,6 +70,12 @@ pub enum ProjectedReply {
         /// Bounded, already-masked message parts, in deterministic order.
         parts: Vec<String>,
     },
+    /// A turn that already created a progress card is finalized by updating
+    /// that card in place with the complete fallback answer.
+    ProgressFinal {
+        /// Bounded, already-masked final card text.
+        text: String,
+    },
     /// Clean-empty turn (no visible output): send nothing.
     Empty,
 }
@@ -88,6 +90,10 @@ impl fmt::Debug for ProjectedReply {
                     "total_chars",
                     &parts.iter().map(|part| part.chars().count()).sum::<usize>(),
                 )
+                .finish(),
+            Self::ProgressFinal { text } => formatter
+                .debug_struct("ProgressFinal")
+                .field("text_chars", &text.chars().count())
                 .finish(),
             Self::Empty => formatter.write_str("Empty"),
         }
@@ -120,15 +126,15 @@ impl fmt::Debug for ProjectorOutput {
 
 /// Pure, transport-agnostic reply projector.
 ///
-/// The final-only durable sink calls [`ReplyProjector::project_final`] (which
-/// never consults streaming state). The streaming [`observe`] path is the
-/// deferred progress-integration seam that will later be driven from the scope
-/// actor's `ThreadSubscription`.
+/// The scope runtime owns one projector per live turn. The final-only helper
+/// [`ReplyProjector::project_final`] remains available for recovery and tests
+/// that have no live streaming state.
 pub struct ReplyProjector {
     config: ProjectorConfig,
     progress_buffer: String,
     last_progress: Option<Instant>,
-    streamed: bool,
+    emitted_progress: u32,
+    streamed_content: String,
     /// Id of the item whose deltas are currently buffered. A single slot is
     /// enough and bounded (`O(1)`): Codex delivers one agent message's deltas
     /// to completion before the next item, so the slot resets when the item id
@@ -157,7 +163,8 @@ impl ReplyProjector {
             config,
             progress_buffer: String::new(),
             last_progress: None,
-            streamed: false,
+            emitted_progress: 0,
+            streamed_content: String::new(),
             current_item_id: None,
             current_item_buffer: String::new(),
             last_completed_item_id: None,
@@ -206,10 +213,12 @@ impl ReplyProjector {
                     },
                 ..
             } => {
-                if is_final_phase(phase.as_ref()) {
-                    // The final answer's streamed text belongs to the
-                    // terminal projection (contract 1/2): drop its buffer,
-                    // never emit progress for it.
+                if !is_progress_phase(phase.as_ref()) {
+                    // Only an explicitly commentary-phase item is safe to
+                    // expose as progress. A phase-less agent message is the
+                    // protocol fallback final when no explicit final exists,
+                    // so treating `None` as progress could both leak and then
+                    // swallow the terminal answer.
                     self.drop_item_buffer(id);
                     return ProjectorOutput::Nothing;
                 }
@@ -279,13 +288,37 @@ impl ReplyProjector {
             && self.progress_buffer.chars().count() >= self.config.min_chars
         {
             self.last_progress = Some(now);
-            self.streamed = true;
+            self.emitted_progress = self.emitted_progress.saturating_add(1);
             let text = email_mask(&self.progress_buffer);
+            self.streamed_content.push_str(&text);
+            truncate_to_chars(&mut self.streamed_content, self.config.max_chars);
             self.progress_buffer.clear();
             ProjectorOutput::Progress { text }
         } else {
             ProjectorOutput::Nothing
         }
+    }
+
+    /// Restores the most recent progress chunk after the durable sink rejects
+    /// it. The actor calls this immediately on enqueue failure, before feeding
+    /// another event, so the terminal projection can still deliver the text.
+    pub fn restore_progress(&mut self, text: &str) {
+        self.emitted_progress = self.emitted_progress.saturating_sub(1);
+        if self.streamed_content.ends_with(text) {
+            self.streamed_content
+                .truncate(self.streamed_content.len().saturating_sub(text.len()));
+        } else {
+            // The actor restores immediately, so a mismatch indicates the
+            // bounded prefix truncated this chunk. Clearing is conservative:
+            // the terminal path will send the whole fallback independently.
+            self.streamed_content.clear();
+            self.emitted_progress = 0;
+        }
+        let mut restored = String::with_capacity(text.len() + self.progress_buffer.len());
+        restored.push_str(text);
+        restored.push_str(&self.progress_buffer);
+        truncate_to_chars(&mut restored, self.config.max_chars);
+        self.progress_buffer = restored;
     }
 
     /// Projects the terminal reply, honoring the "never repeat streamed text"
@@ -298,6 +331,9 @@ impl ReplyProjector {
     #[must_use]
     pub fn finish(&self, outcome: &TurnOutcome) -> ProjectedReply {
         let Some(extracted) = extract_final(outcome) else {
+            if self.emitted_progress > 0 {
+                return self.render_progress_snapshot();
+            }
             return ProjectedReply::Empty;
         };
         if extracted.independent {
@@ -305,12 +341,11 @@ impl ReplyProjector {
             // (contract 1/4): any residual progress buffer is dropped.
             return self.render_final(&extracted.text);
         }
-        if self.streamed {
-            // Some progress was emitted: only the not-yet-displayed content
-            // remains to deliver as the final.
-            let mut rest = self.progress_buffer.clone();
-            rest.push_str(&self.current_item_buffer);
-            return self.render_final(&rest);
+        if self.emitted_progress > 0 {
+            // The complete fallback is applied to the existing progress card
+            // in place. This neither repeats already displayed text in a new
+            // message nor loses residual text that missed a progress update.
+            return self.render_progress_snapshot();
         }
         self.render_final(&extracted.text)
     }
@@ -346,6 +381,23 @@ impl ReplyProjector {
             }
         }
     }
+
+    fn render_progress_final(&self, text: &str) -> ProjectedReply {
+        let mut masked = email_mask(text.trim());
+        truncate_to_chars(&mut masked, self.config.max_chars);
+        if masked.is_empty() {
+            ProjectedReply::Empty
+        } else {
+            ProjectedReply::ProgressFinal { text: masked }
+        }
+    }
+
+    fn render_progress_snapshot(&self) -> ProjectedReply {
+        let mut complete = self.streamed_content.clone();
+        complete.push_str(&email_mask(&self.progress_buffer));
+        complete.push_str(&email_mask(&self.current_item_buffer));
+        self.render_progress_final(&complete)
+    }
 }
 
 impl fmt::Debug for ReplyProjector {
@@ -353,8 +405,9 @@ impl fmt::Debug for ReplyProjector {
         formatter
             .debug_struct("ReplyProjector")
             .field("config", &self.config)
-            .field("streamed", &self.streamed)
+            .field("streamed", &(self.emitted_progress > 0))
             .field("buffered_chars", &self.progress_buffer.chars().count())
+            .field("streamed_chars", &self.streamed_content.chars().count())
             .field("has_current_item", &self.current_item_id.is_some())
             .field(
                 "current_item_buffer_chars",
@@ -388,10 +441,12 @@ fn extract_final(outcome: &TurnOutcome) -> Option<ExtractedFinal> {
         }
     }
     for item in outcome.completed_items.iter().rev() {
-        if let ThreadItem::AgentMessage { text, .. } = item {
+        if let ThreadItem::AgentMessage { text, phase, .. } = item {
             return Some(ExtractedFinal {
                 text: text.clone(),
-                independent: false,
+                // A phase-less item is the protocol's standalone-final
+                // fallback and is deliberately never emitted as progress.
+                independent: phase.is_none(),
             });
         }
     }
@@ -400,6 +455,10 @@ fn extract_final(outcome: &TurnOutcome) -> Option<ExtractedFinal> {
 
 fn is_final_phase(phase: Option<&MessagePhase>) -> bool {
     matches!(phase, Some(MessagePhase::FinalAnswer))
+}
+
+fn is_progress_phase(phase: Option<&MessagePhase>) -> bool {
+    matches!(phase, Some(MessagePhase::Commentary))
 }
 
 /// Returns the portion of a completed item's `text` not already buffered as

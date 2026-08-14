@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant as StdInstant, SystemTime, UNIX_EPOCH};
 
 use futures_util::future::BoxFuture;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
@@ -21,9 +21,10 @@ use crate::codex::types::{
 use crate::lark::bridge::QueuedInboundEvent;
 use crate::lark::normalize::{InboundEvent, ScopeKey};
 use crate::limits::{
-    SCOPE_MAILBOX_BYTE_BUDGET, SCOPE_MAILBOX_CAPACITY, TURN_BATCH_MAX_MESSAGES,
-    TURN_BATCH_TEXT_BYTE_BUDGET,
+    REPLY_MESSAGE_MAX_CHARS, SCOPE_MAILBOX_BYTE_BUDGET, SCOPE_MAILBOX_CAPACITY,
+    TURN_BATCH_MAX_MESSAGES, TURN_BATCH_TEXT_BYTE_BUDGET,
 };
+use crate::render::{ProjectedReply, ProjectorOutput, ReplyProjector};
 use crate::runtime::policy::AccessPolicy;
 use crate::runtime::router::RouterSettings;
 use crate::store::{
@@ -84,6 +85,34 @@ pub struct TurnFinalization {
     pub outcome: Option<TurnOutcome>,
 }
 
+/// One durable progress-card snapshot for a running turn.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TurnProgress {
+    /// Store turn row owning the deterministic progress key.
+    pub turn_row_id: i64,
+    /// Owning scope key.
+    pub scope_key: String,
+    /// Original Lark reply target.
+    pub source: TurnSource,
+    /// Zero-based progress update sequence.
+    pub sequence: u32,
+    /// Bounded, already-masked cumulative progress text.
+    pub text: String,
+}
+
+impl fmt::Debug for TurnProgress {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TurnProgress")
+            .field("turn_row_id", &self.turn_row_id)
+            .field("scope_key_len", &self.scope_key.len())
+            .field("source", &self.source)
+            .field("sequence", &self.sequence)
+            .field("text_chars", &self.text.chars().count())
+            .finish()
+    }
+}
+
 impl fmt::Debug for TurnFinalization {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -114,8 +143,25 @@ pub trait DurableReplySink: Send + Sync {
         reason: InboundRejectionKind,
     ) -> Result<NewOutboxRow, ReplySinkError>;
 
+    /// Persists a progress-card snapshot. The default no-op keeps test and
+    /// alternate sinks source-compatible; production overrides it with the
+    /// durable outbox implementation.
+    fn progress(&self, _progress: TurnProgress) -> BoxFuture<'static, Result<(), ReplySinkError>> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Persists the terminal reply effects before the caller resolves store state.
     fn finalize(&self, turn: TurnFinalization) -> BoxFuture<'static, Result<(), ReplySinkError>>;
+
+    /// Persists a terminal reply already projected with live progress state.
+    /// The default falls back to [`DurableReplySink::finalize`].
+    fn finalize_projected(
+        &self,
+        turn: TurnFinalization,
+        _reply: ProjectedReply,
+    ) -> BoxFuture<'static, Result<(), ReplySinkError>> {
+        self.finalize(turn)
+    }
 }
 
 /// Observable per-scope state. Payload and filesystem details are never held.
@@ -461,6 +507,9 @@ async fn process_batch(
         return Ok(());
     }
     set_state(state, ScopeState::Running { turn_row_id });
+    let mut projector = ReplyProjector::with_defaults();
+    let mut progress_sequence = 0_u32;
+    let mut progress_snapshot = String::new();
     let outcome = loop {
         let event = tokio::select! {
             biased;
@@ -474,7 +523,39 @@ async fn process_batch(
                 break Some(outcome);
             }
             Some(AppServerEvent::ConnectionClosed { .. }) | None => break None,
-            _ => {}
+            Some(event) if event_belongs_to_turn(&event, &started.id) => {
+                if let ProjectorOutput::Progress { text } =
+                    projector.observe(&event, StdInstant::now())
+                {
+                    let Some(source) = sources.last().cloned() else {
+                        projector.restore_progress(&text);
+                        continue;
+                    };
+                    let snapshot = append_progress_snapshot(&progress_snapshot, &text);
+                    let progress = TurnProgress {
+                        turn_row_id,
+                        scope_key: scope.to_string(),
+                        source,
+                        sequence: progress_sequence,
+                        text: snapshot.clone(),
+                    };
+                    match sink.progress(progress).await {
+                        Ok(()) => {
+                            progress_snapshot = snapshot;
+                            progress_sequence = progress_sequence.saturating_add(1);
+                        }
+                        Err(error) => {
+                            projector.restore_progress(&text);
+                            tracing::warn!(
+                                error = %error,
+                                turn_row_id,
+                                "durable progress projection was rejected"
+                            );
+                        }
+                    }
+                }
+            }
+            Some(_) => {}
         }
     };
     set_state(state, ScopeState::Finalizing { turn_row_id });
@@ -483,6 +564,7 @@ async fn process_batch(
         return Ok(());
     };
     let (resolution, inbound) = resolution_for(&outcome.status);
+    let projected_reply = projector.finish(&outcome);
     persist_finalization(
         sink.as_ref(),
         settings,
@@ -493,6 +575,7 @@ async fn process_batch(
             resolution,
             outcome: Some(outcome),
         },
+        Some(projected_reply),
     )
     .await?;
     store
@@ -500,6 +583,53 @@ async fn process_batch(
         .await
         .map_err(|_| ScopeFailureKind::Store)?;
     Ok(())
+}
+
+fn event_belongs_to_turn(event: &AppServerEvent, turn_id: &str) -> bool {
+    match event {
+        AppServerEvent::AgentMessageDelta {
+            turn_id: event_turn,
+            ..
+        }
+        | AppServerEvent::CommandOutputDelta {
+            turn_id: event_turn,
+            ..
+        }
+        | AppServerEvent::ItemStarted {
+            turn_id: event_turn,
+            ..
+        }
+        | AppServerEvent::ItemCompleted {
+            turn_id: event_turn,
+            ..
+        }
+        | AppServerEvent::TokenUsageUpdated {
+            turn_id: event_turn,
+            ..
+        }
+        | AppServerEvent::Error {
+            turn_id: event_turn,
+            ..
+        } => event_turn.as_str() == turn_id,
+        AppServerEvent::TurnCompleted(outcome) => outcome.turn_id.as_str() == turn_id,
+        AppServerEvent::ThreadStarted { .. }
+        | AppServerEvent::TurnStarted { .. }
+        | AppServerEvent::SubscriptionInvalidated { .. }
+        | AppServerEvent::Unknown { .. }
+        | AppServerEvent::ConnectionClosed { .. } => false,
+    }
+}
+
+fn append_progress_snapshot(current: &str, next: &str) -> String {
+    let mut snapshot = String::with_capacity(current.len().saturating_add(next.len()));
+    snapshot.push_str(current);
+    snapshot.push_str(next);
+    let byte = snapshot
+        .char_indices()
+        .nth(REPLY_MESSAGE_MAX_CHARS)
+        .map_or(snapshot.len(), |(index, _)| index);
+    snapshot.truncate(byte);
+    snapshot
 }
 
 fn deduplicate_batch(batch: Vec<ActorInbound>) -> Result<Vec<ActorInbound>, ScopeFailureKind> {
@@ -739,6 +869,7 @@ async fn finalize_uncertain(
             resolution: TurnResolution::Uncertain,
             outcome: None,
         },
+        None,
     )
     .await?;
     store
@@ -756,6 +887,7 @@ async fn persist_finalization(
     sink: &dyn DurableReplySink,
     settings: &RouterSettings,
     finalization: TurnFinalization,
+    projected_reply: Option<ProjectedReply>,
 ) -> Result<(), ScopeFailureKind> {
     loop {
         let attempt = TurnFinalization {
@@ -765,7 +897,12 @@ async fn persist_finalization(
             resolution: finalization.resolution,
             outcome: finalization.outcome.clone(),
         };
-        match sink.finalize(attempt).await {
+        let result = if let Some(reply) = projected_reply.clone() {
+            sink.finalize_projected(attempt, reply).await
+        } else {
+            sink.finalize(attempt).await
+        };
+        match result {
             Ok(()) => return Ok(()),
             Err(ReplySinkError::Invariant) => return Err(ScopeFailureKind::Projection),
             Err(ReplySinkError::Unavailable | ReplySinkError::Capacity) => {

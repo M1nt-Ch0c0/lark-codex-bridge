@@ -215,6 +215,22 @@ impl LarkApi {
             .await
     }
 
+    /// Replies to a message with an interactive card inside its topic thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified error on token, transport, or server failure, or
+    /// [`LarkError::Exhausted`] when the serialized body exceeds
+    /// [`LARK_MAX_SEND_BODY_BYTES`].
+    pub async fn reply_card_in_thread(
+        &self,
+        message_id: &str,
+        card: Value,
+    ) -> Result<MessageRef, LarkError> {
+        self.reply(message_id, "interactive", card_content(&card)?, true)
+            .await
+    }
+
     /// Updates an interactive card in place (`PATCH`).
     ///
     /// # Errors
