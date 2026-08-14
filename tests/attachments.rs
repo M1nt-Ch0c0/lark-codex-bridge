@@ -1297,6 +1297,90 @@ async fn second_open_in_the_same_directory_fails_closed() {
     let _ = store.shutdown().await;
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn open_refuses_a_symlink_instance_lock_without_chmodding_its_target() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let temp = tempdir().expect("tempdir");
+    let root = temp.path().join("cache");
+    let outside = temp.path().join("outside-lock-target");
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let first = AttachmentCache::open(
+        &root,
+        store.clone(),
+        downloader(&[]),
+        AttachmentLimits::default(),
+    )
+    .expect("seed dedicated cache");
+    drop(first);
+    std::fs::remove_file(root.join(ATTACHMENT_INSTANCE_LOCK)).expect("remove seed lock");
+    std::fs::write(&outside, b"outside").expect("outside file");
+    std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o640))
+        .expect("outside permissions");
+    symlink(&outside, root.join(ATTACHMENT_INSTANCE_LOCK)).expect("symlink lock");
+
+    let reopened = AttachmentCache::open(
+        &root,
+        store.clone(),
+        downloader(&[]),
+        AttachmentLimits::default(),
+    );
+    assert!(
+        matches!(reopened, Err(AttachError::InvalidPath { .. })),
+        "a symlink lock path must be refused fail-closed"
+    );
+    let mode = std::fs::metadata(&outside)
+        .expect("outside metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o640, "the symlink target must never be chmod'd");
+    let _ = store.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn open_refuses_a_hard_link_instance_lock_without_chmodding_its_alias() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().expect("tempdir");
+    let root = temp.path().join("cache");
+    let outside = temp.path().join("outside-lock-alias");
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let first = AttachmentCache::open(
+        &root,
+        store.clone(),
+        downloader(&[]),
+        AttachmentLimits::default(),
+    )
+    .expect("seed dedicated cache");
+    drop(first);
+    std::fs::remove_file(root.join(ATTACHMENT_INSTANCE_LOCK)).expect("remove seed lock");
+    std::fs::write(&outside, b"outside").expect("outside file");
+    std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o640))
+        .expect("outside permissions");
+    std::fs::hard_link(&outside, root.join(ATTACHMENT_INSTANCE_LOCK)).expect("hard-link lock");
+
+    let reopened = AttachmentCache::open(
+        &root,
+        store.clone(),
+        downloader(&[]),
+        AttachmentLimits::default(),
+    );
+    assert!(
+        matches!(reopened, Err(AttachError::InvalidPath { .. })),
+        "a multiply-linked lock inode must be refused fail-closed"
+    );
+    let mode = std::fs::metadata(&outside)
+        .expect("outside metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o640, "the hard-link alias must never be chmod'd");
+    let _ = store.shutdown().await;
+}
+
 #[tokio::test]
 async fn dropping_the_file_lock_lets_a_later_instance_reopen() {
     let temp = tempdir().expect("tempdir");

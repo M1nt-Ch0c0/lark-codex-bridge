@@ -23,7 +23,9 @@
 //! crash, with no stale-file deletion protocol. Within one process the
 //! per-cache [`tokio::sync::Mutex`] and the single-writer WAL `SQLite` store
 //! serialize `fetch`/`gc`/`reconcile`, so a valid lease cannot point at a
-//! missing file.
+//! missing file. Blocking mutations carry an owned mutex guard into Tokio's
+//! blocking pool; cancelling the caller therefore cannot release the cache
+//! lock while a detached filesystem operation is still running.
 //!
 //! Reconciliation keeps a resumable `ReadDir` iterator per cache and consumes
 //! at most [`AttachmentLimits::reconcile_batch`] entries per call. Directory
@@ -480,7 +482,7 @@ pub struct AttachmentCache {
     /// Serializes the destructive file/row pairs of `fetch` (install, commit,
     /// re-verify), `gc` (delete row, delete file), and `reconcile` against one
     /// another so a valid lease can never point at a missing file (B2).
-    lock: tokio::sync::Mutex<()>,
+    lock: Arc<tokio::sync::Mutex<()>>,
     /// Serializes calls that advance the resumable directory iterator.
     reconcile_lock: tokio::sync::Mutex<()>,
     /// Resumable directory iterator. It is moved into the blocking worker for
@@ -543,7 +545,7 @@ impl AttachmentCache {
             store,
             downloader,
             limits,
-            lock: tokio::sync::Mutex::new(()),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
             reconcile_lock: tokio::sync::Mutex::new(()),
             scan: std::sync::Mutex::new(None),
             _instance_lock: instance_lock,
@@ -605,17 +607,16 @@ impl AttachmentCache {
         // file write and the row/lease commit, which would otherwise leave a
         // valid lease pointing at a file GC then removed (B2). The network
         // download stays outside the lock.
-        let _guard = self.lock.lock().await;
+        let mut guard = Some(Arc::clone(&self.lock).lock_owned().await);
         let root = self.root.clone();
         let install_sha = sha.clone();
         let install_bytes = bytes.clone();
-        tokio::task::spawn_blocking(move || {
-            install_file(&root, &install_sha, install_bytes.as_ref())
-        })
-        .await
-        .map_err(|_| AttachError::Io {
-            context: "installing a downloaded attachment",
-        })??;
+        run_locked_blocking(
+            &mut guard,
+            "installing a downloaded attachment",
+            move || install_file(&root, &install_sha, install_bytes.as_ref()),
+        )
+        .await?;
         // Row and lease commit in one transaction (design §10, Task 7 Step 1),
         // so GC can never observe an unleased row and evict it mid-fetch.
         self.store
@@ -628,17 +629,14 @@ impl AttachmentCache {
         let root = self.root.clone();
         let verify_sha = sha.clone();
         let verify_bytes = bytes.clone();
-        tokio::task::spawn_blocking(move || {
+        run_locked_blocking(&mut guard, "verifying an installed attachment", move || {
             let path = root.join(&verify_sha);
             if verify_existing(&path, &verify_sha, verify_bytes.len()).is_err() {
                 install_file(&root, &verify_sha, verify_bytes.as_ref())?;
             }
             Ok::<(), AttachError>(())
         })
-        .await
-        .map_err(|_| AttachError::Io {
-            context: "verifying an installed attachment",
-        })??;
+        .await?;
         Ok(CachedAttachment {
             sha256: sha,
             path: final_path,
@@ -671,14 +669,17 @@ impl AttachmentCache {
     ///
     /// Returns a classified store or I/O failure.
     pub async fn gc(&self) -> Result<GcStats, AttachError> {
-        let _guard = self.lock.lock().await;
-        self.gc_inner().await
+        let mut guard = Some(Arc::clone(&self.lock).lock_owned().await);
+        self.gc_inner(&mut guard).await
     }
 
     /// Eviction pass without the per-cache lock; callers hold it (so
     /// `reconcile` can run GC inside its own critical section without
     /// re-acquiring the lock and deadlocking).
-    async fn gc_inner(&self) -> Result<GcStats, AttachError> {
+    async fn gc_inner(
+        &self,
+        guard: &mut Option<tokio::sync::OwnedMutexGuard<()>>,
+    ) -> Result<GcStats, AttachError> {
         let rows = self
             .store
             .list_attachments()
@@ -730,13 +731,11 @@ impl AttachmentCache {
                 }
                 let root = self.root.clone();
                 let sha = row.sha256.clone();
-                tokio::task::spawn_blocking(move || {
+                run_locked_blocking(guard, "removing an evicted cached file", move || {
                     remove_direct_child(&root, &root.join(sha), "removing an evicted cached file")
+                        .map(|_| ())
                 })
-                .await
-                .map_err(|_| AttachError::Io {
-                    context: "removing an evicted cached file",
-                })??;
+                .await?;
             }
             files = files.saturating_sub(1);
             total_bytes = total_bytes.saturating_sub(row.bytes);
@@ -805,8 +804,8 @@ impl AttachmentCache {
 
         // Phase C — apply the candidates under the per-cache lock, re-verified
         // against fresh store rows.
-        let _guard = self.lock.lock().await;
-        self.reconcile_locked(scan.candidates).await
+        let mut guard = Some(Arc::clone(&self.lock).lock_owned().await);
+        self.reconcile_locked(scan.candidates, &mut guard).await
     }
 
     /// Destructive half of reconciliation; the caller holds the per-cache
@@ -816,6 +815,7 @@ impl AttachmentCache {
     async fn reconcile_locked(
         &self,
         candidates: ScanCandidates,
+        guard: &mut Option<tokio::sync::OwnedMutexGuard<()>>,
     ) -> Result<ReconcileStats, AttachError> {
         let rows = self
             .store
@@ -835,22 +835,44 @@ impl AttachmentCache {
 
         let batch = self.limits.reconcile_batch;
         let root = self.root.clone();
-        let applied = tokio::task::spawn_blocking(move || {
+        let applied = run_locked_blocking(guard, "applying reconciliation candidates", move || {
             apply_scan_candidates(&root, candidates, &rows_by_sha, malformed_rows, batch)
         })
-        .await
-        .map_err(|_| AttachError::Io {
-            context: "applying reconciliation candidates",
-        })??;
+        .await?;
         let mut stats = applied.stats;
         for sha in &applied.drop_rows {
-            if self
+            let dropped = self
                 .store
                 .delete_attachment_force(sha)
                 .await
-                .map_err(|error| store_err("dropping a dangling attachment row", error))?
-            {
+                .map_err(|error| store_err("dropping a dangling attachment row", error))?;
+            if dropped {
                 stats.dropped_rows = stats.dropped_rows.saturating_add(1);
+            }
+            if applied.delete_after_drop.contains(sha)
+                && self
+                    .store
+                    .attachment_row(sha)
+                    .await
+                    .map_err(|error| {
+                        store_err("re-checking a corrupt attachment before unlink", error)
+                    })?
+                    .is_none()
+            {
+                let root = self.root.clone();
+                let sha = sha.clone();
+                let removed =
+                    run_locked_blocking(guard, "removing a corrupt cached file", move || {
+                        remove_direct_child(
+                            &root,
+                            &root.join(sha),
+                            "removing a corrupt cached file",
+                        )
+                    })
+                    .await?;
+                if removed {
+                    stats.corrupt_files = stats.corrupt_files.saturating_add(1);
+                }
             }
         }
         stats.stale_leases = self
@@ -858,9 +880,34 @@ impl AttachmentCache {
             .delete_stale_attachment_leases()
             .await
             .map_err(|error| store_err("deleting stale attachment leases", error))?;
-        stats.gc = self.gc_inner().await?;
+        stats.gc = self.gc_inner(guard).await?;
         Ok(stats)
     }
+}
+
+/// Runs one filesystem mutation on Tokio's blocking pool without opening a
+/// cancellation window in the cache critical section. The owned mutex guard
+/// travels into the blocking closure and is returned only after the mutation
+/// completes. If the awaiting future is cancelled, the detached blocking job
+/// still owns the guard until it exits, so no later cache mutation can
+/// interleave with it.
+async fn run_locked_blocking<T, F>(
+    guard: &mut Option<tokio::sync::OwnedMutexGuard<()>>,
+    context: &'static str,
+    task: F,
+) -> Result<T, AttachError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, AttachError> + Send + 'static,
+{
+    let owned = guard.take().ok_or(AttachError::Io {
+        context: "holding the attachment cache mutation lock",
+    })?;
+    let (owned, result) = tokio::task::spawn_blocking(move || (owned, task()))
+        .await
+        .map_err(|_| AttachError::Io { context })?;
+    *guard = Some(owned);
+    result
 }
 
 /// Writes `bytes` to a same-directory temp file, `fsync`s, and atomically
@@ -967,6 +1014,10 @@ struct ScanBatch {
 struct AppliedCandidates {
     stats: ReconcileStats,
     drop_rows: HashSet<String>,
+    /// Corrupt content files whose store row must be dropped before unlink.
+    /// Keeping the delete on the safe side of that ordering means cancellation
+    /// can leave only an orphan file, never a row/lease pointing at no file.
+    delete_after_drop: HashSet<String>,
 }
 
 /// Advances a resumable directory iterator by at most `batch` entries. The
@@ -1061,6 +1112,7 @@ fn apply_scan_candidates(
         ..ReconcileStats::default()
     };
     let mut deletions = 0_usize;
+    let mut delete_after_drop = HashSet::new();
 
     for path in candidates.temp {
         if deletions >= batch {
@@ -1095,11 +1147,9 @@ fn apply_scan_candidates(
         if actual == expected {
             continue;
         }
-        if remove_direct_child(root, &path, "removing a corrupt cached file")? {
-            stats.corrupt_files = stats.corrupt_files.saturating_add(1);
-            deletions = deletions.saturating_add(1);
-        }
+        delete_after_drop.insert(sha.clone());
         drop_rows.insert(sha);
+        deletions = deletions.saturating_add(1);
     }
     for path in candidates.unrecognized {
         if deletions >= batch {
@@ -1116,7 +1166,11 @@ fn apply_scan_candidates(
             drop_rows.insert(sha.clone());
         }
     }
-    Ok(AppliedCandidates { stats, drop_rows })
+    Ok(AppliedCandidates {
+        stats,
+        drop_rows,
+        delete_after_drop,
+    })
 }
 
 fn remove_direct_child(
@@ -1149,16 +1203,19 @@ struct InstanceLockGuard {
 /// or unlink race is involved.
 fn acquire_instance_lock(root: &Path) -> Result<InstanceLockGuard, AttachError> {
     let path = root.join(ATTACHMENT_INSTANCE_LOCK);
+    validate_instance_lock_path(&path)?;
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
+        options.custom_flags(libc::O_NOFOLLOW);
     }
     let file = options.open(&path).map_err(|_| AttachError::Io {
         context: "opening the instance lock",
     })?;
+    validate_opened_instance_lock(&path, &file)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1179,6 +1236,63 @@ fn acquire_instance_lock(root: &Path) -> Result<InstanceLockGuard, AttachError> 
         }
     })?;
     Ok(InstanceLockGuard { _file: file })
+}
+
+/// Refuses an existing lock path unless it is a direct regular file with no
+/// detectable hard-link alias. This check happens before opening so no chmod
+/// or lock operation can touch an obvious path redirection.
+fn validate_instance_lock_path(path: &Path) -> Result<(), AttachError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => validate_lock_metadata(&metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(AttachError::Io {
+            context: "inspecting the instance lock path",
+        }),
+    }
+}
+
+/// Re-validates the path and opened handle before changing permissions. On
+/// Unix, `O_NOFOLLOW` closes the symlink race and device/inode equality closes
+/// replacement races between the pre-open check and `open`; a link count other
+/// than one rejects a hard-link alias.
+fn validate_opened_instance_lock(path: &Path, file: &std::fs::File) -> Result<(), AttachError> {
+    let path_metadata = std::fs::symlink_metadata(path).map_err(|_| AttachError::Io {
+        context: "re-checking the instance lock path",
+    })?;
+    validate_lock_metadata(&path_metadata)?;
+    let file_metadata = file.metadata().map_err(|_| AttachError::Io {
+        context: "inspecting the opened instance lock",
+    })?;
+    validate_lock_metadata(&file_metadata)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if path_metadata.dev() != file_metadata.dev() || path_metadata.ino() != file_metadata.ino()
+        {
+            return Err(AttachError::InvalidPath {
+                context: "instance lock path changed while opening",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_lock_metadata(metadata: &std::fs::Metadata) -> Result<(), AttachError> {
+    if !metadata.file_type().is_file() {
+        return Err(AttachError::InvalidPath {
+            context: "instance lock must be a regular file",
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(AttachError::InvalidPath {
+                context: "instance lock must not have hard-link aliases",
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Ensures `root` exists as a real (non-symlink) directory, creating it when
@@ -1431,6 +1545,40 @@ fn now_ms() -> i64 {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_waiter_cannot_release_a_running_blocking_mutation() {
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let mut guard = Some(Arc::clone(&lock).lock_owned().await);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let task = tokio::spawn(async move {
+            run_locked_blocking(&mut guard, "testing cancellation shielding", move || {
+                let _ = entered_tx.send(());
+                release_rx.recv().map_err(|_| AttachError::Io {
+                    context: "waiting to release the blocking test mutation",
+                })?;
+                Ok(())
+            })
+            .await
+        });
+        entered_rx.await.expect("blocking mutation entered");
+        task.abort();
+        let join = task.await.expect_err("outer waiter must be cancelled");
+        assert!(join.is_cancelled());
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), Arc::clone(&lock).lock_owned())
+                .await
+                .is_err(),
+            "the detached blocking mutation must retain the cache lock"
+        );
+        release_tx.send(()).expect("release blocking mutation");
+        let _guard = tokio::time::timeout(Duration::from_secs(1), Arc::clone(&lock).lock_owned())
+            .await
+            .expect("lock released after blocking mutation");
+    }
 
     /// The chmod failure path is hard to reach through `AttachmentCache::open`
     /// (the directory must first pass marker validation before the chmod, and

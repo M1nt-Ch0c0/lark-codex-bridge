@@ -897,6 +897,7 @@ dependencies = [
  "flate2",
  "fs2",
  "futures-util",
+ "libc",
  "predicates",
  "prost",
  "reqwest",
