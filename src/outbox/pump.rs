@@ -199,7 +199,21 @@ async fn process_row(
         Ok(operation) => operation,
         Err(error) => {
             tracing::warn!(error = %error, outbox_id = row.id, "outbox payload is undeliverable");
-            let _ = store.fail_outbox_terminal(row.id).await;
+            if let Err(store_error) = write_receipt(shutdown, config.poll_interval, || {
+                store.fail_outbox_terminal(row.id)
+            })
+            .await
+            {
+                // The row stays `sending`; startup `recover_sending_outbox`
+                // will mark it explicitly uncertain, so a transient store
+                // failure can never silently drop an undeliverable payload.
+                tracing::warn!(
+                    error = %error,
+                    store_error = %store_error,
+                    outbox_id = row.id,
+                    "outbox payload is undeliverable and the terminal receipt could not be recorded"
+                );
+            }
             return;
         }
     };

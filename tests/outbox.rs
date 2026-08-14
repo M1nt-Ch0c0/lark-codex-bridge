@@ -586,6 +586,44 @@ async fn permanent_auth_is_terminal_failed_without_resend() {
 }
 
 #[tokio::test]
+async fn undeliverable_payload_is_terminally_failed_without_send() {
+    // A corrupt payload (unknown operation) must be classified as an
+    // undeliverable permanent failure before any send: the row goes terminal
+    // `failed` in one pass, without a send attempt, instead of being stranded
+    // in `sending`.
+    let server = StubServer::start(token_plus(|_| ok_message("om_unused"))).await;
+    let api = api_for(&server);
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let id = store
+        .enqueue_outbox(NewOutboxRow {
+            idempotency_key: "1:final:evt_1".to_owned(),
+            scope_key: "im:oc_chat".to_owned(),
+            kind: "final".to_owned(),
+            payload_json: r#"{"version":1,"op":"send_text","message_id":"m","text":"t"}"#
+                .to_owned(),
+            next_retry_ms: 0,
+        })
+        .await
+        .expect("enqueue");
+    let id = match id {
+        OutboxEnqueue::New(row) | OutboxEnqueue::Duplicate(row) => row.id,
+    };
+    let (_, rx) = watch::channel(TransportState::Connected);
+    let pump = OutboxPump::spawn(store.clone(), api, rx, fast_config());
+
+    let row = wait_for_state(&store, id, OutboxState::Failed).await;
+    assert_eq!(row.state, OutboxState::Failed);
+    assert_eq!(row.attempts, 0, "a corrupt payload is never send-retried");
+    assert_eq!(
+        reply_requests(&server).len(),
+        0,
+        "a corrupt payload must fail before any Lark send"
+    );
+
+    pump.shutdown().await;
+}
+
+#[tokio::test]
 async fn empty_message_id_is_not_recorded_as_delivered() {
     // A code-0 response without a usable message_id means the send outcome is
     // unknown: the row becomes uncertain and is never re-sent.
