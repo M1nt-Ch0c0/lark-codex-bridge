@@ -10,6 +10,7 @@ fn help_describes_the_codex_command() {
         .assert()
         .success()
         .stdout(predicate::str::contains("lark-codex-bridge"))
+        .stdout(predicate::str::contains("run"))
         .stdout(predicate::str::contains("codex"));
 }
 
@@ -63,4 +64,15 @@ fn parsed_cli_debug_redacts_secrets_ids_and_absolute_paths() {
     ])
     .expect("parse codex command");
     assert!(!format!("{codex:?}").contains("/sensitive/customer"));
+
+    let run = Cli::try_parse_from([
+        "lark-codex-bridge",
+        "run",
+        "--config",
+        "/sensitive/customer/bridge.toml",
+    ])
+    .expect("parse run command");
+    let run_debug = format!("{run:?}");
+    assert!(run_debug.contains("config_configured"));
+    assert!(!run_debug.contains("/sensitive/customer"));
 }

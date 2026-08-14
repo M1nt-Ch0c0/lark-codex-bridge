@@ -201,6 +201,11 @@ pub const STORE_RECOVERY_TURN_MAX_ROWS: usize = 32;
 pub const STORE_RECOVERY_TURN_MAX_BYTES: usize = 1024 * 1024;
 /// Send attempts after which an outbox row is marked terminally `failed`.
 pub const STORE_OUTBOX_MAX_ATTEMPTS: u32 = 8;
+/// Receipt-write attempts for one outbox row transition. A transient writer
+/// queue overflow or `SQLite` failure must not strand a `sending` row
+/// in-process: the pump retries this many times before warning and leaving the
+/// row `sending` for startup `recover_sending_outbox` to reconcile.
+pub const STORE_RECEIPT_WRITE_ATTEMPTS: u32 = 3;
 /// Maximum length of a stored inbound-event rejection reason; reasons are
 /// operator-facing classifications, never message content.
 pub const STORE_REJECTION_REASON_MAX_BYTES: usize = 128;
@@ -250,3 +255,45 @@ pub const TURN_BATCH_MAX_MESSAGES: usize = 64;
 pub const TURN_BATCH_TEXT_BYTE_BUDGET: usize = 768 * 1024;
 /// Maximum bytes parsed as one recognized first-stage bridge command.
 pub const BRIDGE_COMMAND_MAX_BYTES: usize = 16 * 1024;
+
+/// Maximum characters (Unicode scalar values) in one projected reply message
+/// before deterministic splitting. A part never exceeds this bound.
+pub const REPLY_MESSAGE_MAX_CHARS: usize = 4000;
+/// Maximum split parts for one projected reply; any remainder is truncated
+/// with an explicit marker instead of producing an unbounded part count.
+pub const REPLY_MAX_SPLITS: usize = 8;
+/// Deterministic truncation marker appended to the final split part.
+pub const REPLY_TRUNCATION_MARKER: &str = "…[truncated]";
+/// Minimum interval between two progress upserts of the same turn.
+pub const REPLY_UPDATE_MIN_INTERVAL: Duration = Duration::from_millis(1500);
+/// Minimum newly accumulated characters before the next progress upsert.
+pub const REPLY_UPDATE_MIN_CHARS: usize = 200;
+
+/// Base delay of the outbox pump's deterministic exponential backoff.
+pub const OUTBOX_RETRY_BASE: Duration = Duration::from_millis(500);
+/// Upper bound of one outbox pump retry delay.
+pub const OUTBOX_RETRY_MAX: Duration = Duration::from_secs(30);
+/// Poll cadence for discovering newly enqueued rows while the transport is
+/// connected and no rows are due yet.
+pub const OUTBOX_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// Retention window for automatically sweepable terminal (`sent`/`failed`)
+/// outbox rows, in milliseconds. `uncertain_delivery` evidence is retained
+/// until explicit operator resolution; the all-state hard caps still bound
+/// the durable table and fail producers closed.
+pub const OUTBOX_TERMINAL_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+/// Maximum terminal outbox rows deleted by one bounded sweep.
+pub const OUTBOX_SWEEP_BATCH: u32 = 256;
+/// Interval between bounded outbox terminal sweeps.
+pub const OUTBOX_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// Hard upper bound on the total outbox row count across **all** states
+/// (`pending`, `sending`, `sent`, `failed`, `uncertain_delivery`). Counting
+/// every state means no state transition can ever push the table past the
+/// bound (a row only moves between states, never changing the total). The
+/// periodic sweep only frees `sent`/`failed` rows past the retention window,
+/// so a burst of rows can outrun it; enqueue fails closed (after one bounded
+/// inline sweep) once this cap is reached instead of letting the table grow
+/// without bound.
+pub const OUTBOX_TERMINAL_MAX_ROWS: u64 = 65_536;
+/// Hard upper bound on payload bytes retained by the outbox table across all
+/// states (see [`OUTBOX_TERMINAL_MAX_ROWS`]).
+pub const OUTBOX_TERMINAL_MAX_BYTES: u64 = 256 * 1024 * 1024;

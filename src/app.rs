@@ -16,6 +16,7 @@ use crate::lark::credentials::{LarkCredentials, load_credentials};
 use crate::lark::http::LarkHttp;
 use crate::lark::token::TenantTokenProvider;
 use crate::lark::transport::TransportState;
+use crate::outbox::{OutboxPump, OutboxPumpConfig, OutboxReplySink};
 use crate::runtime::intake::{DurableIntake, TenantNamespace};
 use crate::runtime::policy::AccessPolicy;
 use crate::runtime::router::{RouteAttemptError, RouteError, Router, RouterHandle, RouterSettings};
@@ -70,6 +71,25 @@ pub trait OutboundFactory: Send + Sync {
         api: LarkApi,
         transport: watch::Receiver<TransportState>,
     ) -> Result<OutboundRuntime, OutboundStartError>;
+}
+
+/// Production durable-outbox assembly used by the CLI.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProductionOutboundFactory;
+
+impl OutboundFactory for ProductionOutboundFactory {
+    fn start(
+        &self,
+        store: StoreHandle,
+        api: LarkApi,
+        transport: watch::Receiver<TransportState>,
+    ) -> Result<OutboundRuntime, OutboundStartError> {
+        let sink: Arc<dyn DurableReplySink> = Arc::new(OutboxReplySink::new(store.clone()));
+        let pump = OutboxPump::spawn(store, api, transport, OutboxPumpConfig::default());
+        Ok(OutboundRuntime::new(sink, async move {
+            pump.shutdown().await;
+        }))
+    }
 }
 
 /// The two outbound capabilities needed by application assembly.
@@ -135,6 +155,19 @@ where
         .map_err(|_| AppError::Credentials)?
         .ok_or(AppError::Credentials)?;
     run_config_with_outbound_until(config, credentials, outbound_factory, shutdown).await
+}
+
+/// Runs the production bridge with the durable outbox until `shutdown`.
+///
+/// # Errors
+///
+/// Returns the same content-free startup/runtime classifications as
+/// [`run_with_outbound_until`].
+pub async fn run_until<S>(config_path: Option<&Path>, shutdown: S) -> Result<DriveSummary, AppError>
+where
+    S: Future<Output = ()>,
+{
+    run_with_outbound_until(config_path, &ProductionOutboundFactory, shutdown).await
 }
 
 /// Runs an already-loaded bridge configuration until `shutdown`.
@@ -381,15 +414,24 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use futures_util::{FutureExt, future::BoxFuture};
-    use tokio::sync::{Semaphore, mpsc};
+    use secrecy::SecretString;
+    use tokio::sync::{Semaphore, mpsc, watch};
 
-    use super::{DriveExit, EventRouteError, EventRouter, OutboundRuntime, drive_inbound};
-    use crate::lark::api::ChatMode;
+    use super::{
+        DriveExit, EventRouteError, EventRouter, OutboundFactory, OutboundRuntime,
+        ProductionOutboundFactory, drive_inbound,
+    };
+    use crate::lark::api::{ChatMode, LarkApi};
     use crate::lark::bridge::QueuedInboundEvent;
+    use crate::lark::config::{LarkEndpoints, TenantBrand};
+    use crate::lark::credentials::LarkCredentials;
+    use crate::lark::http::LarkHttp;
     use crate::lark::normalize::{InboundEvent, ScopeKey};
+    use crate::lark::token::TenantTokenProvider;
+    use crate::lark::transport::TransportState;
     use crate::runtime::router::RouteError;
     use crate::runtime::scope::{DurableReplySink, ReplySinkError, TurnFinalization};
-    use crate::store::{InboundRejectionKind, NewOutboxRow};
+    use crate::store::{InboundRejectionKind, NewOutboxRow, StoreHandle};
 
     struct FakeRouter {
         event_ids: Mutex<Vec<String>>,
@@ -549,5 +591,32 @@ mod tests {
         runtime.shutdown().await;
 
         assert!(stopped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn production_outbound_factory_starts_sink_and_joins_pump() {
+        let store = StoreHandle::open_in_memory().await.expect("store");
+        let credentials = LarkCredentials::new(
+            "cli_app_factory".to_owned(),
+            SecretString::from("test-secret"),
+            TenantBrand::Feishu,
+        );
+        let endpoints = LarkEndpoints::for_tenant(TenantBrand::Feishu);
+        let http = LarkHttp::new(endpoints).expect("http");
+        let tokens = TenantTokenProvider::new(http.clone(), credentials);
+        let api = LarkApi::new(http, tokens);
+        let (_transport, state) = watch::channel(TransportState::Connecting { attempt: 1 });
+
+        let runtime = ProductionOutboundFactory
+            .start(store.clone(), api, state)
+            .expect("factory start");
+        let event = queued("factory").await;
+        let row = runtime
+            .sink()
+            .rejection_notice(&event.event, InboundRejectionKind::Policy)
+            .expect("production sink");
+        assert_eq!(row.kind, "notice");
+        runtime.shutdown().await;
+        store.shutdown().await.expect("store shutdown");
     }
 }

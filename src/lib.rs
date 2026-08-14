@@ -4,5 +4,7 @@ pub mod codex;
 pub mod config;
 pub mod lark;
 pub mod limits;
+pub mod outbox;
+pub mod render;
 pub mod runtime;
 pub mod store;

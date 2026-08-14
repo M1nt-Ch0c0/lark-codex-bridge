@@ -366,9 +366,12 @@ fn ensure_success(status: StatusCode, context: &'static str) -> Result<(), LarkE
     if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
         return Err(LarkError::Retryable { context, code });
     }
-    // Any other 4xx means this client sent a request the server rejects;
-    // retrying the identical request cannot succeed.
-    Err(LarkError::ProtocolViolation { context })
+    // Any other 4xx is a definitive rejection: the server responded and
+    // nothing was sent. Keep the `ProtocolViolation` kind (so the transport
+    // still treats an explicit bootstrap rejection as fatal) but carry the
+    // HTTP status as a `code` so the delivery classifier can tell a rejected
+    // (safe-to-retry, bounded) send from an unparseable response.
+    Err(LarkError::ProtocolViolation { context, code })
 }
 
 fn parse_json<R: DeserializeOwned>(body: &[u8], context: &'static str) -> Result<R, LarkError> {

@@ -31,8 +31,14 @@ pub struct Cli {
     pub command: Command,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 pub enum Command {
+    /// Run the Feishu/Lark ↔ Codex bridge until Ctrl-C.
+    Run {
+        /// Optional TOML configuration path; defaults to the platform config directory.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     /// Inspect the local Codex installation.
     Codex {
         #[command(subcommand)]
@@ -43,6 +49,25 @@ pub enum Command {
         #[command(subcommand)]
         command: LarkCommand,
     },
+}
+
+impl fmt::Debug for Command {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Run { config } => formatter
+                .debug_struct("Run")
+                .field("config_configured", &config.is_some())
+                .finish(),
+            Self::Codex { command } => formatter
+                .debug_struct("Codex")
+                .field("command", command)
+                .finish(),
+            Self::Lark { command } => formatter
+                .debug_struct("Lark")
+                .field("command", command)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -151,6 +176,7 @@ pub async fn run() -> Result<()> {
 /// Returns an error when the selected command cannot complete successfully.
 pub async fn run_with(cli: Cli) -> Result<()> {
     match cli.command {
+        Command::Run { config } => run_bridge(config).await,
         Command::Codex {
             command: CodexCommand::Probe { binary },
         } => probe_codex(binary).await,
@@ -175,6 +201,18 @@ pub async fn run_with(cli: Cli) -> Result<()> {
             command: LarkCommand::Probe,
         } => lark_probe().await,
     }
+}
+
+async fn run_bridge(config: Option<PathBuf>) -> Result<()> {
+    let shutdown = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    crate::app::run_until(config.as_deref(), shutdown)
+        .await
+        .context("bridge runtime stopped with an error")?;
+    Ok(())
 }
 
 /// The only fields `codex probe` may ever print: no Codex home, account
