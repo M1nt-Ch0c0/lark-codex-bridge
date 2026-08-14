@@ -15,11 +15,12 @@
 //! group message event also only fires when the bot is `@`-mentioned. This
 //! smoke is therefore honest operator-assisted: it starts the bridge, waits
 //! for the transport to reach `Connected`, prints a unique nonce, and asks a
-//! human to send that nonce from a *human* account into the target group while
-//! `@`-mentioning the bot. It then verifies the normalized event carries the
-//! right `chat_id` and contains the nonce, replies `pong` over `OpenAPI`, and
-//! shuts the transport down on every path. Because it requires a human, it is
-//! `#[ignore]`d and gated on `LARK_E2E=1`; it is never a CI test.
+//! human to send that nonce from a *human* account into the target chat
+//! (`@`-mentioning the bot only when the chat is a group). It then verifies
+//! the normalized event carries the right `chat_id` and contains the nonce,
+//! replies `pong` over `OpenAPI`, and shuts the transport down on every path.
+//! Because it requires a human, it is `#[ignore]`d and gated on `LARK_E2E=1`;
+//! it is never a CI test.
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
@@ -158,10 +159,12 @@ async fn run_operator_round_trip(
     let nonce = generate_nonce();
     println!(
         "\n===== Lark operator-assisted smoke =====\n\
-         From a HUMAN account, send the following nonce to the target group and\n\
-         @-mention the bot (TEST) in the SAME message. The nonce may come before\n\
-         or after the mention:\n\
+         Send the following nonce from a HUMAN account:\n\
          \n    {nonce}\n\
+         \n  - If the target chat is a p2p (single) chat with the bot: send the\n\
+         nonce as-is.\n\
+         - If the target chat is a group: send the nonce AND @-mention the bot\n\
+         (TEST) in the SAME message (nonce and mention order is free).\n\
          \nTarget chat_id: {chat_id}\n\
          Waiting up to {}s for the round trip…\n\
          =========================================\n",
@@ -240,7 +243,20 @@ async fn await_operator_nonce(
                     event.text.len(),
                     event.message_type,
                 );
+                // This is an opt-in, human-assisted smoke against a chat the
+                // operator controls. When the event is from the target chat,
+                // echo the received text (escaped) so a nonce that was
+                // mistyped or transformed by the client is visible instead of
+                // surfacing as an anonymous length mismatch. Every other chat
+                // stays length-only.
+                if event.chat_id == chat_id {
+                    println!(
+                        "operator message text (target chat): message_id={} text={:?}",
+                        event.message_id, event.text
+                    );
+                }
                 if event.chat_id == chat_id && text_contains_nonce(&event.text, nonce) {
+                    println!("nonce matched: message_id={}", event.message_id);
                     return Ok(event);
                 }
             }
