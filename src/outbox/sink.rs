@@ -75,8 +75,8 @@ impl DurableReplySink for OutboxReplySink {
 
 /// Builds every deterministic outbox row for one turn finalization.
 ///
-/// `Completed` turns project the standalone final answer (one reply per
-/// originating source, split into bounded parts). `Failed`/`Interrupted`/
+/// `Completed` turns project the standalone final answer for the last
+/// originating source only (split into bounded parts). `Failed`/`Interrupted`/
 /// `Uncertain` turns enqueue a deterministic, content-free notice so the user
 /// is never left with a silently dropped turn.
 fn build_finalization_rows(
@@ -106,22 +106,28 @@ fn final_rows(
     turn: &TurnFinalization,
     parts: &[String],
 ) -> Result<Vec<NewOutboxRow>, ReplySinkError> {
+    // One terminal answer per turn, addressed to the last source only. The
+    // reference implementation (feishu-claude-code-bridge @ e5d3ce5) replies
+    // to the last message of each debounced batch (channel.ts
+    // `replyTo: lastMsg.messageId`), so a turn must not fan one final out to
+    // every source.
+    let Some(source) = turn.sources.last() else {
+        return Ok(Vec::new());
+    };
     let mut rows = Vec::new();
-    for source in &turn.sources {
-        for (index, text) in parts.iter().enumerate() {
-            let key = if index == 0 {
-                format!("{}:final:{}", turn.turn_row_id, source.event_id)
-            } else {
-                format!("{}:final:{}:{}", turn.turn_row_id, source.event_id, index)
-            };
-            rows.push(NewOutboxRow {
-                idempotency_key: key,
-                scope_key: turn.scope_key.clone(),
-                kind: "final".to_owned(),
-                payload_json: encode_reply(source, text)?,
-                next_retry_ms: 0,
-            });
-        }
+    for (index, text) in parts.iter().enumerate() {
+        let key = if index == 0 {
+            format!("{}:final", turn.turn_row_id)
+        } else {
+            format!("{}:final:{}", turn.turn_row_id, index)
+        };
+        rows.push(NewOutboxRow {
+            idempotency_key: key,
+            scope_key: turn.scope_key.clone(),
+            kind: "final".to_owned(),
+            payload_json: encode_reply(source, text)?,
+            next_retry_ms: 0,
+        });
     }
     Ok(rows)
 }
@@ -130,17 +136,17 @@ fn notice_rows(
     turn: &TurnFinalization,
     text: &'static str,
 ) -> Result<Vec<NewOutboxRow>, ReplySinkError> {
-    let mut rows = Vec::new();
-    for source in &turn.sources {
-        rows.push(NewOutboxRow {
-            idempotency_key: format!("{}:notice:{}", turn.turn_row_id, source.event_id),
-            scope_key: turn.scope_key.clone(),
-            kind: "notice".to_owned(),
-            payload_json: encode_reply(source, text)?,
-            next_retry_ms: 0,
-        });
-    }
-    Ok(rows)
+    // A single notice per turn, addressed to the last source only.
+    let Some(source) = turn.sources.last() else {
+        return Ok(Vec::new());
+    };
+    Ok(vec![NewOutboxRow {
+        idempotency_key: format!("{}:notice", turn.turn_row_id),
+        scope_key: turn.scope_key.clone(),
+        kind: "notice".to_owned(),
+        payload_json: encode_reply(source, text)?,
+        next_retry_ms: 0,
+    }])
 }
 
 fn encode_reply(source: &TurnSource, text: &str) -> Result<String, ReplySinkError> {

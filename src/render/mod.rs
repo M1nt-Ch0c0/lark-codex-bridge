@@ -164,7 +164,6 @@ impl ReplyProjector {
         if delta.is_empty() {
             return ProjectorOutput::Nothing;
         }
-        self.streamed = true;
         self.progress_buffer.push_str(delta);
         truncate_to_chars(&mut self.progress_buffer, self.config.max_chars);
         let elapsed = self
@@ -174,6 +173,7 @@ impl ReplyProjector {
             && self.progress_buffer.chars().count() >= self.config.min_chars
         {
             self.last_progress = Some(now);
+            self.streamed = true;
             let text = email_mask(&self.progress_buffer);
             self.progress_buffer.clear();
             ProjectorOutput::Progress { text }
@@ -183,16 +183,23 @@ impl ReplyProjector {
     }
 
     /// Projects the terminal reply, honoring the "never repeat streamed text"
-    /// contract: when a turn ends without an independent final answer but
-    /// content was already streamed into the progress view, nothing more is
-    /// sent (contract 5).
+    /// contract: when a turn ends without an independent final answer, the
+    /// content already emitted into the progress view is finalized in place
+    /// (contract 5). Anything accumulated but not yet emitted is delivered as
+    /// the final, so a short streaming answer below the progress threshold is
+    /// never silently dropped.
     #[must_use]
     pub fn finish(&self, outcome: &TurnOutcome) -> ProjectedReply {
         let Some(extracted) = extract_final(outcome) else {
             return ProjectedReply::Empty;
         };
-        if !extracted.independent && self.streamed {
-            return ProjectedReply::Empty;
+        if extracted.independent {
+            return self.render_final(&extracted.text);
+        }
+        if self.streamed {
+            // Some progress was emitted: only the not-yet-displayed buffer
+            // tail remains to deliver as the final.
+            return self.render_final(&self.progress_buffer);
         }
         self.render_final(&extracted.text)
     }
@@ -296,10 +303,12 @@ pub fn email_mask(text: &str) -> String {
     out
 }
 
-/// Whether the `@` at byte `index` is the separator of an email address:
-/// a non-empty, valid local character on the left and a right-hand token that
-/// contains a dot and at least one alphabetic character (so `@1.2.3` versions
-/// are never masked).
+/// Whether the `@` at byte `index` is the separator of an email address: a
+/// non-empty, valid local character on the left and a right-hand token whose
+/// first character is not a digit (so `pkg@1.2.3` version ranges are never
+/// masked) and whose last-dot segment is a pure alphabetic domain label of
+/// 2..=24 letters (so `pkg@v1.2.3`-style tokens and other dot-separated
+/// identifiers stay untouched).
 fn is_email_at(text: &str, index: usize) -> bool {
     let Some(left) = text[..index].chars().next_back() else {
         return false;
@@ -309,9 +318,18 @@ fn is_email_at(text: &str, index: usize) -> bool {
     }
     let right = &text[index + 1..];
     let token: String = right.chars().take_while(|c| !c.is_whitespace()).collect();
-    let has_dot = token.contains('.');
-    let has_alpha = token.chars().any(|c| c.is_ascii_alphabetic());
-    has_dot && has_alpha
+    let Some(first) = token.chars().next() else {
+        return false;
+    };
+    if first.is_ascii_digit() {
+        return false;
+    }
+    let Some(last_dot) = token.rfind('.') else {
+        return false;
+    };
+    let label = &token[last_dot + 1..];
+    let len = label.chars().count();
+    (2..=24).contains(&len) && label.chars().all(|c| c.is_ascii_alphabetic())
 }
 
 /// Deterministically splits `text` into at most `max_splits` parts of at most

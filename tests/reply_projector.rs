@@ -130,31 +130,91 @@ fn progress_failure_does_not_swallow_the_final() {
     }
 }
 
+fn low_chars_config() -> ProjectorConfig {
+    ProjectorConfig {
+        max_chars: 4000,
+        max_splits: 8,
+        min_interval: Duration::from_millis(1500),
+        min_chars: 3,
+    }
+}
+
 #[test]
-fn streamed_content_is_not_resent_without_an_independent_final() {
-    // With streaming already observed, a trailing agent message without a
-    // FinalAnswer phase was already shown as progress and must not be resent.
-    let mut streamed = ReplyProjector::with_defaults();
+fn short_streamed_answer_below_threshold_is_delivered_as_final() {
+    // A short streaming answer that never crossed the progress emit threshold
+    // must not be silently dropped: nothing was actually shown, so the whole
+    // trailing message is delivered as the final.
+    let mut projector = ReplyProjector::new(low_chars_config());
     let now = Instant::now();
-    let _ = streamed.observe(&delta("this was already streamed"), now);
+    assert!(matches!(
+        projector.observe(&delta("ab"), now),
+        ProjectorOutput::Nothing
+    ));
     let turn = outcome(
-        vec![agent(
-            "a1",
-            "this was already streamed",
-            Some(MessagePhase::Commentary),
-        )],
+        vec![agent("a1", "ab", Some(MessagePhase::Commentary))],
         TurnStatus::Completed,
     );
-    assert_eq!(streamed.finish(&turn), ProjectedReply::Empty);
+    match projector.finish(&turn) {
+        ProjectedReply::Final { parts } => assert_eq!(parts, vec!["ab"]),
+        ProjectedReply::Empty => panic!("the unstreamed short answer must be delivered"),
+    }
+}
 
-    // The final-only path (no streaming observed) still delivers the trailing
-    // agent message as the standalone answer.
-    let fresh = ReplyProjector::with_defaults();
-    match fresh.project_final(&turn) {
-        ProjectedReply::Final { parts } => {
-            assert_eq!(parts, vec!["this was already streamed"]);
-        }
-        ProjectedReply::Empty => panic!("expected the trailing message"),
+#[test]
+fn streamed_emitted_content_is_not_resent_as_final() {
+    // Once Progress is actually emitted, the shown content is finalized in
+    // place (contract 5) and must not be re-sent as the final.
+    let mut projector = ReplyProjector::new(low_chars_config());
+    let now = Instant::now();
+    assert!(matches!(
+        projector.observe(&delta("abc"), now),
+        ProjectorOutput::Progress { .. }
+    ));
+    let turn = outcome(
+        vec![agent("a1", "abc", Some(MessagePhase::Commentary))],
+        TurnStatus::Completed,
+    );
+    assert_eq!(projector.finish(&turn), ProjectedReply::Empty);
+}
+
+#[test]
+fn partial_stream_emits_only_the_unshown_remainder_as_final() {
+    // After one Progress emission, the not-yet-displayed buffer tail is the
+    // only content left to deliver as the final.
+    let mut projector = ReplyProjector::new(low_chars_config());
+    let now = Instant::now();
+    assert!(matches!(
+        projector.observe(&delta("abc"), now),
+        ProjectorOutput::Progress { .. }
+    ));
+    assert!(matches!(
+        projector.observe(&delta("de"), now),
+        ProjectorOutput::Nothing
+    ));
+    let turn = outcome(
+        vec![agent("a1", "abcde", Some(MessagePhase::Commentary))],
+        TurnStatus::Completed,
+    );
+    match projector.finish(&turn) {
+        ProjectedReply::Final { parts } => assert_eq!(parts, vec!["de"]),
+        ProjectedReply::Empty => panic!("the unstreamed remainder must be delivered"),
+    }
+}
+
+#[test]
+fn project_final_path_ignores_streaming_state() {
+    // The final-only durable path never consults streaming state: the trailing
+    // agent message is always delivered whole, regardless of prior progress.
+    let mut projector = ReplyProjector::new(low_chars_config());
+    let now = Instant::now();
+    let _ = projector.observe(&delta("abc"), now);
+    let turn = outcome(
+        vec![agent("a1", "abcde", Some(MessagePhase::Commentary))],
+        TurnStatus::Completed,
+    );
+    match projector.project_final(&turn) {
+        ProjectedReply::Final { parts } => assert_eq!(parts, vec!["abcde"]),
+        ProjectedReply::Empty => panic!("project_final must deliver the whole trailing message"),
     }
 }
 
@@ -179,6 +239,23 @@ fn email_mask_masks_only_plausible_emails() {
     assert_eq!(email_mask("hi @everyone"), "hi @everyone");
     assert_eq!(email_mask("hello@world"), "hello@world");
     assert_eq!(email_mask("trailing@"), "trailing@");
+}
+
+#[test]
+fn email_mask_leaves_version_like_tokens_and_mentions_untouched() {
+    // Version ranges (`pkg@1.0.229-beta`, `pkg@v1.2.3`) must not be masked:
+    // the right-hand token starts with a digit, or the last-dot segment is not
+    // a pure alphabetic domain label.
+    assert_eq!(email_mask("serde@1.0.229-beta"), "serde@1.0.229-beta");
+    assert_eq!(email_mask("foo@v1.2.3"), "foo@v1.2.3");
+
+    // Mentions and underscore-suffixed usernames stay untouched.
+    assert_eq!(email_mask("@mention"), "@mention");
+    assert_eq!(email_mask("@_user_1"), "@_user_1");
+
+    // A real address is still masked; an already-masked one has no '@' left.
+    assert_eq!(email_mask("user@example.com"), "user[at]example.com");
+    assert_eq!(email_mask("user[at]example.com"), "user[at]example.com");
 }
 
 #[test]

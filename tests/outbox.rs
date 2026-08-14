@@ -127,6 +127,12 @@ fn source(event_id: &str, message_id: &str) -> TurnSource {
     }
 }
 
+fn many_sources(n: usize) -> Vec<TurnSource> {
+    (0..n)
+        .map(|index| source(&format!("evt_{index}"), &format!("om_{index}")))
+        .collect()
+}
+
 fn agent(text: &str, phase: Option<MessagePhase>) -> ThreadItem {
     ThreadItem::AgentMessage {
         id: "agent_1".to_owned(),
@@ -356,7 +362,7 @@ async fn finalize_enqueues_the_final_row() {
     let depth = store.outbox_depth().await.expect("depth");
     assert_eq!(depth.pending, 1);
     let row = store.outbox_row(1).await.expect("row").expect("exists");
-    assert_eq!(row.idempotency_key, "1:final:evt_1");
+    assert_eq!(row.idempotency_key, "1:final");
     assert_eq!(row.kind, "final");
     let decoded = OutboxOperation::decode(&row.payload_json).expect("decode");
     match decoded {
@@ -402,7 +408,7 @@ async fn uncertain_finalization_enqueues_a_deterministic_notice() {
     sink.finalize(turn).await.expect("finalize");
 
     let row = store.outbox_row(1).await.expect("row").expect("exists");
-    assert_eq!(row.idempotency_key, "7:notice:evt_1");
+    assert_eq!(row.idempotency_key, "7:notice");
     assert_eq!(row.kind, "notice");
 }
 
@@ -424,6 +430,115 @@ async fn rejection_notice_is_deterministic() {
         } => {
             assert_eq!(message_id, "om_parent");
             assert!(!text.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn final_rows_reply_only_to_the_last_source_bounded_by_parts() {
+    // The reference implementation (feishu-claude-code-bridge @ e5d3ce5)
+    // replies to the last message of a debounced batch (channel.ts
+    // `replyTo: lastMsg.messageId`). One turn therefore emits one terminal
+    // answer — only the last source, split into at most the part count —
+    // instead of one reply per source.
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = OutboxReplySink::new(store.clone());
+
+    // 7 * 4000 + 1 chars split into exactly 8 parts (max_splits).
+    let text = "x".repeat(7 * 4000 + 1);
+    let turn = TurnFinalization {
+        turn_row_id: 42,
+        scope_key: "im:oc_chat".to_owned(),
+        sources: many_sources(64),
+        resolution: TurnResolution::Completed,
+        outcome: Some(TurnOutcome {
+            thread_id: ThreadId::from("thread_1"),
+            turn_id: TurnId::from("turn_1"),
+            status: TurnStatus::Completed,
+            error: None,
+            completed_items: vec![agent(&text, Some(MessagePhase::FinalAnswer))],
+            token_usage: None,
+        }),
+    };
+
+    sink.finalize(turn).await.expect("finalize");
+
+    let depth = store.outbox_depth().await.expect("depth");
+    assert_eq!(
+        depth.pending, 8,
+        "only the parts of a single final answer are enqueued, never 64 * 8"
+    );
+
+    let first = store.outbox_row(1).await.expect("row").expect("exists");
+    assert_eq!(first.idempotency_key, "42:final");
+    assert_eq!(first.kind, "final");
+    let decoded = OutboxOperation::decode(&first.payload_json).expect("decode");
+    match decoded {
+        OutboxOperation::ReplyText { message_id, .. } => {
+            assert_eq!(message_id, "om_63", "the reply targets the last source");
+        }
+    }
+
+    let last = store.outbox_row(8).await.expect("row").expect("exists");
+    assert_eq!(last.idempotency_key, "42:final:7");
+}
+
+#[tokio::test]
+async fn empty_sources_produce_no_rows() {
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = OutboxReplySink::new(store.clone());
+
+    let completed = TurnFinalization {
+        turn_row_id: 1,
+        scope_key: "im:oc_chat".to_owned(),
+        sources: vec![],
+        resolution: TurnResolution::Completed,
+        outcome: Some(TurnOutcome {
+            thread_id: ThreadId::from("thread_1"),
+            turn_id: TurnId::from("turn_1"),
+            status: TurnStatus::Completed,
+            error: None,
+            completed_items: vec![agent("the answer", Some(MessagePhase::FinalAnswer))],
+            token_usage: None,
+        }),
+    };
+    sink.finalize(completed).await.expect("finalize");
+    assert_eq!(store.outbox_depth().await.expect("depth").pending, 0);
+
+    let uncertain = TurnFinalization {
+        turn_row_id: 2,
+        scope_key: "im:oc_chat".to_owned(),
+        sources: vec![],
+        resolution: TurnResolution::Uncertain,
+        outcome: None,
+    };
+    sink.finalize(uncertain).await.expect("finalize");
+    assert_eq!(store.outbox_depth().await.expect("depth").pending, 0);
+}
+
+#[tokio::test]
+async fn notice_rows_reply_only_to_the_last_source() {
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = OutboxReplySink::new(store.clone());
+    let turn = TurnFinalization {
+        turn_row_id: 77,
+        scope_key: "im:oc_chat".to_owned(),
+        sources: many_sources(64),
+        resolution: TurnResolution::Uncertain,
+        outcome: None,
+    };
+
+    sink.finalize(turn).await.expect("finalize");
+
+    let depth = store.outbox_depth().await.expect("depth");
+    assert_eq!(depth.pending, 1, "exactly one notice per turn");
+    let row = store.outbox_row(1).await.expect("row").expect("exists");
+    assert_eq!(row.idempotency_key, "77:notice");
+    assert_eq!(row.kind, "notice");
+    let decoded = OutboxOperation::decode(&row.payload_json).expect("decode");
+    match decoded {
+        OutboxOperation::ReplyText { message_id, .. } => {
+            assert_eq!(message_id, "om_63", "the notice targets the last source");
         }
     }
 }
