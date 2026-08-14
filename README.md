@@ -23,8 +23,8 @@
 解析与 help 元数据，还未进入运行时。启动时会预装有界的 `Received` 行，但尚无周期性
 重扫。当前还有一个 P1 首次启动缺口：扫码注册只保存应用凭证，尚未像参考实现一样自动
 携带创建者身份、生成安全默认工作区和运行配置并直接启动；现阶段仍需手工创建 TOML。
-具体边界和验收标准见 [已知遗留项](docs/KNOWN_GAPS.md)。真实 Lark smoke 是显式门控
-验收项；未运行或只看到 skip 都不算通过。
+具体边界和验收标准见 [GitHub Issue #2](https://github.com/M1nt-Ch0c0/lark-codex-bridge/issues/2)。
+真实 Lark smoke 是显式门控验收项；未运行或只看到 skip 都不算通过。
 
 ## 最小试用
 
@@ -119,11 +119,8 @@ LARK_E2E=1 LARK_E2E_APP_ID=… LARK_E2E_APP_SECRET=… LARK_E2E_TENANT=feishu LA
   cargo test --test lark_smoke --locked -- --ignored --nocapture
 ```
 
-设计规格见
-[docs/superpowers/specs/2026-08-12-lark-codex-bridge-design.md](docs/superpowers/specs/2026-08-12-lark-codex-bridge-design.md)。
-
-仓库只跟踪稳定的产品说明和架构规格。实施计划、实时进度、Agent 接管记录和临时
-测试证据属于本地开发材料，不发布到 Git。
+仓库只跟踪稳定的产品说明；缺陷和遗留项通过 GitHub Issue 与对应 PR 跟踪。实施计划、
+实时进度、Agent 接管记录和临时测试证据属于本地开发材料，不发布到 Git。
 
 ## 目标
 
