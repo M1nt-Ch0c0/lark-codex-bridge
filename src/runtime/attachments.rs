@@ -489,7 +489,7 @@ pub struct AttachmentCache {
     /// one bounded batch, then returned here for the next call.
     scan: std::sync::Mutex<Option<std::fs::ReadDir>>,
     /// RAII owner of the OS-released cross-instance file lock.
-    _instance_lock: InstanceLockGuard,
+    instance_lock: Arc<InstanceLockGuard>,
 }
 
 impl fmt::Debug for AttachmentCache {
@@ -548,7 +548,7 @@ impl AttachmentCache {
             lock: Arc::new(tokio::sync::Mutex::new(())),
             reconcile_lock: tokio::sync::Mutex::new(()),
             scan: std::sync::Mutex::new(None),
-            _instance_lock: instance_lock,
+            instance_lock: Arc::new(instance_lock),
         })
     }
 
@@ -613,6 +613,7 @@ impl AttachmentCache {
         let install_bytes = bytes.clone();
         run_locked_blocking(
             &mut guard,
+            Arc::clone(&self.instance_lock),
             "installing a downloaded attachment",
             move || install_file(&root, &install_sha, install_bytes.as_ref()),
         )
@@ -629,13 +630,18 @@ impl AttachmentCache {
         let root = self.root.clone();
         let verify_sha = sha.clone();
         let verify_bytes = bytes.clone();
-        run_locked_blocking(&mut guard, "verifying an installed attachment", move || {
-            let path = root.join(&verify_sha);
-            if verify_existing(&path, &verify_sha, verify_bytes.len()).is_err() {
-                install_file(&root, &verify_sha, verify_bytes.as_ref())?;
-            }
-            Ok::<(), AttachError>(())
-        })
+        run_locked_blocking(
+            &mut guard,
+            Arc::clone(&self.instance_lock),
+            "verifying an installed attachment",
+            move || {
+                let path = root.join(&verify_sha);
+                if verify_existing(&path, &verify_sha, verify_bytes.len()).is_err() {
+                    install_file(&root, &verify_sha, verify_bytes.as_ref())?;
+                }
+                Ok::<(), AttachError>(())
+            },
+        )
         .await?;
         Ok(CachedAttachment {
             sha256: sha,
@@ -731,10 +737,19 @@ impl AttachmentCache {
                 }
                 let root = self.root.clone();
                 let sha = row.sha256.clone();
-                run_locked_blocking(guard, "removing an evicted cached file", move || {
-                    remove_direct_child(&root, &root.join(sha), "removing an evicted cached file")
+                run_locked_blocking(
+                    guard,
+                    Arc::clone(&self.instance_lock),
+                    "removing an evicted cached file",
+                    move || {
+                        remove_direct_child(
+                            &root,
+                            &root.join(sha),
+                            "removing an evicted cached file",
+                        )
                         .map(|_| ())
-                })
+                    },
+                )
                 .await?;
             }
             files = files.saturating_sub(1);
@@ -835,9 +850,12 @@ impl AttachmentCache {
 
         let batch = self.limits.reconcile_batch;
         let root = self.root.clone();
-        let applied = run_locked_blocking(guard, "applying reconciliation candidates", move || {
-            apply_scan_candidates(&root, candidates, &rows_by_sha, malformed_rows, batch)
-        })
+        let applied = run_locked_blocking(
+            guard,
+            Arc::clone(&self.instance_lock),
+            "applying reconciliation candidates",
+            move || apply_scan_candidates(&root, candidates, &rows_by_sha, malformed_rows, batch),
+        )
         .await?;
         let mut stats = applied.stats;
         for sha in &applied.drop_rows {
@@ -861,15 +879,19 @@ impl AttachmentCache {
             {
                 let root = self.root.clone();
                 let sha = sha.clone();
-                let removed =
-                    run_locked_blocking(guard, "removing a corrupt cached file", move || {
+                let removed = run_locked_blocking(
+                    guard,
+                    Arc::clone(&self.instance_lock),
+                    "removing a corrupt cached file",
+                    move || {
                         remove_direct_child(
                             &root,
                             &root.join(sha),
                             "removing a corrupt cached file",
                         )
-                    })
-                    .await?;
+                    },
+                )
+                .await?;
                 if removed {
                     stats.corrupt_files = stats.corrupt_files.saturating_add(1);
                 }
@@ -887,12 +909,14 @@ impl AttachmentCache {
 
 /// Runs one filesystem mutation on Tokio's blocking pool without opening a
 /// cancellation window in the cache critical section. The owned mutex guard
-/// travels into the blocking closure and is returned only after the mutation
-/// completes. If the awaiting future is cancelled, the detached blocking job
-/// still owns the guard until it exits, so no later cache mutation can
-/// interleave with it.
+/// and an owner of the OS instance lock travel into the blocking closure and
+/// are returned only after the mutation completes. If the awaiting future is
+/// cancelled, the detached blocking job still owns both locks until it exits,
+/// so neither a same-process cache operation nor a newly opened bridge
+/// instance can interleave with it.
 async fn run_locked_blocking<T, F>(
     guard: &mut Option<tokio::sync::OwnedMutexGuard<()>>,
+    instance_lock: Arc<InstanceLockGuard>,
     context: &'static str,
     task: F,
 ) -> Result<T, AttachError>
@@ -903,10 +927,12 @@ where
     let owned = guard.take().ok_or(AttachError::Io {
         context: "holding the attachment cache mutation lock",
     })?;
-    let (owned, result) = tokio::task::spawn_blocking(move || (owned, task()))
-        .await
-        .map_err(|_| AttachError::Io { context })?;
+    let (owned, instance_lock, result) =
+        tokio::task::spawn_blocking(move || (owned, instance_lock, task()))
+            .await
+            .map_err(|_| AttachError::Io { context })?;
     *guard = Some(owned);
+    drop(instance_lock);
     result
 }
 
@@ -1546,27 +1572,58 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
 
+    struct EmptyDownloader;
+
+    impl ResourceDownloader for EmptyDownloader {
+        fn download(
+            &self,
+            _message_id: &str,
+            _key: &str,
+            _kind: ResourceKind,
+        ) -> BoxFuture<'static, Result<Bytes, AttachError>> {
+            Box::pin(async { Ok(Bytes::new()) })
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancelled_waiter_cannot_release_a_running_blocking_mutation() {
-        let lock = Arc::new(tokio::sync::Mutex::new(()));
+    async fn cancelled_last_owner_retains_both_locks_until_blocking_mutation_finishes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StoreHandle::open_in_memory().await.expect("store");
+        let cache = AttachmentCache::open(
+            temp.path(),
+            store.clone(),
+            Arc::new(EmptyDownloader),
+            AttachmentLimits::default(),
+        )
+        .expect("cache");
+        let lock = Arc::clone(&cache.lock);
         let mut guard = Some(Arc::clone(&lock).lock_owned().await);
+        let instance_lock = Arc::clone(&cache.instance_lock);
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
 
         let task = tokio::spawn(async move {
-            run_locked_blocking(&mut guard, "testing cancellation shielding", move || {
-                let _ = entered_tx.send(());
-                release_rx.recv().map_err(|_| AttachError::Io {
-                    context: "waiting to release the blocking test mutation",
-                })?;
-                Ok(())
-            })
+            run_locked_blocking(
+                &mut guard,
+                instance_lock,
+                "testing cancellation shielding",
+                move || {
+                    let _ = entered_tx.send(());
+                    release_rx.recv().map_err(|_| AttachError::Io {
+                        context: "waiting to release the blocking test mutation",
+                    })?;
+                    let _ = finished_tx.send(());
+                    Ok(())
+                },
+            )
             .await
         });
         entered_rx.await.expect("blocking mutation entered");
         task.abort();
         let join = task.await.expect_err("outer waiter must be cancelled");
         assert!(join.is_cancelled());
+        drop(cache);
 
         assert!(
             tokio::time::timeout(Duration::from_millis(50), Arc::clone(&lock).lock_owned())
@@ -1574,10 +1631,44 @@ mod tests {
                 .is_err(),
             "the detached blocking mutation must retain the cache lock"
         );
+        let second = AttachmentCache::open(
+            temp.path(),
+            store.clone(),
+            Arc::new(EmptyDownloader),
+            AttachmentLimits::default(),
+        );
+        assert!(
+            matches!(second, Err(AttachError::InvalidPath { .. })),
+            "the detached mutation must retain the OS instance lock after the last cache owner drops"
+        );
+
         release_tx.send(()).expect("release blocking mutation");
-        let _guard = tokio::time::timeout(Duration::from_secs(1), Arc::clone(&lock).lock_owned())
-            .await
-            .expect("lock released after blocking mutation");
+        finished_rx.await.expect("blocking mutation finished");
+        let reacquired_guard =
+            tokio::time::timeout(Duration::from_secs(1), Arc::clone(&lock).lock_owned())
+                .await
+                .expect("lock released after blocking mutation");
+        drop(reacquired_guard);
+
+        let mut reopened = None;
+        for _ in 0..100 {
+            match AttachmentCache::open(
+                temp.path(),
+                store.clone(),
+                Arc::new(EmptyDownloader),
+                AttachmentLimits::default(),
+            ) {
+                Ok(cache) => {
+                    reopened = Some(cache);
+                    break;
+                }
+                Err(AttachError::InvalidPath { .. }) => tokio::task::yield_now().await,
+                Err(error) => panic!("unexpected reopen error: {error:?}"),
+            }
+        }
+        assert!(reopened.is_some(), "cache reopens after detached job exits");
+        drop(reopened);
+        let _ = store.shutdown().await;
     }
 
     /// The chmod failure path is hard to reach through `AttachmentCache::open`
