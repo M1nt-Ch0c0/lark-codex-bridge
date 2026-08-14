@@ -15,6 +15,24 @@
 //!
 //! Redaction: no `Debug`, tracing, or error carries attachment bytes, message
 //! text, user file names, or absolute paths outside the cache root.
+//!
+//! Single-instance constraint: the cache root and its backing store are
+//! private to one bridge instance; sharing one cache root across processes is
+//! unsupported. Within one process the per-cache [`tokio::sync::Mutex`] and
+//! the single-writer WAL `SQLite` store serialize `fetch`/`gc`/`reconcile`, so a
+//! valid lease can never point at a missing file. `gc`'s "delete row then
+//! delete file" window cannot be closed across processes without a
+//! cross-process lock, which is deliberately not introduced (no `flock`, no
+//! Unix-only primitives); `gc` re-checks the row before unlinking as best
+//! effort only, which narrows but does not close that window.
+//!
+//! Reconciliation is a single streaming `read_dir` pass: directory entries are
+//! never materialized into a sorted vector, so scan memory is O(1) in the
+//! directory size. Destructive cleanup (orphan temp/content files and
+//! size-mismatched files) is capped at [`AttachmentLimits::reconcile_batch`]
+//! deletions per pass; the scan itself is never truncated, so each pass walks
+//! the whole directory and orphan cleanup converges because the entry count
+//! strictly decreases by at most `reconcile_batch` files per pass.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -37,7 +55,7 @@ use crate::limits::{
     ATTACHMENT_MAX_PER_MESSAGE, ATTACHMENT_MIME_MAX_BYTES, ATTACHMENT_RECONCILE_BATCH,
     ATTACHMENT_RESOURCE_KEY_MAX_BYTES, ATTACHMENT_TEMP_PREFIX, ATTACHMENT_TURN_TOTAL_BYTES,
 };
-use crate::store::{AttachmentRow, StoreError, StoreHandle};
+use crate::store::{StoreError, StoreHandle};
 
 /// Fixed marker-file contents proving a directory is a dedicated attachment
 /// cache. Any other contents are rejected fail-closed at [`AttachmentCache::open`].
@@ -68,7 +86,8 @@ pub struct AttachmentLimits {
     pub gc_age: Duration,
     /// Victims examined and evicted by one GC pass.
     pub gc_batch: usize,
-    /// Directory entries scanned by one reconciliation pass.
+    /// Files deleted by one reconciliation pass (the destructive-cleanup cap;
+    /// the scan itself always walks the whole directory).
     pub reconcile_batch: usize,
 }
 
@@ -462,11 +481,18 @@ impl fmt::Debug for AttachmentCache {
 
 impl AttachmentCache {
     /// Creates (if needed) and canonicalizes the cache directory, then builds
-    /// the cache. The directory is tightened to owner-only permissions on
-    /// Unix and must carry a valid [`ATTACHMENT_CACHE_MARKER`] marker file:
-    /// an empty directory gets one written on first open; a non-empty
-    /// directory is accepted only when its marker validates (fail-closed, so a
-    /// misconfigured root such as `$HOME` is refused rather than scanned).
+    /// the cache. The directory must be a dedicated attachment cache: on first
+    /// open an empty directory gets a valid [`ATTACHMENT_CACHE_MARKER`] marker
+    /// written to prove ownership, and a non-empty directory is accepted only
+    /// when its marker validates (fail-closed, so a misconfigured root such as
+    /// `$HOME` is refused rather than scanned). Only after the marker
+    /// validates is the directory tightened to owner-only permissions (0700)
+    /// on Unix — a refused directory is never chmod'd — and a chmod failure is
+    /// a non-fatal warning, never an error.
+    ///
+    /// Single-instance constraint: the cache root and store are private to one
+    /// bridge instance; sharing one root across processes is unsupported (see
+    /// the module docs).
     ///
     /// # Errors
     ///
@@ -479,15 +505,13 @@ impl AttachmentCache {
         limits: AttachmentLimits,
     ) -> Result<Self, AttachError> {
         ensure_cache_directory(root)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700));
-        }
         let root = std::fs::canonicalize(root).map_err(|_| AttachError::Io {
             context: "resolving the cache directory",
         })?;
         validate_cache_marker(&root)?;
+        // Only a validated dedicated directory may have its mode tightened; a
+        // misconfigured root must be refused without mutating its permissions.
+        tighten_permissions(&root);
         Ok(Self {
             root,
             store,
@@ -516,6 +540,12 @@ impl AttachmentCache {
     /// [`AttachmentLimits::check_mime`]) apply to metadata that
     /// [`ResourceDesc`] does not carry (only `kind` + `key`), so they remain
     /// public for the scope-actor wiring point that does carry that metadata.
+    ///
+    /// The install/commit/re-verify sequence runs under the per-cache lock so
+    /// a concurrent same-process `gc`/`reconcile` cannot delete the file
+    /// between the write and the row/lease commit. This is in-process
+    /// serialization only; the cache root is single-instance (see the module
+    /// docs).
     ///
     /// # Errors
     ///
@@ -579,7 +609,10 @@ impl AttachmentCache {
     /// Evicts unleased attachments, oldest (`last_used_ms`) first, until the
     /// cache is within its file/byte caps and no aged-out unleased entries
     /// remain. Leased rows are never deleted. Work is bounded by
-    /// [`AttachmentLimits::gc_batch`].
+    /// [`AttachmentLimits::gc_batch`]. Runs under the per-cache lock, which
+    /// serializes it against same-process `fetch`/`reconcile`; the cache root
+    /// is single-instance, so there is no cross-process guarantee (see the
+    /// module docs).
     ///
     /// # Errors
     ///
@@ -630,6 +663,21 @@ impl AttachmentCache {
             // Only after the row was atomically confirmed unleased may the
             // file go; a crash here leaves an orphan, never a dangling row.
             if is_valid_sha256_name(&row.sha256) {
+                // Defense in depth against sharing one cache root across
+                // processes (unsupported, see module docs): the row was
+                // deleted above, but another instance could re-install the
+                // same hash between that delete and this unlink. Re-checking
+                // narrows that window without closing it, so it is best
+                // effort, not a correctness guarantee.
+                if self
+                    .store
+                    .attachment_row(&row.sha256)
+                    .await
+                    .map_err(|error| store_err("re-checking an attachment before unlink", error))?
+                    .is_some()
+                {
+                    continue;
+                }
                 let _ = self.remove_file(
                     &self.root.join(&row.sha256),
                     "removing an evicted cached file",
@@ -646,8 +694,11 @@ impl AttachmentCache {
     /// Reconciles the cache directory with the store at startup. Handles
     /// residual temp files, files without a store row, store rows without a
     /// file, size-mismatched files, stale leases, and over-capacity caches.
-    /// Bounded, idempotent, and repeatable: a single bad entry is skipped,
-    /// never fatal.
+    /// The directory scan is one complete streaming pass (never truncated);
+    /// destructive file cleanup is capped at
+    /// [`AttachmentLimits::reconcile_batch`] deletions per pass, so repeated
+    /// passes converge. Bounded, idempotent, and repeatable: a single bad
+    /// entry is skipped, never fatal.
     ///
     /// # Errors
     ///
@@ -667,18 +718,17 @@ impl AttachmentCache {
             .await
             .map_err(|error| store_err("listing attachments for reconciliation", error))?;
 
-        let mut rows_by_sha: HashMap<String, usize> = HashMap::new();
+        let mut rows_by_sha: HashMap<String, u64> = HashMap::new();
         let mut drop_rows: HashSet<String> = HashSet::new();
-        for (index, row) in rows.iter().enumerate() {
+        for row in &rows {
             if is_valid_sha256_name(&row.sha256) {
-                rows_by_sha.insert(row.sha256.clone(), index);
+                rows_by_sha.insert(row.sha256.clone(), row.bytes);
             } else {
                 drop_rows.insert(row.sha256.clone());
             }
         }
 
-        self.scan_entries(&rows, &rows_by_sha, &mut drop_rows, &mut stats)
-            .await?;
+        self.scan_entries(&rows_by_sha, &mut drop_rows, &mut stats)?;
 
         for sha in &drop_rows {
             if self
@@ -691,9 +741,10 @@ impl AttachmentCache {
             }
         }
         // Missing-file detection is per-row and independent of the directory
-        // scan cursor: a store row whose backing file is not a regular file on
-        // disk is dangling and dropped (leases cascade). This is always
-        // complete, so it never confuses "unscanned" with "missing".
+        // scan: a store row whose backing file is not a regular file on disk
+        // is dangling and dropped (leases cascade). The scan is one complete
+        // pass (never truncated), so there is no "unscanned" tail to confuse
+        // with "missing"; this loop is therefore always complete.
         for sha in rows_by_sha.keys() {
             if drop_rows.contains(sha) {
                 continue;
@@ -718,66 +769,39 @@ impl AttachmentCache {
         Ok(stats)
     }
 
-    /// Scans direct children of the cache root (bounded by
-    /// [`AttachmentLimits::reconcile_batch`] per pass), deleting orphan temp
-    /// files, orphan/unrecognized content files, and size-mismatched files. A
-    /// persisted cursor records the last entry name fully processed so that
-    /// repeated truncated passes advance monotonically through the directory
-    /// and converge across restarts, instead of re-scanning the same head
-    /// entries forever (B3).
-    ///
-    /// Entries are sorted by name so the cursor's "after" relation is
-    /// deterministic regardless of filesystem `readdir` order. A cursor that
-    /// points at a deleted or stale name simply resumes after that name; it
-    /// can never cause a deletion.
-    async fn scan_entries(
+    /// Streams one complete `read_dir` pass over the cache root, deleting
+    /// orphan temp files, orphan/unrecognized content files, and
+    /// size-mismatched files. Entries are inspected one at a time and never
+    /// materialized into a sorted vector, so memory is O(1) in the directory
+    /// size (the `rows_by_sha`/`drop_rows` working set is bounded by the
+    /// store's attachment-row cap, not by directory size). Destructive cleanup
+    /// is capped at [`AttachmentLimits::reconcile_batch`] deletions per pass;
+    /// the scan itself is never truncated, so each pass walks the whole
+    /// directory and orphan cleanup converges because the entry count strictly
+    /// decreases by at most `reconcile_batch` files per pass.
+    fn scan_entries(
         &self,
-        rows: &[AttachmentRow],
-        rows_by_sha: &HashMap<String, usize>,
+        rows_by_sha: &HashMap<String, u64>,
         drop_rows: &mut HashSet<String>,
         stats: &mut ReconcileStats,
     ) -> Result<(), AttachError> {
-        let mut entries: Vec<(PathBuf, String)> = Vec::new();
         let dir = std::fs::read_dir(&self.root).map_err(|_| AttachError::Io {
             context: "reading the cache directory",
         })?;
+        let batch = self.limits.reconcile_batch;
+        let mut deletions = 0_usize;
+
         for entry in dir {
             let Ok(entry) = entry else {
                 stats.errors = stats.errors.saturating_add(1);
                 continue;
             };
-            let name = entry.file_name().to_string_lossy().into_owned();
-            entries.push((entry.path(), name));
-        }
-        entries.sort_by(|left, right| left.1.cmp(&right.1));
-
-        let cursor = self
-            .store
-            .attachment_scan_cursor()
-            .await
-            .map_err(|error| store_err("reading the attachment scan cursor", error))?;
-        let start = match &cursor {
-            Some(name) => {
-                entries.partition_point(|(_, entry_name)| entry_name.as_str() <= name.as_str())
-            }
-            None => 0,
-        };
-
-        let mut processed = 0_usize;
-        let mut last_name: Option<String> = None;
-        let mut truncated = false;
-
-        for (path, sort_key) in entries.iter().skip(start) {
-            if processed >= self.limits.reconcile_batch {
-                truncated = true;
-                break;
-            }
-            processed = processed.saturating_add(1);
-            last_name = Some(sort_key.clone());
-            if sort_key == ATTACHMENT_CACHE_MARKER {
+            let path = entry.path();
+            let file_name = entry.file_name();
+            if file_name.to_string_lossy() == ATTACHMENT_CACHE_MARKER {
                 continue;
             }
-            let file_type = if let Ok(metadata) = std::fs::symlink_metadata(path) {
+            let file_type = if let Ok(metadata) = std::fs::symlink_metadata(&path) {
                 metadata.file_type()
             } else {
                 stats.errors = stats.errors.saturating_add(1);
@@ -791,49 +815,47 @@ impl AttachmentCache {
                 // Symlinks and special files are never followed or deleted.
                 continue;
             }
-            let Some(name) = path.file_name().and_then(|os| os.to_str()) else {
-                if self.remove_file(path, "removing an unrecognized cache file")? {
+            // A regular file that is a deletion candidate: apply the per-pass
+            // deletion cap. Candidates beyond the cap are left for the next
+            // pass (the scan restarts from the directory head, so they are
+            // not lost).
+            if deletions >= batch {
+                continue;
+            }
+            let Some(name) = file_name.to_str() else {
+                if self.remove_file(&path, "removing an unrecognized cache file")? {
                     stats.orphan_files = stats.orphan_files.saturating_add(1);
+                    deletions = deletions.saturating_add(1);
                 }
                 continue;
             };
             if name.starts_with(ATTACHMENT_TEMP_PREFIX) {
-                if self.remove_file(path, "removing an orphan temp file")? {
+                if self.remove_file(&path, "removing an orphan temp file")? {
                     stats.temp_files = stats.temp_files.saturating_add(1);
+                    deletions = deletions.saturating_add(1);
                 }
                 continue;
             }
             if is_valid_sha256_name(name) {
-                if let Some(&index) = rows_by_sha.get(name) {
-                    let actual = std::fs::metadata(path).map_or(u64::MAX, |m| m.len());
-                    if actual != rows[index].bytes {
-                        if self.remove_file(path, "removing a corrupt cached file")? {
+                if let Some(&expected) = rows_by_sha.get(name) {
+                    let actual = std::fs::metadata(&path).map_or(u64::MAX, |m| m.len());
+                    if actual != expected {
+                        if self.remove_file(&path, "removing a corrupt cached file")? {
                             stats.corrupt_files = stats.corrupt_files.saturating_add(1);
+                            deletions = deletions.saturating_add(1);
                         }
                         drop_rows.insert(name.to_owned());
                     }
-                } else if self.remove_file(path, "removing an orphan cached file")? {
+                } else if self.remove_file(&path, "removing an orphan cached file")? {
                     stats.orphan_files = stats.orphan_files.saturating_add(1);
+                    deletions = deletions.saturating_add(1);
                 }
                 continue;
             }
-            if self.remove_file(path, "removing an unrecognized cache file")? {
+            if self.remove_file(&path, "removing an unrecognized cache file")? {
                 stats.orphan_files = stats.orphan_files.saturating_add(1);
+                deletions = deletions.saturating_add(1);
             }
-        }
-
-        if truncated {
-            if let Some(name) = last_name {
-                self.store
-                    .set_attachment_scan_cursor(&name)
-                    .await
-                    .map_err(|error| store_err("saving the attachment scan cursor", error))?;
-            }
-        } else {
-            self.store
-                .clear_attachment_scan_cursor()
-                .await
-                .map_err(|error| store_err("clearing the attachment scan cursor", error))?;
         }
         Ok(())
     }
@@ -952,6 +974,25 @@ fn ensure_cache_directory(root: &Path) -> Result<(), AttachError> {
         }
     }
     Ok(())
+}
+
+/// Tightens a validated cache directory to owner-only permissions (0700) on
+/// Unix. Failure is a non-fatal `tracing::warn` — never an error, never a
+/// panic — because the directory already passed marker validation and the
+/// cache must still open. No-op on non-Unix platforms.
+fn tighten_permissions(root: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) = std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)) {
+            tracing::warn!(
+                error = %error,
+                "failed to tighten attachment cache directory permissions to 0700"
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = root;
 }
 
 /// Validates the dedicated-directory marker, writing one into a fresh empty

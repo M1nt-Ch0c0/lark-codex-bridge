@@ -539,12 +539,13 @@ async fn reconcile_is_idempotent() {
 }
 
 #[tokio::test]
-async fn reconcile_truncated_scan_preserves_valid_rows_and_leases() {
+async fn reconcile_streams_bounded_deletions_and_preserves_valid_entries() {
     let temp = tempdir().expect("tempdir");
     let store = StoreHandle::open_in_memory().await.expect("store");
     let dl = downloader(&[("k", b"survivor")]);
+    let batch = 8_usize;
     let limits = AttachmentLimits {
-        reconcile_batch: 0,
+        reconcile_batch: batch,
         ..AttachmentLimits::default()
     };
     let cache = cache(temp.path(), store.clone(), dl, limits);
@@ -555,60 +556,50 @@ async fn reconcile_truncated_scan_preserves_valid_rows_and_leases() {
         .await
         .expect("fetch");
 
-    // A zero batch forces a truncated scan: the directory entry is never
-    // scanned, so it must not be mistaken for a missing file. The store row
-    // and its lease must both survive (the lease cascades away if the row is
-    // force-deleted).
-    let stats = cache.reconcile().await.expect("reconcile");
-    assert_eq!(stats.dropped_rows, 0, "truncated scan must not drop rows");
-
-    let rows = store.list_attachments().await.expect("list");
-    assert_eq!(rows.len(), 1, "valid store row survives");
-    assert_eq!(rows[0].sha256, sha);
-    assert_eq!(
-        store.attachment_leases(&sha).await.expect("leases").len(),
-        1,
-        "valid lease survives"
-    );
-    assert!(temp.path().join(&sha).exists(), "valid file survives");
-    let _ = store.shutdown().await;
-}
-
-#[tokio::test]
-async fn reconcile_converges_orphans_across_repeated_truncated_passes() {
-    let temp = tempdir().expect("tempdir");
-    let store = StoreHandle::open_in_memory().await.expect("store");
-    let dl = downloader(&[("k", b"keep")]);
-    let limits = AttachmentLimits {
-        reconcile_batch: 2,
-        ..AttachmentLimits::default()
-    };
-    let cache = cache(temp.path(), store.clone(), dl, limits);
-    let turn_id = record_turn(&store, "turn-1").await;
-    let sha = sha_hex(b"keep");
-    cache
-        .fetch("om_test", &desc("k", ResourceKind::File), turn_id)
-        .await
-        .expect("fetch");
-
-    // More directory entries than one pass can scan: a valid file plus five
-    // orphan temp files. Reconcile must converge to only the valid file, and
-    // must never drop the valid row/lease even while scans are truncated.
-    for index in 0..5 {
-        std::fs::write(temp.path().join(format!(".tmp-{index}")), b"x").expect("temp");
+    // Scatter more than one batch of orphans across the directory: a mix of
+    // orphan temp files and orphan content files (valid hash names with no
+    // store row), so the streaming pass must delete across the whole name
+    // space rather than a sorted head.
+    let total = batch * 3;
+    for index in 0..total {
+        if index % 2 == 0 {
+            std::fs::write(temp.path().join(format!(".tmp-{index}")), b"x").expect("temp");
+        } else {
+            let orphan = sha_hex(format!("orphan-{index}").as_bytes());
+            std::fs::write(temp.path().join(&orphan), format!("orphan-{index}")).expect("orphan");
+        }
     }
 
-    let mut temp_removed = 0_u64;
-    for _ in 0..10 {
+    // Behavioral convergence: each pass may delete at most `batch` files, and
+    // enough passes clear every orphan while the valid file/row/lease survive
+    // untouched. No heap-size assertion is made: the O(1)-memory property is
+    // structural (the scan never materializes a directory vector) and a
+    // byte-count assertion would be allocator- and platform-dependent.
+    let batch_cap = u64::try_from(batch).unwrap_or(u64::MAX);
+    let total_count = u64::try_from(total).unwrap_or(u64::MAX);
+    let mut removed = 0_u64;
+    let mut max_deletions = 0_u64;
+    for _ in 0..(total + 2) {
         let stats = cache.reconcile().await.expect("reconcile");
-        temp_removed = temp_removed.saturating_add(stats.temp_files);
+        let deletions = stats.temp_files + stats.orphan_files + stats.corrupt_files;
+        assert!(
+            deletions <= batch_cap,
+            "a pass deleted {deletions} files, above the batch cap {batch}"
+        );
+        max_deletions = max_deletions.max(deletions);
+        removed = removed.saturating_add(deletions);
         if file_names(temp.path()) == vec![sha.clone()] {
             break;
         }
     }
 
-    assert_eq!(file_names(temp.path()), vec![sha.clone()]);
-    assert_eq!(temp_removed, 5, "every orphan temp file is removed");
+    assert_eq!(
+        file_names(temp.path()),
+        vec![sha.clone()],
+        "orphans cleared"
+    );
+    assert_eq!(removed, total_count, "every orphan removed exactly once");
+    assert!(max_deletions <= batch_cap, "per-pass deletion cap held");
     let rows = store.list_attachments().await.expect("list");
     assert_eq!(rows.len(), 1, "valid row survives every pass");
     assert_eq!(rows[0].sha256, sha);
@@ -617,6 +608,7 @@ async fn reconcile_converges_orphans_across_repeated_truncated_passes() {
         1,
         "valid lease survives every pass"
     );
+    assert!(temp.path().join(&sha).is_file(), "valid file survives");
     let _ = store.shutdown().await;
 }
 
@@ -959,6 +951,79 @@ async fn open_refuses_a_symlink_root() {
     let _ = store.shutdown().await;
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn open_refusal_does_not_chmod_the_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().expect("tempdir");
+    let root = temp.path().join("cache");
+    std::fs::create_dir_all(&root).expect("create dir");
+    std::fs::write(root.join("user-data.txt"), b"precious").expect("write stray");
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let store = StoreHandle::open_in_memory().await.expect("store");
+
+    // A non-empty directory without a valid marker is refused fail-closed. The
+    // refusal must happen before any chmod, so the directory's permissions are
+    // left exactly as configured.
+    let result = AttachmentCache::open(
+        &root,
+        store.clone(),
+        downloader(&[]),
+        AttachmentLimits::default(),
+    );
+    assert!(matches!(result, Err(AttachError::InvalidPath { .. })));
+
+    let mode = std::fs::metadata(&root)
+        .expect("metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o755,
+        "a refused directory's permissions must be untouched"
+    );
+    assert_eq!(
+        std::fs::read(root.join("user-data.txt")).expect("read"),
+        b"precious"
+    );
+    assert!(
+        !root.join(ATTACHMENT_CACHE_MARKER).exists(),
+        "no marker may be written on refusal"
+    );
+    let _ = store.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn open_tightens_permissions_only_after_marker_validation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().expect("tempdir");
+    let root = temp.path().join("cache");
+    std::fs::create_dir_all(&root).expect("create dir");
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let store = StoreHandle::open_in_memory().await.expect("store");
+
+    // An empty directory passes marker validation (marker is written), and
+    // only then is its mode tightened to owner-only.
+    let cache = AttachmentCache::open(
+        &root,
+        store.clone(),
+        downloader(&[]),
+        AttachmentLimits::default(),
+    )
+    .expect("open");
+    let mode = std::fs::metadata(&root)
+        .expect("metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o700, "a validated directory is tightened to 0700");
+    drop(cache);
+    let _ = store.shutdown().await;
+}
+
 // --- B2: GC vs. fetch serialization ------------------------------------------------
 
 #[tokio::test]
@@ -1088,116 +1153,6 @@ async fn concurrent_fetch_gc_never_leaves_a_leased_row_without_file() {
             cache.release_turn(turn).await.expect("release fetch lease");
         }
     }
-    let _ = store.shutdown().await;
-}
-
-// --- B3: reconciliation convergence via persisted cursor ---------------------------
-
-#[tokio::test]
-async fn reconcile_cursor_converges_across_restart() {
-    let temp = tempdir().expect("tempdir");
-    let db = temp.path().join("store.sqlite");
-    let cache_dir = temp.path().join("cache");
-    let limits = AttachmentLimits {
-        reconcile_batch: 2,
-        ..AttachmentLimits::default()
-    };
-
-    let sha = {
-        let store = StoreHandle::open(&db).await.expect("open");
-        let cache = cache(
-            &cache_dir,
-            store.clone(),
-            downloader(&[("k", b"keeper")]),
-            limits,
-        );
-        let turn = record_turn(&store, "restart-turn").await;
-        let sha = sha_hex(b"keeper");
-        cache
-            .fetch("om_test", &desc("k", ResourceKind::File), turn)
-            .await
-            .expect("fetch");
-        for index in 0..6 {
-            std::fs::write(cache_dir.join(format!(".tmp-{index}")), b"x").expect("temp");
-        }
-        store.shutdown().await.expect("shutdown");
-        sha
-    };
-
-    // Repeatedly reopen + reconcile (each reopen simulates a restart). The
-    // persisted cursor must advance the tail orphans to deletion.
-    let mut remaining = 6_u64;
-    for _ in 0..20 {
-        let store = StoreHandle::open(&db).await.expect("reopen");
-        let cache = cache(
-            &cache_dir,
-            store.clone(),
-            downloader(&[("k", b"keeper")]),
-            limits,
-        );
-        let stats = cache.reconcile().await.expect("reconcile");
-        remaining = remaining.saturating_sub(stats.temp_files);
-        store.shutdown().await.expect("shutdown");
-        if remaining == 0 && file_names(&cache_dir) == vec![sha.clone()] {
-            break;
-        }
-    }
-
-    assert_eq!(file_names(&cache_dir), vec![sha.clone()]);
-    let store = StoreHandle::open(&db).await.expect("reopen verify");
-    let rows = store.list_attachments().await.expect("list");
-    assert_eq!(rows.len(), 1, "valid row survives every restart");
-    assert_eq!(rows[0].sha256, sha);
-    assert_eq!(
-        store.attachment_leases(&sha).await.expect("leases").len(),
-        1,
-        "valid lease survives every restart"
-    );
-    store.shutdown().await.expect("shutdown");
-}
-
-#[tokio::test]
-async fn reconcile_stale_cursor_resets_without_misdeletion() {
-    let temp = tempdir().expect("tempdir");
-    let store = StoreHandle::open_in_memory().await.expect("store");
-    let cache = cache(
-        temp.path(),
-        store.clone(),
-        downloader(&[("k", b"survivor")]),
-        AttachmentLimits::default(),
-    );
-    let turn = record_turn(&store, "stale-cursor").await;
-    let sha = sha_hex(b"survivor");
-    cache
-        .fetch("om_test", &desc("k", ResourceKind::File), turn)
-        .await
-        .expect("fetch");
-
-    // A cursor that sorts after every real entry, as if it pointed at a
-    // deleted entry. It must be cleared, never cause a deletion.
-    store
-        .set_attachment_scan_cursor(
-            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
-        )
-        .await
-        .expect("stale cursor");
-
-    let stats = cache.reconcile().await.expect("reconcile");
-    assert_eq!(stats.dropped_rows, 0, "a stale cursor must not drop rows");
-    assert!(
-        store
-            .attachment_scan_cursor()
-            .await
-            .expect("cursor")
-            .is_none(),
-        "a full pass must clear the stale cursor"
-    );
-    assert!(temp.path().join(&sha).is_file(), "valid file survives");
-    assert_eq!(
-        store.attachment_leases(&sha).await.expect("leases").len(),
-        1,
-        "valid lease survives"
-    );
     let _ = store.shutdown().await;
 }
 
