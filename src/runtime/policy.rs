@@ -39,7 +39,9 @@ pub enum AccessDecision {
     DenyMissingMention,
     /// An owner-only control command arrived from a non-owner sender.
     DenyOwnerCommandRequired,
-    DenyWorkspace { reason: &'static str },
+    DenyWorkspace {
+        reason: &'static str,
+    },
 }
 
 impl fmt::Debug for AccessDecision {

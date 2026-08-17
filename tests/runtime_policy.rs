@@ -536,7 +536,12 @@ fn ordinary_turn_matrix_distinguishes_owner_sender_group_roles() {
     );
     // non-human P2P is never accepted, even with an owner ID
     assert_eq!(
-        policy.decide(&non_human("ou_owner_123456", ChatMode::P2p, "oc_test", false)),
+        policy.decide(&non_human(
+            "ou_owner_123456",
+            ChatMode::P2p,
+            "oc_test",
+            false
+        )),
         AccessDecision::DenyNotSender
     );
 }
@@ -639,9 +644,8 @@ fn config_rejects_malformed_or_oversized_sender_and_group_allowlists() {
     assert!(config.validate().is_err());
 
     let mut config = policy_config(safe.clone());
-    config.allowed_senders = vec!["o".repeat(
-        lark_codex_bridge::limits::MAX_CONFIG_ALLOWED_SENDER_BYTES + 1,
-    )];
+    config.allowed_senders =
+        vec!["o".repeat(lark_codex_bridge::limits::MAX_CONFIG_ALLOWED_SENDER_BYTES + 1)];
     assert!(config.validate().is_err());
 
     let mut config = policy_config(safe.clone());
@@ -651,9 +655,8 @@ fn config_rejects_malformed_or_oversized_sender_and_group_allowlists() {
     assert!(config.validate().is_err());
 
     let mut config = policy_config(safe.clone());
-    config.allowed_groups = vec!["g".repeat(
-        lark_codex_bridge::limits::MAX_CONFIG_ALLOWED_GROUP_BYTES + 1,
-    )];
+    config.allowed_groups =
+        vec!["g".repeat(lark_codex_bridge::limits::MAX_CONFIG_ALLOWED_GROUP_BYTES + 1)];
     assert!(config.validate().is_err());
 }
 
