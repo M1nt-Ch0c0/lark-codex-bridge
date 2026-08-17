@@ -456,7 +456,8 @@ impl LarkApi {
             .ok_or_else(|| LarkError::protocol("file upload response missing file_key"))
     }
 
-    /// Fetches the application creator (owner) `open_id` for the current app.
+    /// Fetches the application creator (owner) `open_id` for the current app,
+    /// returning `None` when the app reports no creator identifier.
     ///
     /// The creator is the user who owns the application, never the bot
     /// identity, and the `user_id_type=open_id` query scopes the returned
@@ -465,8 +466,8 @@ impl LarkApi {
     /// # Errors
     ///
     /// Returns a classified error on token exchange, transport, or server
-    /// failure, or `ProtocolViolation` when the response omits the creator.
-    pub async fn app_creator_id(&self, app_id: &str) -> Result<String, LarkError> {
+    /// failure.
+    pub async fn app_creator_id(&self, app_id: &str) -> Result<Option<String>, LarkError> {
         #[derive(Deserialize)]
         struct AppInfoResponse {
             code: i64,
@@ -488,14 +489,11 @@ impl LarkApi {
             async move {
                 let response: AppInfoResponse = self.http.get_json(&path, Some(&token)).await?;
                 check_code(response.code, "fetching the application creator")?;
-                response
+                Ok(response
                     .data
                     .and_then(|data| data.app)
                     .and_then(|app| app.creator_id)
-                    .filter(|id| !id.is_empty())
-                    .ok_or_else(|| {
-                        LarkError::protocol("application info response missing the creator")
-                    })
+                    .filter(|id| !id.is_empty()))
             }
         })
         .await

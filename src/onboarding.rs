@@ -35,7 +35,6 @@ use crate::config::{BridgeConfig, PathsSection, WorkspacePolicy, default_config_
 use crate::lark::api::LarkApi;
 use crate::lark::config::{LarkEndpoints, TenantBrand};
 use crate::lark::credentials::{CredentialStore, FileCredentialStore, LarkCredentials};
-use crate::lark::error::LarkError;
 use crate::lark::http::LarkHttp;
 use crate::lark::register::{RegistrationFlow, RegistrationOutcome};
 use crate::lark::token::TenantTokenProvider;
@@ -160,16 +159,10 @@ impl OnboardingOps for ProductionOps {
     fn app_creator(&self, creds: &LarkCredentials) -> BoxFuture<'_, Result<Option<String>>> {
         let creds = creds.clone();
         Box::pin(async move {
-            let Ok(http) = LarkHttp::new(LarkEndpoints::for_tenant(creds.tenant)) else {
-                return Ok(None);
-            };
+            let http = LarkHttp::new(LarkEndpoints::for_tenant(creds.tenant))?;
             let tokens = TenantTokenProvider::new(http.clone(), creds.clone());
             let api = LarkApi::new(http, tokens);
-            match api.app_creator_id(&creds.app_id).await {
-                Ok(creator) if valid_owner_id(&creator) => Ok(Some(creator)),
-                Err(error @ LarkError::PermanentAuth { .. }) => Err(error.into()),
-                Ok(_) | Err(_) => Ok(None),
-            }
+            Ok(api.app_creator_id(&creds.app_id).await?)
         })
     }
 
@@ -255,13 +248,17 @@ async fn resolve_owner<O: OnboardingOps>(
             return Ok(owner.to_owned());
         }
     }
-    if let Some(creator) = ops.app_creator(creds).await? {
-        if valid_owner_id(&creator) {
-            return Ok(creator);
+    match ops.app_creator(creds).await {
+        Ok(Some(creator)) if valid_owner_id(&creator) => Ok(creator),
+        Ok(_) => {
+            eprintln!("unable to discover the application creator; please enter the owner open_id manually");
+            ops.prompt_owner().await
+        }
+        Err(error) => {
+            eprintln!("unable to look up the application creator");
+            Err(error)
         }
     }
-    eprintln!("unable to discover the application creator; please enter the owner open_id manually");
-    ops.prompt_owner().await
 }
 
 async fn run_device_flow() -> Result<(LarkCredentials, Option<String>)> {
@@ -434,9 +431,7 @@ fn acquire_lock(path: &Path) -> Result<fs::File> {
 }
 
 /// Writes bytes to path atomically via a same-directory temp file plus rename,
-/// with private permissions. A failed replace leaves no temp file. On Windows
-/// the rename target must be removed first, so the replace is not atomic there
-/// (matching the credentials store).
+/// with private permissions. A failed replace leaves no temp file.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -445,12 +440,6 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     }
     let temp = temp_path_for(path);
     write_private_file(&temp, bytes)?;
-    // Windows cannot rename over an existing file; remove the target first
-    // there (non-atomic), while Unix gets a true atomic replace.
-    #[cfg(windows)]
-    if path.exists() {
-        fs::remove_file(path).map_err(|_| anyhow!("unable to replace the file"))?;
-    }
     if fs::rename(&temp, path).is_err() {
         let _ = fs::remove_file(&temp);
         return Err(anyhow!("unable to replace the file"));
@@ -588,7 +577,12 @@ mod tests {
         let roots = injected_roots(scratch.path());
         let paths = OnboardingPaths::from_dirs(
             &scratch.path().join("config"),
-            &scratch.path().join("home").join("data"),
+            &scratch
+                .path()
+                .join("home")
+                .join(".local")
+                .join("share")
+                .join("lark-codex-bridge"),
         );
         fs::create_dir_all(&paths.workspace_dir).expect("workspace should exist");
 
@@ -821,7 +815,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_credentials_only_leaves_existing_config_untouched() {
+    async fn register_credentials_only_saves_credentials_and_leaves_config_untouched() {
         let scratch = TempDir::new().expect("scratch dir");
         let paths = dirs(scratch.path());
         fs::create_dir_all(scratch.path().join("config")).expect("config dir");
@@ -842,7 +836,7 @@ mod tests {
             .load()
             .expect("credentials should load")
             .is_some());
-        assert_eq!(load_owner_hint(&paths).expect("hint should load"), None);
+        assert!(!paths.profile_path.exists());
     }
 
     #[tokio::test]

@@ -717,9 +717,25 @@ async fn app_creator_id_returns_the_owner_not_the_bot() {
         .await
         .expect("creator lookup should succeed");
 
-    assert_eq!(creator, "ou_creator");
-    assert_ne!(creator, "ou_bot");
+    assert_eq!(creator.as_deref(), Some("ou_creator"));
+    assert_ne!(creator.as_deref(), Some("ou_bot"));
     let request = &requests_to(&server, "/open-apis/application/v6/applications")[0];
     assert_eq!(request.method, "GET");
     assert_eq!(request.header("authorization"), Some("Bearer token-0"));
+}
+
+#[tokio::test]
+async fn app_creator_id_returns_none_when_creator_is_absent() {
+    let server = StubServer::start(token_plus(|_| {
+        StubResponse::json(200, r#"{"code":0,"data":{"app":{}}}"#)
+    }))
+    .await;
+    let api = api_for(&server);
+
+    let creator = api
+        .app_creator_id(TEST_APP_ID)
+        .await
+        .expect("creator lookup should succeed");
+
+    assert_eq!(creator, None);
 }
