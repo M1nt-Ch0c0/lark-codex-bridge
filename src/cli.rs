@@ -204,6 +204,7 @@ pub async fn run_with(cli: Cli) -> Result<()> {
 }
 
 async fn run_bridge(config: Option<PathBuf>) -> Result<()> {
+    let config = crate::onboarding::resolve_run_config(config).await?;
     let shutdown = async {
         if tokio::signal::ctrl_c().await.is_err() {
             std::future::pending::<()>().await;

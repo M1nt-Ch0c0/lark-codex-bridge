@@ -21,61 +21,45 @@
 尚未接线的是 slash command handler、Codex 审批卡、服务管理和完整故障注入/恢复。
 `/stop`、`/status` 按当前最小试用范围明确暂缓；`/new`、`/cd`、`/help` 目前也只有
 解析与 help 元数据，还未进入运行时。启动时会预装有界的 `Received` 行，但尚无周期性
-重扫。当前还有一个 P1 首次启动缺口：扫码注册只保存应用凭证，尚未像参考实现一样自动
-携带创建者身份、生成安全默认工作区和运行配置并直接启动；现阶段仍需手工创建 TOML。
-具体边界和验收标准见 [GitHub Issue #2](https://github.com/M1nt-Ch0c0/lark-codex-bridge/issues/2)。
+重扫。首次启动 onboarding 已恢复参考实现的一命令体验：扫码注册后自动携带创建者身份、
+生成安全默认工作区和运行配置并直接启动，见
+[GitHub Issue #2](https://github.com/M1nt-Ch0c0/lark-codex-bridge/issues/2)。
 真实 Lark smoke 是显式门控验收项；未运行或只看到 skip 都不算通过。
 
 ## 最小试用
 
 前提：本机已安装并登录受支持的 `codex-cli 0.146.0` 或更高版本，飞书/Lark 应用机器人已创建并
-加入目标会话，并准备好 owner 的 `open_id` 与一个允许 Codex 操作的安全工作区。
+加入目标会话。首次运行不再需要手写 TOML、手动查询 `open_id` 或预先创建工作区。
 
-先登记凭证：
+直接启动常驻桥接器，按提示完成扫码授权即可：
 
 ```bash
-cargo run --locked -- lark auth register
-# 或已有应用；secret 建议只放环境变量，避免进入 shell history
-LARK_APP_SECRET=… cargo run --locked -- lark auth register --app-id cli_… --tenant feishu
+cargo run --locked -- run
 ```
 
-创建配置文件，例如 `config.toml`。相对的数据库和缓存路径以配置文件所在目录为基准：
+首次运行会自动完成以下步骤，然后直接进入前台桥接器：
 
-```toml
-owners = ["ou_owner_open_id"]
-default_workspace = "/absolute/path/to/workspace"
+1. 通过二维码/设备流登记一个 `PersonalAgent` 应用（或复用已存的凭证）；
+2. 把授权者（应用创建者）的 `open_id` 作为 owner 写入访问控制；
+3. 在平台数据目录下创建受管工作区，并派生本地数据库与附件缓存路径；
+4. 以私有权限、原子替换的方式写入凭证、owner 提示和 `config.toml`。
 
-[workspace]
-allow_roots = ["/absolute/path/to/workspace"]
-network_access = false
+生成的工作区位于 `~/.local/share/lark-codex-bridge/workspace`（Windows 为
+`%LOCALAPPDATA%\lark-codex-bridge\workspace`），配置文件位于平台配置目录
+（Linux/macOS 为 `~/.config/lark-codex-bridge/config.toml`，Windows 为
+`%APPDATA%\lark-codex-bridge\config.toml`）。已有配置文件或显式 `--config` 绝不会被
+静默覆盖；重复运行与并发首次运行均幂等。
 
-[codex]
-binary = "codex"
-sandbox = "workspace-write"
-approval_policy = "never"
+私聊可直接发消息；群聊和话题需要直接 @机器人。按 `Ctrl-C` 结束。当前真实飞书的
+“发消息 → Codex 回答 → 飞书收到回复”验收由操作者手动执行。
 
-[paths]
-database = "state/bridge.sqlite3"
-attachment_cache = "state/attachments"
-```
-
-配置会拒绝相对工作区、文件系统根、HOME 根、系统目录、临时目录以及 allow root 外的
-路径。首次试用前建议分别检查两侧连接：
+已登记应用与诊断场景保持不变；如需分别检查两侧连接：
 
 ```bash
 cargo run --locked -- codex probe
 cargo run --locked -- lark auth check
 cargo run --locked -- lark probe
 ```
-
-启动常驻桥接器：
-
-```bash
-cargo run --locked -- run --config /absolute/path/to/config.toml
-```
-
-私聊可直接发消息；群聊和话题需要直接 @机器人。按 `Ctrl-C` 结束。当前真实飞书的
-“发消息 → Codex 回答 → 飞书收到回复”验收由操作者手动执行。
 
 ## Codex 环境检查
 

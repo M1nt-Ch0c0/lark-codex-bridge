@@ -696,3 +696,30 @@ async fn debug_output_never_contains_secret_material() {
     assert!(!rendered.contains("resource-bytes"));
     assert!(rendered.contains("len"));
 }
+
+#[tokio::test]
+async fn app_creator_id_returns_the_owner_not_the_bot() {
+    let server = StubServer::start(token_plus(|request: &RecordedRequest| {
+        assert!(request
+            .path
+            .starts_with("/open-apis/application/v6/applications/cli_test_app"));
+        assert!(request.path.contains("user_id_type=open_id"));
+        StubResponse::json(
+            200,
+            r#"{"code":0,"data":{"app":{"creator_id":"ou_creator"}}}"#,
+        )
+    }))
+    .await;
+    let api = api_for(&server);
+
+    let creator = api
+        .app_creator_id(TEST_APP_ID)
+        .await
+        .expect("creator lookup should succeed");
+
+    assert_eq!(creator, "ou_creator");
+    assert_ne!(creator, "ou_bot");
+    let request = &requests_to(&server, "/open-apis/application/v6/applications")[0];
+    assert_eq!(request.method, "GET");
+    assert_eq!(request.header("authorization"), Some("Bearer token-0"));
+}
