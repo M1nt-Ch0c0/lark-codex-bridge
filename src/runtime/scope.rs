@@ -491,11 +491,8 @@ async fn process_batch(
             Some(InboundRejectionKind::Overloaded)
         } else if is_stale(&item.queued.event, settings.message_max_age) {
             Some(InboundRejectionKind::Stale)
-        } else if policy.decide(&item.queued.event) != crate::runtime::policy::AccessDecision::Allow
-        {
-            Some(InboundRejectionKind::Policy)
         } else {
-            None
+            policy.decide(&item.queued.event).rejection_kind()
         };
         if let Some(reason) = reason {
             reject_item(store, sink.as_ref(), &item, reason).await?;

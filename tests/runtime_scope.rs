@@ -289,6 +289,7 @@ fn event_in_chat(event_id: &str, sender_id: &str, chat_id: &str) -> InboundEvent
         text: "hello".to_owned(),
         mentions_bot: false,
         mention_all: false,
+        sender_is_human: true,
         resources: Vec::new(),
         message_type: "text".to_owned(),
         create_time_ms: now_ms(),
@@ -567,7 +568,7 @@ async fn router_rejects_non_owner_with_one_atomic_durable_notice() {
     assert_eq!(store.outbox_depth().await.expect("outbox").pending, 1);
     assert_eq!(
         *sink.rejections.lock().expect("rejection lock"),
-        vec![InboundRejectionKind::Policy]
+        vec![InboundRejectionKind::NotOwner]
     );
     router.shutdown().await.expect("shutdown");
     store.shutdown().await.expect("store shutdown");

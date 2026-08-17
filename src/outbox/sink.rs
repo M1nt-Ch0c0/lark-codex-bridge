@@ -277,7 +277,12 @@ const UNCERTAIN_TEXT: &str = "任务执行结果未知，请重新发起";
 fn rejection_text(reason: InboundRejectionKind) -> &'static str {
     match reason {
         InboundRejectionKind::Overloaded => "当前处理负载过高，请稍后重试",
-        InboundRejectionKind::Policy => "该消息未获授权处理",
+        InboundRejectionKind::NotOwner
+        | InboundRejectionKind::NotSender
+        | InboundRejectionKind::NotGroup
+        | InboundRejectionKind::MissingMention
+        | InboundRejectionKind::OwnerCommandRequired
+        | InboundRejectionKind::Policy => "该消息未获授权处理",
         InboundRejectionKind::Stale => "消息已过期，未处理",
         InboundRejectionKind::Internal => "处理该消息时发生内部错误",
     }
@@ -286,6 +291,11 @@ fn rejection_text(reason: InboundRejectionKind) -> &'static str {
 fn rejection_key(reason: InboundRejectionKind) -> &'static str {
     match reason {
         InboundRejectionKind::Overloaded => "overloaded",
+        InboundRejectionKind::NotOwner => "not_owner",
+        InboundRejectionKind::NotSender => "not_sender",
+        InboundRejectionKind::NotGroup => "not_group",
+        InboundRejectionKind::MissingMention => "missing_mention",
+        InboundRejectionKind::OwnerCommandRequired => "owner_command_required",
         InboundRejectionKind::Policy => "policy",
         InboundRejectionKind::Stale => "stale",
         InboundRejectionKind::Internal => "internal",

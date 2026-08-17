@@ -240,6 +240,81 @@ async fn group_message_without_mention_does_not_flag_the_bot() {
 }
 
 #[tokio::test]
+async fn app_sender_type_is_not_treated_as_a_human() {
+    let server = StubServer::start(im_stub(|_| chat_mode_ok("group"), failing)).await;
+    let normalizer = normalizer_for(&server);
+
+    let payload = serde_json::json!({
+        "schema": "2.0",
+        "header": {
+            "event_id": "evt_app_sender",
+            "event_type": "im.message.receive_v1",
+        },
+        "event": {
+            "sender": {
+                "sender_id": {"open_id": "ou_app_bot"},
+                "sender_type": "app",
+            },
+            "message": {
+                "message_id": "om_app_sender",
+                "chat_id": "oc_group_chat",
+                "chat_type": "group",
+                "message_type": "text",
+                "content": "{\"text\":\"plain\"}",
+                "create_time": "1700000004000",
+                "mentions": [],
+            },
+        },
+    })
+    .to_string();
+
+    let (event, _) = unwrap_event(
+        normalizer
+            .normalize(payload.as_bytes())
+            .await
+            .expect("app sender event should normalize"),
+    );
+    assert!(!event.sender_is_human);
+}
+
+#[tokio::test]
+async fn missing_sender_type_fails_closed_as_not_human() {
+    let server = StubServer::start(im_stub(|_| chat_mode_ok("group"), failing)).await;
+    let normalizer = normalizer_for(&server);
+
+    let payload = serde_json::json!({
+        "schema": "2.0",
+        "header": {
+            "event_id": "evt_no_sender_type",
+            "event_type": "im.message.receive_v1",
+        },
+        "event": {
+            "sender": {
+                "sender_id": {"open_id": "ou_no_type"},
+            },
+            "message": {
+                "message_id": "om_no_type",
+                "chat_id": "oc_group_chat",
+                "chat_type": "group",
+                "message_type": "text",
+                "content": "{\"text\":\"plain\"}",
+                "create_time": "1700000004000",
+                "mentions": [],
+            },
+        },
+    })
+    .to_string();
+
+    let (event, _) = unwrap_event(
+        normalizer
+            .normalize(payload.as_bytes())
+            .await
+            .expect("missing sender type should normalize"),
+    );
+    assert!(!event.sender_is_human);
+}
+
+#[tokio::test]
 async fn topic_reply_uses_thread_scope() {
     let server = StubServer::start(im_stub(|_| chat_mode_ok("topic"), failing)).await;
     let normalizer = normalizer_for(&server);

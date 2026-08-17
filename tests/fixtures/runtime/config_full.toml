@@ -1,4 +1,6 @@
 owners = ["ou_owner_123456", "ou_admin_654321"]
+allowed_senders = ["ou_sender_111111"]
+allowed_groups = ["oc_group_222222"]
 
 [workspace]
 allow_roots = []

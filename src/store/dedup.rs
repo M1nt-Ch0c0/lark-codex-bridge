@@ -193,7 +193,18 @@ pub enum ResolveTurnOutcome {
 pub enum InboundRejectionKind {
     /// Local bounded capacity is exhausted.
     Overloaded,
-    /// Runtime policy refused the event.
+    /// Sender is a human P2P caller with no owner/sender/group grant.
+    NotOwner,
+    /// Sender is not an ordinary human (bot/app/system/anonymous).
+    NotSender,
+    /// Sender is a human group/topic caller with no owner/sender/allowed-group
+    /// grant.
+    NotGroup,
+    /// A group/topic message lacked a real direct bot mention.
+    MissingMention,
+    /// An owner-only control command arrived from a non-owner sender.
+    OwnerCommandRequired,
+    /// Runtime policy refused the event for another reason.
     Policy,
     /// Event is too old to process safely.
     Stale,
@@ -205,6 +216,11 @@ impl InboundRejectionKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::Overloaded => "overloaded",
+            Self::NotOwner => "not_owner",
+            Self::NotSender => "not_sender",
+            Self::NotGroup => "not_group",
+            Self::MissingMention => "missing_mention",
+            Self::OwnerCommandRequired => "owner_command_required",
             Self::Policy => "policy",
             Self::Stale => "stale",
             Self::Internal => "internal",
@@ -805,6 +821,10 @@ struct InboundPayloadV1 {
     text: String,
     mentions_bot: bool,
     mention_all: bool,
+    /// Whether the wire sender is a human user. Defaults to `false` (fail
+    /// closed) for legacy payloads recorded before sender discrimination.
+    #[serde(default)]
+    sender_is_human: bool,
     resources: Vec<ResourceWire>,
     message_type: String,
     create_time_ms: i64,
@@ -1027,6 +1047,7 @@ impl InboundPayloadV1 {
             text: event.text.clone(),
             mentions_bot: event.mentions_bot,
             mention_all: event.mention_all,
+            sender_is_human: event.sender_is_human,
             resources,
             message_type: event.message_type.clone(),
             create_time_ms: event.create_time_ms,
@@ -1062,6 +1083,7 @@ impl InboundPayloadV1 {
             text: self.text,
             mentions_bot: self.mentions_bot,
             mention_all: self.mention_all,
+            sender_is_human: self.sender_is_human,
             resources: self
                 .resources
                 .into_iter()
@@ -1845,4 +1867,33 @@ fn read_inbound_state(
             })
         })
         .transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_payload_without_sender_human_flag_decodes_as_non_human() {
+        let payload = serde_json::json!({
+            "event_id": "evt_legacy",
+            "message_id": "om_legacy",
+            "chat_id": "oc_legacy",
+            "sender_id": "ou_legacy",
+            "chat_type": "group",
+            "thread_id": null,
+            "root_id": null,
+            "reply_to_message_id": null,
+            "text": "hello",
+            "mentions_bot": true,
+            "mention_all": false,
+            "resources": [],
+            "message_type": "text",
+            "create_time_ms": 1,
+            "scope": {"kind": "chat", "chat_id": "oc_legacy", "thread_id": null},
+        });
+        let dto: InboundPayloadV1 =
+            serde_json::from_value(payload).expect("legacy payload should decode");
+        assert!(!dto.sender_is_human);
+    }
 }

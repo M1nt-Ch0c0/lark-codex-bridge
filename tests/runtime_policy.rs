@@ -33,6 +33,7 @@ fn event(sender: &str, chat_type: ChatMode, mentions_bot: bool) -> InboundEvent 
         text: "untrusted text".to_owned(),
         mentions_bot,
         mention_all: false,
+        sender_is_human: true,
         resources: vec![],
         message_type: "text".to_owned(),
         create_time_ms: 0,
@@ -51,9 +52,32 @@ fn event_with_mentions(
     event
 }
 
+fn event_in_chat(
+    sender: &str,
+    chat_type: ChatMode,
+    chat_id: &str,
+    mentions_bot: bool,
+) -> InboundEvent {
+    let mut event = event(sender, chat_type, mentions_bot);
+    chat_id.clone_into(&mut event.chat_id);
+    event.scope = match chat_type {
+        ChatMode::P2p | ChatMode::Group => ScopeKey::Chat(chat_id.to_owned()),
+        ChatMode::Topic => ScopeKey::Thread(chat_id.to_owned(), "omt_test".to_owned()),
+    };
+    event
+}
+
+fn non_human(sender: &str, chat_type: ChatMode, chat_id: &str, mentions_bot: bool) -> InboundEvent {
+    let mut event = event_in_chat(sender, chat_type, chat_id, mentions_bot);
+    event.sender_is_human = false;
+    event
+}
+
 fn policy_config(allow_root: PathBuf) -> BridgeConfig {
     BridgeConfig {
         owners: vec!["ou_owner_123456".to_owned()],
+        allowed_senders: vec![],
+        allowed_groups: vec![],
         default_workspace: None,
         workspace: WorkspacePolicy {
             allow_roots: vec![allow_root],
@@ -67,6 +91,17 @@ fn policy_config(allow_root: PathBuf) -> BridgeConfig {
 
 fn policy(allow_root: PathBuf) -> AccessPolicy {
     AccessPolicy::from_config(&policy_config(allow_root)).expect("safe test policy should build")
+}
+
+fn policy_with(
+    allow_root: PathBuf,
+    allowed_senders: Vec<String>,
+    allowed_groups: Vec<String>,
+) -> AccessPolicy {
+    let mut config = policy_config(allow_root);
+    config.allowed_senders = allowed_senders;
+    config.allowed_groups = allowed_groups;
+    AccessPolicy::from_config(&config).expect("safe test policy should build")
 }
 
 fn production_home() -> PathBuf {
@@ -99,6 +134,8 @@ fn minimal_config_has_safe_defaults_and_resolves_relative_runtime_paths() {
     let config = BridgeConfig::load(Some(&config_path)).expect("minimal config should load");
 
     assert_eq!(config.owners, ["ou_owner_123456"]);
+    assert!(config.allowed_senders.is_empty());
+    assert!(config.allowed_groups.is_empty());
     assert!(config.workspace.allow_roots.is_empty());
     assert!(!config.workspace.network_access);
     assert_eq!(config.concurrency.active_turn_permits, 4);
@@ -124,6 +161,8 @@ fn full_config_round_trips_and_resolves_only_runtime_relative_paths() {
     let config = BridgeConfig::load(Some(&config_path)).expect("full config should load");
 
     assert_eq!(config.owners.len(), 2);
+    assert_eq!(config.allowed_senders, ["ou_sender_111111"]);
+    assert_eq!(config.allowed_groups, ["oc_group_222222"]);
     assert!(config.workspace.network_access);
     assert_eq!(config.concurrency.active_turn_permits, 9);
     assert_eq!(config.concurrency.max_scope_actors, 31);
@@ -146,6 +185,8 @@ fn full_config_round_trips_and_resolves_only_runtime_relative_paths() {
     let encoded = toml::to_string(&config).expect("full config should serialize");
     let reparsed = toml::from_str::<BridgeConfig>(&encoded).expect("full config should reparse");
     assert_eq!(reparsed.owners, config.owners);
+    assert_eq!(reparsed.allowed_senders, config.allowed_senders);
+    assert_eq!(reparsed.allowed_groups, config.allowed_groups);
     assert_eq!(reparsed.codex.approval_policy, config.codex.approval_policy);
     assert_eq!(reparsed.paths.database, config.paths.database);
 }
@@ -353,7 +394,7 @@ fn owner_and_direct_mention_gate_uses_chat_mode_not_scope() {
     );
     assert_eq!(
         policy.decide(&event("ou_stranger", ChatMode::Group, false)),
-        AccessDecision::DenyNotOwner
+        AccessDecision::DenyNotGroup
     );
     assert_eq!(
         policy.decide(&event("ou_owner_123456", ChatMode::Group, false)),
@@ -376,6 +417,223 @@ fn owner_and_direct_mention_gate_uses_chat_mode_not_scope() {
         policy.decide(&event("ou_owner_123456", ChatMode::Topic, true)),
         AccessDecision::Allow
     );
+}
+
+#[test]
+fn ordinary_turn_matrix_distinguishes_owner_sender_group_roles() {
+    let temp = scratch();
+    let allowed = temp.path().join("safe");
+    fs::create_dir_all(&allowed).expect("safe root should be created");
+    let policy = policy_with(
+        allowed,
+        vec!["ou_sender".to_owned()],
+        vec!["oc_allowed_group".to_owned()],
+    );
+
+    // owner, P2P
+    assert_eq!(
+        policy.decide(&event("ou_owner_123456", ChatMode::P2p, false)),
+        AccessDecision::Allow
+    );
+    // allowed sender, P2P
+    assert_eq!(
+        policy.decide(&event("ou_sender", ChatMode::P2p, false)),
+        AccessDecision::Allow
+    );
+    // owner in group, direct mention
+    assert_eq!(
+        policy.decide(&event("ou_owner_123456", ChatMode::Group, true)),
+        AccessDecision::Allow
+    );
+    // allowed sender in group, direct mention
+    assert_eq!(
+        policy.decide(&event("ou_sender", ChatMode::Group, true)),
+        AccessDecision::Allow
+    );
+    // allowed-group ordinary member, direct mention
+    assert_eq!(
+        policy.decide(&event_in_chat(
+            "ou_member",
+            ChatMode::Group,
+            "oc_allowed_group",
+            true,
+        )),
+        AccessDecision::Allow
+    );
+    // allowed-group ordinary member, no mention
+    assert_eq!(
+        policy.decide(&event_in_chat(
+            "ou_member",
+            ChatMode::Group,
+            "oc_allowed_group",
+            false,
+        )),
+        AccessDecision::DenyMissingMention
+    );
+    // allowed-group ordinary member, @all only
+    let mut at_all = event_in_chat("ou_member", ChatMode::Group, "oc_allowed_group", false);
+    at_all.mention_all = true;
+    assert_eq!(policy.decide(&at_all), AccessDecision::DenyMissingMention);
+    // owner in group, no mention
+    assert_eq!(
+        policy.decide(&event("ou_owner_123456", ChatMode::Group, false)),
+        AccessDecision::DenyMissingMention
+    );
+    // unauthorized group
+    assert_eq!(
+        policy.decide(&event("ou_stranger", ChatMode::Group, true)),
+        AccessDecision::DenyNotGroup
+    );
+    // unauthorized P2P
+    assert_eq!(
+        policy.decide(&event("ou_stranger", ChatMode::P2p, false)),
+        AccessDecision::DenyNotOwner
+    );
+    // non-human in an allowed group is never accepted
+    assert_eq!(
+        policy.decide(&non_human(
+            "ou_member",
+            ChatMode::Group,
+            "oc_allowed_group",
+            true,
+        )),
+        AccessDecision::DenyNotSender
+    );
+    // non-human P2P is never accepted, even with an owner ID
+    assert_eq!(
+        policy.decide(&non_human("ou_owner_123456", ChatMode::P2p, "oc_test", false)),
+        AccessDecision::DenyNotSender
+    );
+}
+
+#[test]
+fn command_path_never_authorizes_via_sender_or_group_allowlists() {
+    let temp = scratch();
+    let allowed = temp.path().join("safe");
+    fs::create_dir_all(&allowed).expect("safe root should be created");
+    let policy = policy_with(
+        allowed,
+        vec!["ou_sender".to_owned()],
+        vec!["oc_allowed_group".to_owned()],
+    );
+
+    assert_eq!(
+        policy.decide_command(&event("ou_owner_123456", ChatMode::P2p, false)),
+        AccessDecision::Allow
+    );
+    assert_eq!(
+        policy.decide_command(&event("ou_owner_123456", ChatMode::Group, true)),
+        AccessDecision::Allow
+    );
+    assert_eq!(
+        policy.decide_command(&event("ou_owner_123456", ChatMode::Group, false)),
+        AccessDecision::DenyMissingMention
+    );
+    assert_eq!(
+        policy.decide_command(&event("ou_sender", ChatMode::P2p, false)),
+        AccessDecision::DenyOwnerCommandRequired
+    );
+    assert_eq!(
+        policy.decide_command(&event("ou_sender", ChatMode::Group, true)),
+        AccessDecision::DenyOwnerCommandRequired
+    );
+    assert_eq!(
+        policy.decide_command(&event_in_chat(
+            "ou_member",
+            ChatMode::Group,
+            "oc_allowed_group",
+            true,
+        )),
+        AccessDecision::DenyOwnerCommandRequired
+    );
+    assert_eq!(
+        policy.decide_command(&non_human(
+            "ou_owner_123456",
+            ChatMode::Group,
+            "oc_allowed_group",
+            true,
+        )),
+        AccessDecision::DenyNotSender
+    );
+}
+
+#[test]
+fn config_deduplicates_sender_and_group_allowlists_idempotently() {
+    let temp = scratch();
+    let safe = temp.path().join("safe");
+    fs::create_dir_all(&safe).expect("safe root should be created");
+    let mut config = policy_config(safe);
+    config.allowed_senders = vec![
+        "ou_sender".to_owned(),
+        "ou_sender".to_owned(),
+        "ou_other".to_owned(),
+    ];
+    config.allowed_groups = vec![
+        "oc_group".to_owned(),
+        "oc_group".to_owned(),
+        "oc_other".to_owned(),
+    ];
+    config
+        .validate()
+        .expect("duplicate allowlist IDs should normalize");
+    assert_eq!(config.allowed_senders, ["ou_sender", "ou_other"]);
+    assert_eq!(config.allowed_groups, ["oc_group", "oc_other"]);
+}
+
+#[test]
+fn config_rejects_malformed_or_oversized_sender_and_group_allowlists() {
+    let temp = scratch();
+    let safe = temp.path().join("safe");
+    fs::create_dir_all(&safe).expect("safe root should be created");
+
+    for bad_sender in ["", " ", "ou_sender ", "ou sender", "ou\tsender"] {
+        let mut config = policy_config(safe.clone());
+        config.allowed_senders = vec![bad_sender.to_owned()];
+        assert!(config.validate().is_err());
+    }
+    for bad_group in ["", " ", "oc_group ", "oc group"] {
+        let mut config = policy_config(safe.clone());
+        config.allowed_groups = vec![bad_group.to_owned()];
+        assert!(config.validate().is_err());
+    }
+
+    let mut config = policy_config(safe.clone());
+    config.allowed_senders = (0..=lark_codex_bridge::limits::MAX_CONFIG_ALLOWED_SENDERS)
+        .map(|index| format!("ou_sender_{index}"))
+        .collect();
+    assert!(config.validate().is_err());
+
+    let mut config = policy_config(safe.clone());
+    config.allowed_senders = vec!["o".repeat(
+        lark_codex_bridge::limits::MAX_CONFIG_ALLOWED_SENDER_BYTES + 1,
+    )];
+    assert!(config.validate().is_err());
+
+    let mut config = policy_config(safe.clone());
+    config.allowed_groups = (0..=lark_codex_bridge::limits::MAX_CONFIG_ALLOWED_GROUPS)
+        .map(|index| format!("oc_group_{index}"))
+        .collect();
+    assert!(config.validate().is_err());
+
+    let mut config = policy_config(safe.clone());
+    config.allowed_groups = vec!["g".repeat(
+        lark_codex_bridge::limits::MAX_CONFIG_ALLOWED_GROUP_BYTES + 1,
+    )];
+    assert!(config.validate().is_err());
+}
+
+#[test]
+fn group_authorization_revokes_when_the_group_id_is_removed() {
+    let temp = scratch();
+    let allowed = temp.path().join("safe");
+    fs::create_dir_all(&allowed).expect("safe root should be created");
+
+    let granted = policy_with(allowed.clone(), vec![], vec!["oc_allowed_group".to_owned()]);
+    let member = event_in_chat("ou_member", ChatMode::Group, "oc_allowed_group", true);
+    assert_eq!(granted.decide(&member), AccessDecision::Allow);
+
+    let revoked = policy_with(allowed, vec![], vec![]);
+    assert_eq!(revoked.decide(&member), AccessDecision::DenyNotGroup);
 }
 
 #[test]
