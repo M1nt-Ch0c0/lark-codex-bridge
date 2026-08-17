@@ -93,6 +93,24 @@ platform family/OS 和 epoch；不包含 Codex home、账户身份、token 或�
 CODEX_E2E=1 cargo test --test codex_smoke --locked -- --ignored --nocapture
 ```
 
+## 授权角色（owner / sender / group）
+
+除 owner 外，`config.toml` 还支持两类低权限授权（均为可选、默认拒绝）：
+
+```toml
+owners = ["ou_owner_open_id"]
+allowed_senders = ["ou_member_open_id"]   # 按用户身份授权的普通调用者
+allowed_groups = ["oc_chat_id"]           # 仅该群内普通人类成员可发起普通 turn
+```
+
+语义要点：
+
+- 群/话题中的普通 turn 仍要求真实直接 @机器人，`@all` 不算数；私聊不受影响。
+- 群白名单只授予普通消息；owner-only 控制命令仅 owner 可执行。
+- 非人类 sender（应用、机器人等）一律拒绝，任何 allowlist 都不例外。
+- 列表有数量与字节上限（各 256 条 / 32 KiB），重复条目幂等去重，畸形 ID 拒绝加载。
+- 不匹配的通配符、群名称匹配、成员自动同步均不支持；移除条目即撤销授权。
+
 ## 飞书 / Lark 接入与检查
 
 登记应用凭证（扫码注册新 PersonalAgent 应用，或登记已有 App ID/Secret）：
