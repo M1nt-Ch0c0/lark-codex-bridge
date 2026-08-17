@@ -12,7 +12,7 @@
   长驻 supervisor、thread 复用、`codex probe` 和门控的真实 Codex smoke；
 - Rust 原生飞书/Lark 凭证登记、OpenAPI、WebSocket transport、事件归一化、
   `lark probe` 和门控的真实 Lark smoke；
-- SQLite WAL 单写者 store、持久 inbox/outbox、去重、owner gate、安全工作区策略、
+- SQLite WAL 单写者 store、持久 inbox/outbox、去重、owner/指定 sender/指定群组 allowlist 授权、安全工作区策略、
   scope actor、同 scope 串行 turn 和不同 scope 的有界并发；
 - 延迟进度卡、独立最终回复、重试/receipt/uncertain delivery，以及终态先持久化再收口；
 - 图片 `localImage` 和普通文件结构化路径输入、内容寻址缓存、turn lease、GC 与启动校验；

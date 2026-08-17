@@ -450,6 +450,21 @@ fn ordinary_turn_matrix_distinguishes_owner_sender_group_roles() {
         policy.decide(&event("ou_sender", ChatMode::Group, true)),
         AccessDecision::Allow
     );
+    // allowed sender in group, no mention
+    assert_eq!(
+        policy.decide(&event("ou_sender", ChatMode::Group, false)),
+        AccessDecision::DenyMissingMention
+    );
+    // allowed sender in topic, direct mention
+    assert_eq!(
+        policy.decide(&event("ou_sender", ChatMode::Topic, true)),
+        AccessDecision::Allow
+    );
+    // allowed sender in topic, no mention
+    assert_eq!(
+        policy.decide(&event("ou_sender", ChatMode::Topic, false)),
+        AccessDecision::DenyMissingMention
+    );
     // allowed-group ordinary member, direct mention
     assert_eq!(
         policy.decide(&event_in_chat(
@@ -474,6 +489,26 @@ fn ordinary_turn_matrix_distinguishes_owner_sender_group_roles() {
     let mut at_all = event_in_chat("ou_member", ChatMode::Group, "oc_allowed_group", false);
     at_all.mention_all = true;
     assert_eq!(policy.decide(&at_all), AccessDecision::DenyMissingMention);
+    // allowed-group ordinary member in topic, direct mention
+    assert_eq!(
+        policy.decide(&event_in_chat(
+            "ou_member",
+            ChatMode::Topic,
+            "oc_allowed_group",
+            true,
+        )),
+        AccessDecision::Allow
+    );
+    // allowed-group ordinary member in topic, no mention
+    assert_eq!(
+        policy.decide(&event_in_chat(
+            "ou_member",
+            ChatMode::Topic,
+            "oc_allowed_group",
+            false,
+        )),
+        AccessDecision::DenyMissingMention
+    );
     // owner in group, no mention
     assert_eq!(
         policy.decide(&event("ou_owner_123456", ChatMode::Group, false)),

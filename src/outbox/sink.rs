@@ -289,15 +289,5 @@ fn rejection_text(reason: InboundRejectionKind) -> &'static str {
 }
 
 fn rejection_key(reason: InboundRejectionKind) -> &'static str {
-    match reason {
-        InboundRejectionKind::Overloaded => "overloaded",
-        InboundRejectionKind::NotOwner => "not_owner",
-        InboundRejectionKind::NotSender => "not_sender",
-        InboundRejectionKind::NotGroup => "not_group",
-        InboundRejectionKind::MissingMention => "missing_mention",
-        InboundRejectionKind::OwnerCommandRequired => "owner_command_required",
-        InboundRejectionKind::Policy => "policy",
-        InboundRejectionKind::Stale => "stale",
-        InboundRejectionKind::Internal => "internal",
-    }
+    reason.as_str()
 }

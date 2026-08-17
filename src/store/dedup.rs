@@ -213,7 +213,7 @@ pub enum InboundRejectionKind {
 }
 
 impl InboundRejectionKind {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Overloaded => "overloaded",
             Self::NotOwner => "not_owner",
