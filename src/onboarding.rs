@@ -35,6 +35,7 @@ use crate::config::{BridgeConfig, PathsSection, WorkspacePolicy, default_config_
 use crate::lark::api::LarkApi;
 use crate::lark::config::{LarkEndpoints, TenantBrand};
 use crate::lark::credentials::{CredentialStore, FileCredentialStore, LarkCredentials};
+use crate::lark::error::LarkError;
 use crate::lark::http::LarkHttp;
 use crate::lark::register::{RegistrationFlow, RegistrationOutcome};
 use crate::lark::token::TenantTokenProvider;
@@ -166,6 +167,7 @@ impl OnboardingOps for ProductionOps {
             let api = LarkApi::new(http, tokens);
             match api.app_creator_id(&creds.app_id).await {
                 Ok(creator) if valid_owner_id(&creator) => Ok(Some(creator)),
+                Err(error @ LarkError::PermanentAuth { .. }) => Err(error.into()),
                 Ok(_) | Err(_) => Ok(None),
             }
         })
@@ -253,7 +255,7 @@ async fn resolve_owner<O: OnboardingOps>(
             return Ok(owner.to_owned());
         }
     }
-    if let Ok(Some(creator)) = ops.app_creator(creds).await {
+    if let Some(creator) = ops.app_creator(creds).await? {
         if valid_owner_id(&creator) {
             return Ok(creator);
         }
@@ -432,7 +434,9 @@ fn acquire_lock(path: &Path) -> Result<fs::File> {
 }
 
 /// Writes bytes to path atomically via a same-directory temp file plus rename,
-/// with private permissions. A failed replace leaves no temp file.
+/// with private permissions. A failed replace leaves no temp file. On Windows
+/// the rename target must be removed first, so the replace is not atomic there
+/// (matching the credentials store).
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -579,6 +583,25 @@ mod tests {
     }
 
     #[test]
+    fn generated_config_passes_policy_with_workspace_under_home() {
+        let scratch = TempDir::new().expect("scratch dir");
+        let roots = injected_roots(scratch.path());
+        let paths = OnboardingPaths::from_dirs(
+            &scratch.path().join("config"),
+            &scratch.path().join("home").join("data"),
+        );
+        fs::create_dir_all(&paths.workspace_dir).expect("workspace should exist");
+
+        let mut config = build_config(&paths, "ou_creator_123");
+        config
+            .validate_with_platform_roots(&roots)
+            .expect("under-home workspace must pass policy");
+
+        assert_eq!(config.owners, vec!["ou_creator_123".to_owned()]);
+        assert!(config.default_workspace.is_some());
+    }
+
+    #[test]
     fn owner_hint_round_trips_without_partial_state() {
         let scratch = TempDir::new().expect("scratch dir");
         let paths = dirs(scratch.path());
@@ -656,6 +679,7 @@ mod tests {
         store: FileCredentialStore,
         register: Option<(LarkCredentials, Option<String>)>,
         creator: Option<String>,
+        creator_error: bool,
         prompt: String,
         roots: PlatformRoots,
     }
@@ -681,7 +705,14 @@ mod tests {
 
         fn app_creator(&self, _creds: &LarkCredentials) -> BoxFuture<'_, Result<Option<String>>> {
             let out = self.creator.clone();
-            Box::pin(async move { Ok(out) })
+            let error = self.creator_error;
+            Box::pin(async move {
+                if error {
+                    Err(anyhow!("creator lookup failed permanently"))
+                } else {
+                    Ok(out)
+                }
+            })
         }
 
         fn prompt_owner(&self) -> BoxFuture<'_, Result<String>> {
@@ -703,6 +734,7 @@ mod tests {
             store: FileCredentialStore::new(credentials_path(base)),
             register: register.map(|id| (test_creds("cli_new"), Some(id.to_owned()))),
             creator: creator.map(str::to_owned),
+            creator_error: false,
             prompt: "ou_prompted".to_owned(),
             roots: injected_roots(base),
         }
@@ -786,5 +818,43 @@ mod tests {
             fs::read_to_string(&paths.config_path).expect("config unchanged"),
             before
         );
+    }
+
+    #[tokio::test]
+    async fn register_credentials_only_leaves_existing_config_untouched() {
+        let scratch = TempDir::new().expect("scratch dir");
+        let paths = dirs(scratch.path());
+        fs::create_dir_all(scratch.path().join("config")).expect("config dir");
+        fs::write(&paths.config_path, "owners = [\"ou_existing\"]\n").expect("config written");
+        let before = fs::read_to_string(&paths.config_path).expect("read config");
+        let ops = fake_ops(scratch.path(), Some("ou_unused"), None);
+
+        onboard(&paths, &ops)
+            .await
+            .expect("credentials-only onboarding should succeed");
+
+        assert_eq!(
+            fs::read_to_string(&paths.config_path).expect("config unchanged"),
+            before
+        );
+        assert!(ops
+            .store
+            .load()
+            .expect("credentials should load")
+            .is_some());
+        assert_eq!(load_owner_hint(&paths).expect("hint should load"), None);
+    }
+
+    #[tokio::test]
+    async fn resolve_owner_surfaces_definitive_creator_failure() {
+        let scratch = TempDir::new().expect("scratch dir");
+        let mut ops = fake_ops(scratch.path(), None, None);
+        ops.creator_error = true;
+
+        let error = resolve_owner(&test_creds("cli_existing"), None, &ops)
+            .await
+            .expect_err("a definitive creator failure must surface");
+
+        assert!(format!("{error:#}").contains("creator lookup failed permanently"));
     }
 }
