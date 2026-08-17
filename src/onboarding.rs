@@ -193,8 +193,10 @@ pub(crate) async fn resolve_run_config(config: Option<PathBuf>) -> Result<Option
 }
 
 async fn onboard_if_needed<O: OnboardingOps>(paths: &OnboardingPaths, ops: &O) -> Result<()> {
-    if decide(paths.config_path.exists(), ops.load_credentials()?.is_some())
-        == OnboardingAction::Ready
+    if decide(
+        paths.config_path.exists(),
+        ops.load_credentials()?.is_some(),
+    ) == OnboardingAction::Ready
     {
         return Ok(());
     }
@@ -251,7 +253,9 @@ async fn resolve_owner<O: OnboardingOps>(
     match ops.app_creator(creds).await {
         Ok(Some(creator)) if valid_owner_id(&creator) => Ok(creator),
         Ok(_) => {
-            eprintln!("unable to discover the application creator; please enter the owner open_id manually");
+            eprintln!(
+                "unable to discover the application creator; please enter the owner open_id manually"
+            );
             ops.prompt_owner().await
         }
         Err(error) => {
@@ -365,10 +369,9 @@ struct GeneratedPaths {
 fn write_config_atomic(paths: &OnboardingPaths, config: &BridgeConfig) -> Result<()> {
     let generated = GeneratedConfig {
         owners: config.owners.clone(),
-        default_workspace: config
-            .default_workspace
-            .clone()
-            .ok_or_else(|| anyhow!("generated bridge configuration is missing a default workspace"))?,
+        default_workspace: config.default_workspace.clone().ok_or_else(|| {
+            anyhow!("generated bridge configuration is missing a default workspace")
+        })?,
         workspace: GeneratedWorkspace {
             allow_roots: config.workspace.allow_roots.clone(),
         },
@@ -534,7 +537,10 @@ mod tests {
     #[test]
     fn decide_covers_all_onboarding_entry_points() {
         assert_eq!(decide(true, true), OnboardingAction::Ready);
-        assert_eq!(decide(true, false), OnboardingAction::RegisterCredentialsOnly);
+        assert_eq!(
+            decide(true, false),
+            OnboardingAction::RegisterCredentialsOnly
+        );
         assert_eq!(decide(false, true), OnboardingAction::GenerateConfig);
         assert_eq!(
             decide(false, false),
@@ -680,7 +686,9 @@ mod tests {
 
     impl OnboardingOps for FakeOps {
         fn load_credentials(&self) -> Result<Option<LarkCredentials>> {
-            self.store.load().context("unable to load stored credentials")
+            self.store
+                .load()
+                .context("unable to load stored credentials")
         }
 
         fn save_credentials(&self, creds: &LarkCredentials) -> Result<()> {
@@ -719,11 +727,7 @@ mod tests {
         }
     }
 
-    fn fake_ops(
-        base: &Path,
-        register: Option<&str>,
-        creator: Option<&str>,
-    ) -> FakeOps {
+    fn fake_ops(base: &Path, register: Option<&str>, creator: Option<&str>) -> FakeOps {
         FakeOps {
             store: FileCredentialStore::new(credentials_path(base)),
             register: register.map(|id| (test_creds("cli_new"), Some(id.to_owned()))),
@@ -740,16 +744,14 @@ mod tests {
         let paths = dirs(scratch.path());
         let ops = fake_ops(scratch.path(), Some("ou_creator_123"), None);
 
-        onboard(&paths, &ops).await.expect("onboarding should succeed");
+        onboard(&paths, &ops)
+            .await
+            .expect("onboarding should succeed");
 
         let text = fs::read_to_string(&paths.config_path).expect("config should exist");
         let parsed: BridgeConfig = toml::from_str(&text).expect("config should parse");
         assert_eq!(parsed.owners, vec!["ou_creator_123".to_owned()]);
-        assert!(ops
-            .store
-            .load()
-            .expect("credentials should load")
-            .is_some());
+        assert!(ops.store.load().expect("credentials should load").is_some());
         assert_eq!(
             load_owner_hint(&paths).expect("hint should load"),
             Some("ou_creator_123".to_owned())
@@ -765,7 +767,9 @@ mod tests {
             .save(&test_creds("cli_existing"))
             .expect("credentials should persist");
 
-        onboard(&paths, &ops).await.expect("onboarding should succeed");
+        onboard(&paths, &ops)
+            .await
+            .expect("onboarding should succeed");
 
         let text = fs::read_to_string(&paths.config_path).expect("config should exist");
         let parsed: BridgeConfig = toml::from_str(&text).expect("config should parse");
@@ -831,11 +835,7 @@ mod tests {
             fs::read_to_string(&paths.config_path).expect("config unchanged"),
             before
         );
-        assert!(ops
-            .store
-            .load()
-            .expect("credentials should load")
-            .is_some());
+        assert!(ops.store.load().expect("credentials should load").is_some());
         assert!(!paths.profile_path.exists());
     }
 

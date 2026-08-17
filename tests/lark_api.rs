@@ -700,9 +700,11 @@ async fn debug_output_never_contains_secret_material() {
 #[tokio::test]
 async fn app_creator_id_returns_the_owner_not_the_bot() {
     let server = StubServer::start(token_plus(|request: &RecordedRequest| {
-        assert!(request
-            .path
-            .starts_with("/open-apis/application/v6/applications/cli_test_app"));
+        assert!(
+            request
+                .path
+                .starts_with("/open-apis/application/v6/applications/cli_test_app")
+        );
         assert!(request.path.contains("user_id_type=open_id"));
         StubResponse::json(
             200,
