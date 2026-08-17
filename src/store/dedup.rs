@@ -18,14 +18,15 @@ use crate::lark::bridge::RetainedInbound;
 use crate::lark::normalize::ShortId;
 use crate::lark::normalize::{InboundEvent, ResourceDesc, ScopeKey};
 use crate::limits::{
-    DEDUP_SWEEP_BATCH, STORE_INBOUND_BEGIN_MAX_KEY_BYTES, STORE_INBOUND_BEGIN_MAX_KEYS,
-    STORE_INBOUND_ID_MAX_BYTES, STORE_INBOUND_MAX_BYTES, STORE_INBOUND_MAX_ROWS,
-    STORE_INBOUND_MESSAGE_TYPE_MAX_BYTES, STORE_INBOUND_PAYLOAD_MAX_BYTES,
-    STORE_INBOUND_RECEIVED_MAX_BYTES, STORE_INBOUND_RECEIVED_MAX_ROWS,
-    STORE_INBOUND_RESOURCE_KEY_MAX_BYTES, STORE_INBOUND_RESOURCE_KEY_MAX_TOTAL_BYTES,
-    STORE_INBOUND_RESOURCE_MAX_COUNT, STORE_INBOUND_SCOPE_MAX_BYTES, STORE_INBOUND_TEXT_MAX_BYTES,
-    STORE_OUTBOX_MAX_QUEUED_BYTES, STORE_OUTBOX_MAX_ROWS, STORE_OUTBOX_PAYLOAD_MAX_BYTES,
-    STORE_RECOVERY_TURN_MAX_BYTES, STORE_RECOVERY_TURN_MAX_ROWS, STORE_REJECTION_REASON_MAX_BYTES,
+    DEDUP_SWEEP_BATCH, OUTBOX_TERMINAL_MAX_BYTES, OUTBOX_TERMINAL_MAX_ROWS,
+    STORE_INBOUND_BEGIN_MAX_KEY_BYTES, STORE_INBOUND_BEGIN_MAX_KEYS, STORE_INBOUND_ID_MAX_BYTES,
+    STORE_INBOUND_MAX_BYTES, STORE_INBOUND_MAX_ROWS, STORE_INBOUND_MESSAGE_TYPE_MAX_BYTES,
+    STORE_INBOUND_PAYLOAD_MAX_BYTES, STORE_INBOUND_RECEIVED_MAX_BYTES,
+    STORE_INBOUND_RECEIVED_MAX_ROWS, STORE_INBOUND_RESOURCE_KEY_MAX_BYTES,
+    STORE_INBOUND_RESOURCE_KEY_MAX_TOTAL_BYTES, STORE_INBOUND_RESOURCE_MAX_COUNT,
+    STORE_INBOUND_SCOPE_MAX_BYTES, STORE_INBOUND_TEXT_MAX_BYTES, STORE_OUTBOX_MAX_QUEUED_BYTES,
+    STORE_OUTBOX_MAX_ROWS, STORE_OUTBOX_PAYLOAD_MAX_BYTES, STORE_RECOVERY_TURN_MAX_BYTES,
+    STORE_RECOVERY_TURN_MAX_ROWS, STORE_REJECTION_REASON_MAX_BYTES,
 };
 use crate::runtime::intake::TenantNamespace;
 
@@ -1611,6 +1612,7 @@ fn reject_received_in_transaction(
     Ok(InboundDisposition::Rejected)
 }
 
+#[allow(clippy::too_many_lines)]
 fn enqueue_notice_in_transaction(
     transaction: &rusqlite::Transaction<'_>,
     notice: &super::NewOutboxRow,
@@ -1670,6 +1672,46 @@ fn enqueue_notice_in_transaction(
             context: "enqueueing an inbound rejection notice",
         });
     }
+    // All-states hard cap (same bounds as `enforce_total_cap` in outbox.rs,
+    // but without the inline sweep): this rejection+notice transaction must
+    // stay atomic, so it cannot first sweep terminal rows. Over the cap the
+    // whole transaction fails closed — the notice insert and the inbound
+    // rejection both roll back, leaving the event `received` for the existing
+    // retry path. The bounds are the same constants `enqueue_one` uses.
+    let (total_rows, total_bytes): (i64, i64) = transaction
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(payload_bytes), 0) FROM outbox",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| sqlite_error("checking total rejection notice capacity", &error))?;
+    if u64::try_from(total_rows)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1)
+        > OUTBOX_TERMINAL_MAX_ROWS
+        || u64::try_from(total_bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_add(payload_bytes)
+            > OUTBOX_TERMINAL_MAX_BYTES
+    {
+        return Err(StoreError::CapacityExceeded {
+            context: "enqueueing an inbound rejection notice",
+        });
+    }
+    // Sequence watermark (same rule as `enqueue_one` in outbox.rs): a newly
+    // enqueued notice must never be claimable before a row already parked for
+    // retry. The notice's requested retry time is raised to the highest live
+    // (`pending`/`sending`) retry time, so a rejection notice can never
+    // overtake a failed row whose retry was already scheduled (global FIFO).
+    let watermark: i64 = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(next_retry_ms), 0) FROM outbox
+             WHERE state IN ('pending', 'sending')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| sqlite_error("reading the outbox retry watermark", &error))?;
+    let next_retry_ms = notice.next_retry_ms.max(watermark);
     let now = now_ms();
     let inserted = transaction
         .execute(
@@ -1683,7 +1725,7 @@ fn enqueue_notice_in_transaction(
                 notice.kind,
                 notice.payload_json,
                 i64::try_from(payload_bytes).unwrap_or(i64::MAX),
-                notice.next_retry_ms,
+                next_retry_ms,
                 now
             ],
         )

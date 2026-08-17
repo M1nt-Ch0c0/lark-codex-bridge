@@ -7,16 +7,17 @@ use lark_codex_bridge::lark::config::TenantBrand;
 use lark_codex_bridge::lark::credentials::LarkCredentials;
 use lark_codex_bridge::lark::normalize::{InboundEvent, ScopeKey};
 use lark_codex_bridge::limits::{
-    STORE_OUTBOX_CLAIM_MAX_BYTES, STORE_OUTBOX_MAX_QUEUED_BYTES, STORE_OUTBOX_PAYLOAD_MAX_BYTES,
-    STORE_RECOVERY_TURN_MAX_BYTES, STORE_RECOVERY_TURN_MAX_ROWS, STORE_REQUEST_MAX_BYTES,
-    STORE_WRITER_BYTE_BUDGET, STORE_WRITER_CAPACITY,
+    OUTBOX_TERMINAL_MAX_ROWS, STORE_OUTBOX_CLAIM_MAX_BYTES, STORE_OUTBOX_MAX_QUEUED_BYTES,
+    STORE_OUTBOX_PAYLOAD_MAX_BYTES, STORE_RECOVERY_TURN_MAX_BYTES, STORE_RECOVERY_TURN_MAX_ROWS,
+    STORE_REQUEST_MAX_BYTES, STORE_WRITER_BYTE_BUDGET, STORE_WRITER_CAPACITY,
 };
 use lark_codex_bridge::runtime::intake::DurableIntake;
 use lark_codex_bridge::runtime::intake::TenantNamespace;
 use lark_codex_bridge::store::{
     BeginTurnOutcome, DedupOutcome, InboundDisposition, InboundEventState, InboundKey,
     InboundRejectionKind, InboundTerminal, NewOutboxRow, NewTurnRow, OutboxEnqueue, OutboxState,
-    ResolveTurnOutcome, StoreError, StoreHandle, TurnResolution, TurnState,
+    ResolveTurnOutcome, ScopeRow, StoreError, StoreHandle, ThreadRow, ThreadStatus, TurnResolution,
+    TurnRow, TurnState,
 };
 use secrecy::SecretString;
 use tempfile::tempdir;
@@ -229,10 +230,19 @@ async fn migration_two_persists_strict_inbound_payload_columns() {
     let temp = tempdir().expect("tempdir");
     let path = temp.path().join("store.sqlite");
     let store = StoreHandle::open(&path).await.expect("open");
-    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 2);
+    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 4);
     store.shutdown().await.expect("shutdown");
 
     let connection = rusqlite::Connection::open(&path).expect("inspect");
+    let obsolete_cursor_tables: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'attachment_scan_cursor'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("inspect obsolete attachment cursor");
+    assert_eq!(obsolete_cursor_tables, 0);
     let inbound_columns = connection
         .prepare("PRAGMA table_info(inbound_events)")
         .expect("prepare inbound columns")
@@ -346,7 +356,7 @@ async fn file_store_applies_pragmas_and_persists_every_typed_table() {
     assert!(pragmas.foreign_keys);
     assert_eq!(pragmas.busy_timeout_ms, 5_000);
     assert_eq!(pragmas.synchronous, 1);
-    assert_eq!(pragmas.user_version, 2);
+    assert_eq!(pragmas.user_version, 4);
     store
         .upsert_scope(&scope, temp.path(), "fp")
         .await
@@ -382,7 +392,7 @@ async fn file_store_applies_pragmas_and_persists_every_typed_table() {
     store.shutdown().await.expect("shutdown");
 
     let store = StoreHandle::open(&path).await.expect("reopen");
-    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 2);
+    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 4);
     assert!(store.scope_row(&scope).await.expect("scope").is_some());
     assert_eq!(
         store
@@ -427,7 +437,7 @@ async fn rejects_future_schema_versions_without_mutating_the_database() {
     {
         let connection = rusqlite::Connection::open(&path).expect("seed");
         connection
-            .pragma_update(None, "user_version", 3_u32)
+            .pragma_update(None, "user_version", 5_u32)
             .expect("version");
     }
     assert!(matches!(
@@ -438,7 +448,7 @@ async fn rejects_future_schema_versions_without_mutating_the_database() {
     let version: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .expect("version");
-    assert_eq!(version, 3);
+    assert_eq!(version, 5);
 }
 
 #[tokio::test]
@@ -1069,6 +1079,56 @@ async fn scope_paths_are_redacted_and_non_utf8_paths_are_refused() {
     store.shutdown().await.expect("shutdown");
 }
 
+#[test]
+fn durable_session_rows_redact_scope_and_workspace_values_from_debug() {
+    let scope_key = "im:oc_sensitive:thread:omt_sensitive".to_owned();
+    let thread_id = "codex-thread-sensitive".to_owned();
+    let scope = ScopeRow {
+        scope_key: scope_key.clone(),
+        cwd: std::path::PathBuf::from("/workspace/secret-project"),
+        policy_fingerprint: "secret-policy-fingerprint".to_owned(),
+        updated_ms: 1,
+    };
+    let thread = ThreadRow {
+        scope_key: scope_key.clone(),
+        codex_thread_id: thread_id.clone(),
+        status: ThreadStatus::Active,
+        created_ms: 2,
+        archived_ms: None,
+    };
+    let turn = TurnRow {
+        id: 3,
+        scope_key: scope_key.clone(),
+        client_message_id: "client-message-sensitive".to_owned(),
+        codex_thread_id: Some(thread_id.clone()),
+        codex_turn_id: Some("codex-turn-sensitive".to_owned()),
+        state: TurnState::Running,
+        uncertain: false,
+        created_ms: 4,
+        updated_ms: 5,
+        inbound_count: 1,
+    };
+    let new_turn = NewTurnRow {
+        scope_key,
+        client_message_id: "new-client-message-sensitive".to_owned(),
+        codex_thread_id: Some(thread_id),
+        state: TurnState::Starting,
+    };
+
+    for debug in [
+        format!("{scope:?}"),
+        format!("{thread:?}"),
+        format!("{turn:?}"),
+        format!("{new_turn:?}"),
+    ] {
+        assert!(
+            !debug.contains("sensitive"),
+            "leaked session value: {debug}"
+        );
+        assert!(!debug.contains("secret-project"), "leaked path: {debug}");
+    }
+}
+
 #[tokio::test]
 async fn outbox_enforces_aggregate_bytes_and_claim_batch_bytes() {
     let store = StoreHandle::open_in_memory().await.expect("open");
@@ -1095,6 +1155,25 @@ async fn outbox_enforces_aggregate_bytes_and_claim_batch_bytes() {
         claimed.len(),
         STORE_OUTBOX_CLAIM_MAX_BYTES / STORE_OUTBOX_PAYLOAD_MAX_BYTES
     );
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn outbox_debug_redacts_payload_routing_and_idempotency_values() {
+    let store = StoreHandle::open_in_memory().await.expect("open");
+    let row = NewOutboxRow {
+        idempotency_key: "sensitive-idempotency-key".to_owned(),
+        scope_key: "im:oc_sensitive:thread:omt_sensitive".to_owned(),
+        kind: "notice".to_owned(),
+        payload_json: "{\"text\":\"sensitive-payload\"}".to_owned(),
+        next_retry_ms: 0,
+    };
+    let new_debug = format!("{row:?}");
+    assert!(!new_debug.contains("sensitive"));
+    let persisted = store.enqueue_outbox(row).await.expect("enqueue");
+    let persisted_debug = format!("{persisted:?}");
+    assert!(!persisted_debug.contains("sensitive"));
+    assert!(persisted_debug.contains("payload_bytes"));
     store.shutdown().await.expect("shutdown");
 }
 
@@ -1508,6 +1587,133 @@ async fn atomic_rejection_notice_rolls_back_at_real_outbox_byte_capacity() {
             .await
             .expect("rollback state"),
         Some(InboundEventState::Received)
+    );
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn rejection_notice_inherits_the_retry_watermark() {
+    let store = StoreHandle::open_in_memory().await.expect("open");
+    // Park a row for retry: enqueue, claim, then fail it retryably so it goes
+    // back to `pending` with a future retry time.
+    store
+        .enqueue_outbox(outbox("watermark-first", "first"))
+        .await
+        .expect("enqueue first");
+    let retry_ms = 60_000_000;
+    let claimed = store.claim_outbox_batch(i64::MAX, 1).await.expect("claim");
+    assert_eq!(claimed.len(), 1);
+    store
+        .fail_outbox(claimed[0].id, 1, retry_ms, false)
+        .await
+        .expect("fail first");
+
+    let tenant = tenant_namespace("cli_notice_watermark");
+    let inbound = event("event-notice-watermark", "message-notice-watermark");
+    store
+        .register_inbound(&tenant, &inbound)
+        .await
+        .expect("register");
+    let notice = outbox("watermark-notice", "body");
+    assert_eq!(
+        store
+            .reject_received_and_enqueue_notice(
+                &InboundKey::new(tenant, inbound.event_id),
+                InboundRejectionKind::Policy,
+                notice.clone(),
+            )
+            .await
+            .expect("atomic reject+notice"),
+        InboundDisposition::Rejected
+    );
+
+    let claimed = store
+        .claim_outbox_batch(i64::MAX, 8)
+        .await
+        .expect("claim all");
+    assert_eq!(
+        claimed
+            .iter()
+            .map(|row| row.idempotency_key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["watermark-first", "watermark-notice"],
+        "the parked row claims before the notice (global id order)"
+    );
+    let notice_row = claimed
+        .iter()
+        .find(|row| row.idempotency_key == notice.idempotency_key)
+        .expect("notice row");
+    assert_eq!(
+        notice_row.next_retry_ms, retry_ms,
+        "the notice inherits the parked row's retry watermark"
+    );
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn rejection_notice_respects_the_all_states_total_hard_cap() {
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("notice-total-cap.sqlite");
+    // Open once to migrate the schema, then shut down so a raw connection can
+    // seed terminal rows putting the table exactly at the all-states hard cap.
+    let seed_store = StoreHandle::open(&path).await.expect("open seed store");
+    seed_store.shutdown().await.expect("shutdown seed store");
+
+    let mut connection = rusqlite::Connection::open(&path).expect("raw seed connection");
+    let transaction = connection.transaction().expect("seed transaction");
+    {
+        let mut statement = transaction
+            .prepare(
+                "INSERT INTO outbox
+                 (idempotency_key, scope_key, kind, payload_json, payload_bytes,
+                  state, attempts, next_retry_ms, receipt_message_id, created_ms, updated_ms)
+                 VALUES (?1, 'im:oc_test', 'final', '', 0, 'sent', 1, 0, 'om_r', 1, 1)",
+            )
+            .expect("prepare terminal seed");
+        let cap = usize::try_from(OUTBOX_TERMINAL_MAX_ROWS).unwrap();
+        for index in 0..cap {
+            statement
+                .execute(rusqlite::params![format!("term:{index}")])
+                .expect("insert terminal row");
+        }
+    }
+    transaction.commit().expect("commit seed");
+    drop(connection);
+
+    let store = StoreHandle::open(&path).await.expect("reopen store");
+    let tenant = tenant_namespace("cli_notice_total_cap");
+    let inbound = event("event-notice-total-cap", "message-notice-total-cap");
+    store
+        .register_inbound(&tenant, &inbound)
+        .await
+        .expect("register");
+    assert!(matches!(
+        store
+            .reject_received_and_enqueue_notice(
+                &InboundKey::new(tenant.clone(), inbound.event_id.clone()),
+                InboundRejectionKind::Overloaded,
+                outbox("total-cap-notice", "x"),
+            )
+            .await,
+        Err(StoreError::CapacityExceeded { .. })
+    ));
+    assert_eq!(
+        store
+            .inbound_state(&tenant, &inbound.event_id)
+            .await
+            .expect("state"),
+        Some(InboundEventState::Received),
+        "the rejection must roll back, leaving the inbound row received"
+    );
+    assert_eq!(
+        store.recover_received(&tenant).await.expect("replay").len(),
+        1,
+        "the received row is retained for the existing retry path"
+    );
+    assert_eq!(
+        store.outbox_depth().await.expect("depth").pending,
+        0,
+        "the notice must roll back, leaving no pending row"
     );
     store.shutdown().await.expect("shutdown");
 }

@@ -238,7 +238,7 @@ pub type ThreadStartResponse = ThreadStartResult;
 pub type ThreadResumeResult = ThreadStartResult;
 pub type ThreadResumeResponse = ThreadStartResult;
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type")]
 pub enum TurnSandboxPolicy {
     #[serde(rename = "readOnly")]
@@ -264,6 +264,34 @@ pub enum TurnSandboxPolicy {
         #[serde(default, rename = "networkAccess")]
         network_access: ExternalNetworkAccess,
     },
+}
+
+impl fmt::Debug for TurnSandboxPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ReadOnly { network_access } => formatter
+                .debug_struct("ReadOnly")
+                .field("network_access", network_access)
+                .finish(),
+            Self::WorkspaceWrite {
+                writable_roots,
+                network_access,
+                exclude_slash_tmp,
+                exclude_tmpdir_env_var,
+            } => formatter
+                .debug_struct("WorkspaceWrite")
+                .field("writable_root_count", &writable_roots.len())
+                .field("network_access", network_access)
+                .field("exclude_slash_tmp", exclude_slash_tmp)
+                .field("exclude_tmpdir_env_var", exclude_tmpdir_env_var)
+                .finish(),
+            Self::DangerFullAccess => formatter.write_str("DangerFullAccess"),
+            Self::ExternalSandbox { network_access } => formatter
+                .debug_struct("ExternalSandbox")
+                .field("network_access", network_access)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

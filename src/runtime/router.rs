@@ -1,6 +1,6 @@
 //! Bounded tenant-scoped routing into one actor per Lark scope.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -9,6 +9,7 @@ use std::time::Duration;
 use futures_util::future::join_all;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
+use tokio::time::{MissedTickBehavior, interval};
 
 use crate::codex::supervisor::{SupervisorError, SupervisorHandle, SupervisorState};
 use crate::codex::types::{ApprovalPolicy, SandboxMode};
@@ -16,12 +17,15 @@ use crate::config::BridgeConfig;
 use crate::lark::bridge::QueuedInboundEvent;
 use crate::limits::{
     ROUTER_ACTIVE_TURN_HARD_LIMIT, ROUTER_COMMAND_BYTE_BUDGET, ROUTER_COMMAND_CAPACITY,
-    ROUTER_SCOPE_ACTOR_HARD_LIMIT,
+    ROUTER_CONTROL_BYTE_BUDGET, ROUTER_CONTROL_CAPACITY, ROUTER_RETRY_BYTE_BUDGET,
+    ROUTER_RETRY_CAPACITY, ROUTER_SCOPE_ACTOR_HARD_LIMIT, STORE_INBOUND_SCOPE_MAX_BYTES,
 };
+use crate::runtime::attachments::AttachmentCache;
 use crate::runtime::intake::TenantNamespace;
 use crate::runtime::policy::{AccessDecision, AccessPolicy};
 use crate::runtime::scope::{
-    ActorRouteError, DurableReplySink, ReplySinkError, ScopeActorHandle, SupervisorAccess,
+    ActorRouteError, DurableReplySink, InterruptOutcome, ReplySinkError, ScopeActorHandle,
+    ScopeSnapshot, SupervisorAccess,
 };
 use crate::store::{InboundKey, InboundRejectionKind, StoreError, StoreHandle};
 
@@ -38,6 +42,7 @@ pub struct RouterSettings {
     pub(crate) debounce: Duration,
     pub(crate) message_max_age: Duration,
     pub(crate) finalization_retry: Duration,
+    pub(crate) shutdown_cleanup_timeout: Duration,
 }
 
 impl RouterSettings {
@@ -55,7 +60,35 @@ impl RouterSettings {
             debounce: Duration::from_millis(600),
             message_max_age: Duration::from_secs(15 * 60),
             finalization_retry: Duration::from_secs(1),
+            shutdown_cleanup_timeout: Duration::from_secs(5),
         }
+    }
+
+    /// Overrides only scheduling timings for deterministic integration tests.
+    ///
+    /// The same non-zero validation and every production count/byte limit
+    /// remain enforced by [`Router::start`].
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_test_timings(
+        mut self,
+        debounce: Duration,
+        message_max_age: Duration,
+        finalization_retry: Duration,
+    ) -> Self {
+        self.debounce = debounce;
+        self.message_max_age = message_max_age;
+        self.finalization_retry = finalization_retry;
+        self
+    }
+
+    /// Overrides the bounded best-effort finalization window used after an
+    /// actor's normal cancellation token has already fired.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_test_shutdown_cleanup_timeout(mut self, timeout: Duration) -> Self {
+        self.shutdown_cleanup_timeout = timeout;
+        self
     }
 
     fn validate(&self) -> Result<(), RouteError> {
@@ -66,6 +99,7 @@ impl RouterSettings {
             || self.debounce.is_zero()
             || self.message_max_age.is_zero()
             || self.finalization_retry.is_zero()
+            || self.shutdown_cleanup_timeout.is_zero()
         {
             return Err(RouteError::InvalidSettings);
         }
@@ -94,6 +128,7 @@ impl fmt::Debug for RouterSettings {
             .field("debounce", &self.debounce)
             .field("message_max_age", &self.message_max_age)
             .field("finalization_retry", &self.finalization_retry)
+            .field("shutdown_cleanup_timeout", &self.shutdown_cleanup_timeout)
             .finish()
     }
 }
@@ -115,6 +150,8 @@ pub enum RouteError {
     Supervisor,
     #[error("scope actor routing is not available")]
     ActorUnavailable,
+    #[error("attachment cache cleanup failed")]
+    Attachment,
 }
 
 impl From<StoreError> for RouteError {
@@ -132,6 +169,30 @@ impl From<ReplySinkError> for RouteError {
 impl From<SupervisorError> for RouteError {
     fn from(_error: SupervisorError) -> Self {
         Self::Supervisor
+    }
+}
+
+/// One route failure together with the event only when the router never
+/// accepted ownership of it.
+pub(crate) struct RouteAttemptError {
+    error: RouteError,
+    event: Option<Box<QueuedInboundEvent>>,
+}
+
+impl RouteAttemptError {
+    pub(crate) fn into_parts(self) -> (RouteError, Option<Box<QueuedInboundEvent>>) {
+        (self.error, self.event)
+    }
+
+    fn retained(error: RouteError, event: Box<QueuedInboundEvent>) -> Self {
+        Self {
+            error,
+            event: Some(event),
+        }
+    }
+
+    fn consumed(error: RouteError) -> Self {
+        Self { error, event: None }
     }
 }
 
@@ -160,27 +221,77 @@ impl Router {
         supervisor: SupervisorHandle,
         sink: Arc<dyn DurableReplySink>,
     ) -> Result<RouterHandle, RouteError> {
-        if let Err(error) = settings.validate() {
-            supervisor.shutdown().await?;
-            return Err(error);
-        }
-        let (sender, receiver) = mpsc::channel(ROUTER_COMMAND_CAPACITY);
-        let snapshot = Arc::new(RwLock::new(RouterSnapshot::default()));
-        let task_snapshot = Arc::clone(&snapshot);
-        let task = tokio::spawn(run_router(
-            receiver,
+        Self::start_inner(store, tenant, policy, settings, supervisor, sink, None).await
+    }
+
+    /// Starts the production router with attachment download/cache support.
+    /// The plain [`Self::start`] constructor remains available for runtimes
+    /// and tests that intentionally do not resolve message resources.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same static classifications as [`Self::start`].
+    pub async fn start_with_attachments(
+        store: StoreHandle,
+        tenant: TenantNamespace,
+        policy: AccessPolicy,
+        settings: RouterSettings,
+        supervisor: SupervisorHandle,
+        sink: Arc<dyn DurableReplySink>,
+        attachments: Arc<AttachmentCache>,
+    ) -> Result<RouterHandle, RouteError> {
+        Self::start_inner(
             store,
             tenant,
             policy,
             settings,
             supervisor,
             sink,
+            Some(attachments),
+        )
+        .await
+    }
+
+    async fn start_inner(
+        store: StoreHandle,
+        tenant: TenantNamespace,
+        policy: AccessPolicy,
+        settings: RouterSettings,
+        supervisor: SupervisorHandle,
+        sink: Arc<dyn DurableReplySink>,
+        attachments: Option<Arc<AttachmentCache>>,
+    ) -> Result<RouterHandle, RouteError> {
+        if let Err(error) = settings.validate() {
+            supervisor.shutdown().await?;
+            return Err(error);
+        }
+        let (sender, receiver) = mpsc::channel(ROUTER_COMMAND_CAPACITY);
+        let (control_sender, control_receiver) = mpsc::channel(ROUTER_CONTROL_CAPACITY);
+        let snapshot = Arc::new(RwLock::new(RouterSnapshot::default()));
+        let task_snapshot = Arc::clone(&snapshot);
+        let active_turn_capacity = settings.active_turn_permits;
+        let active_turns = Arc::new(Semaphore::new(active_turn_capacity));
+        let task = tokio::spawn(run_router(
+            receiver,
+            control_receiver,
+            store,
+            tenant,
+            policy,
+            settings,
+            Arc::clone(&active_turns),
+            supervisor,
+            sink,
+            attachments,
             task_snapshot,
         ));
         Ok(RouterHandle {
             sender,
+            control_sender,
             byte_budget: Arc::new(Semaphore::new(ROUTER_COMMAND_BYTE_BUDGET)),
+            control_byte_budget: Arc::new(Semaphore::new(ROUTER_CONTROL_BYTE_BUDGET)),
             snapshot,
+            active_turns,
+            active_turn_capacity,
             task: Some(task),
         })
     }
@@ -189,8 +300,12 @@ impl Router {
 /// Client handle for routing and orderly shutdown.
 pub struct RouterHandle {
     sender: mpsc::Sender<RouterCommand>,
+    control_sender: mpsc::Sender<RouterControl>,
     byte_budget: Arc<Semaphore>,
+    control_byte_budget: Arc<Semaphore>,
     snapshot: Arc<RwLock<RouterSnapshot>>,
+    active_turns: Arc<Semaphore>,
+    active_turn_capacity: usize,
     task: Option<JoinHandle<Result<(), RouteError>>>,
 }
 
@@ -202,30 +317,123 @@ impl RouterHandle {
     /// Returns a static classification when the bounded queue, store, or sink
     /// cannot accept the event.
     pub async fn route(&self, event: QueuedInboundEvent) -> Result<(), RouteError> {
+        self.route_recoverable(event)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    /// Routes one durable event while returning it only if this handle never
+    /// transferred ownership to the router task.
+    pub(crate) async fn route_recoverable(
+        &self,
+        event: QueuedInboundEvent,
+    ) -> Result<(), RouteAttemptError> {
+        let event = Box::new(event);
         let bytes = event.permit.num_permits();
-        let bytes = u32::try_from(bytes).map_err(|_| RouteError::Capacity)?;
-        let queue_permit = self
-            .byte_budget
+        let Ok(bytes) = u32::try_from(bytes) else {
+            return Err(RouteAttemptError::retained(RouteError::Capacity, event));
+        };
+        let Ok(queue_permit) = self.byte_budget.clone().try_acquire_many_owned(bytes) else {
+            return Err(RouteAttemptError::retained(RouteError::Capacity, event));
+        };
+        let (respond, wait) = oneshot::channel();
+        let command = RouterCommand::Route {
+            event,
+            _queue_permit: queue_permit,
+            respond,
+        };
+        match self.sender.try_send(command) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(command)) => {
+                return Err(retained_command_failure(RouteError::Capacity, command));
+            }
+            Err(mpsc::error::TrySendError::Closed(command)) => {
+                return Err(retained_command_failure(RouteError::Closed, command));
+            }
+        }
+        match wait.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(RouteAttemptError::consumed(error)),
+            Err(_) => Err(RouteAttemptError::consumed(RouteError::Closed)),
+        }
+    }
+
+    /// Returns the latest bounded structural snapshot.
+    #[must_use]
+    pub fn snapshot(&self) -> RouterSnapshot {
+        let mut snapshot = self
+            .snapshot
+            .read()
+            .map_or_else(|_| RouterSnapshot::default(), |snapshot| *snapshot);
+        snapshot.active_turns = self
+            .active_turn_capacity
+            .saturating_sub(self.active_turns.available_permits());
+        snapshot
+    }
+
+    /// Requests interruption of the active turn for one scope.
+    ///
+    /// The control travels a dedicated bounded lane so ordinary inbound
+    /// backlog cannot block `/stop` behind user messages.
+    ///
+    /// # Errors
+    ///
+    /// Returns a static classification when the control lane or router is
+    /// unavailable, or when the app-server rejects the interrupt RPC.
+    pub async fn interrupt(
+        &self,
+        scope: &crate::lark::normalize::ScopeKey,
+    ) -> Result<InterruptOutcome, RouteError> {
+        let scope_key = scope.to_string();
+        if scope_key.len() > STORE_INBOUND_SCOPE_MAX_BYTES {
+            return Err(RouteError::Capacity);
+        }
+        let bytes = u32::try_from(scope_key.len()).map_err(|_| RouteError::Capacity)?;
+        let permit = self
+            .control_byte_budget
             .clone()
             .try_acquire_many_owned(bytes)
             .map_err(|_| RouteError::Capacity)?;
         let (respond, wait) = oneshot::channel();
-        self.sender
-            .try_send(RouterCommand::Route {
-                event: Box::new(event),
-                _queue_permit: queue_permit,
+        self.control_sender
+            .try_send(RouterControl::Interrupt {
+                scope_key,
+                _queue_permit: permit,
                 respond,
             })
             .map_err(|_| RouteError::Capacity)?;
         wait.await.map_err(|_| RouteError::Closed)?
     }
 
-    /// Returns the latest bounded structural snapshot.
-    #[must_use]
-    pub fn snapshot(&self) -> RouterSnapshot {
-        self.snapshot
-            .read()
-            .map_or_else(|_| RouterSnapshot::default(), |snapshot| *snapshot)
+    /// Returns a redacted structural snapshot for one resident scope actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns a static classification when the bounded control lane or
+    /// router is unavailable.
+    pub async fn scope_snapshot(
+        &self,
+        scope: &crate::lark::normalize::ScopeKey,
+    ) -> Result<Option<ScopeSnapshot>, RouteError> {
+        let scope_key = scope.to_string();
+        if scope_key.len() > STORE_INBOUND_SCOPE_MAX_BYTES {
+            return Err(RouteError::Capacity);
+        }
+        let bytes = u32::try_from(scope_key.len()).map_err(|_| RouteError::Capacity)?;
+        let permit = self
+            .control_byte_budget
+            .clone()
+            .try_acquire_many_owned(bytes)
+            .map_err(|_| RouteError::Capacity)?;
+        let (respond, wait) = oneshot::channel();
+        self.control_sender
+            .try_send(RouterControl::Snapshot {
+                scope_key,
+                _queue_permit: permit,
+                respond,
+            })
+            .map_err(|_| RouteError::Capacity)?;
+        wait.await.map_err(|_| RouteError::Closed)
     }
 
     /// Stops the router, its actors, and finally the owned supervisor.
@@ -247,6 +455,13 @@ impl RouterHandle {
     }
 }
 
+fn retained_command_failure(error: RouteError, command: RouterCommand) -> RouteAttemptError {
+    let RouterCommand::Route { event, .. } = command else {
+        unreachable!("route submission only constructs route commands");
+    };
+    RouteAttemptError::retained(error, event)
+}
+
 enum RouterCommand {
     Route {
         event: Box<QueuedInboundEvent>,
@@ -258,23 +473,70 @@ enum RouterCommand {
     },
 }
 
-#[allow(clippy::too_many_arguments)]
+enum RouterControl {
+    Interrupt {
+        scope_key: String,
+        _queue_permit: OwnedSemaphorePermit,
+        respond: oneshot::Sender<Result<InterruptOutcome, RouteError>>,
+    },
+    Snapshot {
+        scope_key: String,
+        _queue_permit: OwnedSemaphorePermit,
+        respond: oneshot::Sender<Option<ScopeSnapshot>>,
+    },
+}
+
+struct RouterRetry {
+    event: QueuedInboundEvent,
+    _queue_permit: OwnedSemaphorePermit,
+}
+
+struct RouteFailure {
+    error: RouteError,
+    event: QueuedInboundEvent,
+    retryable: bool,
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_router(
     mut receiver: mpsc::Receiver<RouterCommand>,
+    mut control_receiver: mpsc::Receiver<RouterControl>,
     store: StoreHandle,
     tenant: TenantNamespace,
     policy: AccessPolicy,
     settings: RouterSettings,
+    active_turns: Arc<Semaphore>,
     mut supervisor: SupervisorHandle,
     sink: Arc<dyn DurableReplySink>,
+    attachments: Option<Arc<AttachmentCache>>,
     snapshot: Arc<RwLock<RouterSnapshot>>,
 ) -> Result<(), RouteError> {
-    let active_turns = Arc::new(Semaphore::new(settings.active_turn_permits));
     let (supervisor_tx, supervisor_rx) = watch::channel(supervisor_access(&supervisor));
     let mut actors = HashMap::<String, ScopeActorHandle>::new();
+    let retry_budget = Arc::new(Semaphore::new(ROUTER_RETRY_BYTE_BUDGET));
+    let mut retries = VecDeque::<RouterRetry>::new();
+    let mut retry_tick = interval(Duration::from_millis(250));
+    retry_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut supervisor_open = true;
     loop {
         tokio::select! {
+            biased;
+            control = control_receiver.recv() => {
+                let Some(control) = control else { break };
+                match control {
+                    RouterControl::Interrupt { scope_key, respond, .. } => {
+                        let result = match actors.get(&scope_key) {
+                            Some(actor) => actor.interrupt().await.map_err(|()| RouteError::ActorUnavailable),
+                            None => Ok(InterruptOutcome::NoActiveTurn),
+                        };
+                        let _ = respond.send(result);
+                    }
+                    RouterControl::Snapshot { scope_key, respond, .. } => {
+                        let result = actors.get(&scope_key).map(ScopeActorHandle::snapshot);
+                        let _ = respond.send(result);
+                    }
+                }
+            }
             state = supervisor.changed(), if supervisor_open => {
                 if state.is_ok() {
                     supervisor_tx.send_replace(supervisor_access(&supervisor));
@@ -283,11 +545,28 @@ async fn run_router(
                     supervisor_tx.send_replace(SupervisorAccess { epoch: 0, client: None });
                 }
             }
+            _ = retry_tick.tick(), if !retries.is_empty() => {
+                retry_one(
+                    &mut retries,
+                    &store,
+                    &tenant,
+                    &policy,
+                    &settings,
+                    &supervisor_rx,
+                    Arc::clone(&active_turns),
+                    Arc::clone(&sink),
+                    attachments.as_ref(),
+                    &mut actors,
+                ).await;
+                update_runtime_snapshot(
+                    &snapshot, &actors, &receiver, &retries, &active_turns, &settings,
+                );
+            }
             command = receiver.recv() => {
                 let Some(command) = command else { break };
                 match command {
                     RouterCommand::Route { event, respond, .. } => {
-                        let result = route_one(
+                        let result = match route_one(
                             &store,
                             &tenant,
                             &policy,
@@ -295,20 +574,33 @@ async fn run_router(
                             &supervisor_rx,
                             Arc::clone(&active_turns),
                             Arc::clone(&sink),
+                            attachments.as_ref(),
                             &mut actors,
                             *event,
-                        ).await;
-                        update_snapshot(
-                            &snapshot,
-                            actors.len(),
-                            receiver.len(),
-                            settings.active_turn_permits.saturating_sub(active_turns.available_permits()),
+                        ).await {
+                            Ok(()) => Ok(()),
+                            Err(failure) if failure.retryable => {
+                                let error = failure.error;
+                                match enqueue_retry(
+                                    &mut retries,
+                                    &retry_budget,
+                                    failure.event,
+                                ) {
+                                    Ok(()) => Ok(()),
+                                    Err(()) => Err(error),
+                                }
+                            }
+                            Err(failure) => Err(failure.error),
+                        };
+                        update_runtime_snapshot(
+                            &snapshot, &actors, &receiver, &retries, &active_turns, &settings,
                         );
                         let _ = respond.send(result);
                     }
                     RouterCommand::Shutdown { respond } => {
                         shutdown_actors(actors).await;
                         supervisor.shutdown().await?;
+                        reconcile_terminal_attachments(attachments.as_deref()).await?;
                         let _ = respond.send(());
                         return Ok(());
                     }
@@ -318,7 +610,59 @@ async fn run_router(
     }
     shutdown_actors(actors).await;
     supervisor.shutdown().await?;
+    reconcile_terminal_attachments(attachments.as_deref()).await?;
     Ok(())
+}
+
+async fn reconcile_terminal_attachments(
+    attachments: Option<&AttachmentCache>,
+) -> Result<(), RouteError> {
+    let Some(cache) = attachments else {
+        return Ok(());
+    };
+    cache
+        .reconcile()
+        .await
+        .map(|_| ())
+        .map_err(|_| RouteError::Attachment)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn retry_one(
+    retries: &mut VecDeque<RouterRetry>,
+    store: &StoreHandle,
+    tenant: &TenantNamespace,
+    policy: &AccessPolicy,
+    settings: &RouterSettings,
+    supervisor: &watch::Receiver<SupervisorAccess>,
+    active_turns: Arc<Semaphore>,
+    sink: Arc<dyn DurableReplySink>,
+    attachments: Option<&Arc<AttachmentCache>>,
+    actors: &mut HashMap<String, ScopeActorHandle>,
+) {
+    let Some(mut retry) = retries.pop_front() else {
+        return;
+    };
+    match route_one(
+        store,
+        tenant,
+        policy,
+        settings,
+        supervisor,
+        active_turns,
+        sink,
+        attachments,
+        actors,
+        retry.event,
+    )
+    .await
+    {
+        Err(failure) if failure.retryable => {
+            retry.event = failure.event;
+            retries.push_back(retry);
+        }
+        Ok(()) | Err(_) => {}
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -330,9 +674,10 @@ async fn route_one(
     supervisor: &watch::Receiver<SupervisorAccess>,
     active_turns: Arc<Semaphore>,
     sink: Arc<dyn DurableReplySink>,
+    attachments: Option<&Arc<AttachmentCache>>,
     actors: &mut HashMap<String, ScopeActorHandle>,
     queued: QueuedInboundEvent,
-) -> Result<(), RouteError> {
+) -> Result<(), RouteFailure> {
     let decision = policy.decide(&queued.event);
     let key = InboundKey::new(tenant.clone(), queued.event.event_id.clone());
     if decision != AccessDecision::Allow {
@@ -343,7 +688,12 @@ async fn route_one(
             &queued.event,
             InboundRejectionKind::Policy,
         )
-        .await;
+        .await
+        .map_err(|error| RouteFailure {
+            error,
+            event: queued,
+            retryable: true,
+        });
     }
     let scope_key = queued.event.scope.to_string();
     if !actors.contains_key(&scope_key) {
@@ -363,7 +713,12 @@ async fn route_one(
                     &queued.event,
                     InboundRejectionKind::Overloaded,
                 )
-                .await;
+                .await
+                .map_err(|error| RouteFailure {
+                    error,
+                    event: queued,
+                    retryable: true,
+                });
             }
         }
         actors.insert(
@@ -376,28 +731,62 @@ async fn route_one(
                 supervisor.clone(),
                 active_turns,
                 Arc::clone(&sink),
+                attachments.map(Arc::clone),
             ),
         );
     }
-    let event = queued.event.clone();
-    let route = actors
-        .get(&scope_key)
-        .ok_or(RouteError::ActorUnavailable)?
-        .try_route(key.clone(), queued);
+    let Some(actor) = actors.get(&scope_key) else {
+        return Err(RouteFailure {
+            error: RouteError::ActorUnavailable,
+            event: queued,
+            retryable: false,
+        });
+    };
+    let route = actor.try_route(key.clone(), queued);
     match route {
         Ok(()) => Ok(()),
-        Err(ActorRouteError::Capacity) => {
+        Err(ActorRouteError::Capacity(queued)) => {
+            let queued = *queued;
             reject_with_notice(
                 store,
                 sink.as_ref(),
                 &key,
-                &event,
+                &queued.event,
                 InboundRejectionKind::Overloaded,
             )
             .await
+            .map_err(|error| RouteFailure {
+                error,
+                event: queued,
+                retryable: true,
+            })
         }
-        Err(ActorRouteError::Closed) => Err(RouteError::ActorUnavailable),
+        Err(ActorRouteError::Closed(queued)) => Err(RouteFailure {
+            error: RouteError::ActorUnavailable,
+            event: *queued,
+            retryable: false,
+        }),
     }
+}
+
+fn enqueue_retry(
+    retries: &mut VecDeque<RouterRetry>,
+    budget: &Arc<Semaphore>,
+    event: QueuedInboundEvent,
+) -> Result<(), ()> {
+    if retries.len() >= ROUTER_RETRY_CAPACITY {
+        return Err(());
+    }
+    let bytes = u32::try_from(event.permit.num_permits()).map_err(|_| ())?;
+    let permit = budget
+        .clone()
+        .try_acquire_many_owned(bytes)
+        .map_err(|_| ())?;
+    retries.push_back(RouterRetry {
+        event,
+        _queue_permit: permit,
+    });
+    Ok(())
 }
 
 async fn reject_with_notice(
@@ -443,5 +832,102 @@ fn update_snapshot(
             queued_commands,
             active_turns,
         };
+    }
+}
+
+fn update_runtime_snapshot(
+    snapshot: &RwLock<RouterSnapshot>,
+    actors: &HashMap<String, ScopeActorHandle>,
+    receiver: &mpsc::Receiver<RouterCommand>,
+    retries: &VecDeque<RouterRetry>,
+    active_turns: &Semaphore,
+    settings: &RouterSettings,
+) {
+    update_snapshot(
+        snapshot,
+        actors.len(),
+        receiver.len().saturating_add(retries.len()),
+        settings
+            .active_turn_permits
+            .saturating_sub(active_turns.available_permits()),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lark::api::ChatMode;
+    use crate::lark::normalize::{InboundEvent, ScopeKey};
+
+    fn handle(sender: mpsc::Sender<RouterCommand>, byte_budget: usize) -> RouterHandle {
+        let (control_sender, _control_receiver) = mpsc::channel(1);
+        RouterHandle {
+            sender,
+            control_sender,
+            byte_budget: Arc::new(Semaphore::new(byte_budget)),
+            control_byte_budget: Arc::new(Semaphore::new(1)),
+            snapshot: Arc::new(RwLock::new(RouterSnapshot::default())),
+            active_turns: Arc::new(Semaphore::new(1)),
+            active_turn_capacity: 1,
+            task: None,
+        }
+    }
+
+    async fn queued(event_id: &str) -> QueuedInboundEvent {
+        let permit = Arc::new(Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .expect("permit");
+        QueuedInboundEvent {
+            event: InboundEvent {
+                event_id: event_id.to_owned(),
+                message_id: format!("message-{event_id}"),
+                chat_id: "chat-router-attempt".to_owned(),
+                sender_id: "owner-router-attempt".to_owned(),
+                chat_type: ChatMode::P2p,
+                thread_id: None,
+                root_id: None,
+                reply_to_message_id: None,
+                text: "hello".to_owned(),
+                mentions_bot: false,
+                mention_all: false,
+                resources: Vec::new(),
+                message_type: "text".to_owned(),
+                create_time_ms: 1,
+                scope: ScopeKey::Chat("chat-router-attempt".to_owned()),
+            },
+            permit,
+        }
+    }
+
+    #[tokio::test]
+    async fn recoverable_route_returns_event_when_byte_budget_is_full() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let handle = handle(sender, 0);
+
+        let failure = handle
+            .route_recoverable(queued("capacity").await)
+            .await
+            .expect_err("capacity");
+        let (error, event) = failure.into_parts();
+
+        assert!(matches!(error, RouteError::Capacity));
+        assert_eq!(event.expect("retained event").event.event_id, "capacity");
+    }
+
+    #[tokio::test]
+    async fn recoverable_route_returns_event_when_router_channel_is_closed() {
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let handle = handle(sender, 1);
+
+        let failure = handle
+            .route_recoverable(queued("closed").await)
+            .await
+            .expect_err("closed");
+        let (error, event) = failure.into_parts();
+
+        assert!(matches!(error, RouteError::Closed));
+        assert_eq!(event.expect("retained event").event.event_id, "closed");
     }
 }

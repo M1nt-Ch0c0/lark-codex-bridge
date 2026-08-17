@@ -1,30 +1,43 @@
 mod fakecodex;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use futures_util::{FutureExt, future::BoxFuture};
 use lark_codex_bridge::codex::process::{CodexProcessConfig, ProcessError};
 use lark_codex_bridge::codex::supervisor::AppServerSupervisor;
 use lark_codex_bridge::config::{BridgeConfig, WorkspacePolicy};
-use lark_codex_bridge::lark::api::ChatMode;
+use lark_codex_bridge::lark::api::{ChatMode, ResourceKind};
 use lark_codex_bridge::lark::bridge::QueuedInboundEvent;
 use lark_codex_bridge::lark::config::TenantBrand;
 use lark_codex_bridge::lark::credentials::LarkCredentials;
-use lark_codex_bridge::lark::normalize::{InboundEvent, ScopeKey};
-use lark_codex_bridge::limits::{ROUTER_ACTIVE_TURN_HARD_LIMIT, ROUTER_SCOPE_ACTOR_HARD_LIMIT};
+use lark_codex_bridge::lark::normalize::{InboundEvent, ResourceDesc, ScopeKey};
+use lark_codex_bridge::limits::{
+    ROUTER_ACTIVE_TURN_HARD_LIMIT, ROUTER_COMMAND_BYTE_BUDGET, ROUTER_RETRY_CAPACITY,
+    ROUTER_SCOPE_ACTOR_HARD_LIMIT, SCOPE_MAILBOX_CAPACITY,
+};
+use lark_codex_bridge::runtime::attachments::{
+    AttachError, AttachmentCache, AttachmentLimits, ResourceDownloader,
+};
 use lark_codex_bridge::runtime::intake::TenantNamespace;
 use lark_codex_bridge::runtime::policy::AccessPolicy;
 use lark_codex_bridge::runtime::router::{RouteError, Router, RouterSettings};
-use lark_codex_bridge::runtime::scope::{DurableReplySink, ReplySinkError, TurnFinalization};
+use lark_codex_bridge::runtime::scope::{
+    DurableReplySink, InterruptOutcome, ReplySinkError, TurnFinalization, TurnProgress,
+};
 use lark_codex_bridge::store::{
-    DedupOutcome, InboundEventState, InboundRejectionKind, NewOutboxRow, StoreHandle,
-    TurnResolution,
+    BeginTurnOutcome, DedupOutcome, InboundEventState, InboundKey, InboundRejectionKind,
+    InboundTerminal, NewOutboxRow, NewTurnRow, StoreHandle, TurnResolution, TurnState,
 };
 use secrecy::SecretString;
 use semver::Version;
 use serde_json::{Value, json};
-use tokio::sync::Semaphore;
+use tempfile::tempdir;
+use tokio::sync::{Notify, Semaphore};
 use tokio::time::{sleep, timeout};
 
 use fakecodex::{FakeFactory, FakeOutcome, test_settings};
@@ -32,7 +45,74 @@ use fakecodex::{FakeFactory, FakeOutcome, test_settings};
 #[derive(Default)]
 struct RecordingSink {
     rejections: Mutex<Vec<InboundRejectionKind>>,
+    progress: Mutex<Vec<(i64, u32, usize)>>,
     finalizations: Mutex<Vec<(i64, lark_codex_bridge::store::TurnResolution, usize)>>,
+}
+
+struct StaticAttachmentDownloader;
+
+struct PendingAttachmentDownloader {
+    started: Arc<AtomicUsize>,
+    started_notify: Arc<Notify>,
+}
+
+struct RemovingWorkspaceDownloader {
+    workspace: std::path::PathBuf,
+}
+
+#[derive(Default)]
+struct YieldingRecordingSink {
+    finalizations: Arc<Mutex<Vec<(i64, TurnResolution)>>>,
+}
+
+impl ResourceDownloader for StaticAttachmentDownloader {
+    fn download(
+        &self,
+        _message_id: &str,
+        key: &str,
+        _kind: ResourceKind,
+    ) -> BoxFuture<'static, Result<Bytes, AttachError>> {
+        let bytes = match key {
+            "img_key" => Bytes::from_static(b"fake-image-bytes"),
+            "file_key" => Bytes::from_static(b"fake-file-bytes"),
+            _ => Bytes::from_static(b"fallback-attachment"),
+        };
+        async move { Ok(bytes) }.boxed()
+    }
+}
+
+impl ResourceDownloader for PendingAttachmentDownloader {
+    fn download(
+        &self,
+        _message_id: &str,
+        _key: &str,
+        _kind: ResourceKind,
+    ) -> BoxFuture<'static, Result<Bytes, AttachError>> {
+        let started = Arc::clone(&self.started);
+        let started_notify = Arc::clone(&self.started_notify);
+        async move {
+            started.fetch_add(1, Ordering::SeqCst);
+            started_notify.notify_waiters();
+            std::future::pending::<Result<Bytes, AttachError>>().await
+        }
+        .boxed()
+    }
+}
+
+impl ResourceDownloader for RemovingWorkspaceDownloader {
+    fn download(
+        &self,
+        _message_id: &str,
+        _key: &str,
+        _kind: ResourceKind,
+    ) -> BoxFuture<'static, Result<Bytes, AttachError>> {
+        let workspace = self.workspace.clone();
+        async move {
+            std::fs::remove_dir(&workspace).expect("remove empty workspace during download");
+            Ok(Bytes::from_static(b"workspace-race-attachment"))
+        }
+        .boxed()
+    }
 }
 
 impl DurableReplySink for RecordingSink {
@@ -59,6 +139,129 @@ impl DurableReplySink for RecordingSink {
         ));
         async { Ok(()) }.boxed()
     }
+
+    fn progress(&self, progress: TurnProgress) -> BoxFuture<'static, Result<(), ReplySinkError>> {
+        self.progress.lock().expect("progress lock").push((
+            progress.turn_row_id,
+            progress.sequence,
+            progress.text.chars().count(),
+        ));
+        async { Ok(()) }.boxed()
+    }
+}
+
+impl DurableReplySink for YieldingRecordingSink {
+    fn rejection_notice(
+        &self,
+        event: &InboundEvent,
+        _reason: InboundRejectionKind,
+    ) -> Result<NewOutboxRow, ReplySinkError> {
+        Ok(NewOutboxRow {
+            idempotency_key: format!("{}:yielding-rejection", event.event_id),
+            scope_key: event.scope.to_string(),
+            kind: "notice".to_owned(),
+            payload_json: "{\"text\":\"rejected\"}".to_owned(),
+            next_retry_ms: 0,
+        })
+    }
+
+    fn finalize(&self, turn: TurnFinalization) -> BoxFuture<'static, Result<(), ReplySinkError>> {
+        let finalizations = Arc::clone(&self.finalizations);
+        async move {
+            tokio::task::yield_now().await;
+            finalizations
+                .lock()
+                .expect("yielding finalization lock")
+                .push((turn.turn_row_id, turn.resolution));
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
+#[derive(Default)]
+struct UnavailableSink {
+    attempts: AtomicUsize,
+    attempted: Notify,
+}
+
+#[derive(Default)]
+struct RetryOnceRejectionSink {
+    attempts: AtomicUsize,
+}
+
+#[derive(Default)]
+struct UnavailableRejectionSink;
+
+impl DurableReplySink for UnavailableRejectionSink {
+    fn rejection_notice(
+        &self,
+        _event: &InboundEvent,
+        _reason: InboundRejectionKind,
+    ) -> Result<NewOutboxRow, ReplySinkError> {
+        Err(ReplySinkError::Unavailable)
+    }
+
+    fn finalize(&self, _turn: TurnFinalization) -> BoxFuture<'static, Result<(), ReplySinkError>> {
+        async { Ok(()) }.boxed()
+    }
+}
+
+impl DurableReplySink for RetryOnceRejectionSink {
+    fn rejection_notice(
+        &self,
+        event: &InboundEvent,
+        reason: InboundRejectionKind,
+    ) -> Result<NewOutboxRow, ReplySinkError> {
+        if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(ReplySinkError::Unavailable);
+        }
+        Ok(NewOutboxRow {
+            idempotency_key: format!("{}:retry:{reason:?}", event.event_id),
+            scope_key: event.scope.to_string(),
+            kind: "notice".to_owned(),
+            payload_json: "{\"text\":\"rejected after retry\"}".to_owned(),
+            next_retry_ms: 0,
+        })
+    }
+
+    fn finalize(&self, _turn: TurnFinalization) -> BoxFuture<'static, Result<(), ReplySinkError>> {
+        async { Ok(()) }.boxed()
+    }
+}
+
+impl UnavailableSink {
+    async fn wait_for_attempt(&self) {
+        timeout(Duration::from_secs(2), async {
+            while self.attempts.load(Ordering::SeqCst) == 0 {
+                self.attempted.notified().await;
+            }
+        })
+        .await
+        .expect("finalization attempt");
+    }
+}
+
+impl DurableReplySink for UnavailableSink {
+    fn rejection_notice(
+        &self,
+        event: &InboundEvent,
+        _reason: InboundRejectionKind,
+    ) -> Result<NewOutboxRow, ReplySinkError> {
+        Ok(NewOutboxRow {
+            idempotency_key: format!("{}:rejection", event.event_id),
+            scope_key: event.scope.to_string(),
+            kind: "notice".to_owned(),
+            payload_json: "{\"text\":\"rejected\"}".to_owned(),
+            next_retry_ms: 0,
+        })
+    }
+
+    fn finalize(&self, _turn: TurnFinalization) -> BoxFuture<'static, Result<(), ReplySinkError>> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        self.attempted.notify_waiters();
+        async { Err(ReplySinkError::Unavailable) }.boxed()
+    }
 }
 
 fn credentials() -> LarkCredentials {
@@ -70,10 +273,14 @@ fn credentials() -> LarkCredentials {
 }
 
 fn event(event_id: &str, sender_id: &str) -> InboundEvent {
+    event_in_chat(event_id, sender_id, "chat-runtime-scope")
+}
+
+fn event_in_chat(event_id: &str, sender_id: &str, chat_id: &str) -> InboundEvent {
     InboundEvent {
         event_id: event_id.to_owned(),
         message_id: format!("message-{event_id}"),
-        chat_id: "chat-runtime-scope".to_owned(),
+        chat_id: chat_id.to_owned(),
         sender_id: sender_id.to_owned(),
         chat_type: ChatMode::P2p,
         thread_id: None,
@@ -85,7 +292,7 @@ fn event(event_id: &str, sender_id: &str) -> InboundEvent {
         resources: Vec::new(),
         message_type: "text".to_owned(),
         create_time_ms: now_ms(),
-        scope: ScopeKey::Chat("chat-runtime-scope".to_owned()),
+        scope: ScopeKey::Chat(chat_id.to_owned()),
     }
 }
 
@@ -141,6 +348,23 @@ async fn ready_supervisor() -> (
     .await
     .expect("ready supervisor");
     (supervisor, control)
+}
+
+async fn restarting_supervisor() -> (
+    lark_codex_bridge::codex::supervisor::SupervisorHandle,
+    fakecodex::FakeControl,
+    fakecodex::FakeControl,
+) {
+    let (first, first_control) = FakeFactory::ready();
+    let (second, second_control) = FakeFactory::ready();
+    let supervisor = AppServerSupervisor::start_with_factory(
+        CodexProcessConfig::default(),
+        Arc::new(FakeFactory::new([first, second])),
+        test_settings(),
+    )
+    .await
+    .expect("restarting supervisor");
+    (supervisor, first_control, second_control)
 }
 
 async fn assert_invalid_router_settings(config: &BridgeConfig) {
@@ -207,6 +431,29 @@ fn turn(turn_id: &str, status: &str) -> Value {
     })
 }
 
+async fn respond_turn_started(control: &fakecodex::FakeControl, request: &Value, turn_id: &str) {
+    control
+        .respond(request, json!({"turn": turn(turn_id, "inProgress")}))
+        .await;
+}
+
+async fn send_turn_completed(
+    control: &fakecodex::FakeControl,
+    thread_id: &str,
+    turn_id: &str,
+    status: &str,
+) {
+    control
+        .send_json(json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": thread_id,
+                "turn": turn(turn_id, status)
+            }
+        }))
+        .await;
+}
+
 async fn queued_registered(
     store: &StoreHandle,
     namespace: &TenantNamespace,
@@ -233,6 +480,14 @@ async fn queued_registered(
     }
 }
 
+async fn queued_synthetic(event: InboundEvent, retained_bytes: usize) -> QueuedInboundEvent {
+    let permit = Arc::new(Semaphore::new(retained_bytes))
+        .acquire_many_owned(u32::try_from(retained_bytes).expect("retained bytes fit"))
+        .await
+        .expect("synthetic retained permit");
+    QueuedInboundEvent { event, permit }
+}
+
 async fn wait_for_inbound_states(
     store: &StoreHandle,
     namespace: &TenantNamespace,
@@ -257,6 +512,23 @@ async fn wait_for_inbound_states(
     })
     .await
     .expect("inbound events reach the expected state");
+}
+
+async fn wait_for_running_turn(store: &StoreHandle, codex_turn_id: &str) {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let turns = store.uncertain_turns().await.expect("live turns");
+            if turns.iter().any(|turn| {
+                turn.state == lark_codex_bridge::store::TurnState::Running
+                    && turn.codex_turn_id.as_deref() == Some(codex_turn_id)
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("turn becomes active");
 }
 
 #[tokio::test]
@@ -301,6 +573,156 @@ async fn router_rejects_non_owner_with_one_atomic_durable_notice() {
     store.shutdown().await.expect("store shutdown");
 }
 
+#[tokio::test]
+async fn router_retries_a_transient_rejection_projection_without_losing_the_received_row() {
+    let config = validated_config();
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RetryOnceRejectionSink::default());
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        degraded_supervisor().await,
+        sink.clone(),
+    )
+    .await
+    .expect("router");
+
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("event-rejection-retry", "intruder-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("bounded retry lane accepts transient projection failure");
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-rejection-retry"],
+        InboundEventState::Rejected,
+    )
+    .await;
+    assert_eq!(sink.attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(store.outbox_depth().await.expect("outbox").pending, 1);
+
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn router_retry_lane_enforces_its_count_bound() {
+    let config = validated_config();
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        degraded_supervisor().await,
+        Arc::new(UnavailableRejectionSink),
+    )
+    .await
+    .expect("router");
+
+    let retry_event = event("event-retry-capacity", "intruder-runtime-scope");
+    router
+        .route(queued_registered(&store, &namespace, retry_event.clone()).await)
+        .await
+        .expect("first bounded retry slot");
+    for _ in 1..ROUTER_RETRY_CAPACITY {
+        router
+            .route(queued_synthetic(retry_event.clone(), 1).await)
+            .await
+            .expect("bounded retry slot");
+    }
+    assert!(matches!(
+        router
+            .route(queued_synthetic(retry_event.clone(), 1).await)
+            .await,
+        Err(RouteError::ReplySink)
+    ));
+    assert_eq!(router.snapshot().queued_commands, ROUTER_RETRY_CAPACITY);
+    assert_eq!(
+        store
+            .inbound_state(&namespace, &retry_event.event_id)
+            .await
+            .expect("overflow state"),
+        Some(InboundEventState::Received)
+    );
+
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn router_retry_lane_enforces_its_aggregate_byte_bound() {
+    let config = validated_config();
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        degraded_supervisor().await,
+        Arc::new(UnavailableRejectionSink),
+    )
+    .await
+    .expect("router");
+    let retained_bytes = ROUTER_COMMAND_BYTE_BUDGET / 2 + 1;
+    let mut first = queued_registered(
+        &store,
+        &namespace,
+        event("event-retry-bytes-first", "intruder-runtime-scope"),
+    )
+    .await;
+    first.permit = Arc::new(Semaphore::new(retained_bytes))
+        .acquire_many_owned(u32::try_from(retained_bytes).expect("retained bytes fit"))
+        .await
+        .expect("first synthetic retained permit");
+    router.route(first).await.expect("first retry fits");
+
+    let overflow_id = "event-retry-bytes-overflow";
+    let mut overflow = queued_registered(
+        &store,
+        &namespace,
+        event(overflow_id, "intruder-runtime-scope"),
+    )
+    .await;
+    overflow.permit = Arc::new(Semaphore::new(retained_bytes))
+        .acquire_many_owned(u32::try_from(retained_bytes).expect("retained bytes fit"))
+        .await
+        .expect("overflow synthetic retained permit");
+    assert!(matches!(
+        router.route(overflow).await,
+        Err(RouteError::ReplySink)
+    ));
+    assert_eq!(
+        store
+            .inbound_state(&namespace, overflow_id)
+            .await
+            .expect("overflow state"),
+        Some(InboundEventState::Received)
+    );
+
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn debounce_batch_claims_one_turn_and_uses_the_exact_client_message_id() {
     let config = validated_config();
@@ -368,12 +790,38 @@ async fn debounce_batch_claims_one_turn_and_uses_the_exact_client_message_id() {
             json!({"turn": turn("turn-runtime", "inProgress")}),
         )
         .await;
+    let progress_text = "p".repeat(200);
+    control
+        .send_json(json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-runtime",
+                "turnId": "turn-runtime",
+                "completedAtMs": 1_786_478_402_500_i64,
+                "item": {
+                    "id": "item-progress",
+                    "type": "agentMessage",
+                    "text": progress_text,
+                    "phase": "commentary",
+                    "memoryCitation": null
+                }
+            }
+        }))
+        .await;
+    let mut completed_turn = turn("turn-runtime", "completed");
+    completed_turn["items"] = json!([{
+        "id": "item-final",
+        "type": "agentMessage",
+        "text": "done",
+        "phase": "final_answer",
+        "memoryCitation": null
+    }]);
     control
         .send_json(json!({
             "method": "turn/completed",
             "params": {
                 "threadId": "thread-runtime",
-                "turn": turn("turn-runtime", "completed")
+                "turn": completed_turn
             }
         }))
         .await;
@@ -398,6 +846,11 @@ async fn debounce_batch_claims_one_turn_and_uses_the_exact_client_message_id() {
         assert_eq!(finalizations[0].2, 2);
         finalizations[0].0
     };
+    assert_eq!(
+        *sink.progress.lock().expect("progress"),
+        vec![(turn_row_id, 0, 200)],
+        "the running actor must durably project the commentary event"
+    );
     let row = store
         .turn_row(turn_row_id)
         .await
@@ -405,6 +858,602 @@ async fn debounce_batch_claims_one_turn_and_uses_the_exact_client_message_id() {
         .expect("persisted turn");
     assert_eq!(row.client_message_id, client_message_id);
     router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn attachment_cache_inputs_are_leased_for_the_turn_and_released_at_completion() {
+    let config = validated_config();
+    let workspace = config
+        .default_workspace
+        .clone()
+        .expect("validated default workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let credentials = credentials();
+    let namespace = TenantNamespace::from_credentials(&credentials);
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RecordingSink::default());
+    let temp = tempdir().expect("tempdir");
+    let cache_root = temp.path().join("attachments");
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &cache_root,
+            store.clone(),
+            Arc::new(StaticAttachmentDownloader),
+            AttachmentLimits::default(),
+        )
+        .expect("attachment cache"),
+    );
+    let canonical_cache_root = std::fs::canonicalize(&cache_root).expect("canonical cache root");
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start_with_attachments(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink.clone(),
+        Arc::clone(&cache),
+    )
+    .await
+    .expect("router");
+
+    let mut inbound = event("event-attachments", "owner-runtime-scope");
+    inbound.resources = vec![
+        ResourceDesc {
+            kind: ResourceKind::Image,
+            key: "img_key".to_owned(),
+        },
+        ResourceDesc {
+            kind: ResourceKind::File,
+            key: "file_key".to_owned(),
+        },
+    ];
+    router
+        .route(queued_registered(&store, &namespace, inbound).await)
+        .await
+        .expect("route attachment event");
+
+    let start_thread = control.next_request().await;
+    assert_eq!(start_thread["method"], "thread/start");
+    control
+        .respond(
+            &start_thread,
+            thread_result("thread-attachments", &workspace),
+        )
+        .await;
+    let start_turn = control.next_request().await;
+    assert_eq!(start_turn["method"], "turn/start");
+    let inputs = start_turn["params"]["input"]
+        .as_array()
+        .expect("turn inputs");
+    assert_eq!(inputs.len(), 3);
+    assert_eq!(inputs[0]["type"], "text");
+    assert_eq!(inputs[0]["text"], "hello");
+    assert_eq!(inputs[1]["type"], "localImage");
+    assert_eq!(inputs[2]["type"], "text");
+    let file_context: Value =
+        serde_json::from_str(inputs[2]["text"].as_str().expect("structured file context"))
+            .expect("file context JSON");
+    assert_eq!(file_context["attachment"]["kind"], "file");
+    assert_eq!(file_context["attachment"]["name"], "attachment-2");
+    let image_path = std::path::PathBuf::from(inputs[1]["path"].as_str().expect("image path"));
+    let file_path = std::path::PathBuf::from(
+        file_context["attachment"]["path"]
+            .as_str()
+            .expect("file path"),
+    );
+    for path in [&image_path, &file_path] {
+        assert!(path.starts_with(&canonical_cache_root));
+        assert!(path.is_file());
+    }
+
+    let rows = store.list_attachments().await.expect("attachment rows");
+    assert_eq!(rows.len(), 2);
+    for row in &rows {
+        assert_eq!(
+            store
+                .attachment_leases(&row.sha256)
+                .await
+                .expect("attachment leases")
+                .len(),
+            1
+        );
+    }
+
+    respond_turn_started(&control, &start_turn, "turn-attachments").await;
+    send_turn_completed(
+        &control,
+        "thread-attachments",
+        "turn-attachments",
+        "completed",
+    )
+    .await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-attachments"],
+        InboundEventState::Completed,
+    )
+    .await;
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let mut leased = false;
+            for row in &rows {
+                leased |= !store
+                    .attachment_leases(&row.sha256)
+                    .await
+                    .expect("attachment leases")
+                    .is_empty();
+            }
+            if !leased {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("leases released after completion");
+
+    router.shutdown().await.expect("shutdown");
+    drop(cache);
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn attachment_limit_failure_is_durably_failed_before_codex_turn_start() {
+    let config = validated_config();
+    let workspace = config
+        .default_workspace
+        .clone()
+        .expect("validated default workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RecordingSink::default());
+    let temp = tempdir().expect("tempdir");
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &temp.path().join("attachments"),
+            store.clone(),
+            Arc::new(StaticAttachmentDownloader),
+            AttachmentLimits {
+                max_attachments_per_message: 1,
+                ..AttachmentLimits::default()
+            },
+        )
+        .expect("attachment cache"),
+    );
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start_with_attachments(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink.clone(),
+        Arc::clone(&cache),
+    )
+    .await
+    .expect("router");
+
+    let mut inbound = event("event-attachment-limit", "owner-runtime-scope");
+    inbound.resources = vec![
+        ResourceDesc {
+            kind: ResourceKind::Image,
+            key: "img_key".to_owned(),
+        },
+        ResourceDesc {
+            kind: ResourceKind::File,
+            key: "file_key".to_owned(),
+        },
+    ];
+    router
+        .route(queued_registered(&store, &namespace, inbound).await)
+        .await
+        .expect("route attachment event");
+    let start_thread = control.next_request().await;
+    assert_eq!(start_thread["method"], "thread/start");
+    control
+        .respond(
+            &start_thread,
+            thread_result("thread-attachment-limit", &workspace),
+        )
+        .await;
+
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-attachment-limit"],
+        InboundEventState::Rejected,
+    )
+    .await;
+    control
+        .expect_no_request_for(Duration::from_millis(100))
+        .await;
+    assert!(
+        store
+            .list_attachments()
+            .await
+            .expect("attachments")
+            .is_empty()
+    );
+    assert!(
+        store
+            .uncertain_turns()
+            .await
+            .expect("live turns")
+            .is_empty()
+    );
+    {
+        let finalizations = sink.finalizations.lock().expect("finalizations");
+        assert_eq!(finalizations.len(), 1);
+        assert_eq!(finalizations[0].1, TurnResolution::Failed);
+    }
+
+    router.shutdown().await.expect("shutdown");
+    drop(cache);
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn workspace_revalidation_failure_finalizes_the_turn_and_releases_attachments() {
+    let repository = std::env::current_dir().expect("repository");
+    let workspace_parent = tempfile::Builder::new()
+        .prefix("workspace-race-")
+        .tempdir_in(&repository)
+        .expect("workspace parent");
+    let workspace = workspace_parent.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let mut config = BridgeConfig {
+        owners: vec!["owner-runtime-scope".to_owned()],
+        default_workspace: Some(workspace.clone()),
+        workspace: WorkspacePolicy {
+            allow_roots: vec![repository],
+            ..WorkspacePolicy::default()
+        },
+        ..BridgeConfig::default()
+    };
+    config.validate().expect("valid workspace race config");
+    let workspace = config
+        .default_workspace
+        .clone()
+        .expect("canonical workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RecordingSink::default());
+    let cache_temp = tempdir().expect("cache tempdir");
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &cache_temp.path().join("attachments"),
+            store.clone(),
+            Arc::new(RemovingWorkspaceDownloader {
+                workspace: workspace.clone(),
+            }),
+            AttachmentLimits::default(),
+        )
+        .expect("attachment cache"),
+    );
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start_with_attachments(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink.clone(),
+        Arc::clone(&cache),
+    )
+    .await
+    .expect("router");
+    let mut inbound = event("event-workspace-race", "owner-runtime-scope");
+    inbound.resources.push(ResourceDesc {
+        kind: ResourceKind::File,
+        key: "file_key".to_owned(),
+    });
+    router
+        .route(queued_registered(&store, &namespace, inbound).await)
+        .await
+        .expect("route attachment event");
+    let start_thread = control.next_request().await;
+    control
+        .respond(
+            &start_thread,
+            thread_result("thread-workspace-race", &workspace),
+        )
+        .await;
+
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-workspace-race"],
+        InboundEventState::Rejected,
+    )
+    .await;
+    control
+        .expect_no_request_for(Duration::from_millis(100))
+        .await;
+    let turn_row_id = sink.finalizations.lock().expect("finalizations")[0].0;
+    assert_eq!(
+        store
+            .turn_row(turn_row_id)
+            .await
+            .expect("turn row")
+            .expect("turn")
+            .state,
+        TurnState::Failed
+    );
+    let attachment_rows = store.list_attachments().await.expect("attachments");
+    assert_eq!(attachment_rows.len(), 1);
+    for row in attachment_rows {
+        assert!(
+            store
+                .attachment_leases(&row.sha256)
+                .await
+                .expect("attachment leases")
+                .is_empty()
+        );
+    }
+    router.shutdown().await.expect("shutdown");
+    drop(cache);
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn shutdown_cancels_attachment_download_without_waiting_for_later_resources() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RecordingSink::default());
+    let started = Arc::new(AtomicUsize::new(0));
+    let started_notify = Arc::new(Notify::new());
+    let cache_temp = tempdir().expect("cache tempdir");
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &cache_temp.path().join("attachments"),
+            store.clone(),
+            Arc::new(PendingAttachmentDownloader {
+                started: Arc::clone(&started),
+                started_notify: Arc::clone(&started_notify),
+            }),
+            AttachmentLimits::default(),
+        )
+        .expect("attachment cache"),
+    );
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start_with_attachments(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink.clone(),
+        Arc::clone(&cache),
+    )
+    .await
+    .expect("router");
+    let mut inbound = event("event-download-shutdown", "owner-runtime-scope");
+    inbound.resources = (0..8)
+        .map(|index| ResourceDesc {
+            kind: ResourceKind::File,
+            key: format!("file_key_{index}"),
+        })
+        .collect();
+    router
+        .route(queued_registered(&store, &namespace, inbound).await)
+        .await
+        .expect("route attachment event");
+    let start_thread = control.next_request().await;
+    control
+        .respond(
+            &start_thread,
+            thread_result("thread-download-shutdown", &workspace),
+        )
+        .await;
+    timeout(Duration::from_secs(2), async {
+        while started.load(Ordering::SeqCst) == 0 {
+            started_notify.notified().await;
+        }
+    })
+    .await
+    .expect("first attachment download started");
+
+    timeout(Duration::from_millis(500), router.shutdown())
+        .await
+        .expect("download-aware shutdown deadline")
+        .expect("router shutdown");
+    assert_eq!(started.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        store
+            .inbound_state(&namespace, "event-download-shutdown")
+            .await
+            .expect("inbound state"),
+        Some(InboundEventState::Rejected)
+    );
+    assert!(
+        store
+            .list_attachments()
+            .await
+            .expect("attachments")
+            .is_empty()
+    );
+    assert!(
+        store
+            .uncertain_turns()
+            .await
+            .expect("live turns")
+            .is_empty()
+    );
+    assert_eq!(
+        sink.finalizations.lock().expect("finalizations")[0].1,
+        TurnResolution::Failed
+    );
+    drop(cache);
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn supervisor_epoch_loss_releases_uncertain_attachment_leases_in_process() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RecordingSink::default());
+    let cache_temp = tempdir().expect("cache tempdir");
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &cache_temp.path().join("attachments"),
+            store.clone(),
+            Arc::new(StaticAttachmentDownloader),
+            AttachmentLimits::default(),
+        )
+        .expect("attachment cache"),
+    );
+    let (supervisor, first_control, _second_control) = restarting_supervisor().await;
+    let router = Router::start_with_attachments(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink,
+        Arc::clone(&cache),
+    )
+    .await
+    .expect("router");
+    let mut inbound = event("event-attachment-epoch-loss", "owner-runtime-scope");
+    inbound.resources.push(ResourceDesc {
+        kind: ResourceKind::Image,
+        key: "img_key".to_owned(),
+    });
+    router
+        .route(queued_registered(&store, &namespace, inbound).await)
+        .await
+        .expect("route attachment event");
+    let start_thread = first_control.next_request().await;
+    first_control
+        .respond(
+            &start_thread,
+            thread_result("thread-attachment-epoch-loss", &workspace),
+        )
+        .await;
+    let start_turn = first_control.next_request().await;
+    respond_turn_started(&first_control, &start_turn, "turn-attachment-epoch-loss").await;
+    wait_for_running_turn(&store, "turn-attachment-epoch-loss").await;
+    let rows = store.list_attachments().await.expect("attachments");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        store
+            .attachment_leases(&rows[0].sha256)
+            .await
+            .expect("attachment leases")
+            .len(),
+        1
+    );
+
+    first_control.unexpected_exit();
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-attachment-epoch-loss"],
+        InboundEventState::Rejected,
+    )
+    .await;
+    timeout(Duration::from_secs(2), async {
+        while !store
+            .attachment_leases(&rows[0].sha256)
+            .await
+            .expect("attachment leases")
+            .is_empty()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("old epoch attachment leases released");
+    router.shutdown().await.expect("shutdown");
+    drop(cache);
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn shutdown_reconciles_uncertain_attachment_leases_after_the_process_stops() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let cache_temp = tempdir().expect("cache tempdir");
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &cache_temp.path().join("attachments"),
+            store.clone(),
+            Arc::new(StaticAttachmentDownloader),
+            AttachmentLimits::default(),
+        )
+        .expect("attachment cache"),
+    );
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start_with_attachments(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        Arc::new(YieldingRecordingSink::default()),
+        Arc::clone(&cache),
+    )
+    .await
+    .expect("router");
+    let mut inbound = event("event-attachment-shutdown", "owner-runtime-scope");
+    inbound.resources.push(ResourceDesc {
+        kind: ResourceKind::File,
+        key: "file_key".to_owned(),
+    });
+    router
+        .route(queued_registered(&store, &namespace, inbound).await)
+        .await
+        .expect("route attachment event");
+    let start_thread = control.next_request().await;
+    control
+        .respond(
+            &start_thread,
+            thread_result("thread-attachment-shutdown", &workspace),
+        )
+        .await;
+    let start_turn = control.next_request().await;
+    respond_turn_started(&control, &start_turn, "turn-attachment-shutdown").await;
+    wait_for_running_turn(&store, "turn-attachment-shutdown").await;
+    let rows = store.list_attachments().await.expect("attachments");
+    assert_eq!(rows.len(), 1);
+
+    router.shutdown().await.expect("shutdown");
+    assert_eq!(
+        store
+            .inbound_state(&namespace, "event-attachment-shutdown")
+            .await
+            .expect("inbound state"),
+        Some(InboundEventState::Rejected)
+    );
+    assert!(
+        store
+            .attachment_leases(&rows[0].sha256)
+            .await
+            .expect("attachment leases")
+            .is_empty()
+    );
+    drop(cache);
     store.shutdown().await.expect("store shutdown");
 }
 
@@ -632,5 +1681,1481 @@ async fn shutdown_durably_resolves_a_running_turn_as_uncertain() {
             .expect("live turns")
             .is_empty()
     );
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn shutdown_uses_a_fresh_deadline_for_an_async_uncertain_finalization() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(YieldingRecordingSink::default());
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink.clone(),
+    )
+    .await
+    .expect("router");
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("event-async-running-shutdown", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("route event");
+    let start_thread = control.next_request().await;
+    control
+        .respond(
+            &start_thread,
+            thread_result("thread-async-running-shutdown", &workspace),
+        )
+        .await;
+    let start_turn = control.next_request().await;
+    respond_turn_started(&control, &start_turn, "turn-async-running-shutdown").await;
+    wait_for_running_turn(&store, "turn-async-running-shutdown").await;
+
+    timeout(Duration::from_millis(500), router.shutdown())
+        .await
+        .expect("router shutdown deadline")
+        .expect("router shutdown");
+    assert_eq!(
+        store
+            .inbound_state(&namespace, "event-async-running-shutdown")
+            .await
+            .expect("inbound state"),
+        Some(InboundEventState::Rejected)
+    );
+    {
+        let finalizations = sink.finalizations.lock().expect("yielding finalizations");
+        assert_eq!(finalizations.len(), 1);
+        assert_eq!(finalizations[0].1, TurnResolution::Uncertain);
+    }
+    assert!(
+        store
+            .uncertain_turns()
+            .await
+            .expect("live turns")
+            .is_empty()
+    );
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn message_while_running_waits_then_resumes_the_same_thread() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RecordingSink::default());
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink.clone(),
+    )
+    .await
+    .expect("router");
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("event-first-turn", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("route first turn");
+    let start_thread = control.next_request().await;
+    assert_eq!(start_thread["method"], "thread/start");
+    control
+        .respond(&start_thread, thread_result("thread-reused", &workspace))
+        .await;
+    let first_turn = control.next_request().await;
+    assert_eq!(first_turn["method"], "turn/start");
+    control
+        .respond(
+            &first_turn,
+            json!({"turn": turn("turn-first", "inProgress")}),
+        )
+        .await;
+
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("event-second-turn", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("queue second turn");
+    control
+        .expect_no_request_for(Duration::from_millis(100))
+        .await;
+    control
+        .send_json(json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-reused",
+                "turn": turn("turn-first", "completed")
+            }
+        }))
+        .await;
+
+    let resume_thread = control.next_request().await;
+    assert_eq!(resume_thread["method"], "thread/resume");
+    assert_eq!(resume_thread["params"]["threadId"], "thread-reused");
+    control
+        .respond(&resume_thread, thread_result("thread-reused", &workspace))
+        .await;
+    let second_turn = control.next_request().await;
+    assert_eq!(second_turn["method"], "turn/start");
+    assert_eq!(second_turn["params"]["threadId"], "thread-reused");
+    control
+        .respond(
+            &second_turn,
+            json!({"turn": turn("turn-second", "inProgress")}),
+        )
+        .await;
+    control
+        .send_json(json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-reused",
+                "turn": turn("turn-second", "completed")
+            }
+        }))
+        .await;
+
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-first-turn", "event-second-turn"],
+        InboundEventState::Completed,
+    )
+    .await;
+    assert_eq!(sink.finalizations.lock().expect("finalizations").len(), 2);
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn shutdown_cancels_unavailable_finalization_without_clearing_accepted_payload() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config)
+        .with_test_shutdown_cleanup_timeout(Duration::from_millis(100));
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(UnavailableSink::default());
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink.clone(),
+    )
+    .await
+    .expect("router");
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("event-finalization-unavailable", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("route event");
+    let start_thread = control.next_request().await;
+    control
+        .respond(
+            &start_thread,
+            thread_result("thread-finalization-unavailable", &workspace),
+        )
+        .await;
+    let start_turn = control.next_request().await;
+    control
+        .respond(
+            &start_turn,
+            json!({"turn": turn("turn-finalization-unavailable", "inProgress")}),
+        )
+        .await;
+    control
+        .send_json(json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-finalization-unavailable",
+                "turn": turn("turn-finalization-unavailable", "completed")
+            }
+        }))
+        .await;
+    sink.wait_for_attempt().await;
+
+    timeout(Duration::from_millis(500), router.shutdown())
+        .await
+        .expect("shutdown cancels the finalization retry")
+        .expect("router shutdown");
+    assert_eq!(
+        store
+            .inbound_state(&namespace, "event-finalization-unavailable")
+            .await
+            .expect("inbound state"),
+        Some(InboundEventState::Accepted)
+    );
+    let live_turns = store.uncertain_turns().await.expect("live turns");
+    assert_eq!(live_turns.len(), 1);
+    assert_eq!(
+        live_turns[0].state,
+        lark_codex_bridge::store::TurnState::Running
+    );
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn global_turn_permit_queues_a_second_scope_and_snapshot_tracks_usage() {
+    let mut config = validated_config();
+    config.concurrency.active_turn_permits = 1;
+    config.validate().expect("single active turn is valid");
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RecordingSink::default());
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink,
+    )
+    .await
+    .expect("router");
+
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event_in_chat("event-scope-one", "owner-runtime-scope", "chat-one"),
+            )
+            .await,
+        )
+        .await
+        .expect("route first scope");
+    let first_thread = control.next_request().await;
+    assert_eq!(first_thread["method"], "thread/start");
+    control
+        .respond(&first_thread, thread_result("thread-one", &workspace))
+        .await;
+    let first_turn = control.next_request().await;
+    assert_eq!(first_turn["method"], "turn/start");
+    respond_turn_started(&control, &first_turn, "turn-one").await;
+    assert_eq!(router.snapshot().active_turns, 1);
+
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event_in_chat("event-scope-two", "owner-runtime-scope", "chat-two"),
+            )
+            .await,
+        )
+        .await
+        .expect("route second scope");
+    control
+        .expect_no_request_for(Duration::from_millis(700))
+        .await;
+
+    send_turn_completed(&control, "thread-one", "turn-one", "completed").await;
+    let second_thread = control.next_request().await;
+    assert_eq!(second_thread["method"], "thread/start");
+    control
+        .respond(&second_thread, thread_result("thread-two", &workspace))
+        .await;
+    let second_turn = control.next_request().await;
+    assert_eq!(second_turn["method"], "turn/start");
+    respond_turn_started(&control, &second_turn, "turn-two").await;
+    send_turn_completed(&control, "thread-two", "turn-two", "completed").await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-scope-one", "event-scope-two"],
+        InboundEventState::Completed,
+    )
+    .await;
+    timeout(Duration::from_secs(2), async {
+        while router.snapshot().active_turns != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("active permit is released");
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn debounce_batch_cap_defers_excess_messages_to_the_next_turn() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RecordingSink::default());
+    let mut queued = Vec::new();
+    for index in 0..=lark_codex_bridge::limits::TURN_BATCH_MAX_MESSAGES {
+        queued.push(
+            queued_registered(
+                &store,
+                &namespace,
+                event(
+                    format!("event-batch-cap-{index}").as_str(),
+                    "owner-runtime-scope",
+                ),
+            )
+            .await,
+        );
+    }
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace,
+        policy,
+        settings,
+        supervisor,
+        sink.clone(),
+    )
+    .await
+    .expect("router");
+    for event in queued {
+        router.route(event).await.expect("route bounded batch item");
+        tokio::task::yield_now().await;
+    }
+
+    let first_thread = control.next_request().await;
+    assert_eq!(first_thread["method"], "thread/start");
+    control
+        .respond(&first_thread, thread_result("thread-batch-cap", &workspace))
+        .await;
+    let first_turn = control.next_request().await;
+    assert_eq!(first_turn["method"], "turn/start");
+    assert_eq!(
+        first_turn["params"]["input"]
+            .as_array()
+            .expect("first turn inputs")
+            .len(),
+        lark_codex_bridge::limits::TURN_BATCH_MAX_MESSAGES
+    );
+    respond_turn_started(&control, &first_turn, "turn-batch-cap-one").await;
+    send_turn_completed(
+        &control,
+        "thread-batch-cap",
+        "turn-batch-cap-one",
+        "completed",
+    )
+    .await;
+
+    let resume = control.next_request().await;
+    assert_eq!(resume["method"], "thread/resume");
+    control
+        .respond(&resume, thread_result("thread-batch-cap", &workspace))
+        .await;
+    let second_turn = control.next_request().await;
+    assert_eq!(second_turn["method"], "turn/start");
+    assert_eq!(
+        second_turn["params"]["input"]
+            .as_array()
+            .expect("second turn inputs")
+            .len(),
+        1
+    );
+    respond_turn_started(&control, &second_turn, "turn-batch-cap-two").await;
+    send_turn_completed(
+        &control,
+        "thread-batch-cap",
+        "turn-batch-cap-two",
+        "completed",
+    )
+    .await;
+    timeout(Duration::from_secs(2), async {
+        while sink.finalizations.lock().expect("finalizations").len() != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both turns finalize");
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn oversized_single_message_is_durably_rejected_without_any_rpc() {
+    let config = validated_config();
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RecordingSink::default());
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink.clone(),
+    )
+    .await
+    .expect("router");
+    let mut oversized = event("event-oversized-turn-input", "owner-runtime-scope");
+    oversized.text = "x".repeat(lark_codex_bridge::limits::TURN_BATCH_TEXT_BYTE_BUDGET + 1);
+    router
+        .route(queued_registered(&store, &namespace, oversized).await)
+        .await
+        .expect("route oversized event");
+
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-oversized-turn-input"],
+        InboundEventState::Rejected,
+    )
+    .await;
+    control
+        .expect_no_request_for(Duration::from_millis(100))
+        .await;
+    assert_eq!(
+        *sink.rejections.lock().expect("rejections"),
+        vec![InboundRejectionKind::Overloaded]
+    );
+    assert_eq!(store.outbox_depth().await.expect("outbox").pending, 1);
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn policy_fingerprint_change_archives_the_old_thread_before_starting_a_new_one() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let inbound = event("event-policy-fingerprint-change", "owner-runtime-scope");
+    store
+        .upsert_scope(&inbound.scope, &workspace, "stale-policy-fingerprint")
+        .await
+        .expect("seed stale scope policy");
+    store
+        .record_active_thread(&inbound.scope, "thread-old-policy")
+        .await
+        .expect("seed old active thread");
+    let sink = Arc::new(RecordingSink::default());
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink,
+    )
+    .await
+    .expect("router");
+    router
+        .route(queued_registered(&store, &namespace, inbound.clone()).await)
+        .await
+        .expect("route event");
+
+    let new_thread = control.next_request().await;
+    assert_eq!(new_thread["method"], "thread/start");
+    control
+        .respond(&new_thread, thread_result("thread-new-policy", &workspace))
+        .await;
+    let start_turn = control.next_request().await;
+    assert_eq!(start_turn["method"], "turn/start");
+    assert_eq!(start_turn["params"]["threadId"], "thread-new-policy");
+    control
+        .respond(
+            &start_turn,
+            json!({"turn": turn("turn-new-policy", "inProgress")}),
+        )
+        .await;
+    control
+        .send_json(json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-new-policy",
+                "turn": turn("turn-new-policy", "completed")
+            }
+        }))
+        .await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-policy-fingerprint-change"],
+        InboundEventState::Completed,
+    )
+    .await;
+    let current_scope = store
+        .scope_row(&inbound.scope)
+        .await
+        .expect("scope row")
+        .expect("scope remains persisted");
+    assert_ne!(current_scope.policy_fingerprint, "stale-policy-fingerprint");
+    assert_eq!(
+        store
+            .active_thread(&inbound.scope)
+            .await
+            .expect("active thread")
+            .expect("new active thread")
+            .codex_thread_id,
+        "thread-new-policy"
+    );
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn interrupt_waits_for_terminal_completion_before_the_next_turn() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RecordingSink::default());
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink,
+    )
+    .await
+    .expect("router");
+    let first = event("event-interrupt-first", "owner-runtime-scope");
+    let scope = first.scope.clone();
+    router
+        .route(queued_registered(&store, &namespace, first).await)
+        .await
+        .expect("route first turn");
+    let start_thread = control.next_request().await;
+    control
+        .respond(&start_thread, thread_result("thread-interrupt", &workspace))
+        .await;
+    let first_turn = control.next_request().await;
+    respond_turn_started(&control, &first_turn, "turn-interrupt-first").await;
+    wait_for_running_turn(&store, "turn-interrupt-first").await;
+
+    let (interrupt, ()) = tokio::join!(router.interrupt(&scope), async {
+        let request = control.next_request().await;
+        assert_eq!(request["method"], "turn/interrupt");
+        assert_eq!(request["params"]["threadId"], "thread-interrupt");
+        assert_eq!(request["params"]["turnId"], "turn-interrupt-first");
+        control.respond(&request, json!({})).await;
+    });
+    assert_eq!(
+        interrupt.expect("interrupt request"),
+        InterruptOutcome::Requested
+    );
+
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("event-interrupt-second", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("queue second turn");
+    control
+        .expect_no_request_for(Duration::from_millis(100))
+        .await;
+    send_turn_completed(
+        &control,
+        "thread-interrupt",
+        "turn-interrupt-first",
+        "interrupted",
+    )
+    .await;
+
+    let resume = control.next_request().await;
+    assert_eq!(resume["method"], "thread/resume");
+    control
+        .respond(&resume, thread_result("thread-interrupt", &workspace))
+        .await;
+    let second_turn = control.next_request().await;
+    assert_eq!(second_turn["method"], "turn/start");
+    respond_turn_started(&control, &second_turn, "turn-interrupt-second").await;
+    send_turn_completed(
+        &control,
+        "thread-interrupt",
+        "turn-interrupt-second",
+        "completed",
+    )
+    .await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-interrupt-first"],
+        InboundEventState::Rejected,
+    )
+    .await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-interrupt-second"],
+        InboundEventState::Completed,
+    )
+    .await;
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn supervisor_epoch_loss_finalizes_uncertain_before_queued_work_resumes() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RecordingSink::default());
+    let (supervisor, first_control, second_control) = restarting_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink.clone(),
+    )
+    .await
+    .expect("router");
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("event-epoch-first", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("route first turn");
+    let start_thread = first_control.next_request().await;
+    first_control
+        .respond(&start_thread, thread_result("thread-epoch", &workspace))
+        .await;
+    let first_turn = first_control.next_request().await;
+    respond_turn_started(&first_control, &first_turn, "turn-epoch-first").await;
+    wait_for_running_turn(&store, "turn-epoch-first").await;
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("event-epoch-second", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("queue second turn");
+
+    first_control.unexpected_exit();
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-epoch-first"],
+        InboundEventState::Rejected,
+    )
+    .await;
+    {
+        let finalizations = sink.finalizations.lock().expect("finalizations");
+        assert_eq!(finalizations.len(), 1);
+        assert_eq!(finalizations[0].1, TurnResolution::Uncertain);
+    }
+
+    let resume = second_control.next_request().await;
+    assert_eq!(resume["method"], "thread/resume");
+    second_control
+        .respond(&resume, thread_result("thread-epoch", &workspace))
+        .await;
+    let second_turn = second_control.next_request().await;
+    assert_eq!(second_turn["method"], "turn/start");
+    respond_turn_started(&second_control, &second_turn, "turn-epoch-second").await;
+    send_turn_completed(
+        &second_control,
+        "thread-epoch",
+        "turn-epoch-second",
+        "completed",
+    )
+    .await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-epoch-second"],
+        InboundEventState::Completed,
+    )
+    .await;
+    assert_eq!(sink.finalizations.lock().expect("finalizations").len(), 2);
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn supervisor_epoch_loss_is_observed_while_the_scope_mailbox_is_full() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RecordingSink::default());
+    let (supervisor, first_control, _second_control) = restarting_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink.clone(),
+    )
+    .await
+    .expect("router");
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("event-full-epoch-running", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("route running turn");
+    let start_thread = first_control.next_request().await;
+    first_control
+        .respond(
+            &start_thread,
+            thread_result("thread-full-epoch", &workspace),
+        )
+        .await;
+    let start_turn = first_control.next_request().await;
+    respond_turn_started(&first_control, &start_turn, "turn-full-epoch").await;
+    wait_for_running_turn(&store, "turn-full-epoch").await;
+
+    for index in 0..SCOPE_MAILBOX_CAPACITY {
+        router
+            .route(
+                queued_registered(
+                    &store,
+                    &namespace,
+                    event(
+                        format!("event-full-epoch-pending-{index}").as_str(),
+                        "owner-runtime-scope",
+                    ),
+                )
+                .await,
+            )
+            .await
+            .expect("fill scope mailbox");
+    }
+
+    first_control.unexpected_exit();
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-full-epoch-running"],
+        InboundEventState::Rejected,
+    )
+    .await;
+    assert_eq!(
+        sink.finalizations.lock().expect("finalizations")[0].1,
+        TurnResolution::Uncertain
+    );
+    assert_eq!(
+        store
+            .inbound_state(
+                &namespace,
+                format!("event-full-epoch-pending-{}", SCOPE_MAILBOX_CAPACITY - 1).as_str(),
+            )
+            .await
+            .expect("queued inbound state"),
+        Some(InboundEventState::Received)
+    );
+
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn mixed_batch_omits_an_already_claimed_key_without_stranding_its_sibling() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let first = event("event-mixed-claimed", "owner-runtime-scope");
+    let second = event("event-mixed-received", "owner-runtime-scope");
+    let first_queued = queued_registered(&store, &namespace, first.clone()).await;
+    let second_queued = queued_registered(&store, &namespace, second).await;
+    let seeded = store
+        .begin_turn_and_claim_inbound(
+            NewTurnRow {
+                scope_key: first.scope.to_string(),
+                client_message_id: "seeded-mixed-claim".to_owned(),
+                codex_thread_id: Some("thread-seeded-mixed".to_owned()),
+                state: TurnState::Starting,
+            },
+            &[InboundKey::new(
+                namespace.clone(),
+                "event-mixed-claimed".to_owned(),
+            )],
+        )
+        .await
+        .expect("seed one claimed key");
+    let BeginTurnOutcome::Started {
+        turn_row_id: seeded_turn,
+        ..
+    } = seeded
+    else {
+        panic!("seeded claim must create a turn");
+    };
+    let sink = Arc::new(RecordingSink::default());
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink,
+    )
+    .await
+    .expect("router");
+    router.route(first_queued).await.expect("route claimed key");
+    router
+        .route(second_queued)
+        .await
+        .expect("route received sibling");
+
+    let start_thread = control.next_request().await;
+    control
+        .respond(&start_thread, thread_result("thread-mixed", &workspace))
+        .await;
+    let start_turn = control.next_request().await;
+    assert_eq!(
+        start_turn["params"]["input"]
+            .as_array()
+            .expect("input array")
+            .len(),
+        1
+    );
+    respond_turn_started(&control, &start_turn, "turn-mixed").await;
+    send_turn_completed(&control, "thread-mixed", "turn-mixed", "completed").await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-mixed-received"],
+        InboundEventState::Completed,
+    )
+    .await;
+    assert_eq!(
+        store
+            .inbound_state(&namespace, "event-mixed-claimed")
+            .await
+            .expect("claimed state"),
+        Some(InboundEventState::Accepted)
+    );
+    store
+        .resolve_turn_and_finish_inbound_batch(
+            seeded_turn,
+            TurnResolution::Uncertain,
+            InboundTerminal::Rejected,
+        )
+        .await
+        .expect("clean up seeded recovery turn");
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn full_scope_mailbox_atomically_rejects_the_overflow_with_a_busy_notice() {
+    let config = validated_config();
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RecordingSink::default());
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        degraded_supervisor().await,
+        sink.clone(),
+    )
+    .await
+    .expect("router");
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("event-mailbox-blocker", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("route blocker");
+    sleep(Duration::from_millis(700)).await;
+    for index in 0..SCOPE_MAILBOX_CAPACITY {
+        router
+            .route(
+                queued_registered(
+                    &store,
+                    &namespace,
+                    event(
+                        format!("event-mailbox-pending-{index}").as_str(),
+                        "owner-runtime-scope",
+                    ),
+                )
+                .await,
+            )
+            .await
+            .expect("fill bounded mailbox");
+    }
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("event-mailbox-overflow", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("overflow becomes a durable rejection");
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-mailbox-overflow"],
+        InboundEventState::Rejected,
+    )
+    .await;
+    assert_eq!(
+        *sink.rejections.lock().expect("rejections"),
+        vec![InboundRejectionKind::Overloaded]
+    );
+    assert_eq!(store.outbox_depth().await.expect("outbox").pending, 1);
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn router_command_byte_budget_refuses_an_oversized_retained_item() {
+    let config = validated_config();
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        degraded_supervisor().await,
+        Arc::new(RecordingSink::default()),
+    )
+    .await
+    .expect("router");
+    let mut queued = queued_registered(
+        &store,
+        &namespace,
+        event("event-router-byte-overflow", "owner-runtime-scope"),
+    )
+    .await;
+    let retained_bytes = ROUTER_COMMAND_BYTE_BUDGET + 1;
+    queued.permit = Arc::new(Semaphore::new(retained_bytes))
+        .acquire_many_owned(u32::try_from(retained_bytes).expect("retained bytes fit"))
+        .await
+        .expect("oversized synthetic retained permit");
+
+    assert!(matches!(
+        router.route(queued).await,
+        Err(RouteError::Capacity)
+    ));
+    assert_eq!(
+        store
+            .inbound_state(&namespace, "event-router-byte-overflow")
+            .await
+            .expect("inbound state"),
+        Some(InboundEventState::Received)
+    );
+
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn connection_loss_after_turn_start_write_is_uncertain_and_never_auto_resent() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RecordingSink::default());
+    let (supervisor, first_control, second_control) = restarting_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink.clone(),
+    )
+    .await
+    .expect("router");
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("event-start-uncertain", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("route event");
+    let start_thread = first_control.next_request().await;
+    first_control
+        .respond(
+            &start_thread,
+            thread_result("thread-start-uncertain", &workspace),
+        )
+        .await;
+    let start_turn = first_control.next_request().await;
+    assert_eq!(start_turn["method"], "turn/start");
+    first_control.unexpected_exit();
+
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-start-uncertain"],
+        InboundEventState::Rejected,
+    )
+    .await;
+    assert_eq!(
+        sink.finalizations.lock().expect("finalizations")[0].1,
+        TurnResolution::Uncertain
+    );
+    assert!(
+        store
+            .uncertain_turns()
+            .await
+            .expect("live turns")
+            .is_empty()
+    );
+    second_control
+        .expect_no_request_for(Duration::from_millis(100))
+        .await;
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn busy_actor_registry_rejects_a_new_scope_without_evicting_live_work() {
+    let mut config = validated_config();
+    config.concurrency.max_scope_actors = 1;
+    config.validate().expect("single actor is valid");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RecordingSink::default());
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        degraded_supervisor().await,
+        sink.clone(),
+    )
+    .await
+    .expect("router");
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event_in_chat("event-actor-live", "owner-runtime-scope", "chat-live"),
+            )
+            .await,
+        )
+        .await
+        .expect("route live actor");
+    sleep(Duration::from_millis(700)).await;
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event_in_chat("event-actor-overflow", "owner-runtime-scope", "chat-new"),
+            )
+            .await,
+        )
+        .await
+        .expect("new scope becomes a durable overload rejection");
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-actor-overflow"],
+        InboundEventState::Rejected,
+    )
+    .await;
+    assert_eq!(router.snapshot().scope_count, 1);
+    assert_eq!(
+        *sink.rejections.lock().expect("rejections"),
+        vec![InboundRejectionKind::Overloaded]
+    );
+    assert_eq!(
+        store
+            .inbound_state(&namespace, "event-actor-live")
+            .await
+            .expect("live state"),
+        Some(InboundEventState::Received)
+    );
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn scope_snapshot_reports_only_structural_state_and_mailbox_depth() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        Arc::new(RecordingSink::default()),
+    )
+    .await
+    .expect("router");
+    let first = event("event-snapshot-first", "owner-runtime-scope");
+    let scope = first.scope.clone();
+    assert_eq!(router.scope_snapshot(&scope).await.expect("snapshot"), None);
+    router
+        .route(queued_registered(&store, &namespace, first).await)
+        .await
+        .expect("route first turn");
+    let start_thread = control.next_request().await;
+    control
+        .respond(&start_thread, thread_result("thread-snapshot", &workspace))
+        .await;
+    let start_turn = control.next_request().await;
+    respond_turn_started(&control, &start_turn, "turn-snapshot").await;
+    wait_for_running_turn(&store, "turn-snapshot").await;
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("event-snapshot-queued", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("queue next turn");
+    let snapshot = router
+        .scope_snapshot(&scope)
+        .await
+        .expect("snapshot")
+        .expect("scope exists");
+    assert!(matches!(
+        snapshot.state,
+        lark_codex_bridge::runtime::scope::ScopeState::Running { .. }
+    ));
+    assert_eq!(snapshot.queued_messages, 1);
+    let debug = format!("{snapshot:?}");
+    assert!(!debug.contains("owner-runtime-scope"));
+    assert!(!debug.contains("event-snapshot"));
+    assert!(!debug.contains(workspace.to_string_lossy().as_ref()));
+
+    send_turn_completed(&control, "thread-snapshot", "turn-snapshot", "completed").await;
+    let resume = control.next_request().await;
+    control
+        .respond(&resume, thread_result("thread-snapshot", &workspace))
+        .await;
+    let queued_turn = control.next_request().await;
+    respond_turn_started(&control, &queued_turn, "turn-snapshot-queued").await;
+    send_turn_completed(
+        &control,
+        "thread-snapshot",
+        "turn-snapshot-queued",
+        "completed",
+    )
+    .await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-snapshot-first", "event-snapshot-queued"],
+        InboundEventState::Completed,
+    )
+    .await;
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn scope_mailbox_byte_budget_rejects_before_the_durable_inbox_limit() {
+    const LARGE_TEXT_BYTES: usize = 700 * 1024;
+
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RecordingSink::default());
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink.clone(),
+    )
+    .await
+    .expect("router");
+    let mut blocker = event("event-byte-blocker", "owner-runtime-scope");
+    blocker.text = "b".repeat(LARGE_TEXT_BYTES);
+    router
+        .route(queued_registered(&store, &namespace, blocker).await)
+        .await
+        .expect("route byte blocker");
+    let start_thread = control.next_request().await;
+    control
+        .respond(
+            &start_thread,
+            thread_result("thread-byte-budget", &workspace),
+        )
+        .await;
+    let start_turn = control.next_request().await;
+    respond_turn_started(&control, &start_turn, "turn-byte-budget").await;
+    wait_for_running_turn(&store, "turn-byte-budget").await;
+
+    let mut rejected = None;
+    for index in 0..16 {
+        let event_id = format!("event-byte-pending-{index}");
+        let mut pending = event(event_id.as_str(), "owner-runtime-scope");
+        pending.text = "p".repeat(LARGE_TEXT_BYTES);
+        router
+            .route(queued_registered(&store, &namespace, pending).await)
+            .await
+            .expect("route or durably reject byte pressure");
+        if store
+            .inbound_state(&namespace, event_id.as_str())
+            .await
+            .expect("inbound state")
+            == Some(InboundEventState::Rejected)
+        {
+            rejected = Some(event_id);
+            break;
+        }
+    }
+    assert!(
+        rejected.is_some(),
+        "actor byte budget must reject bounded input"
+    );
+    assert_eq!(
+        sink.rejections.lock().expect("rejections").as_slice(),
+        &[InboundRejectionKind::Overloaded]
+    );
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn idle_actor_eviction_releases_completed_thread_routes() {
+    let mut config = validated_config();
+    config.concurrency.max_scope_actors = 1;
+    config.validate().expect("single actor is valid");
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config).with_test_timings(
+        Duration::from_millis(1),
+        Duration::from_secs(60),
+        Duration::from_millis(1),
+    );
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        Arc::new(RecordingSink::default()),
+    )
+    .await
+    .expect("router");
+
+    for index in 0..=lark_codex_bridge::limits::CLIENT_PROJECTION_CAPACITY {
+        let event_id = format!("event-evict-{index}");
+        let chat_id = format!("chat-evict-{index}");
+        let thread_id = format!("thread-evict-{index}");
+        let turn_id = format!("turn-evict-{index}");
+        router
+            .route(
+                queued_registered(
+                    &store,
+                    &namespace,
+                    event_in_chat(event_id.as_str(), "owner-runtime-scope", chat_id.as_str()),
+                )
+                .await,
+            )
+            .await
+            .expect("route next scope");
+        let start_thread = control.next_request().await;
+        assert_eq!(start_thread["method"], "thread/start");
+        control
+            .respond(&start_thread, thread_result(thread_id.as_str(), &workspace))
+            .await;
+        let start_turn = control.next_request().await;
+        respond_turn_started(&control, &start_turn, turn_id.as_str()).await;
+        send_turn_completed(&control, thread_id.as_str(), turn_id.as_str(), "completed").await;
+        wait_for_inbound_states(
+            &store,
+            &namespace,
+            &[event_id.as_str()],
+            InboundEventState::Completed,
+        )
+        .await;
+    }
+    assert_eq!(router.snapshot().scope_count, 1);
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn connection_loss_before_atomic_begin_leaves_the_event_received_for_replay() {
+    let config = validated_config();
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config).with_test_timings(
+        Duration::from_millis(1),
+        Duration::from_secs(60),
+        Duration::from_millis(1),
+    );
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let (supervisor, first_control, second_control) = restarting_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        Arc::new(RecordingSink::default()),
+    )
+    .await
+    .expect("router");
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("event-before-begin-crash", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("route event");
+    let start_thread = first_control.next_request().await;
+    assert_eq!(start_thread["method"], "thread/start");
+    first_control.unexpected_exit();
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if router
+                .scope_snapshot(&ScopeKey::Chat("chat-runtime-scope".to_owned()))
+                .await
+                .expect("snapshot")
+                .is_some_and(|snapshot| {
+                    matches!(
+                        snapshot.state,
+                        lark_codex_bridge::runtime::scope::ScopeState::Failed { .. }
+                    )
+                })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("actor records the pre-begin failure");
+    assert_eq!(
+        store
+            .inbound_state(&namespace, "event-before-begin-crash")
+            .await
+            .expect("inbound state"),
+        Some(InboundEventState::Received)
+    );
+    assert!(
+        store
+            .uncertain_turns()
+            .await
+            .expect("live turns")
+            .is_empty()
+    );
+    second_control
+        .expect_no_request_for(Duration::from_millis(100))
+        .await;
+    router.shutdown().await.expect("shutdown");
     store.shutdown().await.expect("store shutdown");
 }

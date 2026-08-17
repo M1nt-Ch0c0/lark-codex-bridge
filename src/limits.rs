@@ -194,6 +194,46 @@ pub const INBOUND_REPLAY_INTERVAL: Duration = Duration::from_secs(30);
 pub const STORE_ATTACHMENT_MAX_ROWS: u64 = 4096;
 /// Maximum durable attachment bytes tracked by the store.
 pub const STORE_ATTACHMENT_MAX_BYTES: u64 = 256 * 1024 * 1024;
+/// Hard cap on one downloaded attachment before it is written to disk.
+/// Reuses the Lark resource download cap so an already-bounded download can
+/// never exceed the cache's per-item budget.
+pub const ATTACHMENT_MAX_BYTES: usize = LARK_MAX_RESOURCE_BYTES;
+/// Maximum distinct resource descriptors accepted for one message/turn.
+pub const ATTACHMENT_MAX_PER_MESSAGE: usize = 16;
+/// Aggregate byte cap across all attachments leased by one turn.
+pub const ATTACHMENT_TURN_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum content files retained on disk in the attachment cache (mirrors
+/// [`STORE_ATTACHMENT_MAX_ROWS`]).
+pub const ATTACHMENT_CACHE_MAX_FILES: usize = 4096;
+/// Maximum total content bytes retained on disk in the attachment cache
+/// (mirrors [`STORE_ATTACHMENT_MAX_BYTES`]).
+pub const ATTACHMENT_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+/// Maximum bytes of a display file name retained as metadata only (never a
+/// disk-path component).
+pub const ATTACHMENT_FILE_NAME_MAX_BYTES: usize = 255;
+/// Maximum bytes of one resource MIME type string.
+pub const ATTACHMENT_MIME_MAX_BYTES: usize = 128;
+/// Maximum bytes of one resource key.
+pub const ATTACHMENT_RESOURCE_KEY_MAX_BYTES: usize = 4 * 1024;
+/// Age after which an unleased attachment becomes eligible for GC.
+pub const ATTACHMENT_GC_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+/// Interval between periodic GC sweeps (the periodic runner is out of scope
+/// for the attachment cache core).
+pub const ATTACHMENT_GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// Maximum victims examined and evicted by one GC pass.
+pub const ATTACHMENT_GC_BATCH: usize = 256;
+/// Maximum directory entries scanned by one reconciliation pass.
+pub const ATTACHMENT_RECONCILE_BATCH: usize = 4096;
+/// In-cache temp-file name prefix (never a valid SHA-256 name).
+pub const ATTACHMENT_TEMP_PREFIX: &str = ".tmp-";
+/// Cache-directory marker file name proving the directory is a dedicated
+/// attachment cache. Never a valid SHA-256 name, and the reconciliation
+/// scanner deliberately skips it.
+pub const ATTACHMENT_CACHE_MARKER: &str = ".attachment-cache";
+/// Cache-directory instance lock file name used for an OS-released exclusive
+/// advisory lock. Never a valid SHA-256 name, and the reconciliation scanner
+/// deliberately skips it.
+pub const ATTACHMENT_INSTANCE_LOCK: &str = ".attachment-instance.lock";
 /// Maximum live (`starting`/`running`/`uncertain`) turns retained for crash
 /// recovery. Terminal turns are historical rows and do not occupy this set.
 pub const STORE_RECOVERY_TURN_MAX_ROWS: usize = 32;
@@ -201,6 +241,11 @@ pub const STORE_RECOVERY_TURN_MAX_ROWS: usize = 32;
 pub const STORE_RECOVERY_TURN_MAX_BYTES: usize = 1024 * 1024;
 /// Send attempts after which an outbox row is marked terminally `failed`.
 pub const STORE_OUTBOX_MAX_ATTEMPTS: u32 = 8;
+/// Receipt-write attempts for one outbox row transition. A transient writer
+/// queue overflow or `SQLite` failure must not strand a `sending` row
+/// in-process: the pump retries this many times before warning and leaving the
+/// row `sending` for startup `recover_sending_outbox` to reconcile.
+pub const STORE_RECEIPT_WRITE_ATTEMPTS: u32 = 3;
 /// Maximum length of a stored inbound-event rejection reason; reasons are
 /// operator-facing classifications, never message content.
 pub const STORE_REJECTION_REASON_MAX_BYTES: usize = 128;
@@ -228,6 +273,14 @@ pub const DEFAULT_MAX_SCOPE_ACTORS: usize = 256;
 pub const ROUTER_COMMAND_CAPACITY: usize = 256;
 /// Aggregate exact persisted inbound bytes waiting in the router command queue.
 pub const ROUTER_COMMAND_BYTE_BUDGET: usize = 8 * 1024 * 1024;
+/// Count bound of transiently failed route decisions waiting for retry.
+pub const ROUTER_RETRY_CAPACITY: usize = 256;
+/// Aggregate exact persisted inbound bytes retained by the router retry lane.
+pub const ROUTER_RETRY_BYTE_BUDGET: usize = 8 * 1024 * 1024;
+/// Count bound of high-priority runtime controls such as turn interruption.
+pub const ROUTER_CONTROL_CAPACITY: usize = 64;
+/// Aggregate serialized scope-key bytes retained by high-priority controls.
+pub const ROUTER_CONTROL_BYTE_BUDGET: usize = 768 * 1024;
 /// Hard upper bound accepted for configured concurrent active turns.
 pub const ROUTER_ACTIVE_TURN_HARD_LIMIT: usize = 64;
 /// Hard upper bound accepted for configured resident scope actors.
@@ -240,3 +293,47 @@ pub const SCOPE_MAILBOX_BYTE_BUDGET: usize = 8 * 1024 * 1024;
 pub const TURN_BATCH_MAX_MESSAGES: usize = 64;
 /// Maximum normalized text bytes assembled into one Codex turn request.
 pub const TURN_BATCH_TEXT_BYTE_BUDGET: usize = 768 * 1024;
+/// Maximum bytes parsed as one recognized first-stage bridge command.
+pub const BRIDGE_COMMAND_MAX_BYTES: usize = 16 * 1024;
+
+/// Maximum characters (Unicode scalar values) in one projected reply message
+/// before deterministic splitting. A part never exceeds this bound.
+pub const REPLY_MESSAGE_MAX_CHARS: usize = 4000;
+/// Maximum split parts for one projected reply; any remainder is truncated
+/// with an explicit marker instead of producing an unbounded part count.
+pub const REPLY_MAX_SPLITS: usize = 8;
+/// Deterministic truncation marker appended to the final split part.
+pub const REPLY_TRUNCATION_MARKER: &str = "…[truncated]";
+/// Minimum interval between two progress upserts of the same turn.
+pub const REPLY_UPDATE_MIN_INTERVAL: Duration = Duration::from_millis(1500);
+/// Minimum newly accumulated characters before the next progress upsert.
+pub const REPLY_UPDATE_MIN_CHARS: usize = 200;
+
+/// Base delay of the outbox pump's deterministic exponential backoff.
+pub const OUTBOX_RETRY_BASE: Duration = Duration::from_millis(500);
+/// Upper bound of one outbox pump retry delay.
+pub const OUTBOX_RETRY_MAX: Duration = Duration::from_secs(30);
+/// Poll cadence for discovering newly enqueued rows while the transport is
+/// connected and no rows are due yet.
+pub const OUTBOX_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// Retention window for automatically sweepable terminal (`sent`/`failed`)
+/// outbox rows, in milliseconds. `uncertain_delivery` evidence is retained
+/// until explicit operator resolution; the all-state hard caps still bound
+/// the durable table and fail producers closed.
+pub const OUTBOX_TERMINAL_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+/// Maximum terminal outbox rows deleted by one bounded sweep.
+pub const OUTBOX_SWEEP_BATCH: u32 = 256;
+/// Interval between bounded outbox terminal sweeps.
+pub const OUTBOX_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// Hard upper bound on the total outbox row count across **all** states
+/// (`pending`, `sending`, `sent`, `failed`, `uncertain_delivery`). Counting
+/// every state means no state transition can ever push the table past the
+/// bound (a row only moves between states, never changing the total). The
+/// periodic sweep only frees `sent`/`failed` rows past the retention window,
+/// so a burst of rows can outrun it; enqueue fails closed (after one bounded
+/// inline sweep) once this cap is reached instead of letting the table grow
+/// without bound.
+pub const OUTBOX_TERMINAL_MAX_ROWS: u64 = 65_536;
+/// Hard upper bound on payload bytes retained by the outbox table across all
+/// states (see [`OUTBOX_TERMINAL_MAX_ROWS`]).
+pub const OUTBOX_TERMINAL_MAX_BYTES: u64 = 256 * 1024 * 1024;

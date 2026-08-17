@@ -372,6 +372,26 @@ impl fmt::Display for ClientError {
 
 impl std::error::Error for ClientError {}
 
+impl ClientError {
+    /// Reports whether a failed `turn/start` is known not to have reached a
+    /// point where Codex could execute it. Callers may safely finalize local
+    /// resources immediately only in this case; every other error remains
+    /// uncertain until the owning connection epoch ends.
+    #[must_use]
+    pub fn turn_start_definitely_not_applied(&self) -> bool {
+        match self {
+            Self::Rpc(error) => definitely_not_applied(error),
+            Self::RouterClosed(_)
+            | Self::RouterTaskFailed(_)
+            | Self::RouterTimeout(_)
+            | Self::Capacity
+            | Self::ControlEventsTaken
+            | Self::InvalidNotification { .. } => true,
+            Self::ConfirmedThreadUntracked { .. } | Self::ConfirmedTurnUntracked { .. } => false,
+        }
+    }
+}
+
 impl From<RpcError> for ClientError {
     fn from(value: RpcError) -> Self {
         Self::Rpc(value)

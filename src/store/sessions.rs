@@ -106,16 +106,16 @@ impl std::fmt::Debug for ScopeRow {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ScopeRow")
-            .field("scope_key", &self.scope_key)
+            .field("scope_key_len", &self.scope_key.len())
             .field("cwd_len", &self.cwd.to_string_lossy().len())
-            .field("policy_fingerprint", &self.policy_fingerprint)
+            .field("policy_fingerprint_len", &self.policy_fingerprint.len())
             .field("updated_ms", &self.updated_ms)
             .finish_non_exhaustive()
     }
 }
 
 /// One row of the `threads` table.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ThreadRow {
     /// Owning scope key.
     pub scope_key: String,
@@ -129,8 +129,21 @@ pub struct ThreadRow {
     pub archived_ms: Option<i64>,
 }
 
+impl std::fmt::Debug for ThreadRow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ThreadRow")
+            .field("scope_key_len", &self.scope_key.len())
+            .field("codex_thread_id_len", &self.codex_thread_id.len())
+            .field("status", &self.status)
+            .field("created_ms", &self.created_ms)
+            .field("archived_ms", &self.archived_ms)
+            .finish_non_exhaustive()
+    }
+}
+
 /// One row of the `turns` table.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct TurnRow {
     /// Row ID.
     pub id: i64,
@@ -154,8 +167,32 @@ pub struct TurnRow {
     pub inbound_count: usize,
 }
 
+impl std::fmt::Debug for TurnRow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TurnRow")
+            .field("id", &self.id)
+            .field("scope_key_len", &self.scope_key.len())
+            .field("client_message_id_len", &self.client_message_id.len())
+            .field(
+                "codex_thread_id_len",
+                &self.codex_thread_id.as_ref().map(String::len),
+            )
+            .field(
+                "codex_turn_id_len",
+                &self.codex_turn_id.as_ref().map(String::len),
+            )
+            .field("state", &self.state)
+            .field("uncertain", &self.uncertain)
+            .field("created_ms", &self.created_ms)
+            .field("updated_ms", &self.updated_ms)
+            .field("inbound_count", &self.inbound_count)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Fields needed to record a new turn row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct NewTurnRow {
     /// Owning scope key.
     pub scope_key: String,
@@ -165,6 +202,21 @@ pub struct NewTurnRow {
     pub codex_thread_id: Option<String>,
     /// Initial state (normally [`TurnState::Starting`]).
     pub state: TurnState,
+}
+
+impl std::fmt::Debug for NewTurnRow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NewTurnRow")
+            .field("scope_key_len", &self.scope_key.len())
+            .field("client_message_id_len", &self.client_message_id.len())
+            .field(
+                "codex_thread_id_len",
+                &self.codex_thread_id.as_ref().map(String::len),
+            )
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
 }
 
 impl StoreHandle {
