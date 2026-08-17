@@ -419,17 +419,20 @@ fn owner_and_direct_mention_gate_uses_chat_mode_not_scope() {
     );
 }
 
-#[test]
-fn ordinary_turn_matrix_distinguishes_owner_sender_group_roles() {
+fn matrix_policy() -> AccessPolicy {
     let temp = scratch();
     let allowed = temp.path().join("safe");
     fs::create_dir_all(&allowed).expect("safe root should be created");
-    let policy = policy_with(
+    policy_with(
         allowed,
         vec!["ou_sender".to_owned()],
         vec!["oc_allowed_group".to_owned()],
-    );
+    )
+}
 
+#[test]
+fn ordinary_turn_matrix_owner_and_sender_rows() {
+    let policy = matrix_policy();
     // owner, P2P
     assert_eq!(
         policy.decide(&event("ou_owner_123456", ChatMode::P2p, false)),
@@ -444,6 +447,11 @@ fn ordinary_turn_matrix_distinguishes_owner_sender_group_roles() {
     assert_eq!(
         policy.decide(&event("ou_owner_123456", ChatMode::Group, true)),
         AccessDecision::Allow
+    );
+    // owner in group, no mention
+    assert_eq!(
+        policy.decide(&event("ou_owner_123456", ChatMode::Group, false)),
+        AccessDecision::DenyMissingMention
     );
     // allowed sender in group, direct mention
     assert_eq!(
@@ -465,6 +473,11 @@ fn ordinary_turn_matrix_distinguishes_owner_sender_group_roles() {
         policy.decide(&event("ou_sender", ChatMode::Topic, false)),
         AccessDecision::DenyMissingMention
     );
+}
+
+#[test]
+fn ordinary_turn_matrix_allowed_group_rows() {
+    let policy = matrix_policy();
     // allowed-group ordinary member, direct mention
     assert_eq!(
         policy.decide(&event_in_chat(
@@ -509,11 +522,11 @@ fn ordinary_turn_matrix_distinguishes_owner_sender_group_roles() {
         )),
         AccessDecision::DenyMissingMention
     );
-    // owner in group, no mention
-    assert_eq!(
-        policy.decide(&event("ou_owner_123456", ChatMode::Group, false)),
-        AccessDecision::DenyMissingMention
-    );
+}
+
+#[test]
+fn ordinary_turn_matrix_unauthorized_and_non_human_rows() {
+    let policy = matrix_policy();
     // unauthorized group
     assert_eq!(
         policy.decide(&event("ou_stranger", ChatMode::Group, true)),
