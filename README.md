@@ -477,3 +477,8 @@ PR 摘要与逐行审查），配置见 [.coderabbit.yaml](.coderabbit.yaml)。�
 的用户可见行为，但使用独立仓库、独立 Git 历史和全新 Rust 实现，并非 fork。
 
 本项目采用 [MIT License](LICENSE)。
+
+
+## 文档手册
+
+更完整的安装、配置、模块说明和架构记录见 [docs/README.md](docs/README.md)。
