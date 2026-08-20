@@ -227,13 +227,13 @@ async fn onboard<O: OnboardingOps>(paths: &OnboardingPaths, ops: &O) -> Result<(
     let hint = match fresh_hint {
         Some(hint) => {
             if valid_owner_id(&hint) {
-                persist_owner_hint(paths, &hint)?;
+                persist_owner_hint(paths, &creds.app_id, &hint)?;
                 Some(hint)
             } else {
                 None
             }
         }
-        None => load_owner_hint(paths)?,
+        None => load_owner_hint(paths, &creds.app_id)?,
     };
     let owner = resolve_owner(&creds, hint.as_deref(), ops).await?;
     let roots = ops.platform_roots()?;
@@ -382,7 +382,7 @@ fn write_config_atomic(paths: &OnboardingPaths, config: &BridgeConfig) -> Result
     };
     let text = toml::to_string(&generated)
         .map_err(|_| anyhow!("unable to encode bridge configuration"))?;
-    write_atomic(&paths.config_path, text.as_bytes())
+    write_atomic_new(&paths.config_path, text.as_bytes())
 }
 
 /// The persisted creator hint; a private-permission sidecar, not the authority
@@ -390,18 +390,21 @@ fn write_config_atomic(paths: &OnboardingPaths, config: &BridgeConfig) -> Result
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProfileFile {
+    #[serde(default)]
+    app_id: Option<String>,
     owner_hint: String,
 }
 
-fn persist_owner_hint(paths: &OnboardingPaths, hint: &str) -> Result<()> {
+fn persist_owner_hint(paths: &OnboardingPaths, app_id: &str, hint: &str) -> Result<()> {
     let text = toml::to_string(&ProfileFile {
+        app_id: Some(app_id.to_owned()),
         owner_hint: hint.to_owned(),
     })
     .map_err(|_| anyhow!("unable to encode the owner hint"))?;
     write_atomic(&paths.profile_path, text.as_bytes())
 }
 
-fn load_owner_hint(paths: &OnboardingPaths) -> Result<Option<String>> {
+fn load_owner_hint(paths: &OnboardingPaths, app_id: &str) -> Result<Option<String>> {
     let text = match fs::read_to_string(&paths.profile_path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -409,7 +412,10 @@ fn load_owner_hint(paths: &OnboardingPaths) -> Result<Option<String>> {
     };
     let file: ProfileFile =
         toml::from_str(&text).map_err(|_| anyhow!("the stored owner hint is malformed"))?;
-    Ok(valid_owner_id(&file.owner_hint).then_some(file.owner_hint))
+    Ok(
+        (file.app_id.as_deref() == Some(app_id) && valid_owner_id(&file.owner_hint))
+            .then_some(file.owner_hint),
+    )
 }
 
 /// Acquires an advisory lock file serializing concurrent first runs. The lock
@@ -448,6 +454,37 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         return Err(anyhow!("unable to replace the file"));
     }
     Ok(())
+}
+
+/// Publishes a newly created file atomically without replacing an existing
+/// destination. The hard link makes the fully written temp inode visible at
+/// the final path in one filesystem operation and fails if the destination was
+/// created concurrently.
+fn write_atomic_new(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            create_private_dir(parent)?;
+        }
+    }
+    let temp = temp_path_for(path);
+    match fs::remove_file(&temp) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(anyhow!("unable to prepare the bridge configuration")),
+    }
+    if let Err(error) = write_private_file(&temp, bytes) {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+    let publish = fs::hard_link(&temp, path);
+    let _ = fs::remove_file(&temp);
+    match publish {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            bail!("bridge configuration already exists")
+        }
+        Err(_) => Err(anyhow!("unable to publish the bridge configuration")),
+    }
 }
 
 fn temp_path_for(path: &Path) -> PathBuf {
@@ -606,12 +643,29 @@ mod tests {
         let scratch = TempDir::new().expect("scratch dir");
         let paths = dirs(scratch.path());
 
-        persist_owner_hint(&paths, "ou_creator_123").expect("hint should persist");
+        persist_owner_hint(&paths, "cli_current", "ou_creator_123").expect("hint should persist");
         assert_eq!(
-            load_owner_hint(&paths).expect("hint should load"),
+            load_owner_hint(&paths, "cli_current").expect("hint should load"),
             Some("ou_creator_123".to_owned())
         );
+        assert_eq!(
+            load_owner_hint(&paths, "cli_other").expect("mismatched hint should be ignored"),
+            None
+        );
         assert!(!temp_path_for(&paths.profile_path).exists());
+    }
+
+    #[test]
+    fn legacy_owner_hint_without_app_id_is_ignored() {
+        let scratch = TempDir::new().expect("scratch dir");
+        let paths = dirs(scratch.path());
+        write_atomic(&paths.profile_path, b"owner_hint = \"ou_legacy\"\n")
+            .expect("legacy hint should persist");
+
+        assert_eq!(
+            load_owner_hint(&paths, "cli_current").expect("legacy hint should load safely"),
+            None
+        );
     }
 
     #[cfg(unix)]
@@ -621,7 +675,7 @@ mod tests {
 
         let scratch = TempDir::new().expect("scratch dir");
         let paths = dirs(scratch.path());
-        persist_owner_hint(&paths, "ou_creator_123").expect("hint should persist");
+        persist_owner_hint(&paths, "cli_current", "ou_creator_123").expect("hint should persist");
         let mode = fs::metadata(&paths.profile_path)
             .expect("profile should exist")
             .permissions()
@@ -651,6 +705,36 @@ mod tests {
             fs::read_to_string(&paths.config_path).expect("config unchanged"),
             text
         );
+    }
+
+    #[test]
+    fn atomic_config_publish_never_replaces_a_concurrent_destination() {
+        let scratch = TempDir::new().expect("scratch dir");
+        let paths = dirs(scratch.path());
+        create_private_dir(
+            paths
+                .config_path
+                .parent()
+                .expect("config path should have a parent"),
+        )
+        .expect("config directory should exist");
+        fs::write(&paths.config_path, "owners = [\"ou_concurrent\"]\n")
+            .expect("concurrent config should exist");
+        // A previous successful publish may leave this private alias behind if
+        // temp cleanup was interrupted. The next attempt must unlink the alias
+        // before writing or it would truncate the existing config inode.
+        fs::hard_link(&paths.config_path, temp_path_for(&paths.config_path))
+            .expect("stale temp alias should exist");
+
+        let error = write_atomic_new(&paths.config_path, b"owners = [\"ou_generated\"]\n")
+            .expect_err("existing config must not be replaced");
+
+        assert!(format!("{error:#}").contains("already exists"));
+        assert_eq!(
+            fs::read_to_string(&paths.config_path).expect("concurrent config should remain"),
+            "owners = [\"ou_concurrent\"]\n"
+        );
+        assert!(!temp_path_for(&paths.config_path).exists());
     }
 
     #[test]
@@ -753,9 +837,28 @@ mod tests {
         assert_eq!(parsed.owners, vec!["ou_creator_123".to_owned()]);
         assert!(ops.store.load().expect("credentials should load").is_some());
         assert_eq!(
-            load_owner_hint(&paths).expect("hint should load"),
+            load_owner_hint(&paths, "cli_new").expect("hint should load"),
             Some("ou_creator_123".to_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn stale_owner_hint_is_ignored_after_app_change() {
+        let scratch = TempDir::new().expect("scratch dir");
+        let paths = dirs(scratch.path());
+        persist_owner_hint(&paths, "cli_old", "ou_old_creator").expect("old hint should persist");
+        let ops = fake_ops(scratch.path(), None, Some("ou_current_creator"));
+        ops.store
+            .save(&test_creds("cli_current"))
+            .expect("current credentials should persist");
+
+        onboard(&paths, &ops)
+            .await
+            .expect("onboarding should ignore the stale hint");
+
+        let text = fs::read_to_string(&paths.config_path).expect("config should exist");
+        let parsed: BridgeConfig = toml::from_str(&text).expect("config should parse");
+        assert_eq!(parsed.owners, vec!["ou_current_creator".to_owned()]);
     }
 
     #[tokio::test]
