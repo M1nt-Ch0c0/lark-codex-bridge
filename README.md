@@ -12,7 +12,7 @@
   长驻 supervisor、thread 复用、`codex probe` 和门控的真实 Codex smoke；
 - Rust 原生飞书/Lark 凭证登记、OpenAPI、WebSocket transport、事件归一化、
   `lark probe` 和门控的真实 Lark smoke；
-- SQLite WAL 单写者 store、持久 inbox/outbox、去重、owner gate、安全工作区策略、
+- SQLite WAL 单写者 store、持久 inbox/outbox、去重、owner/指定 sender/指定群组 allowlist 授权、安全工作区策略、
   scope actor、同 scope 串行 turn 和不同 scope 的有界并发；
 - 延迟进度卡、独立最终回复、重试/receipt/uncertain delivery，以及终态先持久化再收口；
 - 图片 `localImage` 和普通文件结构化路径输入、内容寻址缓存、turn lease、GC 与启动校验；
@@ -92,6 +92,24 @@ platform family/OS 和 epoch；不包含 Codex home、账户身份、token 或�
 ```bash
 CODEX_E2E=1 cargo test --test codex_smoke --locked -- --ignored --nocapture
 ```
+
+## 授权角色（owner / sender / group）
+
+除 owner 外，`config.toml` 还支持两类低权限授权（均为可选、默认拒绝）：
+
+```toml
+owners = ["ou_owner_open_id"]
+allowed_senders = ["ou_member_open_id"]   # 按用户身份授权的普通调用者
+allowed_groups = ["oc_chat_id"]           # 仅该群内普通人类成员可发起普通 turn
+```
+
+语义要点：
+
+- 群/话题中的普通 turn 仍要求真实直接 @机器人，`@all` 不算数；私聊不受影响。
+- 群白名单只授予普通消息；owner-only 控制命令仅 owner 可执行。
+- 非人类 sender（应用、机器人等）一律拒绝，任何 allowlist 都不例外。
+- 列表有数量与字节上限（各 256 条 / 32 KiB），重复条目幂等去重，畸形 ID 拒绝加载。
+- 不匹配的通配符、群名称匹配、成员自动同步均不支持；移除条目即撤销授权。
 
 ## 飞书 / Lark 接入与检查
 

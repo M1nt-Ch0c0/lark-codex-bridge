@@ -68,6 +68,10 @@ pub struct InboundEvent {
     pub mentions_bot: bool,
     /// Whether the message mentions everyone (`<at user_id="all">`).
     pub mention_all: bool,
+    /// Whether the wire sender is an ordinary human user (`sender_type` is
+    /// `"user"`). Bot/app/system/anonymous senders are never eligible for
+    /// sender/group allowlists.
+    pub sender_is_human: bool,
     /// Image/file descriptors (keys and kinds), never bytes.
     pub resources: Vec<ResourceDesc>,
     /// Raw wire `message_type`, kept as an open string so unknown types
@@ -97,6 +101,7 @@ impl fmt::Debug for InboundEvent {
             .field("text_len", &self.text.len())
             .field("mentions_bot", &self.mentions_bot)
             .field("mention_all", &self.mention_all)
+            .field("sender_is_human", &self.sender_is_human)
             .field("resource_count", &self.resources.len())
             .field(
                 "resource_key_bytes",
@@ -299,6 +304,7 @@ impl Normalizer {
                 text: parsed.text,
                 mentions_bot: parsed.mentions_bot,
                 mention_all: parsed.mention_all,
+                sender_is_human: parsed.sender_is_human,
                 resources: parsed.resources,
                 message_type: parsed.message_type,
                 create_time_ms: parsed.create_time_ms,
@@ -340,6 +346,14 @@ impl Normalizer {
         let event = envelope
             .event
             .ok_or_else(|| LarkError::protocol("event payload missing the event object"))?;
+        // Fail closed: only the explicit `"user"` sender type is a human.
+        // Bot/app/system/anonymous senders (or a missing type) are never
+        // eligible for sender/group allowlists.
+        let sender_is_human = event
+            .sender
+            .as_ref()
+            .and_then(|sender| sender.sender_type.as_deref())
+            == Some("user");
         let sender_open_id = event
             .sender
             .and_then(|sender| sender.sender_id)
@@ -379,6 +393,7 @@ impl Normalizer {
             text,
             mentions_bot,
             mention_all: mentions_all_in_array || mentions_all_in_text,
+            sender_is_human,
             resources: extract_resources(&message_type, &content)?,
         }))
     }
@@ -527,6 +542,7 @@ struct ParsedEvent {
     text: String,
     mentions_bot: bool,
     mention_all: bool,
+    sender_is_human: bool,
     resources: Vec<ResourceDesc>,
 }
 
@@ -635,6 +651,7 @@ struct EventBody {
 #[derive(Deserialize)]
 struct EventSender {
     sender_id: Option<EventSenderId>,
+    sender_type: Option<String>,
 }
 
 #[derive(Deserialize)]

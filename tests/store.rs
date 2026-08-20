@@ -35,6 +35,7 @@ fn event(event_id: &str, message_id: &str) -> InboundEvent {
         text: "not persisted".to_owned(),
         mentions_bot: true,
         mention_all: false,
+        sender_is_human: true,
         resources: Vec::new(),
         message_type: "text".to_owned(),
         create_time_ms: 1,

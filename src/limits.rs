@@ -258,6 +258,16 @@ pub const MAX_CONFIG_OWNER_BYTES: usize = 32 * 1024;
 pub const MAX_CONFIG_ALLOW_ROOTS: usize = 64;
 /// Aggregate encoded-path byte budget for configured workspace roots.
 pub const MAX_CONFIG_ALLOW_ROOT_BYTES: usize = 16 * 1024;
+/// Maximum distinct allowed sender open IDs retained in the runtime
+/// configuration.
+pub const MAX_CONFIG_ALLOWED_SENDERS: usize = 256;
+/// Aggregate UTF-8 byte budget for configured allowed sender IDs.
+pub const MAX_CONFIG_ALLOWED_SENDER_BYTES: usize = 32 * 1024;
+/// Maximum distinct allowed group chat IDs retained in the runtime
+/// configuration.
+pub const MAX_CONFIG_ALLOWED_GROUPS: usize = 256;
+/// Aggregate UTF-8 byte budget for configured allowed group chat IDs.
+pub const MAX_CONFIG_ALLOWED_GROUP_BYTES: usize = 32 * 1024;
 /// Maximum distinct canonical protected roots retained by the platform policy.
 pub const MAX_PLATFORM_PROTECTED_ROOTS: usize = 64;
 /// Aggregate encoded-path byte budget for canonical protected roots.

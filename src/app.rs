@@ -502,6 +502,7 @@ mod tests {
                 text: "hello".to_owned(),
                 mentions_bot: false,
                 mention_all: false,
+                sender_is_human: true,
                 resources: Vec::new(),
                 message_type: "text".to_owned(),
                 create_time_ms: 1,

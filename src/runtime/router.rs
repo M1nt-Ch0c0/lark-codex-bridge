@@ -22,7 +22,7 @@ use crate::limits::{
 };
 use crate::runtime::attachments::AttachmentCache;
 use crate::runtime::intake::TenantNamespace;
-use crate::runtime::policy::{AccessDecision, AccessPolicy};
+use crate::runtime::policy::AccessPolicy;
 use crate::runtime::scope::{
     ActorRouteError, DurableReplySink, InterruptOutcome, ReplySinkError, ScopeActorHandle,
     ScopeSnapshot, SupervisorAccess,
@@ -680,20 +680,14 @@ async fn route_one(
 ) -> Result<(), RouteFailure> {
     let decision = policy.decide(&queued.event);
     let key = InboundKey::new(tenant.clone(), queued.event.event_id.clone());
-    if decision != AccessDecision::Allow {
-        return reject_with_notice(
-            store,
-            sink.as_ref(),
-            &key,
-            &queued.event,
-            InboundRejectionKind::Policy,
-        )
-        .await
-        .map_err(|error| RouteFailure {
-            error,
-            event: queued,
-            retryable: true,
-        });
+    if let Some(kind) = decision.rejection_kind() {
+        return reject_with_notice(store, sink.as_ref(), &key, &queued.event, kind)
+            .await
+            .map_err(|error| RouteFailure {
+                error,
+                event: queued,
+                retryable: true,
+            });
     }
     let scope_key = queued.event.scope.to_string();
     if !actors.contains_key(&scope_key) {
@@ -891,6 +885,7 @@ mod tests {
                 text: "hello".to_owned(),
                 mentions_bot: false,
                 mention_all: false,
+                sender_is_human: true,
                 resources: Vec::new(),
                 message_type: "text".to_owned(),
                 create_time_ms: 1,

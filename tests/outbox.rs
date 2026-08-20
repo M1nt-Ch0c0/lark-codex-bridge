@@ -187,6 +187,7 @@ fn inbound_event() -> InboundEvent {
         text: "hello".to_owned(),
         mentions_bot: true,
         mention_all: false,
+        sender_is_human: true,
         resources: vec![],
         message_type: "text".to_owned(),
         create_time_ms: 0,
