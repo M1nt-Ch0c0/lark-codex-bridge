@@ -80,6 +80,30 @@ platform family/OS 和 epoch；不包含 Codex home、账户身份、token 或�
 CODEX_E2E=1 cargo test --test codex_smoke --locked -- --ignored --nocapture
 ```
 
+## 本地语音转写（ASR sidecar）
+
+飞书语音气泡默认**不会**把 `localAudio` 交给 Codex。`bridge_media.read` 对音频按需转写后只回传文本：
+
+1. 入站 payload 已带客户端识别文本时直接使用，不调用 sidecar；
+2. 否则用 `ffmpeg` 解码为 16 kHz WAV，再跑配置的本地 sidecar（stdout 即转写结果）；
+3. 缺 sidecar、解码失败、空转写或过长音频会返回稳定错误码（`sidecar_missing` / `unsupported_codec` / `empty_transcript` / `too_long` / `oversize` / `sidecar_failed`），不会静默丢 part。
+
+推荐 sidecar 是 [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) 上的 SenseVoice Small。仓库不内置模型权重；未配置 sidecar 时图片/文件读取不受影响。
+
+```toml
+[asr]
+command = "/usr/local/bin/sherpa-onnx-offline"
+args = [
+  "--tokens=/var/lib/lark-codex-bridge/sensevoice/tokens.txt",
+  "--sense-voice-model=/var/lib/lark-codex-bridge/sensevoice/model.int8.onnx",
+]
+ffmpeg = "ffmpeg"
+max_duration_ms = 600000
+max_transcript_bytes = 32768
+```
+
+`command` 可省略。相对路径相对配置文件目录解析；单个程序名（如 `ffmpeg`）走 `PATH`。
+
 ## 授权角色（owner / sender / group）
 
 除 owner 外，`config.toml` 还支持两类低权限授权（均为可选、默认拒绝）：

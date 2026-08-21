@@ -618,6 +618,7 @@ async fn audio_video_card_and_forward_have_typed_availability() {
             ("audio", [MessagePart::Audio(media)]) => {
                 assert_eq!(media.key.as_deref(), Some("aud_key"));
                 assert_eq!(media.metadata.duration_ms, Some(1234));
+                assert_eq!(media.metadata.transcript, None);
                 assert_eq!(media.status, PartStatus::Available);
             }
             ("media", [MessagePart::Video(media)]) => {
@@ -634,6 +635,42 @@ async fn audio_video_card_and_forward_have_typed_availability() {
             }
             _ => panic!("unexpected typed part for {kind}"),
         }
+    }
+}
+
+#[tokio::test]
+async fn audio_client_transcript_is_retained_as_text_and_metadata() {
+    let server = StubServer::start(im_stub(|_| chat_mode_ok("group"), failing)).await;
+    let normalizer = normalizer_for(&server);
+    let payload = make_event(
+        "oc_group_chat",
+        "group",
+        "om_audio_text",
+        "audio",
+        &serde_json::json!({
+            "file_key": "aud_key",
+            "duration": 2100,
+            "text": "  please review the patch  "
+        }),
+        None,
+        &serde_json::json!([]),
+    );
+    let (event, _) = unwrap_event(
+        normalizer
+            .normalize(payload.as_bytes())
+            .await
+            .expect("audio with transcript should normalize"),
+    );
+    assert_eq!(event.text, "please review the patch");
+    match event.parts.as_slice() {
+        [MessagePart::Audio(media)] => {
+            assert_eq!(media.key.as_deref(), Some("aud_key"));
+            assert_eq!(
+                media.metadata.transcript.as_deref(),
+                Some("please review the patch")
+            );
+        }
+        _ => panic!("expected one audio part"),
     }
 }
 

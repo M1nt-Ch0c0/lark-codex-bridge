@@ -371,6 +371,7 @@ async fn extended_inbound_payload_v1_round_trips_mentions_parts_and_metadata() {
             mime_type: Some("audio/opus".to_owned()),
             size_bytes: Some(123),
             duration_ms: Some(456),
+            transcript: None,
         },
         status: PartStatus::Available,
     })];

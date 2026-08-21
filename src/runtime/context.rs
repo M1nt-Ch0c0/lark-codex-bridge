@@ -297,6 +297,9 @@ pub struct MediaMetadata {
     /// Duration for audio/video, if known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    /// Client-supplied recognition text, if the inbound payload included it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<String>,
 }
 
 /// Typed part returned by context resolution. Resource keys never appear here.
@@ -573,6 +576,7 @@ fn media_metadata(metadata: &InboundMediaMetadata) -> MediaMetadata {
         mime_type: metadata.mime_type.clone(),
         size_bytes: metadata.size_bytes,
         duration_ms: metadata.duration_ms,
+        transcript: metadata.transcript.clone(),
     }
 }
 
@@ -650,6 +654,10 @@ pub struct AuthorizedResource {
     pub local_turn_row_id: i64,
     /// Key and endpoint kind consumed by `AttachmentCache`.
     pub resource: ResourceDesc,
+    /// Inbound recognition text that can skip the sidecar.
+    pub transcript: Option<String>,
+    /// Declared duration, used to refuse over-long audio before download.
+    pub duration_ms: Option<u64>,
 }
 
 impl fmt::Debug for AuthorizedResource {
@@ -660,6 +668,11 @@ impl fmt::Debug for AuthorizedResource {
             .field("media_kind", &self.media_kind)
             .field("local_turn_row_id", &self.local_turn_row_id)
             .field("resource", &self.resource)
+            .field(
+                "transcript_len",
+                &self.transcript.as_deref().map_or(0, str::len),
+            )
+            .field("duration_ms", &self.duration_ms)
             .finish()
     }
 }
@@ -683,6 +696,8 @@ pub struct ContextRegistryStats {
 struct ResourceGrant {
     kind: MediaKind,
     resource: ResourceDesc,
+    transcript: Option<String>,
+    duration_ms: Option<u64>,
 }
 
 enum EntryState {
@@ -1021,7 +1036,15 @@ fn materialize_part(
             metadata,
         } => {
             let handle = unique_media_handle(grants);
-            grants.insert(handle.clone(), ResourceGrant { kind, resource });
+            grants.insert(
+                handle.clone(),
+                ResourceGrant {
+                    kind,
+                    resource,
+                    transcript: metadata.transcript.clone(),
+                    duration_ms: metadata.duration_ms,
+                },
+            );
             let thumbnail_handle = thumbnail.map(|resource| {
                 let thumbnail_handle = unique_media_handle(grants);
                 grants.insert(
@@ -1029,6 +1052,8 @@ fn materialize_part(
                     ResourceGrant {
                         kind: MediaKind::Image,
                         resource,
+                        transcript: None,
+                        duration_ms: None,
                     },
                 );
                 thumbnail_handle
@@ -1158,6 +1183,8 @@ fn authorized_resource(
         media_kind: grant.kind,
         local_turn_row_id: entry.pending_binding.local_turn_row_id,
         resource: grant.resource.clone(),
+        transcript: grant.transcript.clone(),
+        duration_ms: grant.duration_ms,
     })
 }
 

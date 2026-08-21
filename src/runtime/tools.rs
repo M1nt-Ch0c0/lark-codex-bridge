@@ -12,10 +12,12 @@ use crate::codex::{
         DynamicToolSpec,
     },
 };
+use crate::config::AsrSection;
 use crate::lark::api::ResourceKind;
 use crate::runtime::{
+    asr::{self, AsrError, TranscriptSource},
     attachments::{AttachError, AttachmentCache, DownloadKind},
-    context::{ContextError, ContextErrorCode, ContextId, ContextRegistry, MediaHandle},
+    context::{ContextError, ContextErrorCode, ContextId, ContextRegistry, MediaHandle, MediaKind},
 };
 
 /// Version persisted with Codex threads that were created with these tools.
@@ -85,6 +87,7 @@ pub async fn handle_server_request(
     mut request: ServerRequest,
     contexts: &ContextRegistry,
     attachments: &AttachmentCache,
+    asr: &AsrSection,
 ) {
     if request.method != "item/tool/call" {
         let _ = client
@@ -93,29 +96,25 @@ pub async fn handle_server_request(
         return;
     }
 
-    let params =
-        match request.params.clone().ok_or(()).and_then(|value| {
-            serde_json::from_value::<DynamicToolCallParams>(value).map_err(|_| ())
-        }) {
-            Ok(params) => params,
-            Err(()) => {
-                respond_tool_error(
-                    client,
-                    &mut request,
-                    &tool_error(
-                        "invalid_request",
-                        "dynamic tool parameters are invalid",
-                        false,
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
+    let Ok(params) = request.params.clone().ok_or(()).and_then(|value| {
+        serde_json::from_value::<DynamicToolCallParams>(value).map_err(|_| ())
+    }) else {
+        respond_tool_error(
+            client,
+            &mut request,
+            &tool_error(
+                "invalid_request",
+                "dynamic tool parameters are invalid",
+                false,
+            ),
+        )
+        .await;
+        return;
+    };
 
     let result = match (params.namespace.as_deref(), params.tool.as_str()) {
         (Some("bridge_context"), "resolve") => resolve_context(contexts, &params),
-        (Some("bridge_media"), "read") => read_media(contexts, attachments, &params).await,
+        (Some("bridge_media"), "read") => read_media(contexts, attachments, asr, &params).await,
         _ => Err(tool_error(
             "unsupported",
             "dynamic tool is not registered by this bridge",
@@ -158,6 +157,7 @@ fn resolve_context(
 async fn read_media(
     contexts: &ContextRegistry,
     attachments: &AttachmentCache,
+    asr: &AsrSection,
     params: &DynamicToolCallParams,
 ) -> Result<Value, Value> {
     let arguments =
@@ -173,6 +173,9 @@ async fn read_media(
     let authorized = contexts
         .authorize_media_for_tool(&context_id, &handle, &params.thread_id, &params.turn_id)
         .map_err(context_error)?;
+    if authorized.media_kind == MediaKind::Audio {
+        return read_audio(attachments, asr, &authorized).await;
+    }
     let cached = attachments
         .fetch(
             &authorized.message_id,
@@ -199,6 +202,67 @@ async fn read_media(
     }))
 }
 
+async fn read_audio(
+    attachments: &AttachmentCache,
+    asr: &AsrSection,
+    authorized: &crate::runtime::context::AuthorizedResource,
+) -> Result<Value, Value> {
+    if let Some(transcript) = authorized.transcript.as_deref().and_then(|text| {
+        crate::lark::normalize::normalize_transcript(text, asr.max_transcript_bytes)
+    }) {
+        return Ok(audio_transcript_value(
+            &transcript,
+            TranscriptSource::Inbound,
+            authorized.duration_ms,
+        ));
+    }
+    if authorized
+        .duration_ms
+        .is_some_and(|duration| duration > asr.max_duration_ms)
+    {
+        return Err(asr_error(AsrError::TooLong));
+    }
+    let cached = attachments
+        .fetch(
+            &authorized.message_id,
+            &authorized.resource,
+            authorized.local_turn_row_id,
+        )
+        .await
+        .map_err(|error| match error {
+            AttachError::TooLarge { .. } => asr_error(AsrError::Oversize),
+            other => attachment_error(other),
+        })?;
+    let transcript = asr::transcribe_file(asr, &cached.path, authorized.duration_ms)
+        .await
+        .map_err(asr_error)?;
+    Ok(audio_transcript_value(
+        &transcript,
+        TranscriptSource::Sidecar,
+        authorized.duration_ms,
+    ))
+}
+
+fn audio_transcript_value(
+    transcript: &str,
+    source: TranscriptSource,
+    duration_ms: Option<u64>,
+) -> Value {
+    json!({
+        "media": {
+            "kind": "audio",
+            "semanticKind": "audio",
+            "transcript": transcript,
+            "source": source.as_str(),
+            "durationMs": duration_ms,
+        }
+    })
+}
+
+fn asr_error(error: AsrError) -> Value {
+    tool_error(error.code(), error.message(), false)
+}
+
 fn resource_kind(kind: ResourceKind) -> &'static str {
     match kind {
         ResourceKind::Image => "image",
@@ -206,10 +270,12 @@ fn resource_kind(kind: ResourceKind) -> &'static str {
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn context_error(error: ContextError) -> Value {
     json!({"error": error})
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn attachment_error(error: AttachError) -> Value {
     let retryable = matches!(
         error,
@@ -235,6 +301,7 @@ fn tool_error(code: &'static str, message: &'static str, retryable: bool) -> Val
     })
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn tool_response(value: Value, success: bool) -> DynamicToolCallResponse {
     DynamicToolCallResponse {
         content_items: vec![DynamicToolCallOutputContentItem::InputText {

@@ -21,15 +21,16 @@ use crate::lark::normalize::{
     ScopeKey,
 };
 use crate::limits::{
-    ATTACHMENT_FILE_NAME_MAX_BYTES, ATTACHMENT_MIME_MAX_BYTES, DEDUP_SWEEP_BATCH,
-    OUTBOX_TERMINAL_MAX_BYTES, OUTBOX_TERMINAL_MAX_ROWS, STORE_INBOUND_BEGIN_MAX_KEY_BYTES,
-    STORE_INBOUND_BEGIN_MAX_KEYS, STORE_INBOUND_ID_MAX_BYTES, STORE_INBOUND_MAX_BYTES,
-    STORE_INBOUND_MAX_ROWS, STORE_INBOUND_MESSAGE_TYPE_MAX_BYTES, STORE_INBOUND_PAYLOAD_MAX_BYTES,
-    STORE_INBOUND_RECEIVED_MAX_BYTES, STORE_INBOUND_RECEIVED_MAX_ROWS,
-    STORE_INBOUND_RESOURCE_KEY_MAX_BYTES, STORE_INBOUND_RESOURCE_KEY_MAX_TOTAL_BYTES,
-    STORE_INBOUND_RESOURCE_MAX_COUNT, STORE_INBOUND_SCOPE_MAX_BYTES, STORE_INBOUND_TEXT_MAX_BYTES,
-    STORE_OUTBOX_MAX_QUEUED_BYTES, STORE_OUTBOX_MAX_ROWS, STORE_OUTBOX_PAYLOAD_MAX_BYTES,
-    STORE_RECOVERY_TURN_MAX_BYTES, STORE_RECOVERY_TURN_MAX_ROWS, STORE_REJECTION_REASON_MAX_BYTES,
+    ASR_TRANSCRIPT_MAX_BYTES, ATTACHMENT_FILE_NAME_MAX_BYTES, ATTACHMENT_MIME_MAX_BYTES,
+    DEDUP_SWEEP_BATCH, OUTBOX_TERMINAL_MAX_BYTES, OUTBOX_TERMINAL_MAX_ROWS,
+    STORE_INBOUND_BEGIN_MAX_KEY_BYTES, STORE_INBOUND_BEGIN_MAX_KEYS, STORE_INBOUND_ID_MAX_BYTES,
+    STORE_INBOUND_MAX_BYTES, STORE_INBOUND_MAX_ROWS, STORE_INBOUND_MESSAGE_TYPE_MAX_BYTES,
+    STORE_INBOUND_PAYLOAD_MAX_BYTES, STORE_INBOUND_RECEIVED_MAX_BYTES,
+    STORE_INBOUND_RECEIVED_MAX_ROWS, STORE_INBOUND_RESOURCE_KEY_MAX_BYTES,
+    STORE_INBOUND_RESOURCE_KEY_MAX_TOTAL_BYTES, STORE_INBOUND_RESOURCE_MAX_COUNT,
+    STORE_INBOUND_SCOPE_MAX_BYTES, STORE_INBOUND_TEXT_MAX_BYTES, STORE_OUTBOX_MAX_QUEUED_BYTES,
+    STORE_OUTBOX_MAX_ROWS, STORE_OUTBOX_PAYLOAD_MAX_BYTES, STORE_RECOVERY_TURN_MAX_BYTES,
+    STORE_RECOVERY_TURN_MAX_ROWS, STORE_REJECTION_REASON_MAX_BYTES,
 };
 use crate::runtime::intake::TenantNamespace;
 
@@ -943,6 +944,7 @@ fn encode_event(event: &InboundEvent) -> Result<Vec<u8>, StoreError> {
     Ok(payload)
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_event(event: &InboundEvent) -> Result<(), StoreError> {
     validate_incoming_key(event)?;
     validate_id(&event.chat_id, "validating an inbound chat ID")?;
@@ -1131,6 +1133,15 @@ fn validate_media_part(media: &MediaPart) -> Result<(), StoreError> {
             });
         }
     }
+    if let Some(transcript) = media.metadata.transcript.as_deref() {
+        if crate::lark::normalize::normalize_transcript(transcript, ASR_TRANSCRIPT_MAX_BYTES)
+            .is_none()
+        {
+            return Err(StoreError::CorruptData {
+                context: "validating inbound media transcript metadata",
+            });
+        }
+    }
     Ok(())
 }
 
@@ -1154,6 +1165,7 @@ fn metadata_variable_bytes(metadata: &MediaMetadata) -> usize {
         .as_deref()
         .map_or(0, str::len)
         .saturating_add(metadata.mime_type.as_deref().map_or(0, str::len))
+        .saturating_add(metadata.transcript.as_deref().map_or(0, str::len))
 }
 
 fn part_variable_bytes(part: &MessagePart) -> usize {
