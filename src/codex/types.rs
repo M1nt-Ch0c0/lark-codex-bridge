@@ -66,6 +66,13 @@ impl ClientInfo {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InitializeCapabilities {
+    /// Enables app-server experimental APIs for this connection.
+    ///
+    /// Codex 0.146 and 0.147 require this capability to accept
+    /// `thread/start.dynamicTools` and emit `item/tool/call` requests. It is
+    /// optional so the default handshake remains on the stable API surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub experimental_api: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_server_openai_form_elicitation: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -154,6 +161,8 @@ pub struct ThreadStartParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub developer_instructions: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_tools: Option<Vec<DynamicToolSpec>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_name: Option<String>,
@@ -169,6 +178,98 @@ pub struct ThreadStartParams {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_provider: Option<String>,
+}
+
+/// A client-provided function which Codex may call during a turn.
+///
+/// `input_schema` is the JSON Schema for the function arguments. Codex 0.146
+/// and 0.147 expose this type through the experimental
+/// `thread/start.dynamicTools` field and invoke it through the experimental
+/// `item/tool/call` reverse-request method.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DynamicToolFunctionSpec {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub defer_loading: bool,
+}
+
+/// A named group of dynamic functions exposed as one namespace.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DynamicToolNamespaceSpec {
+    pub name: String,
+    pub description: String,
+    pub tools: Vec<DynamicToolNamespaceTool>,
+}
+
+/// A tool nested inside a [`DynamicToolNamespaceSpec`].
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "type")]
+pub enum DynamicToolNamespaceTool {
+    #[serde(rename = "function")]
+    Function(DynamicToolFunctionSpec),
+}
+
+/// A top-level dynamic function or namespace registered when a thread starts.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "type")]
+pub enum DynamicToolSpec {
+    #[serde(rename = "function")]
+    Function(DynamicToolFunctionSpec),
+    #[serde(rename = "namespace")]
+    Namespace(DynamicToolNamespaceSpec),
+}
+
+/// Parameters sent by Codex in an `item/tool/call` reverse request.
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DynamicToolCallParams {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub call_id: String,
+    /// `None` is serialized as JSON `null`; the field remains required on wire.
+    #[serde(deserialize_with = "deserialize_nullable_dynamic_tool_namespace")]
+    pub namespace: Option<String>,
+    pub tool: String,
+    pub arguments: Value,
+}
+
+/// One content item returned from an `item/tool/call` reverse request.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type")]
+pub enum DynamicToolCallOutputContentItem {
+    #[serde(rename = "inputText")]
+    InputText { text: String },
+    #[serde(rename = "inputImage")]
+    InputImage {
+        #[serde(rename = "imageUrl")]
+        image_url: String,
+    },
+    #[serde(rename = "inputAudio")]
+    InputAudio {
+        #[serde(rename = "audioUrl")]
+        audio_url: String,
+    },
+}
+
+/// Result returned to Codex for an `item/tool/call` reverse request.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DynamicToolCallResponse {
+    pub content_items: Vec<DynamicToolCallOutputContentItem>,
+    pub success: bool,
+}
+
+fn deserialize_nullable_dynamic_tool_namespace<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)
 }
 
 #[derive(Clone, Deserialize, PartialEq, Serialize)]

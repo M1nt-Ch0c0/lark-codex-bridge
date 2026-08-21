@@ -14,3 +14,4 @@
 # Local-only development material (not for publication)
 docs/DEVELOPMENT_HANDOFF.md
 docs/local/
+/.ci-tools/

@@ -1,5 +1,8 @@
 # lark-codex-bridge
 
+[![CI](https://github.com/M1nt-Ch0c0/lark-codex-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/M1nt-Ch0c0/lark-codex-bridge/actions/workflows/ci.yml)
+[![Codecov](https://codecov.io/gh/M1nt-Ch0c0/lark-codex-bridge/branch/main/graph/badge.svg)](https://codecov.io/gh/M1nt-Ch0c0/lark-codex-bridge)
+
 一个面向飞书 / Lark 的 Codex 本地桥接器。项目使用 Rust 重写，直接连接
 `codex app-server`，专注于低资源占用、可靠会话、稳定流式回复和可恢复运行。
 
@@ -12,7 +15,7 @@
   长驻 supervisor、thread 复用、`codex probe` 和门控的真实 Codex smoke；
 - Rust 原生飞书/Lark 凭证登记、OpenAPI、WebSocket transport、事件归一化、
   `lark probe` 和门控的真实 Lark smoke；
-- SQLite WAL 单写者 store、持久 inbox/outbox、去重、owner gate、安全工作区策略、
+- SQLite WAL 单写者 store、持久 inbox/outbox、去重、owner/指定 sender/指定群组 allowlist 授权、安全工作区策略、
   scope actor、同 scope 串行 turn 和不同 scope 的有界并发；
 - 延迟进度卡、独立最终回复、重试/receipt/uncertain delivery，以及终态先持久化再收口；
 - 图片 `localImage` 和普通文件结构化路径输入、内容寻址缓存、turn lease、GC 与启动校验；
@@ -21,61 +24,45 @@
 尚未接线的是 slash command handler、Codex 审批卡、服务管理和完整故障注入/恢复。
 `/stop`、`/status` 按当前最小试用范围明确暂缓；`/new`、`/cd`、`/help` 目前也只有
 解析与 help 元数据，还未进入运行时。启动时会预装有界的 `Received` 行，但尚无周期性
-重扫。当前还有一个 P1 首次启动缺口：扫码注册只保存应用凭证，尚未像参考实现一样自动
-携带创建者身份、生成安全默认工作区和运行配置并直接启动；现阶段仍需手工创建 TOML。
-具体边界和验收标准见 [GitHub Issue #2](https://github.com/M1nt-Ch0c0/lark-codex-bridge/issues/2)。
+重扫。首次启动 onboarding 已恢复参考实现的一命令体验：扫码注册后自动携带创建者身份、
+生成安全默认工作区和运行配置并直接启动，见
+[GitHub Issue #2](https://github.com/M1nt-Ch0c0/lark-codex-bridge/issues/2)。
 真实 Lark smoke 是显式门控验收项；未运行或只看到 skip 都不算通过。
 
 ## 最小试用
 
-前提：本机已安装并登录受支持的 `codex-cli 0.146.x`，飞书/Lark 应用机器人已创建并
-加入目标会话，并准备好 owner 的 `open_id` 与一个允许 Codex 操作的安全工作区。
+前提：本机已安装并登录受支持的 `codex-cli 0.146.0` 或更高版本，飞书/Lark 应用机器人已创建并
+加入目标会话。首次运行不再需要手写 TOML、手动查询 `open_id` 或预先创建工作区。
 
-先登记凭证：
+直接启动常驻桥接器，按提示完成扫码授权即可：
 
 ```bash
-cargo run --locked -- lark auth register
-# 或已有应用；secret 建议只放环境变量，避免进入 shell history
-LARK_APP_SECRET=… cargo run --locked -- lark auth register --app-id cli_… --tenant feishu
+cargo run --locked -- run
 ```
 
-创建配置文件，例如 `config.toml`。相对的数据库和缓存路径以配置文件所在目录为基准：
+首次运行会自动完成以下步骤，然后直接进入前台桥接器：
 
-```toml
-owners = ["ou_owner_open_id"]
-default_workspace = "/absolute/path/to/workspace"
+1. 通过二维码/设备流登记一个 `PersonalAgent` 应用（或复用已存的凭证）；
+2. 把授权者（应用创建者）的 `open_id` 作为 owner 写入访问控制；
+3. 在平台数据目录下创建受管工作区，并派生本地数据库与附件缓存路径；
+4. 以私有权限、原子替换的方式写入凭证、owner 提示和 `config.toml`。
 
-[workspace]
-allow_roots = ["/absolute/path/to/workspace"]
-network_access = false
+生成的工作区位于 `~/.local/share/lark-codex-bridge/workspace`（Windows 为
+`%LOCALAPPDATA%\lark-codex-bridge\workspace`），配置文件位于平台配置目录
+（Linux/macOS 为 `~/.config/lark-codex-bridge/config.toml`，Windows 为
+`%APPDATA%\lark-codex-bridge\config.toml`）。已有配置文件或显式 `--config` 绝不会被
+静默覆盖；重复运行与并发首次运行均幂等。
 
-[codex]
-binary = "codex"
-sandbox = "workspace-write"
-approval_policy = "never"
+私聊可直接发消息；群聊和话题需要直接 @机器人。按 `Ctrl-C` 结束。当前真实飞书的
+“发消息 → Codex 回答 → 飞书收到回复”验收由操作者手动执行。
 
-[paths]
-database = "state/bridge.sqlite3"
-attachment_cache = "state/attachments"
-```
-
-配置会拒绝相对工作区、文件系统根、HOME 根、系统目录、临时目录以及 allow root 外的
-路径。首次试用前建议分别检查两侧连接：
+已登记应用与诊断场景保持不变；如需分别检查两侧连接：
 
 ```bash
 cargo run --locked -- codex probe
 cargo run --locked -- lark auth check
 cargo run --locked -- lark probe
 ```
-
-启动常驻桥接器：
-
-```bash
-cargo run --locked -- run --config /absolute/path/to/config.toml
-```
-
-私聊可直接发消息；群聊和话题需要直接 @机器人。按 `Ctrl-C` 结束。当前真实飞书的
-“发消息 → Codex 回答 → 飞书收到回复”验收由操作者手动执行。
 
 ## Codex 环境检查
 
@@ -92,6 +79,24 @@ platform family/OS 和 epoch；不包含 Codex home、账户身份、token 或�
 ```bash
 CODEX_E2E=1 cargo test --test codex_smoke --locked -- --ignored --nocapture
 ```
+
+## 授权角色（owner / sender / group）
+
+除 owner 外，`config.toml` 还支持两类低权限授权（均为可选、默认拒绝）：
+
+```toml
+owners = ["ou_owner_open_id"]
+allowed_senders = ["ou_member_open_id"]   # 按用户身份授权的普通调用者
+allowed_groups = ["oc_chat_id"]           # 仅该群内普通人类成员可发起普通 turn
+```
+
+语义要点：
+
+- 群/话题中的普通 turn 仍要求真实直接 @机器人，`@all` 不算数；私聊不受影响。
+- 群白名单只授予普通消息；owner-only 控制命令仅 owner 可执行。
+- 非人类 sender（应用、机器人等）一律拒绝，任何 allowlist 都不例外。
+- 列表有数量与字节上限（各 256 条 / 32 KiB），重复条目幂等去重，畸形 ID 拒绝加载。
+- 不匹配的通配符、群名称匹配、成员自动同步均不支持；移除条目即撤销授权。
 
 ## 飞书 / Lark 接入与检查
 
@@ -121,6 +126,28 @@ LARK_E2E=1 LARK_E2E_APP_ID=… LARK_E2E_APP_SECRET=… LARK_E2E_TENANT=feishu LA
 
 仓库只跟踪稳定的产品说明；缺陷和遗留项通过 GitHub Issue 与对应 PR 跟踪。实施计划、
 实时进度、Agent 接管记录和临时测试证据属于本地开发材料，不发布到 Git。
+
+## CI 与质量保障
+
+PR 与 main 推送触发 [ci.yml](.github/workflows/ci.yml)，检查并行执行，每周一凌晨自动
+全量重跑以刷新漏洞库数据：
+
+- 格式与静态检查：`cargo fmt --check`、Clippy（`-D warnings`，含 pedantic）、
+  rustdoc（`-D warnings`，含私有项链接检查）、typos 拼写检查、actionlint 工作流自检；
+- 构建与测试：nextest 全目标测试（失败自动重试一次、慢测试超时告警、JUnit 报告）+
+  doctest；Linux / macOS / Windows 三平台；release 构建；MSRV（Rust 1.85）`--locked` 检查；
+- 依赖健康：cargo-audit 漏洞库（`--deny warnings`）、cargo-deny（漏洞 / 许可证 /
+  重复版本 / 通配符）、cargo-machete 未用依赖、Dependency Review（PR 依赖对比，
+  高危阻断）、Dependabot 每周自动提依赖更新 PR；
+- 覆盖率：`cargo llvm-cov` 生成 LCOV 并上传 [Codecov](https://codecov.io/gh/M1nt-Ch0c0/lark-codex-bridge)。
+  公开仓库无需 token；若仓库转私有，需配置 `CODECOV_TOKEN` secret。
+
+AI Review 使用 [CodeRabbit](https://www.coderabbit.ai/)（公开开源仓库免费，中文评论、
+PR 摘要与逐行审查），配置见 [.coderabbit.yaml](.coderabbit.yaml)。接入步骤：用 GitHub
+账号登录 [app.coderabbit.ai](https://app.coderabbit.ai/) 并选择本仓库完成 GitHub App
+安装（或直接在仓库 Settings → GitHub Apps 搜索安装 CodeRabbit），选择 Free 计划；
+之后每个 PR 会自动触发审查。觉得反馈太多时，把配置里的 `profile` 从 `assertive`
+改为 `chill` 或 `quiet`。
 
 ## 目标
 

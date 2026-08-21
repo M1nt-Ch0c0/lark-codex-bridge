@@ -13,7 +13,9 @@ use crate::codex::process::CodexProcessConfig;
 use crate::codex::types::{ApprovalPolicy, SandboxMode};
 use crate::limits::{
     DEFAULT_ACTIVE_TURN_PERMITS, DEFAULT_MAX_SCOPE_ACTORS, MAX_CONFIG_ALLOW_ROOT_BYTES,
-    MAX_CONFIG_ALLOW_ROOTS, MAX_CONFIG_OWNER_BYTES, MAX_CONFIG_OWNERS,
+    MAX_CONFIG_ALLOW_ROOTS, MAX_CONFIG_ALLOWED_GROUP_BYTES, MAX_CONFIG_ALLOWED_GROUPS,
+    MAX_CONFIG_ALLOWED_SENDER_BYTES, MAX_CONFIG_ALLOWED_SENDERS, MAX_CONFIG_OWNER_BYTES,
+    MAX_CONFIG_OWNERS,
 };
 use crate::runtime::policy::{AccessPolicy, PlatformRoots};
 
@@ -35,6 +37,18 @@ pub enum ConfigError {
     TooManyOwners,
     #[error("bridge configuration owner IDs exceed the byte limit")]
     OwnersTooLarge,
+    #[error("bridge configuration contains an invalid allowed sender open ID")]
+    InvalidSender,
+    #[error("bridge configuration has too many allowed sender open IDs")]
+    TooManySenders,
+    #[error("bridge configuration sender IDs exceed the byte limit")]
+    SendersTooLarge,
+    #[error("bridge configuration contains an invalid allowed group chat ID")]
+    InvalidGroup,
+    #[error("bridge configuration has too many allowed group chat IDs")]
+    TooManyGroups,
+    #[error("bridge configuration group chat IDs exceed the byte limit")]
+    GroupsTooLarge,
     #[error("bridge configuration has too many workspace allow roots")]
     TooManyAllowRoots,
     #[error("bridge configuration workspace allow roots exceed the byte limit")]
@@ -59,6 +73,12 @@ impl fmt::Debug for ConfigError {
             Self::InvalidOwner => "InvalidOwner",
             Self::TooManyOwners => "TooManyOwners",
             Self::OwnersTooLarge => "OwnersTooLarge",
+            Self::InvalidSender => "InvalidSender",
+            Self::TooManySenders => "TooManySenders",
+            Self::SendersTooLarge => "SendersTooLarge",
+            Self::InvalidGroup => "InvalidGroup",
+            Self::TooManyGroups => "TooManyGroups",
+            Self::GroupsTooLarge => "GroupsTooLarge",
             Self::TooManyAllowRoots => "TooManyAllowRoots",
             Self::AllowRootsTooLarge => "AllowRootsTooLarge",
             Self::InvalidAllowRoot => "InvalidAllowRoot",
@@ -75,6 +95,8 @@ impl fmt::Debug for ConfigError {
 #[serde(default, deny_unknown_fields)]
 pub struct BridgeConfig {
     pub owners: Vec<String>,
+    pub allowed_senders: Vec<String>,
+    pub allowed_groups: Vec<String>,
     pub default_workspace: Option<PathBuf>,
     pub workspace: WorkspacePolicy,
     pub concurrency: ConcurrencyConfig,
@@ -87,6 +109,8 @@ impl fmt::Debug for BridgeConfig {
         formatter
             .debug_struct("BridgeConfig")
             .field("owner_count", &self.owners.len())
+            .field("allowed_sender_count", &self.allowed_senders.len())
+            .field("allowed_group_count", &self.allowed_groups.len())
             .field(
                 "default_workspace_configured",
                 &self.default_workspace.is_some(),
@@ -148,24 +172,33 @@ impl BridgeConfig {
     }
 
     pub(crate) fn validate_static(&mut self) -> Result<(), ConfigError> {
-        if self.owners.len() > MAX_CONFIG_OWNERS {
-            return Err(ConfigError::TooManyOwners);
-        }
-        if self.owners.iter().map(String::len).sum::<usize>() > MAX_CONFIG_OWNER_BYTES {
-            return Err(ConfigError::OwnersTooLarge);
-        }
-        if self.owners.iter().any(|owner| {
-            owner.is_empty()
-                || owner.trim() != owner
-                || owner.bytes().any(|byte| byte.is_ascii_whitespace())
-        }) {
-            return Err(ConfigError::InvalidOwner);
-        }
-        let mut known = HashSet::new();
-        self.owners.retain(|owner| known.insert(owner.clone()));
+        normalize_id_collection(
+            &mut self.owners,
+            MAX_CONFIG_OWNERS,
+            MAX_CONFIG_OWNER_BYTES,
+            ConfigError::TooManyOwners,
+            ConfigError::OwnersTooLarge,
+            ConfigError::InvalidOwner,
+        )?;
         if self.owners.is_empty() {
             return Err(ConfigError::EmptyOwners);
         }
+        normalize_id_collection(
+            &mut self.allowed_senders,
+            MAX_CONFIG_ALLOWED_SENDERS,
+            MAX_CONFIG_ALLOWED_SENDER_BYTES,
+            ConfigError::TooManySenders,
+            ConfigError::SendersTooLarge,
+            ConfigError::InvalidSender,
+        )?;
+        normalize_id_collection(
+            &mut self.allowed_groups,
+            MAX_CONFIG_ALLOWED_GROUPS,
+            MAX_CONFIG_ALLOWED_GROUP_BYTES,
+            ConfigError::TooManyGroups,
+            ConfigError::GroupsTooLarge,
+            ConfigError::InvalidGroup,
+        )?;
         if self.workspace.allow_roots.len() > MAX_CONFIG_ALLOW_ROOTS {
             return Err(ConfigError::TooManyAllowRoots);
         }
@@ -457,6 +490,32 @@ fn resolve_relative_path(parent: &Path, path: &Path) -> Result<PathBuf, ConfigEr
         return Err(ConfigError::InvalidRuntimePath);
     }
     Ok(lexical_normalize(&parent.join(path)))
+}
+
+/// Validates one identity/chat ID collection against its count and byte caps,
+/// rejects malformed IDs, and deduplicates idempotently in place.
+fn normalize_id_collection(
+    ids: &mut Vec<String>,
+    max_count: usize,
+    max_bytes: usize,
+    too_many: ConfigError,
+    too_large: ConfigError,
+    invalid: ConfigError,
+) -> Result<(), ConfigError> {
+    if ids.len() > max_count {
+        return Err(too_many);
+    }
+    if ids.iter().map(String::len).sum::<usize>() > max_bytes {
+        return Err(too_large);
+    }
+    if ids.iter().any(|id| {
+        id.is_empty() || id.trim() != id || id.bytes().any(|byte| byte.is_ascii_whitespace())
+    }) {
+        return Err(invalid);
+    }
+    let mut known = HashSet::new();
+    ids.retain(|id| known.insert(id.clone()));
+    Ok(())
 }
 
 #[cfg(all(test, windows))]

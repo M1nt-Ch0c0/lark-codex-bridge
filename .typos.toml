@@ -1,0 +1,4 @@
+# Spell-check config for the `typos` CI job (crate-ci/typos).
+# Add tolerated project terms here instead of fighting CI, e.g.:
+# [default.extend-words]
+# Feishu = "Feishu"

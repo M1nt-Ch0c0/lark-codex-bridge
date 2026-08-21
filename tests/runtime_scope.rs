@@ -15,7 +15,9 @@ use lark_codex_bridge::lark::api::{ChatMode, ResourceKind};
 use lark_codex_bridge::lark::bridge::QueuedInboundEvent;
 use lark_codex_bridge::lark::config::TenantBrand;
 use lark_codex_bridge::lark::credentials::LarkCredentials;
-use lark_codex_bridge::lark::normalize::{InboundEvent, ResourceDesc, ScopeKey};
+use lark_codex_bridge::lark::normalize::{
+    InboundEvent, MediaMetadata, MediaPart, MessagePart, PartStatus, ResourceDesc, ScopeKey,
+};
 use lark_codex_bridge::limits::{
     ROUTER_ACTIVE_TURN_HARD_LIMIT, ROUTER_COMMAND_BYTE_BUDGET, ROUTER_RETRY_CAPACITY,
     ROUTER_SCOPE_ACTOR_HARD_LIMIT, SCOPE_MAILBOX_CAPACITY,
@@ -23,6 +25,7 @@ use lark_codex_bridge::limits::{
 use lark_codex_bridge::runtime::attachments::{
     AttachError, AttachmentCache, AttachmentLimits, ResourceDownloader,
 };
+use lark_codex_bridge::runtime::context::ContextRegistry;
 use lark_codex_bridge::runtime::intake::TenantNamespace;
 use lark_codex_bridge::runtime::policy::AccessPolicy;
 use lark_codex_bridge::runtime::router::{RouteError, Router, RouterSettings};
@@ -289,6 +292,9 @@ fn event_in_chat(event_id: &str, sender_id: &str, chat_id: &str) -> InboundEvent
         text: "hello".to_owned(),
         mentions_bot: false,
         mention_all: false,
+        sender_is_human: true,
+        mentions: Vec::new(),
+        parts: Vec::new(),
         resources: Vec::new(),
         message_type: "text".to_owned(),
         create_time_ms: now_ms(),
@@ -567,7 +573,7 @@ async fn router_rejects_non_owner_with_one_atomic_durable_notice() {
     assert_eq!(store.outbox_depth().await.expect("outbox").pending, 1);
     assert_eq!(
         *sink.rejections.lock().expect("rejection lock"),
-        vec![InboundRejectionKind::Policy]
+        vec![InboundRejectionKind::NotOwner]
     );
     router.shutdown().await.expect("shutdown");
     store.shutdown().await.expect("store shutdown");
@@ -997,6 +1003,176 @@ async fn attachment_cache_inputs_are_leased_for_the_turn_and_released_at_complet
     .await
     .expect("leases released after completion");
 
+    router.shutdown().await.expect("shutdown");
+    drop(cache);
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn lazy_context_resolves_metadata_and_fetches_media_only_on_tool_call() {
+    let config = validated_config();
+    let workspace = config
+        .default_workspace
+        .clone()
+        .expect("validated default workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let credentials = credentials();
+    let namespace = TenantNamespace::from_credentials(&credentials);
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RecordingSink::default());
+    let temp = tempdir().expect("tempdir");
+    let cache_root = temp.path().join("lazy-context-attachments");
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &cache_root,
+            store.clone(),
+            Arc::new(StaticAttachmentDownloader),
+            AttachmentLimits::default(),
+        )
+        .expect("attachment cache"),
+    );
+    let contexts = Arc::new(ContextRegistry::default());
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start_with_contexts(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink,
+        Arc::clone(&cache),
+        contexts,
+    )
+    .await
+    .expect("router");
+
+    let mut inbound = event("event-lazy-context", "owner-runtime-scope");
+    inbound.parts = vec![
+        MessagePart::Text {
+            text: "hello".to_owned(),
+        },
+        MessagePart::Image(MediaPart {
+            key: Some("img_key".to_owned()),
+            thumbnail_key: None,
+            metadata: MediaMetadata::default(),
+            status: PartStatus::Available,
+        }),
+    ];
+    inbound.resources = vec![ResourceDesc {
+        kind: ResourceKind::Image,
+        key: "img_key".to_owned(),
+    }];
+    router
+        .route(queued_registered(&store, &namespace, inbound).await)
+        .await
+        .expect("route context event");
+
+    let start_thread = control.next_request().await;
+    assert_eq!(start_thread["method"], "thread/start");
+    assert_eq!(
+        start_thread["params"]["dynamicTools"]
+            .as_array()
+            .expect("dynamic tool declarations")
+            .len(),
+        2
+    );
+    control
+        .respond(
+            &start_thread,
+            thread_result("thread-lazy-context", &workspace),
+        )
+        .await;
+
+    let start_turn = control.next_request().await;
+    let inputs = start_turn["params"]["input"]
+        .as_array()
+        .expect("turn input array");
+    assert_eq!(inputs.len(), 2, "media must not be downloaded eagerly");
+    assert_eq!(inputs[0]["text"], "hello");
+    let reference = inputs[1]["text"].as_str().expect("context reference");
+    let payload = reference
+        .strip_prefix("<bridge_context>")
+        .and_then(|value| value.strip_suffix("</bridge_context>"))
+        .expect("compact context envelope");
+    let reference: Value = serde_json::from_str(payload).expect("context JSON");
+    let context_id = reference["id"].as_str().expect("opaque context id");
+    assert_eq!(reference["wake"], "message");
+    assert_eq!(reference["mentioned_self"], false);
+    assert!(!reference.to_string().contains("img_key"));
+
+    respond_turn_started(&control, &start_turn, "turn-lazy-context").await;
+    control
+        .send_json(json!({
+            "id": "server-context-resolve",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-lazy-context",
+                "turnId": "turn-lazy-context",
+                "callId": "call-context-resolve",
+                "namespace": "bridge_context",
+                "tool": "resolve",
+                "arguments": {"id": context_id}
+            }
+        }))
+        .await;
+    let context_response = control.next_request().await;
+    assert_eq!(context_response["id"], "server-context-resolve");
+    assert_eq!(context_response["result"]["success"], true);
+    let context_text = context_response["result"]["contentItems"][0]["text"]
+        .as_str()
+        .expect("context result text");
+    let context_value: Value = serde_json::from_str(context_text).expect("context result JSON");
+    assert_eq!(context_value["sender"]["openId"], "owner-runtime-scope");
+    assert!(!context_text.contains("img_key"));
+    let media_handle = context_value["parts"][1]["handle"]
+        .as_str()
+        .expect("opaque media handle");
+
+    control
+        .send_json(json!({
+            "id": "server-media-read",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-lazy-context",
+                "turnId": "turn-lazy-context",
+                "callId": "call-media-read",
+                "namespace": "bridge_media",
+                "tool": "read",
+                "arguments": {"context_id": context_id, "handle": media_handle}
+            }
+        }))
+        .await;
+    let media_response = control.next_request().await;
+    assert_eq!(media_response["id"], "server-media-read");
+    assert_eq!(media_response["result"]["success"], true);
+    let media_text = media_response["result"]["contentItems"][0]["text"]
+        .as_str()
+        .expect("media result text");
+    let media_value: Value = serde_json::from_str(media_text).expect("media result JSON");
+    let media_path = std::path::Path::new(
+        media_value["media"]["path"]
+            .as_str()
+            .expect("cached media path"),
+    );
+    assert!(media_path.is_file());
+    assert_eq!(media_value["media"]["bytes"], 16);
+
+    send_turn_completed(
+        &control,
+        "thread-lazy-context",
+        "turn-lazy-context",
+        "completed",
+    )
+    .await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-lazy-context"],
+        InboundEventState::Completed,
+    )
+    .await;
     router.shutdown().await.expect("shutdown");
     drop(cache);
     store.shutdown().await.expect("store shutdown");

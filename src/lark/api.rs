@@ -34,6 +34,7 @@ const MESSAGES_PATH: &str = "/open-apis/im/v1/messages";
 const IMAGES_PATH: &str = "/open-apis/im/v1/images";
 const FILES_PATH: &str = "/open-apis/im/v1/files";
 const BOT_INFO_PATH: &str = "/open-apis/bot/v3/info";
+const APPLICATION_PATH: &str = "/open-apis/application/v6/applications";
 
 /// Lark `code` range covering invalid or expired tenant/app access tokens.
 /// Unlike the wider permanent-auth range, these specifically mean the bearer
@@ -453,6 +454,49 @@ impl LarkApi {
         data.file_key
             .filter(|key| !key.is_empty())
             .ok_or_else(|| LarkError::protocol("file upload response missing file_key"))
+    }
+
+    /// Fetches the application creator (owner) `open_id` for the current app,
+    /// returning `None` when the app reports no creator identifier.
+    ///
+    /// The creator is the user who owns the application, never the bot
+    /// identity, and the `user_id_type=open_id` query scopes the returned
+    /// identifier to this app.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified error on token exchange, transport, or server
+    /// failure.
+    pub async fn app_creator_id(&self, app_id: &str) -> Result<Option<String>, LarkError> {
+        #[derive(Deserialize)]
+        struct AppInfoResponse {
+            code: i64,
+            data: Option<AppInfoData>,
+        }
+        #[derive(Deserialize)]
+        struct AppInfoData {
+            app: Option<AppInfoDto>,
+        }
+        #[derive(Deserialize)]
+        struct AppInfoDto {
+            creator_id: Option<String>,
+        }
+
+        check_path_segment(app_id)?;
+        let path = format!("{APPLICATION_PATH}/{app_id}?lang=zh_cn&user_id_type=open_id");
+        self.with_auth_retry(|token| {
+            let path = path.clone();
+            async move {
+                let response: AppInfoResponse = self.http.get_json(&path, Some(&token)).await?;
+                check_code(response.code, "fetching the application creator")?;
+                Ok(response
+                    .data
+                    .and_then(|data| data.app)
+                    .and_then(|app| app.creator_id)
+                    .filter(|id| !id.is_empty()))
+            }
+        })
+        .await
     }
 
     /// Fetches the sanitized bot identity.

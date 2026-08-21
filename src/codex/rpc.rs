@@ -26,7 +26,7 @@ use crate::{
         transport::{
             TransportEvent, TransportExit, TransportHandle, TransportSendError, TransportSender,
         },
-        types::{ClientInfo, InitializeParams, InitializeResult},
+        types::{ClientInfo, InitializeCapabilities, InitializeParams, InitializeResult},
     },
     limits::{
         CONTROL_RPC_TIMEOUT, EVENT_CAPACITY, HIGH_PRIORITY_BURST, INITIALIZE_TIMEOUT,
@@ -1694,6 +1694,28 @@ fn request_id_kind(id: &RequestId) -> &'static str {
 /// Returns [`RpcError::AlreadyInitialized`] after any prior attempt on the same
 /// epoch, or another safe RPC failure if the handshake cannot complete.
 pub async fn initialize_connection(handle: &RpcHandle) -> Result<InitializeResult, RpcError> {
+    initialize_connection_with_capabilities(handle, false).await
+}
+
+/// Performs the initialize handshake while opting into app-server dynamic
+/// tools for the long-running bridge runtime.
+///
+/// The opt-in is kept separate from [`initialize_connection`] so probes and
+/// protocol tests can continue exercising the stable handshake.
+///
+/// # Errors
+///
+/// Returns the same failures as [`initialize_connection`].
+pub async fn initialize_connection_with_dynamic_tools(
+    handle: &RpcHandle,
+) -> Result<InitializeResult, RpcError> {
+    initialize_connection_with_capabilities(handle, true).await
+}
+
+async fn initialize_connection_with_capabilities(
+    handle: &RpcHandle,
+    dynamic_tools: bool,
+) -> Result<InitializeResult, RpcError> {
     handle
         .initialize_state
         .compare_exchange(INIT_NEW, INIT_RUNNING, Ordering::AcqRel, Ordering::Acquire)
@@ -1701,7 +1723,13 @@ pub async fn initialize_connection(handle: &RpcHandle) -> Result<InitializeResul
 
     let mut client_info = ClientInfo::new("lark_codex_bridge", env!("CARGO_PKG_VERSION"));
     client_info.title = Some("Lark Codex Bridge".to_owned());
-    let params = InitializeParams::new(client_info);
+    let mut params = InitializeParams::new(client_info);
+    if dynamic_tools {
+        params.capabilities = Some(InitializeCapabilities {
+            experimental_api: Some(true),
+            ..InitializeCapabilities::default()
+        });
+    }
     let result = handle
         .request_high::<_, InitializeResult>("initialize", &params, INITIALIZE_TIMEOUT)
         .await;

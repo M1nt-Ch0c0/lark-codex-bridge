@@ -1,0 +1,43 @@
+# cargo-deny 2.x configuration (run by the `deny` CI job via `cargo deny check`).
+# Tune locally with: cargo deny check
+# https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+# Vulnerability advisories always fail in cargo-deny 2.x. These scopes tune
+# which crates the softer advisory classes are enforced for.
+unmaintained = "workspace"
+unsound = "workspace"
+yanked = "warn"
+ignore = []
+
+[bans]
+# Duplicate crate versions are a supply-chain smell but not a hard gate yet;
+# bump to "deny" once the tree is deduplicated.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[licenses]
+# This project is MIT; its dependency tree is expected to stay permissive.
+# cargo-deny 2.x: anything not explicitly allowed is denied.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "BSL-1.0",
+    "CC0-1.0",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.8
+exceptions = [
+    # Root CA certificate data pulled in by rustls-platform-verifier (reqwest);
+    # data-only crate under the Community Data License. Keep it scoped to this
+    # single crate rather than allowing CDLA globally.
+    { crate = "webpki-root-certs", allow = ["CDLA-Permissive-2.0"] },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

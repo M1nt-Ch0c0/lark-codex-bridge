@@ -5,7 +5,9 @@ use std::task::{Context, Poll, Waker};
 use lark_codex_bridge::lark::api::ChatMode;
 use lark_codex_bridge::lark::config::TenantBrand;
 use lark_codex_bridge::lark::credentials::LarkCredentials;
-use lark_codex_bridge::lark::normalize::{InboundEvent, ScopeKey};
+use lark_codex_bridge::lark::normalize::{
+    InboundEvent, MediaMetadata, MediaPart, MentionIdentity, MessagePart, PartStatus, ScopeKey,
+};
 use lark_codex_bridge::limits::{
     OUTBOX_TERMINAL_MAX_ROWS, STORE_OUTBOX_CLAIM_MAX_BYTES, STORE_OUTBOX_MAX_QUEUED_BYTES,
     STORE_OUTBOX_PAYLOAD_MAX_BYTES, STORE_RECOVERY_TURN_MAX_BYTES, STORE_RECOVERY_TURN_MAX_ROWS,
@@ -35,6 +37,9 @@ fn event(event_id: &str, message_id: &str) -> InboundEvent {
         text: "not persisted".to_owned(),
         mentions_bot: true,
         mention_all: false,
+        sender_is_human: true,
+        mentions: Vec::new(),
+        parts: Vec::new(),
         resources: Vec::new(),
         message_type: "text".to_owned(),
         create_time_ms: 1,
@@ -230,7 +235,7 @@ async fn migration_two_persists_strict_inbound_payload_columns() {
     let temp = tempdir().expect("tempdir");
     let path = temp.path().join("store.sqlite");
     let store = StoreHandle::open(&path).await.expect("open");
-    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 4);
+    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 5);
     store.shutdown().await.expect("shutdown");
 
     let connection = rusqlite::Connection::open(&path).expect("inspect");
@@ -345,6 +350,100 @@ async fn registration_replays_canonical_payload_and_atomic_turn_resolution() {
 }
 
 #[tokio::test]
+async fn extended_inbound_payload_v1_round_trips_mentions_parts_and_metadata() {
+    let store = StoreHandle::open_in_memory().await.expect("open");
+    let tenant = tenant_namespace("cli_store_rich_v2");
+    let mut rich = event("event-rich", "message-rich");
+    rich.message_type = "audio".to_owned();
+    rich.text.clear();
+    rich.mentions = vec![MentionIdentity {
+        key: Some("@_user_1".to_owned()),
+        open_id: Some("ou_mentioned".to_owned()),
+        user_id: Some("user_mentioned".to_owned()),
+        union_id: Some("on_mentioned".to_owned()),
+        name: Some("Mentioned User".to_owned()),
+    }];
+    rich.parts = vec![MessagePart::Audio(MediaPart {
+        key: Some("file_audio".to_owned()),
+        thumbnail_key: None,
+        metadata: MediaMetadata {
+            file_name: Some("voice.opus".to_owned()),
+            mime_type: Some("audio/opus".to_owned()),
+            size_bytes: Some(123),
+            duration_ms: Some(456),
+        },
+        status: PartStatus::Available,
+    })];
+    store
+        .register_inbound(&tenant, &rich)
+        .await
+        .expect("register rich event");
+    let replay = store
+        .register_inbound(&tenant, &rich)
+        .await
+        .expect("replay rich event");
+    let DedupOutcome::ReplayReceived(retained) = replay else {
+        panic!("expected retained rich event");
+    };
+    assert_eq!(retained.event().mentions, rich.mentions);
+    assert_eq!(retained.event().parts, rich.parts);
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn payload_v1_is_read_and_upgraded_to_typed_parts() {
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("payload-v1.sqlite");
+    let tenant = tenant_namespace("cli_store_payload_v1");
+    let store = StoreHandle::open(&path).await.expect("open");
+    let legacy = event("event-v1", "message-v1");
+    store
+        .register_inbound(&tenant, &legacy)
+        .await
+        .expect("seed row");
+    store.shutdown().await.expect("shutdown seed");
+
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "event_id":"event-v1",
+        "message_id":"message-v1",
+        "chat_id":"oc_test",
+        "sender_id":"ou_test",
+        "chat_type":"group",
+        "thread_id":null,
+        "root_id":null,
+        "reply_to_message_id":null,
+        "text":"not persisted",
+        "mentions_bot":true,
+        "mention_all":false,
+        "resources":[],
+        "message_type":"text",
+        "create_time_ms":1,
+        "scope":{"kind":"chat","chat_id":"oc_test","thread_id":null}
+    }))
+    .expect("encode v1");
+    let connection = rusqlite::Connection::open(&path).expect("open raw");
+    connection
+        .execute(
+            "UPDATE inbound_events
+             SET payload_version = 1, payload_blob = ?1, payload_bytes = ?2
+             WHERE event_id = 'event-v1'",
+            rusqlite::params![payload, i64::try_from(payload.len()).expect("length")],
+        )
+        .expect("replace with v1 payload");
+    drop(connection);
+
+    let store = StoreHandle::open(&path).await.expect("reopen");
+    let recovered = store.recover_received(&tenant).await.expect("recover v1");
+    assert_eq!(recovered.len(), 1);
+    assert!(recovered[0].event().mentions.is_empty());
+    assert!(matches!(
+        recovered[0].event().parts.as_slice(),
+        [MessagePart::Text { text }] if text == "not persisted"
+    ));
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
 async fn file_store_applies_pragmas_and_persists_every_typed_table() {
     let temp = tempdir().expect("tempdir");
     let path = temp.path().join("store.sqlite");
@@ -356,7 +455,7 @@ async fn file_store_applies_pragmas_and_persists_every_typed_table() {
     assert!(pragmas.foreign_keys);
     assert_eq!(pragmas.busy_timeout_ms, 5_000);
     assert_eq!(pragmas.synchronous, 1);
-    assert_eq!(pragmas.user_version, 4);
+    assert_eq!(pragmas.user_version, 5);
     store
         .upsert_scope(&scope, temp.path(), "fp")
         .await
@@ -392,7 +491,7 @@ async fn file_store_applies_pragmas_and_persists_every_typed_table() {
     store.shutdown().await.expect("shutdown");
 
     let store = StoreHandle::open(&path).await.expect("reopen");
-    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 4);
+    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 5);
     assert!(store.scope_row(&scope).await.expect("scope").is_some());
     assert_eq!(
         store
@@ -437,7 +536,7 @@ async fn rejects_future_schema_versions_without_mutating_the_database() {
     {
         let connection = rusqlite::Connection::open(&path).expect("seed");
         connection
-            .pragma_update(None, "user_version", 5_u32)
+            .pragma_update(None, "user_version", 6_u32)
             .expect("version");
     }
     assert!(matches!(
@@ -448,7 +547,7 @@ async fn rejects_future_schema_versions_without_mutating_the_database() {
     let version: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .expect("version");
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
 }
 
 #[tokio::test]
@@ -1095,6 +1194,7 @@ fn durable_session_rows_redact_scope_and_workspace_values_from_debug() {
         status: ThreadStatus::Active,
         created_ms: 2,
         archived_ms: None,
+        context_tools_version: 0,
     };
     let turn = TurnRow {
         id: 3,

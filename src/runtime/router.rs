@@ -11,6 +11,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval};
 
+use crate::codex::client::ControlEvent;
 use crate::codex::supervisor::{SupervisorError, SupervisorHandle, SupervisorState};
 use crate::codex::types::{ApprovalPolicy, SandboxMode};
 use crate::config::BridgeConfig;
@@ -21,12 +22,14 @@ use crate::limits::{
     ROUTER_RETRY_CAPACITY, ROUTER_SCOPE_ACTOR_HARD_LIMIT, STORE_INBOUND_SCOPE_MAX_BYTES,
 };
 use crate::runtime::attachments::AttachmentCache;
+use crate::runtime::context::ContextRegistry;
 use crate::runtime::intake::TenantNamespace;
-use crate::runtime::policy::{AccessDecision, AccessPolicy};
+use crate::runtime::policy::AccessPolicy;
 use crate::runtime::scope::{
     ActorRouteError, DurableReplySink, InterruptOutcome, ReplySinkError, ScopeActorHandle,
     ScopeSnapshot, SupervisorAccess,
 };
+use crate::runtime::tools::handle_server_request;
 use crate::store::{InboundKey, InboundRejectionKind, StoreError, StoreHandle};
 
 /// Redacted, validated inputs used by the scope runtime.
@@ -221,7 +224,10 @@ impl Router {
         supervisor: SupervisorHandle,
         sink: Arc<dyn DurableReplySink>,
     ) -> Result<RouterHandle, RouteError> {
-        Self::start_inner(store, tenant, policy, settings, supervisor, sink, None).await
+        Self::start_inner(
+            store, tenant, policy, settings, supervisor, sink, None, None,
+        )
+        .await
     }
 
     /// Starts the production router with attachment download/cache support.
@@ -248,6 +254,36 @@ impl Router {
             supervisor,
             sink,
             Some(attachments),
+            None,
+        )
+        .await
+    }
+
+    /// Starts the production router with lazy, turn-scoped bridge context and
+    /// on-demand attachment retrieval.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same static classifications as [`Self::start`].
+    pub async fn start_with_contexts(
+        store: StoreHandle,
+        tenant: TenantNamespace,
+        policy: AccessPolicy,
+        settings: RouterSettings,
+        supervisor: SupervisorHandle,
+        sink: Arc<dyn DurableReplySink>,
+        attachments: Arc<AttachmentCache>,
+        contexts: Arc<ContextRegistry>,
+    ) -> Result<RouterHandle, RouteError> {
+        Self::start_inner(
+            store,
+            tenant,
+            policy,
+            settings,
+            supervisor,
+            sink,
+            Some(attachments),
+            Some(contexts),
         )
         .await
     }
@@ -260,6 +296,7 @@ impl Router {
         supervisor: SupervisorHandle,
         sink: Arc<dyn DurableReplySink>,
         attachments: Option<Arc<AttachmentCache>>,
+        contexts: Option<Arc<ContextRegistry>>,
     ) -> Result<RouterHandle, RouteError> {
         if let Err(error) = settings.validate() {
             supervisor.shutdown().await?;
@@ -282,6 +319,7 @@ impl Router {
             supervisor,
             sink,
             attachments,
+            contexts,
             task_snapshot,
         ));
         Ok(RouterHandle {
@@ -509,6 +547,7 @@ async fn run_router(
     mut supervisor: SupervisorHandle,
     sink: Arc<dyn DurableReplySink>,
     attachments: Option<Arc<AttachmentCache>>,
+    contexts: Option<Arc<ContextRegistry>>,
     snapshot: Arc<RwLock<RouterSnapshot>>,
 ) -> Result<(), RouteError> {
     let (supervisor_tx, supervisor_rx) = watch::channel(supervisor_access(&supervisor));
@@ -518,6 +557,7 @@ async fn run_router(
     let mut retry_tick = interval(Duration::from_millis(250));
     retry_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut supervisor_open = true;
+    let mut tool_task = start_context_tool_task(&supervisor, &attachments, &contexts);
     loop {
         tokio::select! {
             biased;
@@ -540,7 +580,17 @@ async fn run_router(
             state = supervisor.changed(), if supervisor_open => {
                 if state.is_ok() {
                     supervisor_tx.send_replace(supervisor_access(&supervisor));
+                    let current_epoch = supervisor.client().ok().map(|client| client.epoch());
+                    if tool_task.as_ref().map(|(epoch, _)| *epoch) != current_epoch {
+                        if let Some((_, task)) = tool_task.take() {
+                            task.abort();
+                        }
+                        tool_task = start_context_tool_task(&supervisor, &attachments, &contexts);
+                    }
                 } else {
+                    if let Some((_, task)) = tool_task.take() {
+                        task.abort();
+                    }
                     supervisor_open = false;
                     supervisor_tx.send_replace(SupervisorAccess { epoch: 0, client: None });
                 }
@@ -556,6 +606,7 @@ async fn run_router(
                     Arc::clone(&active_turns),
                     Arc::clone(&sink),
                     attachments.as_ref(),
+                    contexts.as_ref(),
                     &mut actors,
                 ).await;
                 update_runtime_snapshot(
@@ -575,6 +626,7 @@ async fn run_router(
                             Arc::clone(&active_turns),
                             Arc::clone(&sink),
                             attachments.as_ref(),
+                            contexts.as_ref(),
                             &mut actors,
                             *event,
                         ).await {
@@ -599,6 +651,9 @@ async fn run_router(
                     }
                     RouterCommand::Shutdown { respond } => {
                         shutdown_actors(actors).await;
+                        if let Some((_, task)) = tool_task.take() {
+                            task.abort();
+                        }
                         supervisor.shutdown().await?;
                         reconcile_terminal_attachments(attachments.as_deref()).await?;
                         let _ = respond.send(());
@@ -609,9 +664,44 @@ async fn run_router(
         }
     }
     shutdown_actors(actors).await;
+    if let Some((_, task)) = tool_task.take() {
+        task.abort();
+    }
     supervisor.shutdown().await?;
     reconcile_terminal_attachments(attachments.as_deref()).await?;
     Ok(())
+}
+
+fn start_context_tool_task(
+    supervisor: &SupervisorHandle,
+    attachments: &Option<Arc<AttachmentCache>>,
+    contexts: &Option<Arc<ContextRegistry>>,
+) -> Option<(crate::codex::rpc::ConnectionEpoch, JoinHandle<()>)> {
+    let attachments = attachments.as_ref().map(Arc::clone)?;
+    let contexts = contexts.as_ref().map(Arc::clone)?;
+    let client = supervisor.client().ok()?;
+    let epoch = client.epoch();
+    let mut events = client.take_control_events().ok()?;
+    let task = tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            match event {
+                ControlEvent::ServerRequest(request) => {
+                    handle_server_request(
+                        client.as_ref(),
+                        request,
+                        contexts.as_ref(),
+                        attachments.as_ref(),
+                    )
+                    .await;
+                }
+                ControlEvent::ConnectionClosed(_) => break,
+                ControlEvent::ProtocolDrift
+                | ControlEvent::UnknownNotification { .. }
+                | ControlEvent::InvalidNotification { .. } => {}
+            }
+        }
+    });
+    Some((epoch, task))
 }
 
 async fn reconcile_terminal_attachments(
@@ -638,6 +728,7 @@ async fn retry_one(
     active_turns: Arc<Semaphore>,
     sink: Arc<dyn DurableReplySink>,
     attachments: Option<&Arc<AttachmentCache>>,
+    contexts: Option<&Arc<ContextRegistry>>,
     actors: &mut HashMap<String, ScopeActorHandle>,
 ) {
     let Some(mut retry) = retries.pop_front() else {
@@ -652,6 +743,7 @@ async fn retry_one(
         active_turns,
         sink,
         attachments,
+        contexts,
         actors,
         retry.event,
     )
@@ -675,25 +767,20 @@ async fn route_one(
     active_turns: Arc<Semaphore>,
     sink: Arc<dyn DurableReplySink>,
     attachments: Option<&Arc<AttachmentCache>>,
+    contexts: Option<&Arc<ContextRegistry>>,
     actors: &mut HashMap<String, ScopeActorHandle>,
     queued: QueuedInboundEvent,
 ) -> Result<(), RouteFailure> {
     let decision = policy.decide(&queued.event);
     let key = InboundKey::new(tenant.clone(), queued.event.event_id.clone());
-    if decision != AccessDecision::Allow {
-        return reject_with_notice(
-            store,
-            sink.as_ref(),
-            &key,
-            &queued.event,
-            InboundRejectionKind::Policy,
-        )
-        .await
-        .map_err(|error| RouteFailure {
-            error,
-            event: queued,
-            retryable: true,
-        });
+    if let Some(kind) = decision.rejection_kind() {
+        return reject_with_notice(store, sink.as_ref(), &key, &queued.event, kind)
+            .await
+            .map_err(|error| RouteFailure {
+                error,
+                event: queued,
+                retryable: true,
+            });
     }
     let scope_key = queued.event.scope.to_string();
     if !actors.contains_key(&scope_key) {
@@ -732,6 +819,7 @@ async fn route_one(
                 active_turns,
                 Arc::clone(&sink),
                 attachments.map(Arc::clone),
+                contexts.map(Arc::clone),
             ),
         );
     }
@@ -891,6 +979,9 @@ mod tests {
                 text: "hello".to_owned(),
                 mentions_bot: false,
                 mention_all: false,
+                sender_is_human: true,
+                mentions: Vec::new(),
+                parts: Vec::new(),
                 resources: Vec::new(),
                 message_type: "text".to_owned(),
                 create_time_ms: 1,
