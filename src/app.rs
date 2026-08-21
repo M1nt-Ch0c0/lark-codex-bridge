@@ -18,6 +18,7 @@ use crate::lark::token::TenantTokenProvider;
 use crate::lark::transport::TransportState;
 use crate::outbox::{OutboxPump, OutboxPumpConfig, OutboxReplySink};
 use crate::runtime::attachments::{AttachmentCache, AttachmentLimits, LarkResourceDownloader};
+use crate::runtime::context::ContextRegistry;
 use crate::runtime::intake::{DurableIntake, TenantNamespace};
 use crate::runtime::policy::AccessPolicy;
 use crate::runtime::router::{RouteAttemptError, RouteError, Router, RouterHandle, RouterSettings};
@@ -228,6 +229,7 @@ where
         stop_store_after_error(store).await;
         return Err(AppError::Attachments);
     }
+    let context_registry = Arc::new(ContextRegistry::default());
     let Ok(intake) = DurableIntake::prepare(store.clone(), &credentials).await else {
         stop_store_after_error(store).await;
         return Err(AppError::Lark);
@@ -251,7 +253,7 @@ where
         stop_store_after_error(store).await;
         return Err(AppError::Outbound);
     };
-    let Ok(router) = Router::start_with_attachments(
+    let Ok(router) = Router::start_with_contexts(
         store.clone(),
         tenant,
         policy,
@@ -259,6 +261,7 @@ where
         supervisor,
         outbound.sink(),
         Arc::clone(&attachment_cache),
+        context_registry,
     )
     .await
     else {
@@ -503,6 +506,8 @@ mod tests {
                 mentions_bot: false,
                 mention_all: false,
                 sender_is_human: true,
+                mentions: Vec::new(),
+                parts: Vec::new(),
                 resources: Vec::new(),
                 message_type: "text".to_owned(),
                 create_time_ms: 1,

@@ -127,6 +127,8 @@ pub struct ThreadRow {
     pub created_ms: i64,
     /// Archive time, milliseconds since the Unix epoch.
     pub archived_ms: Option<i64>,
+    /// Bridge context-tool contract installed when this thread was created.
+    pub context_tools_version: u32,
 }
 
 impl std::fmt::Debug for ThreadRow {
@@ -138,6 +140,7 @@ impl std::fmt::Debug for ThreadRow {
             .field("status", &self.status)
             .field("created_ms", &self.created_ms)
             .field("archived_ms", &self.archived_ms)
+            .field("context_tools_version", &self.context_tools_version)
             .finish_non_exhaustive()
     }
 }
@@ -295,15 +298,34 @@ impl StoreHandle {
         scope: &ScopeKey,
         codex_thread_id: &str,
     ) -> Result<(), StoreError> {
+        self.record_active_thread_with_context_tools(scope, codex_thread_id, 0)
+            .await
+    }
+
+    /// Records a new active thread mapping together with its bridge context
+    /// tool contract version.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the scope already has an active thread or the
+    /// mapping already exists.
+    pub async fn record_active_thread_with_context_tools(
+        &self,
+        scope: &ScopeKey,
+        codex_thread_id: &str,
+        context_tools_version: u32,
+    ) -> Result<(), StoreError> {
         let scope_key = scope.to_string();
         let codex_thread_id = codex_thread_id.to_owned();
         let request_size = request_bytes(&[&scope_key, &codex_thread_id]);
         self.run_sized(request_size, move |connection| {
             connection
                 .execute(
-                    "INSERT INTO threads (scope_key, codex_thread_id, status, created_ms)
-                     VALUES (?1, ?2, 'active', ?3)",
-                    params![scope_key, codex_thread_id, now_ms()],
+                    "INSERT INTO threads (
+                         scope_key, codex_thread_id, status, created_ms,
+                         context_tools_version
+                     ) VALUES (?1, ?2, 'active', ?3, ?4)",
+                    params![scope_key, codex_thread_id, now_ms(), context_tools_version],
                 )
                 .map_err(|error| sqlite_error("recording an active thread", &error))?;
             Ok(())
@@ -321,7 +343,8 @@ impl StoreHandle {
         let request_size = request_bytes(&[&scope_key]);
         self.run_sized(request_size, move |connection| {
             let row = connection.query_row(
-                "SELECT scope_key, codex_thread_id, status, created_ms, archived_ms
+                "SELECT scope_key, codex_thread_id, status, created_ms, archived_ms,
+                        context_tools_version
                  FROM threads WHERE scope_key = ?1 AND status = 'active'",
                 params![scope_key],
                 read_thread_row,
@@ -345,7 +368,8 @@ impl StoreHandle {
         self.run_sized(request_size, move |connection| {
             let now = now_ms();
             let active = connection.query_row(
-                "SELECT scope_key, codex_thread_id, status, created_ms, archived_ms
+                "SELECT scope_key, codex_thread_id, status, created_ms, archived_ms,
+                        context_tools_version
                  FROM threads WHERE scope_key = ?1 AND status = 'active'",
                 params![scope_key],
                 read_thread_row,
@@ -650,6 +674,7 @@ fn read_thread_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadRow> {
         })?,
         created_ms: row.get(3)?,
         archived_ms: row.get(4)?,
+        context_tools_version: row.get(5)?,
     })
 }
 

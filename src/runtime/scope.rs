@@ -27,8 +27,12 @@ use crate::limits::{
 };
 use crate::render::{ProjectedReply, ProjectorOutput, ReplyProjector};
 use crate::runtime::attachments::{AttachError, AttachmentCache};
+use crate::runtime::context::{
+    ContextDraft, ContextId, ContextRegistry, PendingBinding, RevocationReason,
+};
 use crate::runtime::policy::AccessPolicy;
 use crate::runtime::router::RouterSettings;
+use crate::runtime::tools::{CONTEXT_TOOLS_VERSION, bridge_dynamic_tools};
 use crate::store::{
     BeginTurnOutcome, ClaimedInbound, InboundKey, InboundRejectionKind, InboundTerminal,
     NewOutboxRow, NewTurnRow, StoreHandle, TurnResolution, TurnState,
@@ -204,6 +208,7 @@ pub struct ScopeSnapshot {
 pub enum ScopeFailureKind {
     Store,
     Attachment,
+    Context,
     Policy,
     Supervisor,
     Projection,
@@ -260,6 +265,7 @@ impl ScopeActorHandle {
         active_turns: Arc<Semaphore>,
         sink: Arc<dyn DurableReplySink>,
         attachments: Option<Arc<AttachmentCache>>,
+        contexts: Option<Arc<ContextRegistry>>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel(SCOPE_MAILBOX_CAPACITY);
         let state = Arc::new(RwLock::new(ScopeState::Idle));
@@ -277,6 +283,7 @@ impl ScopeActorHandle {
             active_turns,
             sink,
             attachments,
+            contexts,
             task_state,
             task_active_turn,
             shutdown.clone(),
@@ -385,6 +392,7 @@ async fn run_scope_actor(
     active_turns: Arc<Semaphore>,
     sink: Arc<dyn DurableReplySink>,
     attachments: Option<Arc<AttachmentCache>>,
+    contexts: Option<Arc<ContextRegistry>>,
     state: Arc<RwLock<ScopeState>>,
     active_turn: Arc<RwLock<Option<ActiveTurn>>>,
     shutdown: CancellationToken,
@@ -444,6 +452,7 @@ async fn run_scope_actor(
                     Arc::clone(&active_turns),
                     Arc::clone(&sink),
                     attachments.as_deref(),
+                    contexts.as_deref(),
                     &state,
                     &active_turn,
                     &shutdown,
@@ -473,6 +482,7 @@ async fn process_batch(
     active_turns: Arc<Semaphore>,
     sink: Arc<dyn DurableReplySink>,
     attachments: Option<&AttachmentCache>,
+    contexts: Option<&ContextRegistry>,
     state: &Arc<RwLock<ScopeState>>,
     active_turn: &RwLock<Option<ActiveTurn>>,
     shutdown: &CancellationToken,
@@ -519,7 +529,16 @@ async fn process_batch(
     let thread_id = tokio::select! {
         biased;
         () = shutdown.cancelled() => return Err(ScopeFailureKind::Supervisor),
-        result = ensure_thread(scope, store, policy, settings, &client, &cwd, &fingerprint) => {
+        result = ensure_thread(
+            scope,
+            store,
+            policy,
+            settings,
+            &client,
+            &cwd,
+            &fingerprint,
+            contexts.is_some(),
+        ) => {
             result?
         }
     };
@@ -564,7 +583,16 @@ async fn process_batch(
             thread_id: claimed.retained.event().thread_id.clone(),
         })
         .collect::<Vec<_>>();
-    let inputs = match assemble_turn_inputs(&claimed, attachments, turn_row_id, shutdown).await {
+    let assembly = match assemble_turn_inputs(
+        &claimed,
+        attachments,
+        contexts,
+        &thread_id,
+        turn_row_id,
+        shutdown,
+    )
+    .await
+    {
         Ok(inputs) => inputs,
         Err(AttachmentAssemblyError::Failed | AttachmentAssemblyError::Cancelled) => {
             finalize_failed(
@@ -595,7 +623,8 @@ async fn process_batch(
         release_attachments(attachments, turn_row_id).await?;
         return Ok(());
     };
-    let mut params = TurnStartParams::new(&thread_id, inputs);
+    let mut context_lease = assembly.contexts;
+    let mut params = TurnStartParams::new(&thread_id, assembly.inputs);
     params.client_user_message_id = Some(client_message_id);
     params.cwd = Some(rpc_cwd.clone());
     params.approval_policy = Some(settings.approval_policy.clone());
@@ -639,6 +668,24 @@ async fn process_batch(
             return Ok(());
         }
     };
+    if let Some(lease) = context_lease.as_ref() {
+        if lease.activate(&started.id).is_err() {
+            finalize_uncertain_and_settle_attachments(
+                store,
+                sink.as_ref(),
+                settings,
+                turn_row_id,
+                scope,
+                sources,
+                attachments,
+                &mut supervisor,
+                turn_epoch,
+                shutdown,
+            )
+            .await?;
+            return Ok(());
+        }
+    }
     if store
         .set_turn_state(turn_row_id, TurnState::Running, Some(&started.id))
         .await
@@ -765,6 +812,13 @@ async fn process_batch(
         .resolve_turn_and_finish_inbound_batch(turn_row_id, resolution, inbound)
         .await
         .map_err(|_| ScopeFailureKind::Store)?;
+    if let Some(lease) = context_lease.as_mut() {
+        lease.reason = match resolution {
+            TurnResolution::Completed => RevocationReason::Completed,
+            TurnResolution::Interrupted => RevocationReason::Cancelled,
+            TurnResolution::Failed | TurnResolution::Uncertain => RevocationReason::Failed,
+        };
+    }
     if resolution != TurnResolution::Uncertain {
         release_attachments(attachments, turn_row_id).await?;
     }
@@ -833,14 +887,27 @@ fn deduplicate_batch(batch: Vec<ActorInbound>) -> Vec<ActorInbound> {
 async fn assemble_turn_inputs(
     claimed: &[ClaimedInbound],
     attachments: Option<&AttachmentCache>,
+    contexts: Option<&ContextRegistry>,
+    codex_thread_id: &str,
     turn_row_id: i64,
     shutdown: &CancellationToken,
-) -> Result<Vec<UserInput>, AttachmentAssemblyError> {
+) -> Result<TurnInputAssembly, AttachmentAssemblyError> {
     // Resource counts are untrusted until each message passes the cache's
     // hard limit, so reserve only the already bounded claimed-message count.
     let mut inputs = Vec::with_capacity(claimed.len());
     let mut turn_bytes = 0_u64;
     let mut attachment_sequence = 0_u32;
+    let binding = PendingBinding {
+        codex_thread_id: codex_thread_id.to_owned(),
+        local_turn_row_id: turn_row_id,
+    };
+    let context_lease = contexts.map(|registry| TurnContextLease {
+        registry: registry.clone(),
+        binding: binding.clone(),
+        context_ids: Vec::with_capacity(claimed.len()),
+        reason: RevocationReason::Failed,
+    });
+    let mut context_lease = context_lease;
 
     for claimed in claimed {
         if shutdown.is_cancelled() {
@@ -848,6 +915,27 @@ async fn assemble_turn_inputs(
         }
         let event = claimed.retained.event();
         inputs.push(UserInput::text(event.text.clone()));
+        if let (Some(registry), Some(lease)) = (contexts, context_lease.as_mut()) {
+            let registered = registry
+                .register_pending(binding.clone(), ContextDraft::from_inbound(event))
+                .map_err(|_| AttachmentAssemblyError::Failed)?;
+            let wake = if event.mentions_bot {
+                "mention"
+            } else {
+                "message"
+            };
+            let reference = serde_json::to_string(&serde_json::json!({
+                "id": registered.context_id.as_str(),
+                "wake": wake,
+                "mentioned_self": event.mentions_bot,
+            }))
+            .map_err(|_| AttachmentAssemblyError::Failed)?;
+            inputs.push(UserInput::text(format!(
+                "<bridge_context>{reference}</bridge_context>"
+            )));
+            lease.context_ids.push(registered.context_id);
+            continue;
+        }
         let Some(cache) = attachments else {
             continue;
         };
@@ -893,7 +981,39 @@ async fn assemble_turn_inputs(
             }
         }
     }
-    Ok(inputs)
+    Ok(TurnInputAssembly {
+        inputs,
+        contexts: context_lease,
+    })
+}
+
+struct TurnInputAssembly {
+    inputs: Vec<UserInput>,
+    contexts: Option<TurnContextLease>,
+}
+
+struct TurnContextLease {
+    registry: ContextRegistry,
+    binding: PendingBinding,
+    context_ids: Vec<ContextId>,
+    reason: RevocationReason,
+}
+
+impl TurnContextLease {
+    fn activate(&self, codex_turn_id: &str) -> Result<(), ScopeFailureKind> {
+        for context_id in &self.context_ids {
+            self.registry
+                .activate(context_id, &self.binding, codex_turn_id)
+                .map_err(|_| ScopeFailureKind::Context)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for TurnContextLease {
+    fn drop(&mut self) {
+        let _ = self.registry.revoke_turn(&self.binding, self.reason);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1037,23 +1157,39 @@ async fn ensure_thread(
     client: &AppServerClient,
     cwd: &Path,
     fingerprint: &str,
+    context_tools: bool,
 ) -> Result<String, ScopeFailureKind> {
     if let Some(active) = store
         .active_thread(scope)
         .await
         .map_err(|_| ScopeFailureKind::Store)?
     {
-        let rpc_cwd = revalidate_workspace(policy, cwd, fingerprint)?;
-        let mut params = ThreadResumeParams::new(&active.codex_thread_id);
-        params.overrides.cwd = Some(rpc_cwd);
-        params.overrides.sandbox = Some(settings.sandbox);
-        params.overrides.approval_policy = Some(settings.approval_policy.clone());
-        params.overrides.model.clone_from(&settings.model);
-        let thread = client
-            .resume_thread(params)
-            .await
-            .map_err(|_| ScopeFailureKind::Client)?;
-        return Ok(thread.id);
+        let required_version = if context_tools {
+            CONTEXT_TOOLS_VERSION
+        } else {
+            0
+        };
+        if active.context_tools_version != required_version {
+            store
+                .archive_active_thread(scope)
+                .await
+                .map_err(|_| ScopeFailureKind::Store)?;
+            let _ = client
+                .release_thread(&ThreadId::from(active.codex_thread_id.as_str()))
+                .await;
+        } else {
+            let rpc_cwd = revalidate_workspace(policy, cwd, fingerprint)?;
+            let mut params = ThreadResumeParams::new(&active.codex_thread_id);
+            params.overrides.cwd = Some(rpc_cwd);
+            params.overrides.sandbox = Some(settings.sandbox);
+            params.overrides.approval_policy = Some(settings.approval_policy.clone());
+            params.overrides.model.clone_from(&settings.model);
+            let thread = client
+                .resume_thread(params)
+                .await
+                .map_err(|_| ScopeFailureKind::Client)?;
+            return Ok(thread.id);
+        }
     }
     let rpc_cwd = revalidate_workspace(policy, cwd, fingerprint)?;
     let params = ThreadStartParams {
@@ -1061,6 +1197,7 @@ async fn ensure_thread(
         sandbox: Some(settings.sandbox),
         approval_policy: Some(settings.approval_policy.clone()),
         model: settings.model.clone(),
+        dynamic_tools: context_tools.then(bridge_dynamic_tools),
         ..ThreadStartParams::default()
     };
     let thread = client
@@ -1068,7 +1205,15 @@ async fn ensure_thread(
         .await
         .map_err(|_| ScopeFailureKind::Client)?;
     store
-        .record_active_thread(scope, &thread.id)
+        .record_active_thread_with_context_tools(
+            scope,
+            &thread.id,
+            if context_tools {
+                CONTEXT_TOOLS_VERSION
+            } else {
+                0
+            },
+        )
         .await
         .map_err(|_| ScopeFailureKind::Store)?;
     Ok(thread.id)

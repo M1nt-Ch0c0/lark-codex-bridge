@@ -16,19 +16,24 @@ use super::{StoreError, StoreHandle, now_ms, query_optional, request_bytes, sqli
 use crate::lark::api::{ChatMode, ResourceKind};
 use crate::lark::bridge::RetainedInbound;
 use crate::lark::normalize::ShortId;
-use crate::lark::normalize::{InboundEvent, ResourceDesc, ScopeKey};
+use crate::lark::normalize::{
+    InboundEvent, MediaMetadata, MediaPart, MentionIdentity, MessagePart, PartStatus, ResourceDesc,
+    ScopeKey,
+};
 use crate::limits::{
-    DEDUP_SWEEP_BATCH, OUTBOX_TERMINAL_MAX_BYTES, OUTBOX_TERMINAL_MAX_ROWS,
-    STORE_INBOUND_BEGIN_MAX_KEY_BYTES, STORE_INBOUND_BEGIN_MAX_KEYS, STORE_INBOUND_ID_MAX_BYTES,
-    STORE_INBOUND_MAX_BYTES, STORE_INBOUND_MAX_ROWS, STORE_INBOUND_MESSAGE_TYPE_MAX_BYTES,
-    STORE_INBOUND_PAYLOAD_MAX_BYTES, STORE_INBOUND_RECEIVED_MAX_BYTES,
-    STORE_INBOUND_RECEIVED_MAX_ROWS, STORE_INBOUND_RESOURCE_KEY_MAX_BYTES,
-    STORE_INBOUND_RESOURCE_KEY_MAX_TOTAL_BYTES, STORE_INBOUND_RESOURCE_MAX_COUNT,
-    STORE_INBOUND_SCOPE_MAX_BYTES, STORE_INBOUND_TEXT_MAX_BYTES, STORE_OUTBOX_MAX_QUEUED_BYTES,
-    STORE_OUTBOX_MAX_ROWS, STORE_OUTBOX_PAYLOAD_MAX_BYTES, STORE_RECOVERY_TURN_MAX_BYTES,
-    STORE_RECOVERY_TURN_MAX_ROWS, STORE_REJECTION_REASON_MAX_BYTES,
+    ATTACHMENT_FILE_NAME_MAX_BYTES, ATTACHMENT_MIME_MAX_BYTES, DEDUP_SWEEP_BATCH,
+    OUTBOX_TERMINAL_MAX_BYTES, OUTBOX_TERMINAL_MAX_ROWS, STORE_INBOUND_BEGIN_MAX_KEY_BYTES,
+    STORE_INBOUND_BEGIN_MAX_KEYS, STORE_INBOUND_ID_MAX_BYTES, STORE_INBOUND_MAX_BYTES,
+    STORE_INBOUND_MAX_ROWS, STORE_INBOUND_MESSAGE_TYPE_MAX_BYTES, STORE_INBOUND_PAYLOAD_MAX_BYTES,
+    STORE_INBOUND_RECEIVED_MAX_BYTES, STORE_INBOUND_RECEIVED_MAX_ROWS,
+    STORE_INBOUND_RESOURCE_KEY_MAX_BYTES, STORE_INBOUND_RESOURCE_KEY_MAX_TOTAL_BYTES,
+    STORE_INBOUND_RESOURCE_MAX_COUNT, STORE_INBOUND_SCOPE_MAX_BYTES, STORE_INBOUND_TEXT_MAX_BYTES,
+    STORE_OUTBOX_MAX_QUEUED_BYTES, STORE_OUTBOX_MAX_ROWS, STORE_OUTBOX_PAYLOAD_MAX_BYTES,
+    STORE_RECOVERY_TURN_MAX_BYTES, STORE_RECOVERY_TURN_MAX_ROWS, STORE_REJECTION_REASON_MAX_BYTES,
 };
 use crate::runtime::intake::TenantNamespace;
+
+const INBOUND_PAYLOAD_VERSION: i64 = 1;
 
 /// Processing state of one registered inbound event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,13 +309,14 @@ impl StoreHandle {
                     "INSERT INTO inbound_events
                      (tenant, event_id, message_id, scope_key, state, first_seen_ms, updated_ms,
                       payload_version, payload_blob, payload_bytes, turn_row_id)
-                     VALUES (?1, ?2, ?3, ?4, 'received', ?5, ?5, 1, ?6, ?7, NULL)",
+                     VALUES (?1, ?2, ?3, ?4, 'received', ?5, ?5, ?6, ?7, ?8, NULL)",
                     params![
                         tenant,
                         event_id,
                         message_id,
                         scope_key,
                         now,
+                        INBOUND_PAYLOAD_VERSION,
                         payload,
                         i64::try_from(payload_bytes).unwrap_or(i64::MAX)
                     ],
@@ -825,6 +831,10 @@ struct InboundPayloadV1 {
     /// closed) for legacy payloads recorded before sender discrimination.
     #[serde(default)]
     sender_is_human: bool,
+    #[serde(default)]
+    mentions: Vec<MentionIdentity>,
+    #[serde(default)]
+    parts: Vec<MessagePart>,
     resources: Vec<ResourceWire>,
     message_type: String,
     create_time_ms: i64,
@@ -894,6 +904,8 @@ fn inbound_event_variable_bytes(event: &InboundEvent) -> usize {
             .iter()
             .map(|resource| resource.key.len())
             .sum(),
+        event.mentions.iter().map(mention_variable_bytes).sum(),
+        event.parts.iter().map(part_variable_bytes).sum(),
     ]
     .into_iter()
     .fold(0_usize, usize::saturating_add)
@@ -1002,7 +1014,165 @@ fn validate_event(event: &InboundEvent) -> Result<(), StoreError> {
             context: "validating aggregate inbound resource keys",
         });
     }
+    if event.mentions.len() > STORE_INBOUND_RESOURCE_MAX_COUNT {
+        return Err(StoreError::CapacityExceeded {
+            context: "validating inbound mention count",
+        });
+    }
+    for mention in &event.mentions {
+        for value in [
+            mention.key.as_deref(),
+            mention.open_id.as_deref(),
+            mention.user_id.as_deref(),
+            mention.union_id.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if value.len() > STORE_INBOUND_ID_MAX_BYTES {
+                return Err(StoreError::PayloadTooLarge {
+                    context: "validating an inbound mention identity",
+                    limit: u64::try_from(STORE_INBOUND_ID_MAX_BYTES).unwrap_or(u64::MAX),
+                });
+            }
+        }
+        if mention
+            .name
+            .as_deref()
+            .is_some_and(|name| name.len() > STORE_INBOUND_TEXT_MAX_BYTES)
+        {
+            return Err(StoreError::PayloadTooLarge {
+                context: "validating an inbound mention name",
+                limit: u64::try_from(STORE_INBOUND_TEXT_MAX_BYTES).unwrap_or(u64::MAX),
+            });
+        }
+    }
+    if event.parts.len() > STORE_INBOUND_RESOURCE_MAX_COUNT {
+        return Err(StoreError::CapacityExceeded {
+            context: "validating inbound part count",
+        });
+    }
+    for part in &event.parts {
+        validate_part(part)?;
+    }
     Ok(())
+}
+
+fn validate_part(part: &MessagePart) -> Result<(), StoreError> {
+    match part {
+        MessagePart::Text { text } => {
+            if text.len() > STORE_INBOUND_TEXT_MAX_BYTES {
+                return Err(StoreError::PayloadTooLarge {
+                    context: "validating an inbound text part",
+                    limit: u64::try_from(STORE_INBOUND_TEXT_MAX_BYTES).unwrap_or(u64::MAX),
+                });
+            }
+        }
+        MessagePart::Image(media)
+        | MessagePart::File(media)
+        | MessagePart::Sticker(media)
+        | MessagePart::Audio(media)
+        | MessagePart::Video(media) => validate_media_part(media)?,
+        MessagePart::Forward { message_id, .. } => validate_optional_id(
+            message_id.as_deref(),
+            "validating an inbound forwarded message ID",
+        )?,
+        MessagePart::Card { .. } => {}
+        MessagePart::Unsupported { message_type, .. } => {
+            if message_type.is_empty() || message_type.len() > STORE_INBOUND_MESSAGE_TYPE_MAX_BYTES
+            {
+                return Err(StoreError::PayloadTooLarge {
+                    context: "validating an unsupported inbound message type",
+                    limit: u64::try_from(STORE_INBOUND_MESSAGE_TYPE_MAX_BYTES).unwrap_or(u64::MAX),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_media_part(media: &MediaPart) -> Result<(), StoreError> {
+    for key in [media.key.as_deref(), media.thumbnail_key.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if key.is_empty() || key.len() > STORE_INBOUND_RESOURCE_KEY_MAX_BYTES {
+            return Err(StoreError::PayloadTooLarge {
+                context: "validating an inbound media key",
+                limit: u64::try_from(STORE_INBOUND_RESOURCE_KEY_MAX_BYTES).unwrap_or(u64::MAX),
+            });
+        }
+    }
+    if media.status == PartStatus::Available && media.key.is_none() {
+        return Err(StoreError::CorruptData {
+            context: "validating an available inbound media part",
+        });
+    }
+    if let Some(name) = media.metadata.file_name.as_deref() {
+        if name.is_empty()
+            || name.len() > ATTACHMENT_FILE_NAME_MAX_BYTES
+            || matches!(name, "." | "..")
+            || name
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || matches!(byte, b'/' | b'\\'))
+        {
+            return Err(StoreError::CorruptData {
+                context: "validating inbound media file name metadata",
+            });
+        }
+    }
+    if let Some(mime) = media.metadata.mime_type.as_deref() {
+        if mime.is_empty()
+            || mime.len() > ATTACHMENT_MIME_MAX_BYTES
+            || !mime.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+        {
+            return Err(StoreError::CorruptData {
+                context: "validating inbound media MIME metadata",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn mention_variable_bytes(mention: &MentionIdentity) -> usize {
+    [
+        mention.key.as_deref(),
+        mention.open_id.as_deref(),
+        mention.user_id.as_deref(),
+        mention.union_id.as_deref(),
+        mention.name.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::len)
+    .fold(0_usize, usize::saturating_add)
+}
+
+fn metadata_variable_bytes(metadata: &MediaMetadata) -> usize {
+    metadata
+        .file_name
+        .as_deref()
+        .map_or(0, str::len)
+        .saturating_add(metadata.mime_type.as_deref().map_or(0, str::len))
+}
+
+fn part_variable_bytes(part: &MessagePart) -> usize {
+    match part {
+        MessagePart::Text { text } => text.len(),
+        MessagePart::Image(media)
+        | MessagePart::File(media)
+        | MessagePart::Sticker(media)
+        | MessagePart::Audio(media)
+        | MessagePart::Video(media) => media
+            .key
+            .as_deref()
+            .map_or(0, str::len)
+            .saturating_add(media.thumbnail_key.as_deref().map_or(0, str::len))
+            .saturating_add(metadata_variable_bytes(&media.metadata)),
+        MessagePart::Forward { message_id, .. } => message_id.as_deref().map_or(0, str::len),
+        MessagePart::Card { .. } => 0,
+        MessagePart::Unsupported { message_type, .. } => message_type.len(),
+    }
 }
 
 impl InboundPayloadV1 {
@@ -1048,6 +1218,8 @@ impl InboundPayloadV1 {
             mentions_bot: event.mentions_bot,
             mention_all: event.mention_all,
             sender_is_human: event.sender_is_human,
+            mentions: event.mentions.clone(),
+            parts: event.parts.clone(),
             resources,
             message_type: event.message_type.clone(),
             create_time_ms: event.create_time_ms,
@@ -1067,6 +1239,22 @@ impl InboundPayloadV1 {
                 });
             }
         };
+        let resources: Vec<ResourceDesc> = self
+            .resources
+            .into_iter()
+            .map(|resource| ResourceDesc {
+                kind: match resource.kind {
+                    ResourceKindWire::Image => ResourceKind::Image,
+                    ResourceKindWire::File => ResourceKind::File,
+                },
+                key: resource.key,
+            })
+            .collect();
+        let parts = if self.parts.is_empty() {
+            parts_from_v1(&self.message_type, &self.text, &resources)
+        } else {
+            self.parts
+        };
         let event = InboundEvent {
             event_id: self.event_id,
             message_id: self.message_id,
@@ -1084,23 +1272,52 @@ impl InboundPayloadV1 {
             mentions_bot: self.mentions_bot,
             mention_all: self.mention_all,
             sender_is_human: self.sender_is_human,
-            resources: self
-                .resources
-                .into_iter()
-                .map(|resource| ResourceDesc {
-                    kind: match resource.kind {
-                        ResourceKindWire::Image => ResourceKind::Image,
-                        ResourceKindWire::File => ResourceKind::File,
-                    },
-                    key: resource.key,
-                })
-                .collect(),
+            mentions: self.mentions,
+            parts,
+            resources,
             message_type: self.message_type,
             create_time_ms: self.create_time_ms,
             scope,
         };
         validate_event(&event)?;
         Ok(event)
+    }
+}
+
+fn parts_from_v1(message_type: &str, text: &str, resources: &[ResourceDesc]) -> Vec<MessagePart> {
+    match message_type {
+        "text" => vec![MessagePart::Text {
+            text: text.to_owned(),
+        }],
+        "image" => vec![MessagePart::Image(legacy_media_part(
+            resources,
+            ResourceKind::Image,
+        ))],
+        "file" => vec![MessagePart::File(legacy_media_part(
+            resources,
+            ResourceKind::File,
+        ))],
+        _ => vec![MessagePart::Unsupported {
+            message_type: message_type.to_owned(),
+            status: PartStatus::Unsupported,
+        }],
+    }
+}
+
+fn legacy_media_part(resources: &[ResourceDesc], kind: ResourceKind) -> MediaPart {
+    let key = resources
+        .iter()
+        .find(|resource| resource.kind == kind)
+        .map(|resource| resource.key.clone());
+    MediaPart {
+        status: if key.is_some() {
+            PartStatus::Available
+        } else {
+            PartStatus::Unavailable
+        },
+        key,
+        thumbnail_key: None,
+        metadata: MediaMetadata::default(),
     }
 }
 
@@ -1193,7 +1410,10 @@ fn retained_from_stored(stored: StoredInbound) -> Result<RetainedInbound, StoreE
             context: "decoding a terminal inbound payload",
         });
     }
-    if stored.payload_version != Some(1) || stored.payload_bytes < 0 {
+    let payload_version = stored.payload_version.ok_or(StoreError::CorruptData {
+        context: "decoding an inbound payload version",
+    })?;
+    if payload_version != INBOUND_PAYLOAD_VERSION || stored.payload_bytes < 0 {
         return Err(StoreError::CorruptData {
             context: "decoding an inbound payload version",
         });
@@ -1208,11 +1428,11 @@ fn retained_from_stored(stored: StoredInbound) -> Result<RetainedInbound, StoreE
             context: "validating an inbound payload length",
         });
     }
-    let dto: InboundPayloadV1 =
-        serde_json::from_slice(&payload).map_err(|_| StoreError::CorruptData {
-            context: "decoding a strict inbound payload",
-        })?;
-    let event = dto.into_event()?;
+    let event = serde_json::from_slice::<InboundPayloadV1>(&payload)
+        .map_err(|_| StoreError::CorruptData {
+            context: "decoding a strict inbound payload v1",
+        })?
+        .into_event()?;
     if event.event_id != stored.event_id
         || event.message_id != stored.message_id
         || event.scope.to_string() != stored.scope_key

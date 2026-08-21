@@ -21,7 +21,7 @@ use crate::{
     codex::{
         client::AppServerClient,
         process::{CodexProcess, CodexProcessConfig, ProcessError, ProcessExit, spawn_app_server},
-        rpc::{ConnectionEpoch, RpcError, initialize_connection, spawn_rpc},
+        rpc::{ConnectionEpoch, RpcError, initialize_connection_with_dynamic_tools, spawn_rpc},
         transport::spawn_stream_transport,
         types::InitializeResult,
     },
@@ -510,7 +510,7 @@ async fn connect_epoch(
         spawn_stream_transport(stdio.stdout, stdio.stdin, stdio.stderr, shutdown.clone());
     let mut connection = spawn_rpc(transport, ConnectionEpoch::new(epoch), shutdown.clone());
     let handle = connection.handle.clone();
-    let initialize = match initialize_connection(&handle).await {
+    let initialize = match initialize_connection_with_dynamic_tools(&handle).await {
         Ok(initialize) => initialize,
         Err(error) => {
             let _ = connection.shutdown().await;

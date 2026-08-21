@@ -188,6 +188,8 @@ fn inbound_event() -> InboundEvent {
         mentions_bot: true,
         mention_all: false,
         sender_is_human: true,
+        mentions: Vec::new(),
+        parts: Vec::new(),
         resources: vec![],
         message_type: "text".to_owned(),
         create_time_ms: 0,
@@ -359,7 +361,7 @@ fn delivery_classification_distinguishes_the_three_outcomes() {
         }),
         DeliveryClass::Retryable
     );
-    // A protocol violation without a peer status (unparseable body, missing
+    // A protocol violation without a peer status (unparsable body, missing
     // fields) means the send may have been applied: uncertain.
     assert_eq!(
         classify_delivery(&LarkError::ProtocolViolation {

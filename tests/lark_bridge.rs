@@ -109,6 +109,8 @@ fn stored_event(event_id: &str, message_id: &str) -> InboundEvent {
         mentions_bot: false,
         mention_all: false,
         sender_is_human: true,
+        mentions: Vec::new(),
+        parts: Vec::new(),
         resources: Vec::new(),
         message_type: "text".to_owned(),
         create_time_ms: 1_700_000_000_000,

@@ -34,6 +34,8 @@ fn event(sender: &str, chat_type: ChatMode, mentions_bot: bool) -> InboundEvent 
         mentions_bot,
         mention_all: false,
         sender_is_human: true,
+        mentions: Vec::new(),
+        parts: Vec::new(),
         resources: vec![],
         message_type: "text".to_owned(),
         create_time_ms: 0,

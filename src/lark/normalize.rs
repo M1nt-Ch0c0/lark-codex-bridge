@@ -29,14 +29,15 @@ use std::fmt;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::api::{ChatMode, LarkApi, ResourceKind};
 use super::error::{LarkError, LarkErrorKind};
 use crate::limits::{
-    LARK_CHAT_MODE_CACHE_CAPACITY, LARK_CHAT_MODE_CACHE_KEY_BYTES, LARK_CHAT_MODE_CACHE_TTL,
-    LARK_MAX_EVENT_PAYLOAD_BYTES,
+    ATTACHMENT_FILE_NAME_MAX_BYTES, ATTACHMENT_MIME_MAX_BYTES, LARK_CHAT_MODE_CACHE_CAPACITY,
+    LARK_CHAT_MODE_CACHE_KEY_BYTES, LARK_CHAT_MODE_CACHE_TTL, LARK_MAX_EVENT_PAYLOAD_BYTES,
 };
 
 /// Stable inbound message model handed to the scope runtime.
@@ -72,6 +73,14 @@ pub struct InboundEvent {
     /// `"user"`). Bot/app/system/anonymous senders are never eligible for
     /// sender/group allowlists.
     pub sender_is_human: bool,
+    /// Structured mention identities from the event. Display names and IDs
+    /// are retained for an authorized context resolver but never printed by
+    /// `Debug`.
+    pub mentions: Vec<MentionIdentity>,
+    /// Typed message content. Every known rich-message kind is represented,
+    /// including an explicit unsupported/unavailable status when its content
+    /// cannot be exposed safely.
+    pub parts: Vec<MessagePart>,
     /// Image/file descriptors (keys and kinds), never bytes.
     pub resources: Vec<ResourceDesc>,
     /// Raw wire `message_type`, kept as an open string so unknown types
@@ -102,6 +111,8 @@ impl fmt::Debug for InboundEvent {
             .field("mentions_bot", &self.mentions_bot)
             .field("mention_all", &self.mention_all)
             .field("sender_is_human", &self.sender_is_human)
+            .field("mention_count", &self.mentions.len())
+            .field("part_count", &self.parts.len())
             .field("resource_count", &self.resources.len())
             .field(
                 "resource_key_bytes",
@@ -115,6 +126,179 @@ impl fmt::Debug for InboundEvent {
             .field("create_time_ms", &self.create_time_ms)
             .field("scope", &self.scope)
             .finish_non_exhaustive()
+    }
+}
+
+/// One identity from the message's `mentions` array.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MentionIdentity {
+    /// Placeholder key used by some Feishu message bodies (for example
+    /// `@_user_1`).
+    pub key: Option<String>,
+    /// Mentioned user's tenant-local `open_id`, when supplied.
+    pub open_id: Option<String>,
+    /// Mentioned user's `user_id`, including the sentinel `all`.
+    pub user_id: Option<String>,
+    /// Mentioned user's cross-app `union_id`, when supplied.
+    pub union_id: Option<String>,
+    /// Display name supplied by Feishu, when present.
+    pub name: Option<String>,
+}
+
+impl fmt::Debug for MentionIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MentionIdentity")
+            .field("key_len", &self.key.as_deref().map_or(0, str::len))
+            .field("open_id_len", &self.open_id.as_deref().map_or(0, str::len))
+            .field("user_id_len", &self.user_id.as_deref().map_or(0, str::len))
+            .field(
+                "union_id_len",
+                &self.union_id.as_deref().map_or(0, str::len),
+            )
+            .field("name_len", &self.name.as_deref().map_or(0, str::len))
+            .finish_non_exhaustive()
+    }
+}
+
+/// Whether a typed part can be resolved by the bridge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PartStatus {
+    /// The descriptor contains enough information for the bridge to expose or
+    /// retrieve the part.
+    Available,
+    /// The message kind is recognized but deliberately not exposed yet.
+    Unsupported,
+    /// The kind is supported, but this event omitted the required handle.
+    Unavailable,
+}
+
+/// Safe metadata accompanying a media descriptor. String values are bounded
+/// and validated before retention and are redacted from `Debug`.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MediaMetadata {
+    /// User-facing file name, only when it is a safe basename.
+    pub file_name: Option<String>,
+    /// MIME type, only when it contains bounded printable ASCII.
+    pub mime_type: Option<String>,
+    /// Resource size in bytes, when supplied as a non-negative integer.
+    pub size_bytes: Option<u64>,
+    /// Media duration in milliseconds, when supplied as a non-negative
+    /// integer.
+    pub duration_ms: Option<u64>,
+}
+
+impl fmt::Debug for MediaMetadata {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MediaMetadata")
+            .field(
+                "file_name_len",
+                &self.file_name.as_deref().map_or(0, str::len),
+            )
+            .field(
+                "mime_type_len",
+                &self.mime_type.as_deref().map_or(0, str::len),
+            )
+            .field("size_bytes", &self.size_bytes)
+            .field("duration_ms", &self.duration_ms)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Descriptor shared by image, file, sticker, audio, and video parts.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MediaPart {
+    /// Server-side resource handle. Images use `image_key`; all other media
+    /// use `file_key`.
+    pub key: Option<String>,
+    /// Optional video thumbnail `image_key`.
+    pub thumbnail_key: Option<String>,
+    /// Safe metadata supplied by the event.
+    pub metadata: MediaMetadata,
+    /// Availability of the part.
+    pub status: PartStatus,
+}
+
+impl fmt::Debug for MediaPart {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MediaPart")
+            .field("key_len", &self.key.as_deref().map_or(0, str::len))
+            .field(
+                "thumbnail_key_len",
+                &self.thumbnail_key.as_deref().map_or(0, str::len),
+            )
+            .field("metadata", &self.metadata)
+            .field("status", &self.status)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Typed content of one inbound message.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum MessagePart {
+    /// Plain text after mention tags were stripped.
+    Text { text: String },
+    /// Image descriptor.
+    Image(MediaPart),
+    /// File descriptor.
+    File(MediaPart),
+    /// Sticker descriptor.
+    Sticker(MediaPart),
+    /// Audio descriptor.
+    Audio(MediaPart),
+    /// Video descriptor (`media` on current Feishu wire payloads).
+    Video(MediaPart),
+    /// Merge-forward or forward message reference.
+    Forward {
+        message_id: Option<String>,
+        status: PartStatus,
+    },
+    /// Interactive/card content. Raw card JSON is not retained.
+    Card { status: PartStatus },
+    /// An open wire type unknown to this bridge version.
+    Unsupported {
+        message_type: String,
+        status: PartStatus,
+    },
+}
+
+impl fmt::Debug for MessagePart {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text { text } => formatter
+                .debug_struct("Text")
+                .field("text_len", &text.len())
+                .finish(),
+            Self::Image(media) => formatter.debug_tuple("Image").field(media).finish(),
+            Self::File(media) => formatter.debug_tuple("File").field(media).finish(),
+            Self::Sticker(media) => formatter.debug_tuple("Sticker").field(media).finish(),
+            Self::Audio(media) => formatter.debug_tuple("Audio").field(media).finish(),
+            Self::Video(media) => formatter.debug_tuple("Video").field(media).finish(),
+            Self::Forward { message_id, status } => formatter
+                .debug_struct("Forward")
+                .field("message_id_len", &message_id.as_deref().map_or(0, str::len))
+                .field("status", status)
+                .finish(),
+            Self::Card { status } => formatter
+                .debug_struct("Card")
+                .field("status", status)
+                .finish(),
+            Self::Unsupported {
+                message_type,
+                status,
+            } => formatter
+                .debug_struct("Unsupported")
+                .field("message_type_len", &message_type.len())
+                .field("status", status)
+                .finish(),
+        }
     }
 }
 
@@ -305,6 +489,8 @@ impl Normalizer {
                 mentions_bot: parsed.mentions_bot,
                 mention_all: parsed.mention_all,
                 sender_is_human: parsed.sender_is_human,
+                mentions: parsed.mentions,
+                parts: parsed.parts,
                 resources: parsed.resources,
                 message_type: parsed.message_type,
                 create_time_ms: parsed.create_time_ms,
@@ -369,15 +555,16 @@ impl Normalizer {
         let create_time_ms = required(message.create_time, "message missing create_time")?
             .parse::<i64>()
             .map_err(|_| LarkError::protocol("message create_time is not a millisecond integer"))?;
-        let mentions = message.mentions.unwrap_or_default();
-        let mentions_bot = mentions.iter().any(|mention| {
+        let raw_mentions = message.mentions.unwrap_or_default();
+        let mentions_bot = raw_mentions.iter().any(|mention| {
             mention.id.as_ref().and_then(|id| id.open_id.as_deref())
                 == Some(self.bot_open_id.as_str())
         });
-        let mentions_all_in_array = mentions
+        let mentions_all_in_array = raw_mentions
             .iter()
             .any(|mention| mention.id.as_ref().and_then(|id| id.user_id.as_deref()) == Some("all"));
-        let (text, mentions_all_in_text) = extract_text(&message_type, &content)?;
+        let mentions = raw_mentions.into_iter().map(mention_identity).collect();
+        let extracted = extract_message_content(&message_type, &content)?;
 
         Ok(Some(ParsedEvent {
             event_id,
@@ -390,11 +577,13 @@ impl Normalizer {
             thread_id: non_empty(message.thread_id),
             root_id: non_empty(message.root_id),
             parent_id: non_empty(message.parent_id),
-            text,
+            text: extracted.text,
             mentions_bot,
-            mention_all: mentions_all_in_array || mentions_all_in_text,
+            mention_all: mentions_all_in_array || extracted.mentions_all,
             sender_is_human,
-            resources: extract_resources(&message_type, &content)?,
+            mentions,
+            parts: extracted.parts,
+            resources: extracted.resources,
         }))
     }
 
@@ -543,6 +732,8 @@ struct ParsedEvent {
     mentions_bot: bool,
     mention_all: bool,
     sender_is_human: bool,
+    mentions: Vec<MentionIdentity>,
+    parts: Vec<MessagePart>,
     resources: Vec<ResourceDesc>,
 }
 
@@ -556,33 +747,184 @@ fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.is_empty())
 }
 
-#[derive(Deserialize)]
-struct TextContent {
-    text: Option<String>,
+struct ExtractedContent {
+    text: String,
+    mentions_all: bool,
+    resources: Vec<ResourceDesc>,
+    parts: Vec<MessagePart>,
 }
 
-#[derive(Deserialize)]
-struct ImageContent {
-    image_key: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct FileContent {
-    file_key: Option<String>,
-}
-
-/// Extracts the text body of a `text` message with every `<at …>…</at>`
-/// mention tag stripped; also reports whether the raw text mentioned
-/// `@all`. Non-text types yield an empty string.
-fn extract_text(message_type: &str, content: &str) -> Result<(String, bool), LarkError> {
-    if message_type != "text" {
-        return Ok((String::new(), false));
+/// Extracts legacy text/resource fields and the richer typed representation
+/// in one parse. Unknown wire kinds survive as an explicit unsupported part;
+/// their opaque content is never retained.
+fn extract_message_content(
+    message_type: &str,
+    content: &str,
+) -> Result<ExtractedContent, LarkError> {
+    let known = matches!(
+        message_type,
+        "text"
+            | "image"
+            | "file"
+            | "sticker"
+            | "audio"
+            | "video"
+            | "media"
+            | "interactive"
+            | "card"
+            | "merge_forward"
+            | "forward"
+    );
+    if !known {
+        return Ok(ExtractedContent {
+            text: String::new(),
+            mentions_all: false,
+            resources: Vec::new(),
+            parts: vec![MessagePart::Unsupported {
+                message_type: message_type.to_owned(),
+                status: PartStatus::Unsupported,
+            }],
+        });
     }
-    let parsed: TextContent = serde_json::from_str(content)
-        .map_err(|_| LarkError::protocol("text message content is not valid JSON"))?;
-    let raw = parsed.text.unwrap_or_default();
-    let mentions_all = raw.contains("<at user_id=\"all\">");
-    Ok((strip_mention_tags(&raw), mentions_all))
+    let value: Value = serde_json::from_str(content)
+        .map_err(|_| LarkError::protocol("message content is not valid JSON"))?;
+    match message_type {
+        "text" => {
+            let raw = value
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let mentions_all = raw.contains("<at user_id=\"all\">");
+            let text = strip_mention_tags(raw);
+            Ok(ExtractedContent {
+                parts: vec![MessagePart::Text { text: text.clone() }],
+                text,
+                mentions_all,
+                resources: Vec::new(),
+            })
+        }
+        "image" => {
+            let key = content_string(&value, "image_key");
+            let media = media_part(key.clone(), None, &value);
+            Ok(ExtractedContent {
+                text: String::new(),
+                mentions_all: false,
+                resources: resource_desc(key, ResourceKind::Image),
+                parts: vec![MessagePart::Image(media)],
+            })
+        }
+        "file" => {
+            let key = content_string(&value, "file_key");
+            let media = media_part(key.clone(), None, &value);
+            Ok(ExtractedContent {
+                text: String::new(),
+                mentions_all: false,
+                resources: resource_desc(key, ResourceKind::File),
+                parts: vec![MessagePart::File(media)],
+            })
+        }
+        "sticker" => Ok(rich_media_content(&value, MessagePart::Sticker)),
+        "audio" => Ok(rich_media_content(&value, MessagePart::Audio)),
+        "video" | "media" => {
+            let key = content_string(&value, "file_key");
+            let thumbnail_key = content_string(&value, "image_key");
+            Ok(ExtractedContent {
+                text: String::new(),
+                mentions_all: false,
+                resources: Vec::new(),
+                parts: vec![MessagePart::Video(media_part(key, thumbnail_key, &value))],
+            })
+        }
+        "interactive" | "card" => Ok(ExtractedContent {
+            text: String::new(),
+            mentions_all: false,
+            resources: Vec::new(),
+            parts: vec![MessagePart::Card {
+                status: PartStatus::Unsupported,
+            }],
+        }),
+        "merge_forward" | "forward" => {
+            let message_id = content_string(&value, "message_id");
+            let status = if message_id.is_some() {
+                PartStatus::Available
+            } else {
+                PartStatus::Unavailable
+            };
+            Ok(ExtractedContent {
+                text: String::new(),
+                mentions_all: false,
+                resources: Vec::new(),
+                parts: vec![MessagePart::Forward { message_id, status }],
+            })
+        }
+        _ => unreachable!("known message type handled above"),
+    }
+}
+
+fn rich_media_content(value: &Value, wrap: fn(MediaPart) -> MessagePart) -> ExtractedContent {
+    let key = content_string(value, "file_key");
+    ExtractedContent {
+        text: String::new(),
+        mentions_all: false,
+        resources: Vec::new(),
+        parts: vec![wrap(media_part(key, None, value))],
+    }
+}
+
+fn media_part(key: Option<String>, thumbnail_key: Option<String>, value: &Value) -> MediaPart {
+    let status = if key.is_some() {
+        PartStatus::Available
+    } else {
+        PartStatus::Unavailable
+    };
+    MediaPart {
+        key,
+        thumbnail_key,
+        metadata: MediaMetadata {
+            file_name: content_string(value, "file_name")
+                .or_else(|| content_string(value, "name"))
+                .filter(|name| safe_file_name(name)),
+            mime_type: content_string(value, "mime_type")
+                .or_else(|| content_string(value, "mime"))
+                .filter(|mime| safe_mime(mime)),
+            size_bytes: content_u64(value, &["file_size", "size"]),
+            duration_ms: content_u64(value, &["duration_ms", "duration"]),
+        },
+        status,
+    }
+}
+
+fn content_string(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn content_u64(value: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|key| {
+        value.get(*key).and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|value| value.parse::<u64>().ok()))
+        })
+    })
+}
+
+fn safe_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= ATTACHMENT_FILE_NAME_MAX_BYTES
+        && !matches!(name, "." | "..")
+        && !name
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || matches!(byte, b'/' | b'\\'))
+}
+
+fn safe_mime(mime: &str) -> bool {
+    !mime.is_empty()
+        && mime.len() <= ATTACHMENT_MIME_MAX_BYTES
+        && mime.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
 }
 
 /// Removes every `<at …>…</at>` span and trims surrounding whitespace.
@@ -603,25 +945,6 @@ fn strip_mention_tags(text: &str) -> String {
     }
     stripped.push_str(rest);
     stripped.trim().to_owned()
-}
-
-/// Extracts image/file descriptors from known resource message types.
-/// Unknown types keep no descriptors but survive via the open
-/// `message_type` string.
-fn extract_resources(message_type: &str, content: &str) -> Result<Vec<ResourceDesc>, LarkError> {
-    match message_type {
-        "image" => {
-            let parsed: ImageContent = serde_json::from_str(content)
-                .map_err(|_| LarkError::protocol("image message content is not valid JSON"))?;
-            Ok(resource_desc(parsed.image_key, ResourceKind::Image))
-        }
-        "file" => {
-            let parsed: FileContent = serde_json::from_str(content)
-                .map_err(|_| LarkError::protocol("file message content is not valid JSON"))?;
-            Ok(resource_desc(parsed.file_key, ResourceKind::File))
-        }
-        _ => Ok(Vec::new()),
-    }
 }
 
 fn resource_desc(key: Option<String>, kind: ResourceKind) -> Vec<ResourceDesc> {
@@ -675,11 +998,25 @@ struct EventMessage {
 
 #[derive(Deserialize)]
 struct EventMention {
+    key: Option<String>,
     id: Option<EventMentionId>,
+    name: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct EventMentionId {
     open_id: Option<String>,
     user_id: Option<String>,
+    union_id: Option<String>,
+}
+
+fn mention_identity(mention: EventMention) -> MentionIdentity {
+    let id = mention.id.unwrap_or_default();
+    MentionIdentity {
+        key: non_empty(mention.key),
+        open_id: non_empty(id.open_id),
+        user_id: non_empty(id.user_id),
+        union_id: non_empty(id.union_id),
+        name: non_empty(mention.name),
+    }
 }

@@ -32,6 +32,8 @@ fn event() -> InboundEvent {
         mentions_bot: true,
         mention_all: false,
         sender_is_human: true,
+        mentions: Vec::new(),
+        parts: Vec::new(),
         resources: Vec::new(),
         message_type: "text".to_owned(),
         create_time_ms: 1,

@@ -197,4 +197,12 @@ CREATE TABLE attachment_scan_cursor (
         name: "remove obsolete attachment scan cursor",
         sql: "DROP TABLE attachment_scan_cursor;",
     },
+    Migration {
+        version: 5,
+        name: "track bridge context tools on threads",
+        sql: "
+ALTER TABLE threads ADD COLUMN context_tools_version INTEGER NOT NULL DEFAULT 0
+    CHECK (context_tools_version >= 0);
+",
+    },
 ];
