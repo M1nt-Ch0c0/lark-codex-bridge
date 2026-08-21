@@ -117,7 +117,7 @@ jobs:
           tool: cargo-llvm-cov
       - run: cargo llvm-cov --all-targets --locked --lcov --output-path lcov.info
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           files: lcov.info
           fail_ci_if_error: false
