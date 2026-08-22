@@ -332,4 +332,35 @@ mod tests {
         assert_eq!(error, AsrError::UnsupportedCodec);
         assert_eq!(error.code(), "unsupported_codec");
     }
+
+    #[tokio::test]
+    #[ignore = "requires ffmpeg + sherpa-onnx SenseVoice; run with LARK_ASR_SMOKE=1 -- --ignored"]
+    async fn sensevoice_transcribes_real_feishu_like_ogg() {
+        assert_eq!(
+            std::env::var("LARK_ASR_SMOKE").ok().as_deref(),
+            Some("1"),
+            "set LARK_ASR_SMOKE=1"
+        );
+        let command = PathBuf::from(std::env::var("LARK_ASR_SIDECAR").expect("LARK_ASR_SIDECAR"));
+        let ffmpeg =
+            PathBuf::from(std::env::var("LARK_ASR_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_owned()));
+        let ogg = PathBuf::from(std::env::var("LARK_ASR_SAMPLE_OGG").expect("LARK_ASR_SAMPLE_OGG"));
+        assert!(command.is_file(), "sidecar missing: {}", command.display());
+        assert!(ogg.is_file(), "sample missing: {}", ogg.display());
+        let config = AsrSection {
+            command: Some(command),
+            args: Vec::new(),
+            ffmpeg,
+            ..AsrSection::default()
+        };
+        let text = transcribe_file(&config, &ogg, None)
+            .await
+            .expect("SenseVoice transcript");
+        assert!(
+            (text.contains("开放") || text.contains("开饭"))
+                && text.contains("九点")
+                && text.contains("下午五点"),
+            "unexpected SenseVoice transcript: {text:?}"
+        );
+    }
 }

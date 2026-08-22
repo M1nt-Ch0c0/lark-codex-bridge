@@ -92,17 +92,28 @@ CODEX_E2E=1 cargo test --test codex_smoke --locked -- --ignored --nocapture
 
 ```toml
 [asr]
-command = "/usr/local/bin/sherpa-onnx-offline"
-args = [
-  "--tokens=/var/lib/lark-codex-bridge/sensevoice/tokens.txt",
-  "--sense-voice-model=/var/lib/lark-codex-bridge/sensevoice/model.int8.onnx",
-]
+command = "/Users/YOU/lark-codex-bridge-asr/bin/sensevoice"
 ffmpeg = "ffmpeg"
 max_duration_ms = 600000
 max_transcript_bytes = 32768
 ```
 
 `command` 可省略。相对路径相对配置文件目录解析；单个程序名（如 `ffmpeg`）走 `PATH`。
+
+sherpa-onnx-offline 的 stdout 含配置转储，不能直接当 sidecar。仓库提供
+[`scripts/sensevoice-sidecar.sh`](scripts/sensevoice-sidecar.sh)，只把 JSON 里的
+`text` 打到 stdout。本机冒烟：
+
+```bash
+export SENSEVOICE_BIN=$HOME/lark-codex-bridge-asr/sherpa-onnx-v1.13.6-osx-arm64-static-no-tts/bin/sherpa-onnx-offline
+export SENSEVOICE_MODEL=$HOME/lark-codex-bridge-asr/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09/model.int8.onnx
+export SENSEVOICE_TOKENS=$HOME/lark-codex-bridge-asr/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09/tokens.txt
+export LARK_ASR_SMOKE=1
+export LARK_ASR_SIDECAR=$PWD/scripts/sensevoice-sidecar.sh
+export LARK_ASR_FFMPEG=$(command -v ffmpeg)
+export LARK_ASR_SAMPLE_OGG=$HOME/lark-codex-bridge-asr/samples/zh.ogg
+cargo test --locked --lib runtime::asr::tests::sensevoice_transcribes_real_feishu_like_ogg -- --ignored --nocapture
+```
 
 ## 授权角色（owner / sender / group）
 
