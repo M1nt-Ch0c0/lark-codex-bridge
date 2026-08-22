@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use lark_codex_bridge::codex::types::{ApprovalPolicy, GranularApprovalPolicy, SandboxMode};
 use lark_codex_bridge::config::{
-    BridgeConfig, CodexSection, ConcurrencyConfig, PathsSection, WorkspacePolicy,
+    AsrSection, BridgeConfig, CodexSection, ConcurrencyConfig, PathsSection, WorkspacePolicy,
 };
 use lark_codex_bridge::lark::api::ChatMode;
 use lark_codex_bridge::lark::normalize::{InboundEvent, ScopeKey};
@@ -88,6 +88,7 @@ fn policy_config(allow_root: PathBuf) -> BridgeConfig {
         concurrency: ConcurrencyConfig::default(),
         codex: CodexSection::default(),
         paths: PathsSection::default(),
+        asr: AsrSection::default(),
     }
 }
 
@@ -183,6 +184,12 @@ fn full_config_round_trips_and_resolves_only_runtime_relative_paths() {
         temp.path().join("cache/attachments")
     );
     assert_eq!(config.codex.binary, PathBuf::from("/opt/codex/bin/codex"));
+    assert_eq!(
+        config.asr.command.as_deref(),
+        Some(std::path::Path::new("/opt/asr/sherpa-onnx-offline"))
+    );
+    assert_eq!(config.asr.ffmpeg, PathBuf::from("/usr/bin/ffmpeg"));
+    assert_eq!(config.asr.max_duration_ms, 120_000);
 
     let encoded = toml::to_string(&config).expect("full config should serialize");
     let reparsed = toml::from_str::<BridgeConfig>(&encoded).expect("full config should reparse");
@@ -201,6 +208,7 @@ fn config_rejects_unknown_keys_at_every_schema_level() {
         "owners = [\"ou_owner_123456\"]\n[concurrency]\nunexpected = true",
         "owners = [\"ou_owner_123456\"]\n[codex]\nunexpected = true",
         "owners = [\"ou_owner_123456\"]\n[paths]\nunexpected = true",
+        "owners = [\"ou_owner_123456\"]\n[asr]\nunexpected = true",
     ] {
         assert!(toml::from_str::<BridgeConfig>(source).is_err());
     }

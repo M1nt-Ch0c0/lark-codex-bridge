@@ -12,6 +12,7 @@ use thiserror::Error;
 use crate::codex::process::CodexProcessConfig;
 use crate::codex::types::{ApprovalPolicy, SandboxMode};
 use crate::limits::{
+    ASR_MAX_ARG_BYTES, ASR_MAX_ARGS, ASR_MAX_DURATION_MS, ASR_TRANSCRIPT_MAX_BYTES,
     DEFAULT_ACTIVE_TURN_PERMITS, DEFAULT_MAX_SCOPE_ACTORS, MAX_CONFIG_ALLOW_ROOT_BYTES,
     MAX_CONFIG_ALLOW_ROOTS, MAX_CONFIG_ALLOWED_GROUP_BYTES, MAX_CONFIG_ALLOWED_GROUPS,
     MAX_CONFIG_ALLOWED_SENDER_BYTES, MAX_CONFIG_ALLOWED_SENDERS, MAX_CONFIG_OWNER_BYTES,
@@ -61,6 +62,14 @@ pub enum ConfigError {
     InvalidDefaultWorkspace,
     #[error("unable to determine safe platform filesystem roots")]
     PlatformRoots,
+    #[error("bridge configuration contains an invalid ASR sidecar command")]
+    InvalidAsrCommand,
+    #[error("bridge configuration has too many ASR sidecar arguments")]
+    TooManyAsrArgs,
+    #[error("bridge configuration ASR sidecar arguments exceed the byte limit")]
+    AsrArgsTooLarge,
+    #[error("bridge configuration contains an invalid ASR limit")]
+    InvalidAsrLimit,
 }
 
 impl fmt::Debug for ConfigError {
@@ -85,6 +94,10 @@ impl fmt::Debug for ConfigError {
             Self::InvalidRuntimePath => "InvalidRuntimePath",
             Self::InvalidDefaultWorkspace => "InvalidDefaultWorkspace",
             Self::PlatformRoots => "PlatformRoots",
+            Self::InvalidAsrCommand => "InvalidAsrCommand",
+            Self::TooManyAsrArgs => "TooManyAsrArgs",
+            Self::AsrArgsTooLarge => "AsrArgsTooLarge",
+            Self::InvalidAsrLimit => "InvalidAsrLimit",
         };
         formatter.write_str(category)
     }
@@ -102,6 +115,7 @@ pub struct BridgeConfig {
     pub concurrency: ConcurrencyConfig,
     pub codex: CodexSection,
     pub paths: PathsSection,
+    pub asr: AsrSection,
 }
 
 impl fmt::Debug for BridgeConfig {
@@ -119,6 +133,7 @@ impl fmt::Debug for BridgeConfig {
             .field("concurrency", &self.concurrency)
             .field("codex", &self.codex)
             .field("paths", &self.paths)
+            .field("asr", &self.asr)
             .finish()
     }
 }
@@ -212,6 +227,7 @@ impl BridgeConfig {
         {
             return Err(ConfigError::AllowRootsTooLarge);
         }
+        self.asr.validate()?;
         Ok(())
     }
 
@@ -226,6 +242,10 @@ impl BridgeConfig {
         };
         self.paths.database = resolve_relative_path(&parent, &self.paths.database)?;
         self.paths.attachment_cache = resolve_relative_path(&parent, &self.paths.attachment_cache)?;
+        if let Some(command) = self.asr.command.take() {
+            self.asr.command = Some(resolve_command_path(&parent, &command)?);
+        }
+        self.asr.ffmpeg = resolve_command_path(&parent, &self.asr.ffmpeg)?;
         Ok(())
     }
 }
@@ -451,6 +471,79 @@ impl fmt::Debug for CodexSection {
     }
 }
 
+/// Fail-closed operator configuration for the local ASR sidecar.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AsrSection {
+    /// Optional sidecar executable. Absent means audio cannot be transcribed
+    /// unless the inbound payload already carries recognition text.
+    pub command: Option<PathBuf>,
+    /// Extra arguments inserted before the decoded WAV path.
+    pub args: Vec<String>,
+    /// ffmpeg executable used to decode inbound audio to 16 kHz PCM WAV.
+    pub ffmpeg: PathBuf,
+    /// Audio longer than this is refused without invoking the sidecar.
+    pub max_duration_ms: u64,
+    /// Maximum accepted transcript bytes from inbound text or sidecar stdout.
+    pub max_transcript_bytes: usize,
+}
+
+impl Default for AsrSection {
+    fn default() -> Self {
+        Self {
+            command: None,
+            args: Vec::new(),
+            ffmpeg: PathBuf::from("ffmpeg"),
+            max_duration_ms: ASR_MAX_DURATION_MS,
+            max_transcript_bytes: ASR_TRANSCRIPT_MAX_BYTES,
+        }
+    }
+}
+
+impl AsrSection {
+    pub(crate) fn validate(&mut self) -> Result<(), ConfigError> {
+        if let Some(command) = &self.command {
+            if command.as_os_str().is_empty() {
+                return Err(ConfigError::InvalidAsrCommand);
+            }
+        }
+        if self.ffmpeg.as_os_str().is_empty() {
+            return Err(ConfigError::InvalidAsrCommand);
+        }
+        if self.args.len() > ASR_MAX_ARGS {
+            return Err(ConfigError::TooManyAsrArgs);
+        }
+        if self.args.iter().any(|arg| arg.len() > ASR_MAX_ARG_BYTES) {
+            return Err(ConfigError::AsrArgsTooLarge);
+        }
+        if self.max_duration_ms == 0 || self.max_transcript_bytes == 0 {
+            return Err(ConfigError::InvalidAsrLimit);
+        }
+        Ok(())
+    }
+
+    /// Returns whether a sidecar executable is configured.
+    #[must_use]
+    pub fn is_configured(&self) -> bool {
+        self.command
+            .as_ref()
+            .is_some_and(|command| !command.as_os_str().is_empty())
+    }
+}
+
+impl fmt::Debug for AsrSection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AsrSection")
+            .field("command_configured", &self.command.is_some())
+            .field("arg_count", &self.args.len())
+            .field("ffmpeg_configured", &!self.ffmpeg.as_os_str().is_empty())
+            .field("max_duration_ms", &self.max_duration_ms)
+            .field("max_transcript_bytes", &self.max_transcript_bytes)
+            .finish()
+    }
+}
+
 /// Local runtime storage locations.
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -476,6 +569,16 @@ impl fmt::Debug for PathsSection {
             .field("attachment_cache", &"[configured]")
             .finish()
     }
+}
+
+fn resolve_command_path(parent: &Path, path: &Path) -> Result<PathBuf, ConfigError> {
+    if path.as_os_str().is_empty() {
+        return Err(ConfigError::InvalidAsrCommand);
+    }
+    if path.is_absolute() || path.components().count() <= 1 {
+        return Ok(path.to_path_buf());
+    }
+    resolve_relative_path(parent, path)
 }
 
 fn resolve_relative_path(parent: &Path, path: &Path) -> Result<PathBuf, ConfigError> {

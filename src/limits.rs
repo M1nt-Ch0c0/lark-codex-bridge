@@ -234,6 +234,20 @@ pub const ATTACHMENT_CACHE_MARKER: &str = ".attachment-cache";
 /// advisory lock. Never a valid SHA-256 name, and the reconciliation scanner
 /// deliberately skips it.
 pub const ATTACHMENT_INSTANCE_LOCK: &str = ".attachment-instance.lock";
+/// Default maximum duration of one audio part that may be sent to the local
+/// ASR sidecar (10 minutes). Longer clips fail closed as `too_long`.
+pub const ASR_MAX_DURATION_MS: u64 = 10 * 60 * 1000;
+/// Maximum transcript bytes accepted from inbound recognition text or sidecar
+/// stdout.
+pub const ASR_TRANSCRIPT_MAX_BYTES: usize = 32 * 1024;
+/// Maximum extra arguments forwarded to the ASR sidecar.
+pub const ASR_MAX_ARGS: usize = 32;
+/// Maximum bytes of one ASR sidecar argument.
+pub const ASR_MAX_ARG_BYTES: usize = 4 * 1024;
+/// Deadline for one ffmpeg decode of inbound audio.
+pub const ASR_FFMPEG_TIMEOUT: Duration = Duration::from_secs(30);
+/// Deadline for one local ASR sidecar invocation.
+pub const ASR_SIDECAR_TIMEOUT: Duration = Duration::from_secs(60);
 /// Maximum live (`starting`/`running`/`uncertain`) turns retained for crash
 /// recovery. Terminal turns are historical rows and do not occupy this set.
 pub const STORE_RECOVERY_TURN_MAX_ROWS: usize = 32;

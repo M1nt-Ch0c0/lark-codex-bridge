@@ -217,6 +217,7 @@ fn inbound_rich_parts_become_opaque_typed_context_parts() {
                     mime_type: Some("video/mp4".to_owned()),
                     size_bytes: Some(10),
                     duration_ms: Some(20),
+                    transcript: None,
                 },
                 status: PartStatus::Available,
             }),

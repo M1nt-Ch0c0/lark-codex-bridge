@@ -10,7 +10,7 @@ use bytes::Bytes;
 use futures_util::{FutureExt, future::BoxFuture};
 use lark_codex_bridge::codex::process::{CodexProcessConfig, ProcessError};
 use lark_codex_bridge::codex::supervisor::AppServerSupervisor;
-use lark_codex_bridge::config::{BridgeConfig, WorkspacePolicy};
+use lark_codex_bridge::config::{AsrSection, BridgeConfig, WorkspacePolicy};
 use lark_codex_bridge::lark::api::{ChatMode, ResourceKind};
 use lark_codex_bridge::lark::bridge::QueuedInboundEvent;
 use lark_codex_bridge::lark::config::TenantBrand;
@@ -78,6 +78,7 @@ impl ResourceDownloader for StaticAttachmentDownloader {
         let bytes = match key {
             "img_key" => Bytes::from_static(b"fake-image-bytes"),
             "file_key" => Bytes::from_static(b"fake-file-bytes"),
+            "aud_key" => Bytes::from_static(b"fake-opus-bytes"),
             _ => Bytes::from_static(b"fallback-attachment"),
         };
         async move { Ok(bytes) }.boxed()
@@ -3334,4 +3335,558 @@ async fn connection_loss_before_atomic_begin_leaves_the_event_received_for_repla
         .await;
     router.shutdown().await.expect("shutdown");
     store.shutdown().await.expect("store shutdown");
+}
+
+fn stub_program(
+    dir: &std::path::Path,
+    name: &str,
+    unix: &str,
+    #[allow(unused_variables)] windows: &str,
+) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let path = dir.join(format!("{name}.cmd"));
+        std::fs::write(&path, windows).expect("write windows stub");
+        path
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{unix}\n")).expect("write unix stub");
+        std::fs::set_permissions(&path, PermissionsExt::from_mode(0o755)).expect("chmod stub");
+        path
+    }
+}
+
+fn ffmpeg_stub(dir: &std::path::Path) -> std::path::PathBuf {
+    stub_program(
+        dir,
+        "ffmpeg",
+        r#"out=""; for arg in "$@"; do out=$arg; done; : > "$out""#,
+        "@echo off\r\n:loop\r\nif \"%~2\"==\"\" (\r\ntype nul > \"%~1\"\r\nexit /b 0\r\n)\r\nshift\r\ngoto loop\r\n",
+    )
+}
+
+fn asr_config(
+    command: std::path::PathBuf,
+    ffmpeg: std::path::PathBuf,
+    args: Vec<String>,
+) -> AsrSection {
+    AsrSection {
+        command: Some(command),
+        args,
+        ffmpeg,
+        ..AsrSection::default()
+    }
+}
+
+fn audio_part(transcript: Option<&str>) -> MessagePart {
+    MessagePart::Audio(MediaPart {
+        key: Some("aud_key".to_owned()),
+        thumbnail_key: None,
+        metadata: MediaMetadata {
+            duration_ms: Some(800),
+            transcript: transcript.map(ToOwned::to_owned),
+            ..MediaMetadata::default()
+        },
+        status: PartStatus::Available,
+    })
+}
+
+async fn start_audio_router(
+    config: BridgeConfig,
+    store: StoreHandle,
+    cache: Arc<AttachmentCache>,
+) -> (
+    lark_codex_bridge::runtime::router::RouterHandle,
+    fakecodex::FakeControl,
+    TenantNamespace,
+    std::path::PathBuf,
+) {
+    let workspace = config
+        .default_workspace
+        .clone()
+        .expect("validated default workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let sink = Arc::new(RecordingSink::default());
+    let contexts = Arc::new(ContextRegistry::default());
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start_with_contexts(
+        store,
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink,
+        cache,
+        contexts,
+    )
+    .await
+    .expect("router");
+    (router, control, namespace, workspace)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn route_audio_event(
+    router: &lark_codex_bridge::runtime::router::RouterHandle,
+    store: &StoreHandle,
+    namespace: &TenantNamespace,
+    control: &fakecodex::FakeControl,
+    workspace: &std::path::Path,
+    event_id: &str,
+    inbound: InboundEvent,
+    thread_id: &str,
+    turn_id: &str,
+) -> (String, String) {
+    router
+        .route(queued_registered(store, namespace, inbound).await)
+        .await
+        .expect("route audio event");
+    let start_thread = control.next_request().await;
+    assert_eq!(start_thread["method"], "thread/start");
+    control
+        .respond(&start_thread, thread_result(thread_id, workspace))
+        .await;
+    let start_turn = control.next_request().await;
+    let inputs = start_turn["params"]["input"]
+        .as_array()
+        .expect("turn input array");
+    assert!(
+        inputs
+            .iter()
+            .all(|input| input["type"] != "localAudio" && input["type"] != "audio"),
+        "audio must not be sent as Codex user input"
+    );
+    let reference = inputs
+        .iter()
+        .filter_map(|input| input["text"].as_str())
+        .find_map(|text| {
+            text.strip_prefix("<bridge_context>")
+                .and_then(|value| value.strip_suffix("</bridge_context>"))
+        })
+        .expect("compact context envelope");
+    let reference: Value = serde_json::from_str(reference).expect("context JSON");
+    let context_id = reference["id"]
+        .as_str()
+        .expect("opaque context id")
+        .to_owned();
+    respond_turn_started(control, &start_turn, turn_id).await;
+    control
+        .send_json(json!({
+            "id": format!("server-context-{event_id}"),
+            "method": "item/tool/call",
+            "params": {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "callId": format!("call-context-{event_id}"),
+                "namespace": "bridge_context",
+                "tool": "resolve",
+                "arguments": {"id": context_id}
+            }
+        }))
+        .await;
+    let context_response = control.next_request().await;
+    assert_eq!(context_response["result"]["success"], true);
+    let context_text = context_response["result"]["contentItems"][0]["text"]
+        .as_str()
+        .expect("context result text");
+    let context_value: Value = serde_json::from_str(context_text).expect("context result JSON");
+    let handle = context_value["parts"]
+        .as_array()
+        .expect("parts")
+        .iter()
+        .find(|part| part["kind"] == "audio")
+        .and_then(|part| part["handle"].as_str())
+        .expect("audio handle")
+        .to_owned();
+    (context_id, handle)
+}
+
+async fn read_media(
+    control: &fakecodex::FakeControl,
+    thread_id: &str,
+    turn_id: &str,
+    request_id: &str,
+    context_id: &str,
+    handle: &str,
+) -> Value {
+    control
+        .send_json(json!({
+            "id": request_id,
+            "method": "item/tool/call",
+            "params": {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "callId": request_id,
+                "namespace": "bridge_media",
+                "tool": "read",
+                "arguments": {"context_id": context_id, "handle": handle}
+            }
+        }))
+        .await;
+    control.next_request().await
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn audio_media_read_uses_stub_sidecar_and_leaves_image_path_reads_unchanged() {
+    let mut config = validated_config();
+    let temp = tempdir().expect("tempdir");
+    let marker = temp.path().join("asr-invoked.txt");
+    let asr = stub_program(
+        temp.path(),
+        "asr",
+        r#"printf 'invoked\n' >> "$1"; printf 'KNOWN TRANSCRIPT\n'"#,
+        "@echo off\r\necho invoked>>\"%~1\"\r\necho KNOWN TRANSCRIPT\r\n",
+    );
+    config.asr = asr_config(
+        asr,
+        ffmpeg_stub(temp.path()),
+        vec![marker.to_string_lossy().into_owned()],
+    );
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &temp.path().join("attachments-live"),
+            store.clone(),
+            Arc::new(StaticAttachmentDownloader),
+            AttachmentLimits::default(),
+        )
+        .expect("attachment cache"),
+    );
+    let (router, control, namespace, workspace) =
+        start_audio_router(config, store.clone(), Arc::clone(&cache)).await;
+
+    let mut inbound = event("event-audio-sidecar", "owner-runtime-scope");
+    inbound.message_type = "audio".to_owned();
+    inbound.text = "hello".to_owned();
+    inbound.parts = vec![
+        MessagePart::Text {
+            text: "hello".to_owned(),
+        },
+        MessagePart::Image(MediaPart {
+            key: Some("img_key".to_owned()),
+            thumbnail_key: None,
+            metadata: MediaMetadata::default(),
+            status: PartStatus::Available,
+        }),
+        audio_part(None),
+    ];
+
+    router
+        .route(queued_registered(&store, &namespace, inbound).await)
+        .await
+        .expect("route");
+    let start_thread = control.next_request().await;
+    control
+        .respond(
+            &start_thread,
+            thread_result("thread-audio-sidecar", &workspace),
+        )
+        .await;
+    let start_turn = control.next_request().await;
+    let inputs = start_turn["params"]["input"]
+        .as_array()
+        .expect("turn inputs");
+    assert_eq!(inputs.len(), 2, "media must not be downloaded eagerly");
+    assert!(
+        inputs
+            .iter()
+            .all(|input| input["type"] != "localAudio" && input["type"] != "localImage"),
+        "audio and images stay lazy"
+    );
+    let reference = inputs[1]["text"].as_str().expect("context reference");
+    let payload = reference
+        .strip_prefix("<bridge_context>")
+        .and_then(|value| value.strip_suffix("</bridge_context>"))
+        .expect("compact context envelope");
+    let reference: Value = serde_json::from_str(payload).expect("context JSON");
+    let context_id = reference["id"].as_str().expect("opaque context id");
+    respond_turn_started(&control, &start_turn, "turn-audio-sidecar").await;
+
+    control
+        .send_json(json!({
+            "id": "server-context-audio",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-audio-sidecar",
+                "turnId": "turn-audio-sidecar",
+                "callId": "call-context-audio",
+                "namespace": "bridge_context",
+                "tool": "resolve",
+                "arguments": {"id": context_id}
+            }
+        }))
+        .await;
+    let context_response = control.next_request().await;
+    let context_text = context_response["result"]["contentItems"][0]["text"]
+        .as_str()
+        .expect("context result text");
+    let context_value: Value = serde_json::from_str(context_text).expect("context result JSON");
+    let image_handle = context_value["parts"][1]["handle"]
+        .as_str()
+        .expect("image handle");
+    let audio_handle = context_value["parts"][2]["handle"]
+        .as_str()
+        .expect("audio handle");
+
+    let image_response = read_media(
+        &control,
+        "thread-audio-sidecar",
+        "turn-audio-sidecar",
+        "server-image-read",
+        context_id,
+        image_handle,
+    )
+    .await;
+    assert_eq!(image_response["result"]["success"], true);
+    let image_text = image_response["result"]["contentItems"][0]["text"]
+        .as_str()
+        .expect("image result");
+    let image_value: Value = serde_json::from_str(image_text).expect("image JSON");
+    assert!(
+        std::path::Path::new(image_value["media"]["path"].as_str().expect("image path")).is_file()
+    );
+    assert_eq!(image_value["media"]["bytes"], 16);
+    assert!(image_value["media"]["transcript"].is_null());
+
+    let audio_response = read_media(
+        &control,
+        "thread-audio-sidecar",
+        "turn-audio-sidecar",
+        "server-audio-read",
+        context_id,
+        audio_handle,
+    )
+    .await;
+    assert_eq!(audio_response["result"]["success"], true);
+    let audio_text = audio_response["result"]["contentItems"][0]["text"]
+        .as_str()
+        .expect("audio result");
+    let audio_value: Value = serde_json::from_str(audio_text).expect("audio JSON");
+    assert_eq!(audio_value["media"]["transcript"], "KNOWN TRANSCRIPT");
+    assert_eq!(audio_value["media"]["source"], "sidecar");
+    assert!(audio_value["media"]["path"].is_null());
+    assert!(
+        std::fs::read_to_string(&marker)
+            .expect("marker")
+            .contains("invoked")
+    );
+
+    send_turn_completed(
+        &control,
+        "thread-audio-sidecar",
+        "turn-audio-sidecar",
+        "completed",
+    )
+    .await;
+    router.shutdown().await.expect("shutdown");
+    drop(cache);
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn inbound_audio_transcript_skips_sidecar() {
+    let mut config = validated_config();
+    let temp = tempdir().expect("tempdir");
+    let marker = temp.path().join("must-not-run.txt");
+    let exploding = stub_program(
+        temp.path(),
+        "asr-explode",
+        r#"printf 'invoked\n' >> "$1"; exit 99"#,
+        "@echo off\r\necho invoked>>\"%~1\"\r\nexit /b 99\r\n",
+    );
+    config.asr = asr_config(
+        exploding,
+        ffmpeg_stub(temp.path()),
+        vec![marker.to_string_lossy().into_owned()],
+    );
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &temp.path().join("attachments"),
+            store.clone(),
+            Arc::new(StaticAttachmentDownloader),
+            AttachmentLimits::default(),
+        )
+        .expect("attachment cache"),
+    );
+    let (router, control, namespace, workspace) =
+        start_audio_router(config, store.clone(), cache).await;
+    let mut inbound = event("event-audio-inbound", "owner-runtime-scope");
+    inbound.message_type = "audio".to_owned();
+    inbound.text = "please review the patch".to_owned();
+    inbound.parts = vec![audio_part(Some("please review the patch"))];
+    let (context_id, handle) = route_audio_event(
+        &router,
+        &store,
+        &namespace,
+        &control,
+        &workspace,
+        "inbound",
+        inbound,
+        "thread-audio-inbound",
+        "turn-audio-inbound",
+    )
+    .await;
+    let response = read_media(
+        &control,
+        "thread-audio-inbound",
+        "turn-audio-inbound",
+        "server-audio-inbound",
+        &context_id,
+        &handle,
+    )
+    .await;
+    assert_eq!(response["result"]["success"], true);
+    let body: Value = serde_json::from_str(
+        response["result"]["contentItems"][0]["text"]
+            .as_str()
+            .expect("text"),
+    )
+    .expect("json");
+    assert_eq!(body["media"]["transcript"], "please review the patch");
+    assert_eq!(body["media"]["source"], "inbound");
+    assert!(!marker.exists(), "sidecar must not run for inbound text");
+    send_turn_completed(
+        &control,
+        "thread-audio-inbound",
+        "turn-audio-inbound",
+        "completed",
+    )
+    .await;
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn missing_sidecar_returns_structured_audio_error() {
+    let config = validated_config();
+    let temp = tempdir().expect("tempdir");
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &temp.path().join("attachments"),
+            store.clone(),
+            Arc::new(StaticAttachmentDownloader),
+            AttachmentLimits::default(),
+        )
+        .expect("attachment cache"),
+    );
+    let (router, control, namespace, workspace) =
+        start_audio_router(config, store.clone(), cache).await;
+    let mut inbound = event("event-audio-missing", "owner-runtime-scope");
+    inbound.message_type = "audio".to_owned();
+    inbound.text.clear();
+    inbound.parts = vec![audio_part(None)];
+    let (context_id, handle) = route_audio_event(
+        &router,
+        &store,
+        &namespace,
+        &control,
+        &workspace,
+        "missing",
+        inbound,
+        "thread-audio-missing",
+        "turn-audio-missing",
+    )
+    .await;
+    let response = read_media(
+        &control,
+        "thread-audio-missing",
+        "turn-audio-missing",
+        "server-audio-missing",
+        &context_id,
+        &handle,
+    )
+    .await;
+    assert_eq!(response["result"]["success"], false);
+    let body: Value = serde_json::from_str(
+        response["result"]["contentItems"][0]["text"]
+            .as_str()
+            .expect("text"),
+    )
+    .expect("json");
+    assert_eq!(body["error"]["code"], "sidecar_missing");
+    send_turn_completed(
+        &control,
+        "thread-audio-missing",
+        "turn-audio-missing",
+        "completed",
+    )
+    .await;
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn empty_and_failing_sidecar_return_structured_audio_errors() {
+    for (name, unix, windows, code) in [
+        (
+            "empty",
+            "exit 0",
+            "@echo off\r\nexit /b 0\r\n",
+            "empty_transcript",
+        ),
+        (
+            "failing",
+            "exit 2",
+            "@echo off\r\nexit /b 2\r\n",
+            "sidecar_failed",
+        ),
+    ] {
+        let mut config = validated_config();
+        let temp = tempdir().expect("tempdir");
+        config.asr = asr_config(
+            stub_program(temp.path(), name, unix, windows),
+            ffmpeg_stub(temp.path()),
+            Vec::new(),
+        );
+        let store = StoreHandle::open_in_memory().await.expect("store");
+        let cache = Arc::new(
+            AttachmentCache::open(
+                &temp.path().join("attachments"),
+                store.clone(),
+                Arc::new(StaticAttachmentDownloader),
+                AttachmentLimits::default(),
+            )
+            .expect("attachment cache"),
+        );
+        let (router, control, namespace, workspace) =
+            start_audio_router(config, store.clone(), cache).await;
+        let event_id = format!("event-audio-{name}");
+        let thread_id = format!("thread-audio-{name}");
+        let turn_id = format!("turn-audio-{name}");
+        let mut inbound = event(&event_id, "owner-runtime-scope");
+        inbound.message_type = "audio".to_owned();
+        inbound.text.clear();
+        inbound.parts = vec![audio_part(None)];
+        let (context_id, handle) = route_audio_event(
+            &router, &store, &namespace, &control, &workspace, name, inbound, &thread_id, &turn_id,
+        )
+        .await;
+        let response = read_media(
+            &control,
+            &thread_id,
+            &turn_id,
+            &format!("server-audio-{name}"),
+            &context_id,
+            &handle,
+        )
+        .await;
+        assert_eq!(response["result"]["success"], false);
+        let body: Value = serde_json::from_str(
+            response["result"]["contentItems"][0]["text"]
+                .as_str()
+                .expect("text"),
+        )
+        .expect("json");
+        assert_eq!(body["error"]["code"], code);
+        send_turn_completed(&control, &thread_id, &turn_id, "completed").await;
+        router.shutdown().await.expect("shutdown");
+        store.shutdown().await.expect("store shutdown");
+    }
 }

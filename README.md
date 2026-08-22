@@ -80,6 +80,41 @@ platform family/OS 和 epoch；不包含 Codex home、账户身份、token 或�
 CODEX_E2E=1 cargo test --test codex_smoke --locked -- --ignored --nocapture
 ```
 
+## 本地语音转写（ASR sidecar）
+
+飞书语音气泡默认**不会**把 `localAudio` 交给 Codex。`bridge_media.read` 对音频按需转写后只回传文本：
+
+1. 入站 payload 已带客户端识别文本时直接使用，不调用 sidecar；
+2. 否则用 `ffmpeg` 解码为 16 kHz WAV，再跑配置的本地 sidecar（stdout 即转写结果）；
+3. 缺 sidecar、解码失败、空转写或过长音频会返回稳定错误码（`sidecar_missing` / `unsupported_codec` / `empty_transcript` / `too_long` / `oversize` / `sidecar_failed`），不会静默丢 part。
+
+推荐 sidecar 是 [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) 上的 SenseVoice Small。仓库不内置模型权重；未配置 sidecar 时图片/文件读取不受影响。
+
+```toml
+[asr]
+command = "/Users/YOU/lark-codex-bridge-asr/bin/sensevoice"
+ffmpeg = "ffmpeg"
+max_duration_ms = 600000
+max_transcript_bytes = 32768
+```
+
+`command` 可省略。相对路径相对配置文件目录解析；单个程序名（如 `ffmpeg`）走 `PATH`。
+
+sherpa-onnx-offline 的 stdout 含配置转储，不能直接当 sidecar。仓库提供
+[`scripts/sensevoice-sidecar.sh`](scripts/sensevoice-sidecar.sh)，只把 JSON 里的
+`text` 打到 stdout。本机冒烟：
+
+```bash
+export SENSEVOICE_BIN=$HOME/lark-codex-bridge-asr/sherpa-onnx-v1.13.6-osx-arm64-static-no-tts/bin/sherpa-onnx-offline
+export SENSEVOICE_MODEL=$HOME/lark-codex-bridge-asr/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09/model.int8.onnx
+export SENSEVOICE_TOKENS=$HOME/lark-codex-bridge-asr/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09/tokens.txt
+export LARK_ASR_SMOKE=1
+export LARK_ASR_SIDECAR=$PWD/scripts/sensevoice-sidecar.sh
+export LARK_ASR_FFMPEG=$(command -v ffmpeg)
+export LARK_ASR_SAMPLE_OGG=$HOME/lark-codex-bridge-asr/samples/zh.ogg
+cargo test --locked --lib runtime::asr::tests::sensevoice_transcribes_real_feishu_like_ogg -- --ignored --nocapture
+```
+
 ## 授权角色（owner / sender / group）
 
 除 owner 外，`config.toml` 还支持两类低权限授权（均为可选、默认拒绝）：

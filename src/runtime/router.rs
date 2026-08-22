@@ -14,7 +14,7 @@ use tokio::time::{MissedTickBehavior, interval};
 use crate::codex::client::ControlEvent;
 use crate::codex::supervisor::{SupervisorError, SupervisorHandle, SupervisorState};
 use crate::codex::types::{ApprovalPolicy, SandboxMode};
-use crate::config::BridgeConfig;
+use crate::config::{AsrSection, BridgeConfig};
 use crate::lark::bridge::QueuedInboundEvent;
 use crate::limits::{
     ROUTER_ACTIVE_TURN_HARD_LIMIT, ROUTER_COMMAND_BYTE_BUDGET, ROUTER_COMMAND_CAPACITY,
@@ -46,6 +46,7 @@ pub struct RouterSettings {
     pub(crate) message_max_age: Duration,
     pub(crate) finalization_retry: Duration,
     pub(crate) shutdown_cleanup_timeout: Duration,
+    pub(crate) asr: AsrSection,
 }
 
 impl RouterSettings {
@@ -64,6 +65,7 @@ impl RouterSettings {
             message_max_age: Duration::from_secs(15 * 60),
             finalization_retry: Duration::from_secs(1),
             shutdown_cleanup_timeout: Duration::from_secs(5),
+            asr: config.asr.clone(),
         }
     }
 
@@ -132,6 +134,7 @@ impl fmt::Debug for RouterSettings {
             .field("message_max_age", &self.message_max_age)
             .field("finalization_retry", &self.finalization_retry)
             .field("shutdown_cleanup_timeout", &self.shutdown_cleanup_timeout)
+            .field("asr", &self.asr)
             .finish()
     }
 }
@@ -265,6 +268,7 @@ impl Router {
     /// # Errors
     ///
     /// Returns the same static classifications as [`Self::start`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_with_contexts(
         store: StoreHandle,
         tenant: TenantNamespace,
@@ -288,6 +292,7 @@ impl Router {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn start_inner(
         store: StoreHandle,
         tenant: TenantNamespace,
@@ -557,7 +562,8 @@ async fn run_router(
     let mut retry_tick = interval(Duration::from_millis(250));
     retry_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut supervisor_open = true;
-    let mut tool_task = start_context_tool_task(&supervisor, &attachments, &contexts);
+    let mut tool_task =
+        start_context_tool_task(&supervisor, &attachments, &contexts, settings.asr.clone());
     loop {
         tokio::select! {
             biased;
@@ -585,7 +591,12 @@ async fn run_router(
                         if let Some((_, task)) = tool_task.take() {
                             task.abort();
                         }
-                        tool_task = start_context_tool_task(&supervisor, &attachments, &contexts);
+                        tool_task = start_context_tool_task(
+                            &supervisor,
+                            &attachments,
+                            &contexts,
+                            settings.asr.clone(),
+                        );
                     }
                 } else {
                     if let Some((_, task)) = tool_task.take() {
@@ -672,10 +683,12 @@ async fn run_router(
     Ok(())
 }
 
+#[allow(clippy::ref_option, clippy::too_many_arguments)]
 fn start_context_tool_task(
     supervisor: &SupervisorHandle,
     attachments: &Option<Arc<AttachmentCache>>,
     contexts: &Option<Arc<ContextRegistry>>,
+    asr: AsrSection,
 ) -> Option<(crate::codex::rpc::ConnectionEpoch, JoinHandle<()>)> {
     let attachments = attachments.as_ref().map(Arc::clone)?;
     let contexts = contexts.as_ref().map(Arc::clone)?;
@@ -691,6 +704,7 @@ fn start_context_tool_task(
                         request,
                         contexts.as_ref(),
                         attachments.as_ref(),
+                        &asr,
                     )
                     .await;
                 }

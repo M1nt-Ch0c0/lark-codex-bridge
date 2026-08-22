@@ -1149,6 +1149,7 @@ async fn release_thread_route(
     }
 }
 
+#[allow(clippy::too_many_arguments, clippy::if_not_else)]
 async fn ensure_thread(
     scope: &ScopeKey,
     store: &StoreHandle,

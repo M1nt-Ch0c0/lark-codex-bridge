@@ -36,8 +36,9 @@ use sha2::{Digest, Sha256};
 use super::api::{ChatMode, LarkApi, ResourceKind};
 use super::error::{LarkError, LarkErrorKind};
 use crate::limits::{
-    ATTACHMENT_FILE_NAME_MAX_BYTES, ATTACHMENT_MIME_MAX_BYTES, LARK_CHAT_MODE_CACHE_CAPACITY,
-    LARK_CHAT_MODE_CACHE_KEY_BYTES, LARK_CHAT_MODE_CACHE_TTL, LARK_MAX_EVENT_PAYLOAD_BYTES,
+    ASR_TRANSCRIPT_MAX_BYTES, ATTACHMENT_FILE_NAME_MAX_BYTES, ATTACHMENT_MIME_MAX_BYTES,
+    LARK_CHAT_MODE_CACHE_CAPACITY, LARK_CHAT_MODE_CACHE_KEY_BYTES, LARK_CHAT_MODE_CACHE_TTL,
+    LARK_MAX_EVENT_PAYLOAD_BYTES,
 };
 
 /// Stable inbound message model handed to the scope runtime.
@@ -189,6 +190,9 @@ pub struct MediaMetadata {
     /// Media duration in milliseconds, when supplied as a non-negative
     /// integer.
     pub duration_ms: Option<u64>,
+    /// Client-supplied speech recognition text, when the inbound payload
+    /// already includes a bounded transcript.
+    pub transcript: Option<String>,
 }
 
 impl fmt::Debug for MediaMetadata {
@@ -205,6 +209,10 @@ impl fmt::Debug for MediaMetadata {
             )
             .field("size_bytes", &self.size_bytes)
             .field("duration_ms", &self.duration_ms)
+            .field(
+                "transcript_len",
+                &self.transcript.as_deref().map_or(0, str::len),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -824,7 +832,7 @@ fn extract_message_content(
             })
         }
         "sticker" => Ok(rich_media_content(&value, MessagePart::Sticker)),
-        "audio" => Ok(rich_media_content(&value, MessagePart::Audio)),
+        "audio" => Ok(audio_content(&value)),
         "video" | "media" => {
             let key = content_string(&value, "file_key");
             let thumbnail_key = content_string(&value, "image_key");
@@ -871,7 +879,37 @@ fn rich_media_content(value: &Value, wrap: fn(MediaPart) -> MessagePart) -> Extr
     }
 }
 
+fn audio_content(value: &Value) -> ExtractedContent {
+    let key = content_string(value, "file_key");
+    let transcript = content_transcript(value);
+    ExtractedContent {
+        text: transcript.clone().unwrap_or_default(),
+        mentions_all: false,
+        resources: Vec::new(),
+        parts: vec![MessagePart::Audio(media_part_with_transcript(
+            key, value, transcript,
+        ))],
+    }
+}
+
 fn media_part(key: Option<String>, thumbnail_key: Option<String>, value: &Value) -> MediaPart {
+    media_part_inner(key, thumbnail_key, value, None)
+}
+
+fn media_part_with_transcript(
+    key: Option<String>,
+    value: &Value,
+    transcript: Option<String>,
+) -> MediaPart {
+    media_part_inner(key, None, value, transcript)
+}
+
+fn media_part_inner(
+    key: Option<String>,
+    thumbnail_key: Option<String>,
+    value: &Value,
+    transcript: Option<String>,
+) -> MediaPart {
     let status = if key.is_some() {
         PartStatus::Available
     } else {
@@ -889,9 +927,41 @@ fn media_part(key: Option<String>, thumbnail_key: Option<String>, value: &Value)
                 .filter(|mime| safe_mime(mime)),
             size_bytes: content_u64(value, &["file_size", "size"]),
             duration_ms: content_u64(value, &["duration_ms", "duration"]),
+            transcript,
         },
         status,
     }
+}
+
+/// Trims and bounds recognition text from inbound payloads or sidecar stdout.
+#[must_use]
+pub fn normalize_transcript(text: &str, max_bytes: usize) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.len() > max_bytes {
+        return None;
+    }
+    if trimmed
+        .chars()
+        .any(|ch| ch.is_control() && ch != '\n' && ch != '\t')
+    {
+        return None;
+    }
+    Some(trimmed.to_owned())
+}
+
+fn content_transcript(value: &Value) -> Option<String> {
+    const KEYS: &[&str] = &["text", "recognition", "transcript", "recognized_text"];
+    for key in KEYS {
+        if let Some(text) = content_string(value, key)
+            .and_then(|text| normalize_transcript(&text, ASR_TRANSCRIPT_MAX_BYTES))
+        {
+            return Some(text);
+        }
+    }
+    value
+        .get("recognition")
+        .and_then(|recognition| content_string(recognition, "text"))
+        .and_then(|text| normalize_transcript(&text, ASR_TRANSCRIPT_MAX_BYTES))
 }
 
 fn content_string(value: &Value, key: &str) -> Option<String> {
@@ -1004,6 +1074,7 @@ struct EventMention {
 }
 
 #[derive(Default, Deserialize)]
+#[allow(clippy::struct_field_names)]
 struct EventMentionId {
     open_id: Option<String>,
     user_id: Option<String>,
