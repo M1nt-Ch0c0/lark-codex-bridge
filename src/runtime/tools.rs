@@ -96,9 +96,11 @@ pub async fn handle_server_request(
         return;
     }
 
-    let Ok(params) = request.params.clone().ok_or(()).and_then(|value| {
-        serde_json::from_value::<DynamicToolCallParams>(value).map_err(|_| ())
-    }) else {
+    let Ok(params) =
+        request.params.clone().ok_or(()).and_then(|value| {
+            serde_json::from_value::<DynamicToolCallParams>(value).map_err(|_| ())
+        })
+    else {
         respond_tool_error(
             client,
             &mut request,
