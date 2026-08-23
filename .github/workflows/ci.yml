@@ -27,11 +27,24 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           key: codex-schema-contracts
       - run: python3 -m unittest discover -s tools/tests -p 'test_*.py'
+      - name: Enforce append-only Codex support history
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if git cat-file -e "$BASE_SHA:protocol/codex/support-history.json"; then
+            git show "$BASE_SHA:protocol/codex/support-history.json" > "$RUNNER_TEMP/codex-support-history.json"
+            python3 tools/codex_schema.py verify-history --previous "$RUNNER_TEMP/codex-support-history.json"
+          else
+            python3 tools/codex_schema.py verify
+          fi
       - run: python3 tools/codex_schema.py verify
       - run: cargo fetch --locked
       - run: cargo build --offline --locked

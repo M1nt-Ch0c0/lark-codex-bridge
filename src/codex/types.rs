@@ -277,7 +277,6 @@ open_string_enum! {
         CreatedAt => "created_at",
         UpdatedAt => "updated_at",
         RecencyAt => "recency_at",
-        SectionPosition => "section_position",
     }
 }
 

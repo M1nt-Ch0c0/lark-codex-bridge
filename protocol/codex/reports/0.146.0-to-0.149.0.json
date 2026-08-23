@@ -15,26 +15,6 @@
     {
       "classification": "additive",
       "kind": "definition_added",
-      "path": "roots/notification.item.started/definitions/AgentMessageDelivery"
-    },
-    {
-      "classification": "additive",
-      "kind": "definition_added",
-      "path": "roots/notification.item.started/definitions/ImageGenerationFailure"
-    },
-    {
-      "classification": "additive",
-      "kind": "definition_added",
-      "path": "roots/notification.thread.started/definitions/AgentMessageDelivery"
-    },
-    {
-      "classification": "additive",
-      "kind": "definition_added",
-      "path": "roots/notification.thread.started/definitions/ImageGenerationFailure"
-    },
-    {
-      "classification": "additive",
-      "kind": "definition_added",
       "path": "roots/notification.thread.started/definitions/ThreadSection"
     },
     {
@@ -44,119 +24,8 @@
     },
     {
       "classification": "additive",
-      "kind": "definition_added",
-      "path": "roots/notification.turn.completed/definitions/AgentMessageDelivery"
-    },
-    {
-      "classification": "additive",
-      "kind": "definition_added",
-      "path": "roots/notification.turn.completed/definitions/ImageGenerationFailure"
-    },
-    {
-      "classification": "additive",
-      "kind": "definition_added",
-      "path": "roots/notification.turn.started/definitions/AgentMessageDelivery"
-    },
-    {
-      "classification": "additive",
-      "kind": "definition_added",
-      "path": "roots/notification.turn.started/definitions/ImageGenerationFailure"
-    },
-    {
-      "classification": "additive",
-      "kind": "definition_added",
-      "path": "roots/thread.list.response/definitions/AgentMessageDelivery"
-    },
-    {
-      "classification": "additive",
-      "kind": "definition_added",
-      "path": "roots/thread.list.response/definitions/ImageGenerationFailure"
-    },
-    {
-      "classification": "additive",
-      "kind": "definition_added",
-      "path": "roots/thread.list.response/definitions/ThreadSection"
-    },
-    {
-      "classification": "additive",
-      "kind": "definition_added",
-      "path": "roots/thread.list.response/definitions/ThreadSectionAppearance"
-    },
-    {
-      "classification": "additive",
-      "kind": "definition_added",
-      "path": "roots/thread.read.response/definitions/AgentMessageDelivery"
-    },
-    {
-      "classification": "additive",
-      "kind": "definition_added",
-      "path": "roots/thread.read.response/definitions/ImageGenerationFailure"
-    },
-    {
-      "classification": "additive",
-      "kind": "definition_added",
-      "path": "roots/thread.read.response/definitions/ThreadSection"
-    },
-    {
-      "classification": "additive",
-      "kind": "definition_added",
-      "path": "roots/thread.read.response/definitions/ThreadSectionAppearance"
-    },
-    {
-      "classification": "additive",
-      "kind": "definition_added",
-      "path": "roots/thread.resume.response/definitions/AgentMessageDelivery"
-    },
-    {
-      "classification": "additive",
-      "kind": "definition_added",
-      "path": "roots/thread.resume.response/definitions/ImageGenerationFailure"
-    },
-    {
-      "classification": "additive",
-      "kind": "definition_added",
-      "path": "roots/thread.resume.response/definitions/ThreadSection"
-    },
-    {
-      "classification": "additive",
-      "kind": "definition_added",
-      "path": "roots/thread.resume.response/definitions/ThreadSectionAppearance"
-    },
-    {
-      "classification": "additive",
-      "kind": "definition_added",
-      "path": "roots/thread.start.response/definitions/AgentMessageDelivery"
-    },
-    {
-      "classification": "additive",
-      "kind": "definition_added",
-      "path": "roots/thread.start.response/definitions/ImageGenerationFailure"
-    },
-    {
-      "classification": "additive",
-      "kind": "definition_added",
-      "path": "roots/thread.start.response/definitions/ThreadSection"
-    },
-    {
-      "classification": "additive",
-      "kind": "definition_added",
-      "path": "roots/thread.start.response/definitions/ThreadSectionAppearance"
-    },
-    {
-      "classification": "additive",
-      "kind": "definition_added",
-      "path": "roots/turn.start.response/definitions/AgentMessageDelivery"
-    },
-    {
-      "classification": "additive",
-      "kind": "definition_added",
-      "path": "roots/turn.start.response/definitions/ImageGenerationFailure"
-    },
-    {
-      "classification": "additive",
-      "kind": "enum_values_added",
+      "kind": "finite_values_added",
       "path": "roots/thread.list.params/definitions/ThreadSortKey",
-      "requiresUnknownFallback": true,
       "values": [
         "section_position"
       ]
@@ -188,158 +57,28 @@
     },
     {
       "classification": "additive",
-      "kind": "one_of_variant_added_or_changed",
-      "path": "roots/notification.error/definitions/CodexErrorInfo"
-    },
-    {
-      "classification": "additive",
-      "kind": "one_of_variant_added_or_changed",
-      "path": "roots/notification.item.completed/definitions/CommandAction"
-    },
-    {
-      "classification": "additive",
-      "kind": "one_of_variant_added_or_changed",
-      "path": "roots/notification.item.completed/definitions/ThreadItem"
-    },
-    {
-      "classification": "additive",
-      "kind": "one_of_variant_added_or_changed",
-      "path": "roots/notification.item.started/definitions/CommandAction"
-    },
-    {
-      "classification": "additive",
-      "kind": "one_of_variant_added_or_changed",
-      "path": "roots/notification.item.started/definitions/ThreadItem"
-    },
-    {
-      "classification": "additive",
-      "kind": "one_of_variant_added_or_changed",
-      "path": "roots/notification.thread.started/definitions/CodexErrorInfo"
-    },
-    {
-      "classification": "additive",
-      "kind": "one_of_variant_added_or_changed",
-      "path": "roots/notification.thread.started/definitions/CommandAction"
-    },
-    {
-      "classification": "additive",
-      "kind": "one_of_variant_added_or_changed",
-      "path": "roots/notification.thread.started/definitions/ThreadItem"
-    },
-    {
-      "classification": "additive",
-      "kind": "one_of_variant_added_or_changed",
-      "path": "roots/notification.turn.completed/definitions/CodexErrorInfo"
-    },
-    {
-      "classification": "additive",
-      "kind": "one_of_variant_added_or_changed",
-      "path": "roots/notification.turn.completed/definitions/CommandAction"
-    },
-    {
-      "classification": "additive",
-      "kind": "one_of_variant_added_or_changed",
-      "path": "roots/notification.turn.completed/definitions/ThreadItem"
-    },
-    {
-      "classification": "additive",
-      "kind": "one_of_variant_added_or_changed",
-      "path": "roots/notification.turn.started/definitions/CodexErrorInfo"
-    },
-    {
-      "classification": "additive",
-      "kind": "one_of_variant_added_or_changed",
-      "path": "roots/notification.turn.started/definitions/CommandAction"
-    },
-    {
-      "classification": "additive",
-      "kind": "one_of_variant_added_or_changed",
-      "path": "roots/notification.turn.started/definitions/ThreadItem"
-    },
-    {
-      "classification": "additive",
-      "kind": "one_of_variant_added_or_changed",
-      "path": "roots/thread.list.response/definitions/CodexErrorInfo"
-    },
-    {
-      "classification": "additive",
-      "kind": "one_of_variant_added_or_changed",
-      "path": "roots/thread.list.response/definitions/CommandAction"
-    },
-    {
-      "classification": "additive",
-      "kind": "one_of_variant_added_or_changed",
-      "path": "roots/thread.list.response/definitions/ThreadItem"
-    },
-    {
-      "classification": "additive",
-      "kind": "one_of_variant_added_or_changed",
-      "path": "roots/thread.read.response/definitions/CodexErrorInfo"
-    },
-    {
-      "classification": "additive",
-      "kind": "one_of_variant_added_or_changed",
-      "path": "roots/thread.read.response/definitions/CommandAction"
-    },
-    {
-      "classification": "additive",
-      "kind": "one_of_variant_added_or_changed",
-      "path": "roots/thread.read.response/definitions/ThreadItem"
-    },
-    {
-      "classification": "additive",
-      "kind": "one_of_variant_added_or_changed",
-      "path": "roots/thread.resume.params/definitions/ResponseItem"
-    },
-    {
-      "classification": "additive",
-      "kind": "one_of_variant_added_or_changed",
-      "path": "roots/thread.resume.response/definitions/CodexErrorInfo"
-    },
-    {
-      "classification": "additive",
-      "kind": "one_of_variant_added_or_changed",
-      "path": "roots/thread.resume.response/definitions/CommandAction"
-    },
-    {
-      "classification": "additive",
-      "kind": "one_of_variant_added_or_changed",
-      "path": "roots/thread.resume.response/definitions/ThreadItem"
-    },
-    {
-      "classification": "additive",
-      "kind": "one_of_variant_added_or_changed",
-      "path": "roots/thread.start.response/definitions/CodexErrorInfo"
-    },
-    {
-      "classification": "additive",
-      "kind": "one_of_variant_added_or_changed",
-      "path": "roots/thread.start.response/definitions/CommandAction"
-    },
-    {
-      "classification": "additive",
-      "kind": "one_of_variant_added_or_changed",
-      "path": "roots/thread.start.response/definitions/ThreadItem"
-    },
-    {
-      "classification": "additive",
-      "kind": "one_of_variant_added_or_changed",
-      "path": "roots/turn.start.response/definitions/CodexErrorInfo"
-    },
-    {
-      "classification": "additive",
-      "kind": "one_of_variant_added_or_changed",
-      "path": "roots/turn.start.response/definitions/CommandAction"
-    },
-    {
-      "classification": "additive",
-      "kind": "one_of_variant_added_or_changed",
-      "path": "roots/turn.start.response/definitions/ThreadItem"
+      "kind": "optional_property_added",
+      "path": "roots/initialize.params/definitions/InitializeCapabilities/properties/extensions"
     },
     {
       "classification": "additive",
       "kind": "optional_property_added",
-      "path": "roots/initialize.params/definitions/InitializeCapabilities/properties/extensions"
+      "path": "roots/notification.item.completed/definitions/ThreadItem/oneOf/14/properties/failure"
+    },
+    {
+      "classification": "additive",
+      "kind": "optional_property_added",
+      "path": "roots/notification.item.completed/definitions/ThreadItem/oneOf/14/properties/transparentBackground"
+    },
+    {
+      "classification": "additive",
+      "kind": "optional_property_added",
+      "path": "roots/notification.item.completed/definitions/ThreadItem/oneOf/2/properties/delivery"
+    },
+    {
+      "classification": "additive",
+      "kind": "optional_property_added",
+      "path": "roots/notification.item.completed/definitions/ThreadItem/oneOf/7/properties/readOnlyHint"
     },
     {
       "classification": "additive",
@@ -364,32 +103,7 @@
     {
       "classification": "additive",
       "kind": "optional_property_added",
-      "path": "roots/thread.list.response/definitions/Thread/properties/section"
-    },
-    {
-      "classification": "additive",
-      "kind": "optional_property_added",
-      "path": "roots/thread.list.response/definitions/Thread/properties/sectionEnteredAt"
-    },
-    {
-      "classification": "additive",
-      "kind": "optional_property_added",
-      "path": "roots/thread.read.response/definitions/Thread/properties/section"
-    },
-    {
-      "classification": "additive",
-      "kind": "optional_property_added",
-      "path": "roots/thread.read.response/definitions/Thread/properties/sectionEnteredAt"
-    },
-    {
-      "classification": "additive",
-      "kind": "optional_property_added",
-      "path": "roots/thread.resume.response/definitions/Thread/properties/section"
-    },
-    {
-      "classification": "additive",
-      "kind": "optional_property_added",
-      "path": "roots/thread.resume.response/definitions/Thread/properties/sectionEnteredAt"
+      "path": "roots/thread.resume.params/definitions/ResponseItem/oneOf/4/properties/encrypted_function_args"
     },
     {
       "classification": "additive",
@@ -397,164 +111,68 @@
       "path": "roots/thread.start.params/properties/projectId"
     },
     {
-      "classification": "additive",
-      "kind": "optional_property_added",
-      "path": "roots/thread.start.response/definitions/Thread/properties/section"
-    },
-    {
-      "classification": "additive",
-      "kind": "optional_property_added",
-      "path": "roots/thread.start.response/definitions/Thread/properties/sectionEnteredAt"
+      "classification": "breaking",
+      "kind": "incoming_closed_values_added",
+      "path": "roots/notification.error/definitions/CodexErrorInfo/oneOf/0",
+      "values": [
+        "misalignmentPolicyViolation"
+      ]
     },
     {
       "classification": "breaking",
-      "kind": "one_of_variant_removed_or_changed",
-      "path": "roots/notification.error/definitions/CodexErrorInfo"
+      "construct": "enum",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/AgentMessageDelivery"
     },
     {
       "classification": "breaking",
-      "kind": "one_of_variant_removed_or_changed",
-      "path": "roots/notification.item.completed/definitions/CommandAction"
+      "construct": "oneOf",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/ImageGenerationFailure"
     },
     {
       "classification": "breaking",
-      "kind": "one_of_variant_removed_or_changed",
-      "path": "roots/notification.item.completed/definitions/ThreadItem"
+      "construct": "enum",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/ImageGenerationFailure/oneOf/0/properties/type"
     },
     {
       "classification": "breaking",
-      "kind": "one_of_variant_removed_or_changed",
-      "path": "roots/notification.item.started/definitions/CommandAction"
+      "construct": "anyOf",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/Thread/properties/section"
     },
     {
       "classification": "breaking",
-      "kind": "one_of_variant_removed_or_changed",
-      "path": "roots/notification.item.started/definitions/ThreadItem"
+      "construct": "anyOf",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/ThreadItem/oneOf/14/properties/failure"
     },
     {
       "classification": "breaking",
-      "kind": "one_of_variant_removed_or_changed",
-      "path": "roots/notification.thread.started/definitions/CodexErrorInfo"
+      "construct": "anyOf",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/ThreadItem/oneOf/2/properties/delivery"
     },
     {
       "classification": "breaking",
-      "kind": "one_of_variant_removed_or_changed",
-      "path": "roots/notification.thread.started/definitions/CommandAction"
-    },
-    {
-      "classification": "breaking",
-      "kind": "one_of_variant_removed_or_changed",
-      "path": "roots/notification.thread.started/definitions/ThreadItem"
-    },
-    {
-      "classification": "breaking",
-      "kind": "one_of_variant_removed_or_changed",
-      "path": "roots/notification.turn.completed/definitions/CodexErrorInfo"
-    },
-    {
-      "classification": "breaking",
-      "kind": "one_of_variant_removed_or_changed",
-      "path": "roots/notification.turn.completed/definitions/CommandAction"
-    },
-    {
-      "classification": "breaking",
-      "kind": "one_of_variant_removed_or_changed",
-      "path": "roots/notification.turn.completed/definitions/ThreadItem"
-    },
-    {
-      "classification": "breaking",
-      "kind": "one_of_variant_removed_or_changed",
-      "path": "roots/notification.turn.started/definitions/CodexErrorInfo"
-    },
-    {
-      "classification": "breaking",
-      "kind": "one_of_variant_removed_or_changed",
-      "path": "roots/notification.turn.started/definitions/CommandAction"
-    },
-    {
-      "classification": "breaking",
-      "kind": "one_of_variant_removed_or_changed",
-      "path": "roots/notification.turn.started/definitions/ThreadItem"
-    },
-    {
-      "classification": "breaking",
-      "kind": "one_of_variant_removed_or_changed",
-      "path": "roots/thread.list.response/definitions/CodexErrorInfo"
-    },
-    {
-      "classification": "breaking",
-      "kind": "one_of_variant_removed_or_changed",
-      "path": "roots/thread.list.response/definitions/CommandAction"
-    },
-    {
-      "classification": "breaking",
-      "kind": "one_of_variant_removed_or_changed",
-      "path": "roots/thread.list.response/definitions/ThreadItem"
-    },
-    {
-      "classification": "breaking",
-      "kind": "one_of_variant_removed_or_changed",
-      "path": "roots/thread.read.response/definitions/CodexErrorInfo"
-    },
-    {
-      "classification": "breaking",
-      "kind": "one_of_variant_removed_or_changed",
-      "path": "roots/thread.read.response/definitions/CommandAction"
-    },
-    {
-      "classification": "breaking",
-      "kind": "one_of_variant_removed_or_changed",
-      "path": "roots/thread.read.response/definitions/ThreadItem"
-    },
-    {
-      "classification": "breaking",
-      "kind": "one_of_variant_removed_or_changed",
-      "path": "roots/thread.resume.params/definitions/ResponseItem"
-    },
-    {
-      "classification": "breaking",
-      "kind": "one_of_variant_removed_or_changed",
-      "path": "roots/thread.resume.response/definitions/CodexErrorInfo"
-    },
-    {
-      "classification": "breaking",
-      "kind": "one_of_variant_removed_or_changed",
-      "path": "roots/thread.resume.response/definitions/CommandAction"
-    },
-    {
-      "classification": "breaking",
-      "kind": "one_of_variant_removed_or_changed",
-      "path": "roots/thread.resume.response/definitions/ThreadItem"
-    },
-    {
-      "classification": "breaking",
-      "kind": "one_of_variant_removed_or_changed",
-      "path": "roots/thread.start.response/definitions/CodexErrorInfo"
-    },
-    {
-      "classification": "breaking",
-      "kind": "one_of_variant_removed_or_changed",
-      "path": "roots/thread.start.response/definitions/CommandAction"
-    },
-    {
-      "classification": "breaking",
-      "kind": "one_of_variant_removed_or_changed",
-      "path": "roots/thread.start.response/definitions/ThreadItem"
-    },
-    {
-      "classification": "breaking",
-      "kind": "one_of_variant_removed_or_changed",
-      "path": "roots/turn.start.response/definitions/CodexErrorInfo"
-    },
-    {
-      "classification": "breaking",
-      "kind": "one_of_variant_removed_or_changed",
-      "path": "roots/turn.start.response/definitions/CommandAction"
-    },
-    {
-      "classification": "breaking",
-      "kind": "one_of_variant_removed_or_changed",
-      "path": "roots/turn.start.response/definitions/ThreadItem"
+      "construct": "anyOf",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/ThreadSection/properties/appearance"
     },
     {
       "classification": "breaking",
@@ -568,56 +186,21 @@
     },
     {
       "classification": "breaking",
-      "kind": "property_removed",
-      "path": "roots/thread.list.response/definitions/Thread/properties/isPinned"
-    },
-    {
-      "classification": "breaking",
-      "kind": "property_removed",
-      "path": "roots/thread.read.response/definitions/Thread/properties/isPinned"
-    },
-    {
-      "classification": "breaking",
-      "kind": "property_removed",
-      "path": "roots/thread.resume.response/definitions/Thread/properties/isPinned"
-    },
-    {
-      "classification": "breaking",
-      "kind": "property_removed",
-      "path": "roots/thread.start.response/definitions/Thread/properties/isPinned"
+      "kind": "reference_changed",
+      "path": "roots/notification.item.completed/definitions/CommandAction/oneOf/0/properties/path"
     },
     {
       "classification": "breaking",
       "kind": "required_property_added",
       "path": "roots/notification.thread.started/definitions/Thread/properties/projectId"
-    },
-    {
-      "classification": "breaking",
-      "kind": "required_property_added",
-      "path": "roots/thread.list.response/definitions/Thread/properties/projectId"
-    },
-    {
-      "classification": "breaking",
-      "kind": "required_property_added",
-      "path": "roots/thread.read.response/definitions/Thread/properties/projectId"
-    },
-    {
-      "classification": "breaking",
-      "kind": "required_property_added",
-      "path": "roots/thread.resume.response/definitions/Thread/properties/projectId"
-    },
-    {
-      "classification": "breaking",
-      "kind": "required_property_added",
-      "path": "roots/thread.start.response/definitions/Thread/properties/projectId"
     }
   ],
   "compatible": false,
   "formatVersion": 1,
   "protocolFamily": "codex-app-server-jsonrpc/v1+v2-experimental",
   "summary": {
-    "additive": 80,
-    "breaking": 41,
-    "total": 121
+    "additive": 21,
+    "breaking": 12,
+    "total": 33
   }
 }

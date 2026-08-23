@@ -6,6 +6,7 @@ use lark_codex_bridge::{
             AppServerClient, AppServerEvent, ControlEvent, SubscriptionInvalidation, ThreadId,
             ThreadSubscription, TurnId, TurnOutcome,
         },
+        compat::WireAdapter,
         rpc::{ConnectionEpoch, RpcConnection, initialize_connection, spawn_rpc},
         transport::spawn_stream_transport,
         types::{
@@ -85,7 +86,7 @@ async fn initialize(
         app_stdout,
         app_stdin,
         _app_stderr: app_stderr,
-        client: Arc::new(AppServerClient::spawn(connection)),
+        client: Arc::new(AppServerClient::spawn(connection, WireAdapter::V0_146_0)),
     }
 }
 

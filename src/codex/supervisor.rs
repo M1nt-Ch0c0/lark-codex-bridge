@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     codex::{
         client::AppServerClient,
+        compat::WireAdapter,
         process::{CodexProcess, CodexProcessConfig, ProcessError, ProcessExit, spawn_app_server},
         rpc::{ConnectionEpoch, RpcError, initialize_connection_with_dynamic_tools, spawn_rpc},
         transport::spawn_stream_transport,
@@ -497,6 +498,14 @@ async fn connect_epoch(
     shutdown: &CancellationToken,
 ) -> Result<RunningEpoch, EpochStartError> {
     let version = process.version().clone();
+    let Some(wire) = WireAdapter::for_version(&version) else {
+        return Err(EpochStartError {
+            process,
+            permanent: Some(format!(
+                "Codex {version} has no promoted wire compatibility adapter"
+            )),
+        });
+    };
     let stdio = match process.take_stdio() {
         Ok(stdio) => stdio,
         Err(error) => {
@@ -510,7 +519,7 @@ async fn connect_epoch(
         spawn_stream_transport(stdio.stdout, stdio.stdin, stdio.stderr, shutdown.clone());
     let mut connection = spawn_rpc(transport, ConnectionEpoch::new(epoch), shutdown.clone());
     let handle = connection.handle.clone();
-    let initialize = match initialize_connection_with_dynamic_tools(&handle).await {
+    let initialize = match initialize_connection_with_dynamic_tools(&handle, wire).await {
         Ok(initialize) => initialize,
         Err(error) => {
             let _ = connection.shutdown().await;
@@ -521,7 +530,7 @@ async fn connect_epoch(
         }
     };
     let peer = PeerInfo::from(&initialize);
-    let client = Arc::new(AppServerClient::spawn(connection));
+    let client = Arc::new(AppServerClient::spawn(connection, wire));
     Ok(RunningEpoch {
         process,
         client,

@@ -4,7 +4,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::codex::{
-    client::AppServerClient,
+    client::{AppServerClient, DYNAMIC_TOOL_CALL_METHOD},
     rpc::ServerRequest,
     types::{
         DynamicToolCallOutputContentItem, DynamicToolCallParams, DynamicToolCallResponse,
@@ -86,32 +86,26 @@ pub async fn handle_server_request(
     contexts: &ContextRegistry,
     attachments: &AttachmentCache,
 ) {
-    if request.method != "item/tool/call" {
+    if request.method != DYNAMIC_TOOL_CALL_METHOD {
         let _ = client
             .respond_request_error(&mut request, -32_601, "unsupported server request")
             .await;
         return;
     }
 
-    let params =
-        match request.params.clone().ok_or(()).and_then(|value| {
-            serde_json::from_value::<DynamicToolCallParams>(value).map_err(|_| ())
-        }) {
-            Ok(params) => params,
-            Err(()) => {
-                respond_tool_error(
-                    client,
-                    &mut request,
-                    &tool_error(
-                        "invalid_request",
-                        "dynamic tool parameters are invalid",
-                        false,
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
+    let Ok(params) = client.decode_dynamic_tool_call(&request) else {
+        respond_tool_error(
+            client,
+            &mut request,
+            &tool_error(
+                "invalid_request",
+                "dynamic tool parameters are invalid",
+                false,
+            ),
+        )
+        .await;
+        return;
+    };
 
     let result = match (params.namespace.as_deref(), params.tool.as_str()) {
         (Some("bridge_context"), "resolve") => resolve_context(contexts, &params),
@@ -127,7 +121,9 @@ pub async fn handle_server_request(
         Ok(value) => tool_response(value, true),
         Err(value) => tool_response(value, false),
     };
-    let _ = client.respond_request(&mut request, &response).await;
+    let _ = client
+        .respond_dynamic_tool_call(&mut request, &response)
+        .await;
 }
 
 fn resolve_context(
@@ -248,5 +244,5 @@ fn tool_response(value: Value, success: bool) -> DynamicToolCallResponse {
 
 async fn respond_tool_error(client: &AppServerClient, request: &mut ServerRequest, error: &Value) {
     let response = tool_response(error.clone(), false);
-    let _ = client.respond_request(request, &response).await;
+    let _ = client.respond_dynamic_tool_call(request, &response).await;
 }

@@ -45,7 +45,7 @@ jobs:
           install_root="$(mktemp -d)"
           npm install --prefix "$install_root" "@openai/codex@$CANDIDATE_VERSION"
           python3 tools/codex_schema.py sync --binary "$install_root/node_modules/.bin/codex"
-          baseline="$(jq -r .compatibilityBaselineVersion protocol/codex/support-policy.json)"
+          baseline="$(jq -r .establishedBaselineVersion protocol/codex/support-history.json)"
           python3 tools/codex_schema.py diff --baseline "$baseline" --candidate "$CANDIDATE_VERSION" --write-defaults --allow-breaking
       - uses: actions/upload-artifact@v4
         if: steps.candidate.outputs.known != 'true'
@@ -65,7 +65,7 @@ jobs:
           if gh issue list --state open --search "$title in:title" --json title --jq '.[].title' | grep -Fxq "$title"; then
             exit 0
           fi
-          baseline="$(jq -r .compatibilityBaselineVersion protocol/codex/support-policy.json)"
+          baseline="$(jq -r .establishedBaselineVersion protocol/codex/support-history.json)"
           summary="$(jq -c .summary "protocol/codex/reports/$baseline-to-$CANDIDATE_VERSION.json")"
           compatible="$(jq -r .compatible "protocol/codex/reports/$baseline-to-$CANDIDATE_VERSION.json")"
           gh issue create --title "$title" --label enhancement --body "Automated schema discovery compared $baseline to $CANDIDATE_VERSION. Compatible: $compatible. Classified summary: $summary. Download the workflow artifact, add/review the complete contract fixture, and update support-policy.json only after the offline promotion gate passes. Breaking or contract failures must remain blocked."

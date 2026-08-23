@@ -1,9 +1,11 @@
 {
   "artifactSha256": {
+    "incomingAudit": "3355aad62534ab5d3f2c20be3a596f2cc47f3e52cb01e809137c5944b3e9476d",
     "normalizedSchema": "8f949f41d0de731f26d264db686a90469a817837f83050c47487045745a3b3a6",
-    "rustWire": "08ddf5ecaf127c70969c467bc982b3d1b47cd2b4fd52c8fc74e8f008a864df39"
+    "rustWire": "293b8dfe76516be9cb1e848ea54d5bfa1a4e80d09c5d87f091e672a0c335797a"
   },
   "artifacts": {
+    "incomingAudit": "protocol/codex/schemas/0.146.0/incoming-audit.json",
     "normalizedSchema": "protocol/codex/schemas/0.146.0/selected.schema.json",
     "rustWire": "src/codex/wire/v0_146_0.rs"
   },
@@ -19,7 +21,7 @@
   "generator": {
     "name": "lark-codex-bridge/codex-schema",
     "templateSha256": "4d07c5c97841b0c9fb14aa525e611026543e785347c293ff70498c36051de19e",
-    "version": "1.0.0"
+    "version": "1.1.0"
   },
   "lifecycle": "supported",
   "protocolFamily": "codex-app-server-jsonrpc/v1+v2-experimental",

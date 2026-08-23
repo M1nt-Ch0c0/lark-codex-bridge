@@ -3,6 +3,8 @@
 The bridge supports only exact Codex versions whose generated schema, wire DTOs,
 compatibility mapping, and contract fixture have been reviewed. The authoritative
 policy is [`protocol/codex/support-policy.json`](../protocol/codex/support-policy.json).
+The established baseline and every promoted version are also pinned in the
+append-only [`protocol/codex/support-history.json`](../protocol/codex/support-history.json).
 At present 0.146.0 is supported; 0.149.0 is a recorded candidate and is deliberately
 blocked because its compatibility report contains breaking changes.
 
@@ -24,6 +26,8 @@ runs `app-server generate-json-schema --experimental`, selects only bridge-owned
 roots and their transitive definitions, canonicalizes JSON, and writes:
 
 - `protocol/codex/schemas/X.Y.Z/selected.schema.json`;
+- `incoming-audit.json`, inventorying every incoming enum/union as either an
+  evidenced open fallback or a promotion-blocking closed construct;
 - a manifest containing exact Codex version, protocol family, schema SHA-256,
   generator version/template hash, selected roots, and artifact hashes;
 - `src/codex/wire/vX_Y_Z.rs`, isolated from handwritten `src/codex/types.rs`;
@@ -44,24 +48,34 @@ python3 tools/codex_schema.py contract --version X.Y.Z
 python3 tools/codex_schema.py verify
 ```
 
-The JSON report is the machine-readable source of truth. It separates optional
-additions, notification additions, enum additions and widening from removals,
-new required fields, type narrowing, enum removals, and closed objects. Enum
-additions are accepted only because generated strings cross a handwritten compat
-mapper into stable open enums with an `Unknown(String)` fallback.
+The JSON report is the machine-readable source of truth. Its conservative
+comparison covers type relationships (including integer as a subset of number),
+finite enum/const sets, object/array/string/numeric constraints, and JSON Schema
+combinators. An incoming enum or union addition is breaking unless the generated
+audit points to a tested open fallback. Changes the comparator cannot prove safe
+are blocking, not silently additive.
 
-Promotion requires moving the version to `supportedVersions`, updating the selected
-compat boundary when needed, and passing offline `verify`. A breaking report or any
-missing/invalid contract makes that check fail. Do not edit generated Rust or schema
-artifacts by hand, do not rewrite `compatibilityBaselineVersion` to bypass a report,
-and do not put schema export in `build.rs`.
+Promotion requires adding an append-only support-history record, moving the version
+to `supportedVersions`, adding its explicit `WireAdapter` branch, and passing offline
+`verify`. CI compares the history to the trusted pull-request base so deleting or
+rewriting an earlier supported release cannot make a candidate trust itself.
+`verify` re-renders Rust and the incoming audit from canonical schema bytes, compares
+them byte-for-byte, and validates the complete manifest. Do not edit generated Rust
+or schema artifacts by hand, and do not put schema export in `build.rs`.
 
 Contract fixtures cover initialize, thread start/list/read/resume, turn
 start/interrupt, the dynamic-tool reverse request, all notifications consumed by
 the bridge, normal notification order, and retry/uncertain failure classification.
-Every fixture record is checked against the same byte, nesting, and structural-token
-limits as app-server JSONL. Tool errors identify only a contract/root label and never
-echo fixture or remote payload text.
+Rust tests drive those records through the production wire adapter, JSONL
+encoder/decoder bounds, notification mapping, and actual retry classifier; the
+Python validator checks the records against their selected schemas. Tool errors
+identify only a contract/root label and never echo fixture or remote payload text.
+
+At runtime the supervisor probes the exact binary version before initialization and
+selects only a promoted adapter. Every outgoing request and reverse response is
+serialized through that generated version, while every response, consumed
+notification, and reverse request is decoded through it before reaching stable
+domain types. Candidate 0.149.0 therefore cannot enter production paths.
 
 The scheduled `Codex Schema Upgrade Report` workflow discovers a newer npm release,
 generates the normalized candidate report as a workflow artifact, and opens an
