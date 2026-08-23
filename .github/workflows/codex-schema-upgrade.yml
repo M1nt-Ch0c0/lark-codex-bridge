@@ -1,0 +1,71 @@
+name: Codex Schema Upgrade Report
+
+on:
+  schedule:
+    - cron: "41 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact @openai/codex X.Y.Z candidate (blank discovers latest)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: https://registry.npmjs.org
+      - name: Select candidate
+        id: candidate
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          version="${REQUESTED_VERSION:-$(npm view @openai/codex version)}"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if test -f "protocol/codex/schemas/$version/manifest.json"; then
+            echo "known=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "known=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Export and classify candidate
+        if: steps.candidate.outputs.known != 'true'
+        env:
+          CANDIDATE_VERSION: ${{ steps.candidate.outputs.version }}
+        run: |
+          install_root="$(mktemp -d)"
+          npm install --prefix "$install_root" "@openai/codex@$CANDIDATE_VERSION"
+          python3 tools/codex_schema.py sync --binary "$install_root/node_modules/.bin/codex"
+          baseline="$(jq -r .compatibilityBaselineVersion protocol/codex/support-policy.json)"
+          python3 tools/codex_schema.py diff --baseline "$baseline" --candidate "$CANDIDATE_VERSION" --write-defaults --allow-breaking
+      - uses: actions/upload-artifact@v4
+        if: steps.candidate.outputs.known != 'true'
+        with:
+          name: codex-schema-${{ steps.candidate.outputs.version }}
+          path: |
+            protocol/codex/schemas/${{ steps.candidate.outputs.version }}
+            protocol/codex/reports/*-to-${{ steps.candidate.outputs.version }}.*
+            src/codex/wire/v*.rs
+      - name: Open idempotent review issue
+        if: steps.candidate.outputs.known != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_VERSION: ${{ steps.candidate.outputs.version }}
+        run: |
+          title="Codex schema candidate $CANDIDATE_VERSION"
+          if gh issue list --state open --search "$title in:title" --json title --jq '.[].title' | grep -Fxq "$title"; then
+            exit 0
+          fi
+          baseline="$(jq -r .compatibilityBaselineVersion protocol/codex/support-policy.json)"
+          summary="$(jq -c .summary "protocol/codex/reports/$baseline-to-$CANDIDATE_VERSION.json")"
+          compatible="$(jq -r .compatible "protocol/codex/reports/$baseline-to-$CANDIDATE_VERSION.json")"
+          gh issue create --title "$title" --label enhancement --body "Automated schema discovery compared $baseline to $CANDIDATE_VERSION. Compatible: $compatible. Classified summary: $summary. Download the workflow artifact, add/review the complete contract fixture, and update support-policy.json only after the offline promotion gate passes. Breaking or contract failures must remain blocked."

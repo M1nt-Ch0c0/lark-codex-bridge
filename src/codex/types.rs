@@ -272,6 +272,113 @@ where
     Option::<String>::deserialize(deserializer)
 }
 
+open_string_enum! {
+    pub enum ThreadSortKey {
+        CreatedAt => "created_at",
+        UpdatedAt => "updated_at",
+        RecencyAt => "recency_at",
+        SectionPosition => "section_position",
+    }
+}
+
+open_string_enum! {
+    pub enum SortDirection {
+        Ascending => "asc",
+        Descending => "desc",
+    }
+}
+
+open_string_enum! {
+    pub enum ThreadSourceKind {
+        Cli => "cli",
+        Vscode => "vscode",
+        Exec => "exec",
+        AppServer => "appServer",
+        SubAgent => "subAgent",
+        SubAgentReview => "subAgentReview",
+        SubAgentCompact => "subAgentCompact",
+        SubAgentThreadSpawn => "subAgentThreadSpawn",
+        SubAgentOther => "subAgentOther",
+        UnknownSource => "unknown",
+    }
+}
+
+/// One or several exact working-directory filters for `thread/list`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum ThreadListCwdFilter {
+    One(PathBuf),
+    Many(Vec<PathBuf>),
+}
+
+/// Stable request subset for the selected 0.146.0 `thread/list` contract.
+#[derive(Clone, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadListParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_key: Option<ThreadSortKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_direction: Option<SortDirection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_providers: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_kinds: Option<Vec<ThreadSourceKind>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<ThreadListCwdFilter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_pinned: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_term: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub use_state_db_only: bool,
+}
+
+/// Stable response for `thread/list`.
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadListResult {
+    pub data: Vec<Thread>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    #[serde(default)]
+    pub backwards_cursor: Option<String>,
+}
+
+pub type ThreadListResponse = ThreadListResult;
+
+/// Stable request for `thread/read`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadReadParams {
+    pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_turns: Option<bool>,
+}
+
+impl ThreadReadParams {
+    #[must_use]
+    pub fn new(thread_id: impl Into<String>) -> Self {
+        Self {
+            thread_id: thread_id.into(),
+            include_turns: None,
+        }
+    }
+}
+
+/// Stable response for `thread/read`.
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+pub struct ThreadReadResult {
+    pub thread: Thread,
+}
+
+pub type ThreadReadResponse = ThreadReadResult;
+
 #[derive(Clone, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadResumeParams {

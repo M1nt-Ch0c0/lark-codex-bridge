@@ -548,9 +548,9 @@ fn permanent_process_reason(error: &ProcessError) -> Option<String> {
         ProcessError::InvalidVersionOutput => {
             Some("Codex version output must exactly match `codex-cli X.Y.Z`".to_owned())
         }
-        ProcessError::UnsupportedVersion { found } => {
-            Some(format!("Codex {found} is unsupported; expected >=0.146.0"))
-        }
+        ProcessError::UnsupportedVersion { found } => Some(format!(
+            "Codex {found} is unsupported; expected an exact reviewed version (0.146.0)"
+        )),
         ProcessError::ProbeTimeout(_)
         | ProcessError::ProbeIo { .. }
         | ProcessError::StdioAlreadyTaken

@@ -8,9 +8,8 @@ use tokio::{
     time::timeout,
 };
 
+use crate::codex::wire::is_supported_codex_version;
 use crate::limits::{MAX_VERSION_OUTPUT_BYTES, VERSION_PROBE_TIMEOUT};
-
-const MINIMUM_CODEX_VERSION: Version = Version::new(0, 146, 0);
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct CodexProcessConfig {
@@ -70,7 +69,7 @@ pub enum ProcessError {
     },
     #[error("Codex version output must exactly match `codex-cli X.Y.Z`")]
     InvalidVersionOutput,
-    #[error("Codex {found} is unsupported; expected >=0.146.0")]
+    #[error("Codex {found} is unsupported; expected an exact reviewed version (0.146.0)")]
     UnsupportedVersion { found: Version },
     #[error("Codex app-server stdio was already transferred")]
     StdioAlreadyTaken,
@@ -362,7 +361,7 @@ fn parse_version(bytes: &[u8]) -> Result<Version, ProcessError> {
 }
 
 fn ensure_supported(version: Version) -> Result<Version, ProcessError> {
-    if version >= MINIMUM_CODEX_VERSION {
+    if is_supported_codex_version(&version) {
         Ok(version)
     } else {
         Err(ProcessError::UnsupportedVersion { found: version })
@@ -420,13 +419,18 @@ mod tests {
     }
 
     #[test]
-    fn enforces_only_the_minimum_supported_version() {
+    fn enforces_the_exact_reviewed_schema_versions() {
         assert!(ensure_supported(Version::new(0, 146, 0)).is_ok());
-        assert!(ensure_supported(Version::new(0, 147, 0)).is_ok());
-        assert!(ensure_supported(Version::new(1, 0, 0)).is_ok());
-        assert!(matches!(
-            ensure_supported(Version::new(0, 145, 9)),
-            Err(ProcessError::UnsupportedVersion { .. })
-        ));
+        for version in [
+            Version::new(0, 145, 9),
+            Version::new(0, 147, 0),
+            Version::new(0, 149, 0),
+            Version::new(1, 0, 0),
+        ] {
+            assert!(matches!(
+                ensure_supported(version),
+                Err(ProcessError::UnsupportedVersion { .. })
+            ));
+        }
     }
 }

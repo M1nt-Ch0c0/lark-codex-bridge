@@ -1,0 +1,2 @@
+protocol/codex/schemas/** linguist-generated=true
+src/codex/wire/v*.rs linguist-generated=true

@@ -22,8 +22,9 @@ use crate::{
         types::{
             AgentMessageDeltaNotification, CommandExecutionOutputDeltaNotification,
             ErrorNotification, ItemCompletedNotification, ItemStartedNotification, Thread,
-            ThreadItem, ThreadResumeParams, ThreadResumeResult, ThreadStartParams,
-            ThreadStartResult, ThreadTokenUsageUpdatedNotification, TokenUsageBreakdown, Turn,
+            ThreadItem, ThreadListParams, ThreadListResult, ThreadReadParams, ThreadReadResult,
+            ThreadResumeParams, ThreadResumeResult, ThreadStartParams, ThreadStartResult,
+            ThreadTokenUsageUpdatedNotification, TokenUsageBreakdown, Turn,
             TurnCompletedNotification, TurnError, TurnInterruptParams, TurnInterruptResult,
             TurnStartParams, TurnStartResult, TurnStartedNotification, TurnStatus,
         },
@@ -457,6 +458,38 @@ impl AppServerClient {
                 normal_closed: false,
             }))),
         }
+    }
+
+    /// Lists Codex threads without binding any returned thread to bridge state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a safe client error when the read-only RPC fails.
+    pub async fn list_threads(
+        &self,
+        params: ThreadListParams,
+    ) -> Result<ThreadListResult, ClientError> {
+        self.rpc
+            .request_budgeted("thread/list", &params, CONTROL_RPC_TIMEOUT)
+            .await
+            .map(crate::codex::rpc::BudgetedResponse::into_inner)
+            .map_err(Into::into)
+    }
+
+    /// Reads one Codex thread without binding it to bridge state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a safe client error when the read-only RPC fails.
+    pub async fn read_thread(
+        &self,
+        params: ThreadReadParams,
+    ) -> Result<ThreadReadResult, ClientError> {
+        self.rpc
+            .request_budgeted("thread/read", &params, CONTROL_RPC_TIMEOUT)
+            .await
+            .map(crate::codex::rpc::BudgetedResponse::into_inner)
+            .map_err(Into::into)
     }
 
     /// Creates a Codex thread. This non-idempotent RPC is never retried locally.
