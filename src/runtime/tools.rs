@@ -224,6 +224,9 @@ async fn read_audio(
     {
         return Err(asr_error(AsrError::TooLong));
     }
+    if !asr.is_configured() {
+        return Err(asr_error(AsrError::SidecarMissing));
+    }
     let cached = attachments
         .fetch(
             &authorized.message_id,

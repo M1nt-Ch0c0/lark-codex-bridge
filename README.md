@@ -86,19 +86,21 @@ CODEX_E2E=1 cargo test --test codex_smoke --locked -- --ignored --nocapture
 
 1. 入站 payload 已带客户端识别文本时直接使用，不调用 sidecar；
 2. 否则用 `ffmpeg` 解码为 16 kHz WAV，再跑配置的本地 sidecar（stdout 即转写结果）；
-3. 缺 sidecar、解码失败、空转写或过长音频会返回稳定错误码（`sidecar_missing` / `unsupported_codec` / `empty_transcript` / `too_long` / `oversize` / `sidecar_failed`），不会静默丢 part。
+3. 缺 sidecar、解码失败、空/超限转写或过长音频会返回稳定错误码（`sidecar_missing` / `unsupported_codec` / `empty_transcript` / `transcript_too_large` / `too_long` / `oversize` / `sidecar_failed`），不会静默丢 part。
 
 推荐 sidecar 是 [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) 上的 SenseVoice Small。仓库不内置模型权重；未配置 sidecar 时图片/文件读取不受影响。
 
 ```toml
 [asr]
 command = "/Users/YOU/lark-codex-bridge-asr/bin/sensevoice"
+args = []
 ffmpeg = "ffmpeg"
 max_duration_ms = 600000
 max_transcript_bytes = 32768
 ```
 
-`command` 可省略。相对路径相对配置文件目录解析；单个程序名（如 `ffmpeg`）走 `PATH`。
+`command` 可省略。`args` 按声明顺序传给 sidecar，解码后的 WAV 路径始终作为最后一个参数。
+相对路径相对配置文件目录解析；单个程序名（如 `ffmpeg`）走 `PATH`。
 
 sherpa-onnx-offline 的 stdout 含配置转储，不能直接当 sidecar。仓库提供
 [`scripts/sensevoice-sidecar.sh`](scripts/sensevoice-sidecar.sh)，只把 JSON 里的

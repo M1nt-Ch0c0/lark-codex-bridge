@@ -575,7 +575,14 @@ fn resolve_command_path(parent: &Path, path: &Path) -> Result<PathBuf, ConfigErr
     if path.as_os_str().is_empty() {
         return Err(ConfigError::InvalidAsrCommand);
     }
-    if path.is_absolute() || path.components().count() <= 1 {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    #[cfg(windows)]
+    if path.has_root() || matches!(path.components().next(), Some(Component::Prefix(_))) {
+        return Err(ConfigError::InvalidAsrCommand);
+    }
+    if path.components().count() <= 1 {
         return Ok(path.to_path_buf());
     }
     resolve_relative_path(parent, path)
@@ -634,6 +641,13 @@ mod tests {
         assert_eq!(
             resolve_relative_path(parent, Path::new(r"state\bridge.sqlite3")).unwrap(),
             parent.join(r"state\bridge.sqlite3")
+        );
+        assert!(resolve_command_path(parent, Path::new(r"C:")).is_err());
+        assert!(resolve_command_path(parent, Path::new(r"C:ffmpeg.exe")).is_err());
+        assert!(resolve_command_path(parent, Path::new(r"\ffmpeg.exe")).is_err());
+        assert_eq!(
+            resolve_command_path(parent, Path::new("ffmpeg.exe")).unwrap(),
+            PathBuf::from("ffmpeg.exe")
         );
     }
 }

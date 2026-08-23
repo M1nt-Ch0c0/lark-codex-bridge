@@ -3360,11 +3360,35 @@ fn stub_program(
 }
 
 fn ffmpeg_stub(dir: &std::path::Path) -> std::path::PathBuf {
+    let fixture = dir.join("decoded-audio.wav");
+    let samples = 160_u32;
+    let data_bytes = samples * 2;
+    let mut wav = Vec::with_capacity(44 + data_bytes as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36_u32 + data_bytes).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16_u32.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&16_000_u32.to_le_bytes());
+    wav.extend_from_slice(&32_000_u32.to_le_bytes());
+    wav.extend_from_slice(&2_u16.to_le_bytes());
+    wav.extend_from_slice(&16_u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_bytes.to_le_bytes());
+    wav.resize(44 + data_bytes as usize, 0);
+    std::fs::write(&fixture, wav).expect("write decoded WAV fixture");
+    let source = fixture.to_string_lossy();
     stub_program(
         dir,
         "ffmpeg",
-        r#"out=""; for arg in "$@"; do out=$arg; done; : > "$out""#,
-        "@echo off\r\n:loop\r\nif \"%~2\"==\"\" (\r\ntype nul > \"%~1\"\r\nexit /b 0\r\n)\r\nshift\r\ngoto loop\r\n",
+        &format!(
+            r#"out=""; for arg in "$@"; do out=$arg; done; cp "{}" "$out""#,
+            source.replace('"', r#"\""#)
+        ),
+        &format!(
+            "@echo off\r\n:loop\r\nif \"%~2\"==\"\" (\r\ncopy /y \"{source}\" \"%~1\" >nul\r\nexit /b %errorlevel%\r\n)\r\nshift\r\ngoto loop\r\n"
+        ),
     )
 }
 
@@ -3767,11 +3791,15 @@ async fn missing_sidecar_returns_structured_audio_error() {
     let config = validated_config();
     let temp = tempdir().expect("tempdir");
     let store = StoreHandle::open_in_memory().await.expect("store");
+    let download_count = Arc::new(AtomicUsize::new(0));
     let cache = Arc::new(
         AttachmentCache::open(
             &temp.path().join("attachments"),
             store.clone(),
-            Arc::new(StaticAttachmentDownloader),
+            Arc::new(PendingAttachmentDownloader {
+                started: Arc::clone(&download_count),
+                started_notify: Arc::new(Notify::new()),
+            }),
             AttachmentLimits::default(),
         )
         .expect("attachment cache"),
@@ -3811,6 +3839,11 @@ async fn missing_sidecar_returns_structured_audio_error() {
     )
     .expect("json");
     assert_eq!(body["error"]["code"], "sidecar_missing");
+    assert_eq!(
+        download_count.load(Ordering::SeqCst),
+        0,
+        "missing sidecar must fail before media download"
+    );
     send_turn_completed(
         &control,
         "thread-audio-missing",
