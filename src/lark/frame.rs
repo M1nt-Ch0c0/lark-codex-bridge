@@ -301,7 +301,7 @@ impl MessageType {
     }
 }
 
-/// An owned, clonable snapshot of a frame's headers with typed accessors.
+/// An owned, cloneable snapshot of a frame's headers with typed accessors.
 ///
 /// Owned (not borrowed) so it can cross the async handler boundary and be
 /// reused for receipts. `Debug` redacts `handshake-msg`, which carries

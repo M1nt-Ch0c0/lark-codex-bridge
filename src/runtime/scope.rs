@@ -1149,6 +1149,11 @@ async fn release_thread_route(
     }
 }
 
+#[allow(
+    clippy::if_not_else,
+    clippy::too_many_arguments,
+    reason = "thread recovery keeps its explicit dependencies and fail-closed branch ordering"
+)]
 async fn ensure_thread(
     scope: &ScopeKey,
     store: &StoreHandle,

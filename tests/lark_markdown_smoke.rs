@@ -631,6 +631,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one end-to-end fixture exercises every evidence-binding rejection"
+    )]
     fn low_level_evidence_binding_rejects_unsigned_and_mismatched_fixtures() {
         let temp = tempdir().expect("tempdir");
         let desktop = temp.path().join("desktop.png");

@@ -620,6 +620,10 @@ async fn finalize_is_idempotent_across_retries() {
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the lifecycle assertion keeps create, update, and finalization evidence together"
+)]
 async fn progress_cards_are_created_updated_and_finalized_through_the_outbox() {
     let server = StubServer::start(token_plus(|request| {
         if request.path.ends_with("/reply") {
@@ -736,6 +740,10 @@ async fn progress_cards_are_created_updated_and_finalized_through_the_outbox() {
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one integration test covers the bounded projection across both card versions"
+)]
 async fn card2_projection_and_element_cap_cover_v2_and_v1_create_update_final_replay() {
     let server = StubServer::start(token_plus(|request| {
         if request.method == "POST" {

@@ -10,6 +10,10 @@ readme = "README.md"
 keywords = ["codex", "feishu", "lark", "agent", "bridge"]
 categories = ["command-line-utilities", "development-tools"]
 
+[package.metadata.cargo-machete]
+# Runtime logging initialization lands with the observability work tracked in issue #18.
+ignored = ["tracing-subscriber"]
+
 [dependencies]
 anyhow = "1.0.104"
 base64 = "0.23.1"
