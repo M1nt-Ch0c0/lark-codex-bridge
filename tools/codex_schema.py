@@ -15,6 +15,7 @@ import hashlib
 import json
 import math
 import os
+import queue
 import re
 import signal
 import stat
@@ -24,7 +25,7 @@ import tempfile
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Iterable, Iterator, NoReturn
@@ -53,6 +54,9 @@ MAX_GENERATOR_ARGUMENTS = 64
 MAX_SELECTED_ROOTS = 128
 MAX_TRACKED_VERSIONS = 256
 MAX_OPERATION_SECONDS = 180
+MAX_REGEX_SECONDS = 1.0
+MAX_REGEX_PATTERN_CHARACTERS = 64 * 1024
+MAX_REGEX_TEXT_CHARACTERS = MAX_ARTIFACT_BYTES
 READ_CHUNK_BYTES = 64 * 1024
 SCHEMA_VALIDATION_RECURSION_LIMIT = MAX_JSON_DEPTH
 VERSION_TIMEOUT_SECONDS = 10
@@ -90,6 +94,7 @@ class OperationBudget:
     json_nodes: int = 0
     work: int = 0
     changes: int = 0
+    regex_worker: BoundedRegexWorker | None = field(default=None, init=False, repr=False)
 
     def checkpoint(self, units: int = 1) -> None:
         if units < 0:
@@ -164,6 +169,9 @@ def operation_budget(
     try:
         yield budget
     finally:
+        if budget.regex_worker is not None:
+            budget.regex_worker.close()
+            budget.regex_worker = None
         _ACTIVE_BUDGET.reset(token)
 
 
@@ -398,6 +406,184 @@ def _stop_process(
             process.wait(timeout=1)
         except subprocess.TimeoutExpired:
             pass
+
+
+REGEX_WORKER_SOURCE = r"""
+import json
+import re
+import sys
+
+for line in sys.stdin.buffer:
+    try:
+        request = json.loads(line)
+        if (
+            not isinstance(request, list)
+            or len(request) != 2
+            or not all(isinstance(value, str) for value in request)
+        ):
+            raise ValueError
+        pattern, text = request
+        matched = re.search(pattern, text) is not None
+    except re.error:
+        response = b"E\n"
+    except Exception:
+        response = b"X\n"
+    else:
+        response = b"1\n" if matched else b"0\n"
+    sys.stdout.buffer.write(response)
+    sys.stdout.buffer.flush()
+"""
+
+
+class BoundedRegexWorker:
+    """Evaluate untrusted schema regexes beyond a hard-kill process boundary."""
+
+    def __init__(self) -> None:
+        self._windows_job = WindowsJob() if os.name == "nt" else None
+        self._closed = False
+        self._responses: queue.Queue[bytes] = queue.Queue()
+        self._writers: list[threading.Thread] = []
+        try:
+            self._process = subprocess.Popen(
+                [sys.executable, "-I", "-u", "-c", REGEX_WORKER_SOURCE],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                start_new_session=os.name == "posix",
+                creationflags=0x00000004 if os.name == "nt" else 0,
+            )
+        except (OSError, ValueError) as error:
+            if self._windows_job is not None:
+                self._windows_job.close()
+            raise SchemaToolError("schema regex isolation could not start") from error
+        if self._windows_job is not None:
+            try:
+                self._windows_job.assign_and_resume(self._process)
+            except Exception as error:
+                try:
+                    self._process.kill()
+                    self._process.wait(timeout=1)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+                self._windows_job.close()
+                if isinstance(error, SchemaToolError):
+                    raise
+                raise SchemaToolError("schema regex isolation ownership failed") from error
+        assert self._process.stdin is not None and self._process.stdout is not None
+        self._reader = threading.Thread(target=self._read_responses, daemon=True)
+        try:
+            self._reader.start()
+        except RuntimeError as error:
+            self.close()
+            raise SchemaToolError("schema regex isolation reader could not start") from error
+
+    @property
+    def is_closed(self) -> bool:
+        return (
+            self._closed
+            and self._process.poll() is not None
+            and not self._reader.is_alive()
+            and not any(writer.is_alive() for writer in self._writers)
+        )
+
+    def _read_responses(self) -> None:
+        assert self._process.stdout is not None
+        try:
+            while True:
+                line = self._process.stdout.readline()
+                self._responses.put(line)
+                if not line:
+                    return
+        except (OSError, ValueError):
+            self._responses.put(b"")
+
+    def search(self, pattern: str, text: str, timeout: float) -> bool:
+        if self._closed or self._process.poll() is not None:
+            raise SchemaToolError("schema regex isolation stopped unexpectedly")
+        deadline = time.monotonic() + timeout
+        try:
+            request = (json.dumps([pattern, text], ensure_ascii=False) + "\n").encode("utf-8")
+        except (TypeError, UnicodeError, ValueError) as error:
+            raise ValidationFailure("schema pattern is invalid") from error
+        write_errors: list[BaseException] = []
+
+        def write_request() -> None:
+            try:
+                assert self._process.stdin is not None
+                self._process.stdin.write(request)
+                self._process.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError) as error:
+                write_errors.append(error)
+
+        writer = threading.Thread(target=write_request, daemon=True)
+        try:
+            writer.start()
+        except RuntimeError as error:
+            self.close()
+            raise SchemaToolError("schema regex isolation writer could not start") from error
+        self._writers.append(writer)
+        try:
+            response = self._responses.get(timeout=max(0.0, deadline - time.monotonic()))
+        except queue.Empty:
+            self.close()
+            writer.join(timeout=1)
+            raise SchemaToolError("schema regex evaluation exceeded its bounded deadline") from None
+        writer.join(timeout=1)
+        if writer.is_alive():
+            self.close()
+            raise SchemaToolError("schema regex isolation write did not complete")
+        if write_errors or response in {b"", b"X\n"}:
+            self.close()
+            raise SchemaToolError("schema regex isolation failed safely")
+        if response == b"E\n":
+            raise ValidationFailure("schema pattern is invalid")
+        if response not in {b"0\n", b"1\n"}:
+            self.close()
+            raise SchemaToolError("schema regex isolation returned an invalid response")
+        return response == b"1\n"
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._process.poll() is None:
+            _stop_process(self._process, self._windows_job)
+        elif self._windows_job is not None:
+            self._windows_job.terminate()
+        if os.name == "posix":
+            _signal_process_group(self._process, signal.SIGKILL, self._windows_job)
+        if self._windows_job is not None:
+            self._windows_job.close()
+        for pipe in (self._process.stdin, self._process.stdout):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+        for writer in self._writers:
+            if writer.ident is not None:
+                writer.join(timeout=1)
+        if hasattr(self, "_reader") and self._reader.ident is not None:
+            self._reader.join(timeout=1)
+
+
+def bounded_regex_search(pattern: str, text: str) -> bool:
+    """Match with a per-regex cap no later than the operation deadline."""
+    budget = active_budget()
+    if (
+        len(pattern) > MAX_REGEX_PATTERN_CHARACTERS
+        or len(text) > MAX_REGEX_TEXT_CHARACTERS
+    ):
+        fail("schema regex input exceeds the bounded character limit")
+    budget.checkpoint(max(1, (len(pattern) + len(text)) // 4_096))
+    if budget.regex_worker is None:
+        budget.regex_worker = BoundedRegexWorker()
+    remaining = min(MAX_REGEX_SECONDS, budget.deadline - time.monotonic())
+    if remaining <= 0:
+        fail("maintenance operation exceeded its bounded deadline")
+    matched = budget.regex_worker.search(pattern, text, remaining)
+    budget.checkpoint()
+    return matched
 
 
 def run_bounded(
@@ -1081,11 +1267,13 @@ def make_bundle(export: Path, selection: Selection) -> dict[str, Any]:
         roots[root.name] = normalize_schema(load_json(source))
     catalog_path = isolated_export_file(export, selection.notification_catalog)
     catalog = normalize_schema(load_json(catalog_path))
-    return {
+    bundle = {
         "formatVersion": SCHEMA_BUNDLE_FORMAT_VERSION,
         "notificationMethods": notification_methods(catalog),
         "roots": roots,
     }
+    validate_bundle_schema_shapes(roots)
+    return bundle
 
 
 @budgeted
@@ -1384,6 +1572,268 @@ def existing_wire_versions(extra: str | None = None) -> list[str]:
     return sorted(versions, key=version_key)
 
 
+JSON_SCHEMA_TYPES = frozenset(
+    {"array", "boolean", "integer", "null", "number", "object", "string"}
+)
+SCHEMA_MAP_KEYWORDS = frozenset(
+    {
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+        "patternProperties",
+        "properties",
+    }
+)
+SCHEMA_VALUE_KEYWORDS = frozenset(
+    {
+        "additionalItems",
+        "additionalProperties",
+        "contains",
+        "contentSchema",
+        "else",
+        "if",
+        "not",
+        "propertyNames",
+        "then",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+    }
+)
+SCHEMA_ARRAY_KEYWORDS = frozenset({"allOf", "anyOf", "oneOf"})
+STRING_KEYWORDS = frozenset(
+    {
+        "$anchor",
+        "$comment",
+        "$dynamicAnchor",
+        "$dynamicRef",
+        "$id",
+        "$recursiveRef",
+        "$ref",
+        "$schema",
+        "contentEncoding",
+        "contentMediaType",
+        "description",
+        "format",
+        "id",
+        "pattern",
+        "title",
+    }
+)
+BOOLEAN_KEYWORDS = frozenset(
+    {
+        "$recursiveAnchor",
+        "deprecated",
+        "readOnly",
+        "uniqueItems",
+        "writeOnly",
+    }
+)
+NUMBER_KEYWORDS = frozenset(
+    {"exclusiveMaximum", "exclusiveMinimum", "maximum", "minimum"}
+)
+NONNEGATIVE_INTEGER_KEYWORDS = frozenset(
+    {
+        "maxContains",
+        "maxItems",
+        "maxLength",
+        "maxProperties",
+        "minContains",
+        "minItems",
+        "minLength",
+        "minProperties",
+    }
+)
+
+
+def invalid_schema_keyword_shape() -> NoReturn:
+    fail("normalized schema contains an invalid JSON Schema keyword shape")
+
+
+def is_json_number(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and (not isinstance(value, float) or math.isfinite(value))
+    )
+
+
+def is_nonnegative_integer(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def unique_strings(value: Any, *, require_nonempty: bool) -> bool:
+    if not isinstance(value, list) or (require_nonempty and not value):
+        return False
+    seen: set[str] = set()
+    for item in value:
+        active_budget().checkpoint()
+        if not isinstance(item, str) or item in seen:
+            return False
+        seen.add(item)
+    return True
+
+
+@budgeted
+def validate_schema_keyword_shapes(root: Any) -> None:
+    """Validate every recognized schema keyword before any semantic consumer."""
+    stack: list[tuple[Any, int]] = [(root, 1)]
+    while stack:
+        schema, depth = stack.pop()
+        active_budget().checkpoint()
+        if depth > SCHEMA_VALIDATION_RECURSION_LIMIT:
+            invalid_schema_keyword_shape()
+        if isinstance(schema, bool):
+            continue
+        if not isinstance(schema, dict) or not all(isinstance(key, str) for key in schema):
+            invalid_schema_keyword_shape()
+
+        def push_schema(value: Any) -> None:
+            if not isinstance(value, (dict, bool)):
+                invalid_schema_keyword_shape()
+            stack.append((value, depth + 1))
+
+        for keyword in sorted(STRING_KEYWORDS & schema.keys()):
+            value = schema[keyword]
+            if not isinstance(value, str):
+                invalid_schema_keyword_shape()
+            if keyword == "pattern":
+                try:
+                    bounded_regex_search(value, "")
+                except ValidationFailure:
+                    invalid_schema_keyword_shape()
+
+        for keyword in sorted(BOOLEAN_KEYWORDS & schema.keys()):
+            if not isinstance(schema[keyword], bool):
+                invalid_schema_keyword_shape()
+
+        for keyword in sorted(NUMBER_KEYWORDS & schema.keys()):
+            if not is_json_number(schema[keyword]):
+                invalid_schema_keyword_shape()
+
+        for keyword in sorted(NONNEGATIVE_INTEGER_KEYWORDS & schema.keys()):
+            if not is_nonnegative_integer(schema[keyword]):
+                invalid_schema_keyword_shape()
+
+        if "multipleOf" in schema:
+            multiple = schema["multipleOf"]
+            if not is_json_number(multiple) or multiple <= 0:
+                invalid_schema_keyword_shape()
+
+        if "type" in schema:
+            raw_type = schema["type"]
+            if isinstance(raw_type, str):
+                valid_type = raw_type in JSON_SCHEMA_TYPES
+            else:
+                valid_type = (
+                    unique_strings(raw_type, require_nonempty=True)
+                    and all(value in JSON_SCHEMA_TYPES for value in raw_type)
+                )
+            if not valid_type:
+                invalid_schema_keyword_shape()
+
+        if "enum" in schema:
+            values = schema["enum"]
+            if not isinstance(values, list) or not values:
+                invalid_schema_keyword_shape()
+            semantic_values = [semantic_json_key(value) for value in values]
+            if len(semantic_values) != len(set(semantic_values)):
+                invalid_schema_keyword_shape()
+
+        if "required" in schema and not unique_strings(
+            schema["required"], require_nonempty=False
+        ):
+            invalid_schema_keyword_shape()
+
+        if "examples" in schema and not isinstance(schema["examples"], list):
+            invalid_schema_keyword_shape()
+
+        vocabulary = schema.get("$vocabulary")
+        if "$vocabulary" in schema and (
+            not isinstance(vocabulary, dict)
+            or not all(
+                isinstance(uri, str) and isinstance(required, bool)
+                for uri, required in vocabulary.items()
+            )
+        ):
+            invalid_schema_keyword_shape()
+
+        for keyword in sorted(SCHEMA_MAP_KEYWORDS & schema.keys()):
+            mapping = schema[keyword]
+            if not isinstance(mapping, dict) or not all(
+                isinstance(name, str) for name in mapping
+            ):
+                invalid_schema_keyword_shape()
+            for name in sorted(mapping):
+                active_budget().checkpoint()
+                if keyword == "patternProperties":
+                    try:
+                        bounded_regex_search(name, "")
+                    except ValidationFailure:
+                        invalid_schema_keyword_shape()
+                push_schema(mapping[name])
+
+        dependencies = schema.get("dependencies")
+        if "dependencies" in schema:
+            if not isinstance(dependencies, dict) or not all(
+                isinstance(name, str) for name in dependencies
+            ):
+                invalid_schema_keyword_shape()
+            for name in sorted(dependencies):
+                active_budget().checkpoint()
+                dependency = dependencies[name]
+                if isinstance(dependency, list):
+                    if not unique_strings(dependency, require_nonempty=True):
+                        invalid_schema_keyword_shape()
+                else:
+                    push_schema(dependency)
+
+        dependent_required = schema.get("dependentRequired")
+        if "dependentRequired" in schema:
+            if not isinstance(dependent_required, dict) or not all(
+                isinstance(name, str) for name in dependent_required
+            ):
+                invalid_schema_keyword_shape()
+            for name in sorted(dependent_required):
+                active_budget().checkpoint()
+                if not unique_strings(
+                    dependent_required[name], require_nonempty=False
+                ):
+                    invalid_schema_keyword_shape()
+
+        for keyword in sorted(SCHEMA_VALUE_KEYWORDS & schema.keys()):
+            push_schema(schema[keyword])
+
+        items = schema.get("items")
+        if "items" in schema:
+            if isinstance(items, list):
+                if not items:
+                    invalid_schema_keyword_shape()
+                for child in items:
+                    push_schema(child)
+            else:
+                push_schema(items)
+
+        prefix_items = schema.get("prefixItems")
+        if "prefixItems" in schema:
+            if not isinstance(prefix_items, list):
+                invalid_schema_keyword_shape()
+            for child in prefix_items:
+                push_schema(child)
+
+        for keyword in sorted(SCHEMA_ARRAY_KEYWORDS & schema.keys()):
+            variants = schema[keyword]
+            if not isinstance(variants, list) or not variants:
+                invalid_schema_keyword_shape()
+            for child in variants:
+                push_schema(child)
+
+
+def validate_bundle_schema_shapes(roots: dict[str, Any]) -> None:
+    for name in sorted(roots):
+        active_budget().checkpoint()
+        validate_schema_keyword_shapes(roots[name])
+
+
 @budgeted
 def sync(binary: Path, *, check: bool) -> str:
     selection = read_selection()
@@ -1451,6 +1901,7 @@ def load_bundle(version: str) -> dict[str, Any]:
         or notifications != sorted(set(notifications))
     ):
         fail(f"Codex {version} normalized schema contains an invalid notification catalog")
+    validate_bundle_schema_shapes(bundle["roots"])
     return bundle
 
 
@@ -1808,7 +2259,9 @@ def compare_named_schemas(
         elif "$ref" not in before and isinstance(after_ref, str):
             changes.append(change("breaking", "reference_added", path))
         elif isinstance(before_ref, str) and "$ref" not in after:
-            changes.append(change("additive", "reference_removed", path))
+            # Draft-07 ignores siblings next to $ref. Removing it activates those
+            # siblings, so widening is not proven even when the target disappears.
+            changes.append(change("breaking", "reference_removed", path))
         else:
             changes.append(change("breaking", "reference_invalid_or_changed", path))
 
@@ -2293,8 +2746,8 @@ def validate_instance(instance: Any, schema: Any, root: dict[str, Any], *, depth
                     for pattern, pattern_schema in patterns.items():
                         active_budget().checkpoint()
                         try:
-                            matches_pattern = re.search(pattern, key) is not None
-                        except (TypeError, re.error) as error:
+                            matches_pattern = bounded_regex_search(pattern, key)
+                        except (TypeError, ValidationFailure) as error:
                             raise ValidationFailure("schema pattern is invalid") from error
                         if matches_pattern and isinstance(pattern_schema, (dict, bool)):
                             matched_pattern = True
@@ -2354,10 +2807,10 @@ def validate_instance(instance: Any, schema: Any, root: dict[str, Any], *, depth
         pattern = schema.get("pattern")
         if isinstance(pattern, str):
             try:
-                matched = re.search(pattern, instance)
-            except re.error as error:
+                matched = bounded_regex_search(pattern, instance)
+            except ValidationFailure as error:
                 raise ValidationFailure("schema pattern is invalid") from error
-            if matched is None:
+            if not matched:
                 raise ValidationFailure("string pattern constraint failed")
     if isinstance(instance, (int, float)) and not isinstance(instance, bool):
         if isinstance(schema.get("minimum"), (int, float)) and instance < schema["minimum"]:

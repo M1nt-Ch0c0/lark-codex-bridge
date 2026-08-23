@@ -95,10 +95,131 @@ class CodexSchemaTests(unittest.TestCase):
         for before, after, expected in cases:
             with self.subTest(expected=expected):
                 kinds, _ = self.classified(before, after)
-                self.assertTrue(
-                    any(kind == expected for _classification, kind in kinds),
-                    kinds,
+                self.assertIn(("breaking", expected), kinds)
+
+        # Draft-07 ignores siblings next to $ref. Removing the reference can
+        # therefore activate a previously ignored narrowing constraint.
+        kinds, changes = self.classified(
+            {
+                "$ref": "#/definitions/Text",
+                "type": "integer",
+                "definitions": {"Text": {"type": "string"}},
+            },
+            {
+                "type": "integer",
+                "definitions": {"Text": {"type": "string"}},
+            },
+        )
+        self.assertIn(("breaking", "reference_removed"), kinds)
+        self.assertFalse(
+            any(
+                item["kind"] == "reference_removed"
+                and item["classification"] == "additive"
+                for item in changes
+            )
+        )
+
+    def test_known_keyword_shapes_are_rejected_recursively(self):
+        malformed = {
+            "$ref": {"$ref": 1},
+            "$schema": {"$schema": []},
+            "type": {"type": 7},
+            "enum": {"enum": {"not": "an array"}},
+            "properties": {"properties": []},
+            "property-child": {"properties": {"value": []}},
+            "patternProperties": {"patternProperties": []},
+            "invalid-pattern": {"pattern": "["},
+            "definitions": {"definitions": []},
+            "$defs": {"$defs": []},
+            "required": {"required": "value"},
+            "dependencies": {"dependencies": []},
+            "dependency-child": {"dependencies": {"value": 1}},
+            "dependentSchemas": {"dependentSchemas": []},
+            "dependentRequired": {"dependentRequired": []},
+            "items": {"items": 1},
+            "tuple-items": {"items": []},
+            "additionalItems": {"additionalItems": []},
+            "additionalProperties": {"additionalProperties": []},
+            "contains": {"contains": []},
+            "prefixItems": {"prefixItems": {}},
+            "propertyNames": {"propertyNames": []},
+            "allOf": {"allOf": {}},
+            "anyOf": {"anyOf": {}},
+            "oneOf": {"oneOf": {}},
+            "not": {"not": []},
+            "if": {"if": []},
+            "then": {"then": []},
+            "else": {"else": []},
+            "minimum": {"minimum": True},
+            "maximum": {"maximum": False},
+            "exclusiveMinimum": {"exclusiveMinimum": True},
+            "exclusiveMaximum": {"exclusiveMaximum": False},
+            "multipleOf": {"multipleOf": 0},
+            "minLength": {"minLength": True},
+            "maxLength": {"maxLength": -1},
+            "minItems": {"minItems": 1.5},
+            "maxItems": {"maxItems": True},
+            "uniqueItems": {"uniqueItems": 1},
+            "minProperties": {"minProperties": False},
+            "maxProperties": {"maxProperties": -1},
+            "pattern": {"pattern": {}},
+            "format": {"format": []},
+            "title": {"title": 1},
+            "examples": {"examples": {}},
+            "readOnly": {"readOnly": 1},
+            "$vocabulary": {"$vocabulary": []},
+            "unevaluatedItems": {"unevaluatedItems": []},
+            "unevaluatedProperties": {"unevaluatedProperties": []},
+            "contentSchema": {"contentSchema": []},
+            "contentEncoding": {"contentEncoding": 1},
+            "minContains": {"minContains": True},
+            "maxContains": {"maxContains": -1},
+        }
+        expected = "normalized schema contains an invalid JSON Schema keyword shape"
+        for name, invalid_child in malformed.items():
+            with self.subTest(keyword=name):
+                wrapped = {
+                    "properties": {
+                        "outer": {
+                            "allOf": [
+                                {"definitions": {"Nested": invalid_child}}
+                            ]
+                        }
+                    }
+                }
+                with self.assertRaises(codex_schema.SchemaToolError) as raised:
+                    codex_schema.validate_schema_keyword_shapes(wrapped)
+                self.assertEqual(str(raised.exception), expected)
+
+    def test_malformed_candidate_bundle_cannot_reach_compatibility_promotion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            schemas_root = Path(directory)
+            bundles = {
+                "1.0.0": {
+                    "formatVersion": 1,
+                    "notificationMethods": [],
+                    "roots": {"initialize.params": {"type": "object"}},
+                },
+                "1.0.1": {
+                    "formatVersion": 1,
+                    "notificationMethods": [],
+                    "roots": {
+                        "initialize.params": {
+                            "properties": {"nested": {"anyOf": {}}}
+                        }
+                    },
+                },
+            }
+            for version, bundle in bundles.items():
+                version_root = schemas_root / version
+                version_root.mkdir()
+                (version_root / "selected.schema.json").write_text(
+                    json.dumps(bundle), encoding="utf-8"
                 )
+            with mock.patch.object(codex_schema, "SCHEMAS_ROOT", schemas_root):
+                with self.assertRaises(codex_schema.SchemaToolError) as raised:
+                    codex_schema.compatibility_report("1.0.0", "1.0.1")
+            self.assertIn("invalid JSON Schema keyword shape", str(raised.exception))
 
     def test_boolean_schemas_are_compared_at_every_selected_position(self):
         cases = (
@@ -377,6 +498,37 @@ class CodexSchemaTests(unittest.TestCase):
         with self.assertRaises(codex_schema.ValidationFailure) as raised:
             codex_schema.validate_instance(None, cyclic_schema, cyclic_schema)
         self.assertIn("nesting limit", str(raised.exception))
+
+    def test_hostile_regex_is_preempted_and_worker_is_cleaned_up(self):
+        workers = []
+        real_worker = codex_schema.BoundedRegexWorker
+
+        def capture_worker():
+            worker = real_worker()
+            workers.append(worker)
+            return worker
+
+        hostile = "a" * (codex_schema.MAX_REGEX_TEXT_CHARACTERS - 1) + "!"
+        started = time.monotonic()
+        with mock.patch.object(
+            codex_schema, "BoundedRegexWorker", side_effect=capture_worker
+        ):
+            with self.assertRaises(codex_schema.SchemaToolError) as raised:
+                with codex_schema.operation_budget(timeout=2.0):
+                    codex_schema.validate_instance(
+                        hostile,
+                        {"type": "string", "pattern": "^(a+)+$"},
+                        {"type": "string", "pattern": "^(a+)+$"},
+                    )
+        elapsed = time.monotonic() - started
+        self.assertIn("deadline", str(raised.exception))
+        self.assertLess(elapsed, 5.0)
+        self.assertEqual(len(workers), 1)
+        self.assertTrue(workers[0].is_closed)
+
+        # A killed hostile worker cannot poison a later validation operation.
+        schema = {"type": "string", "pattern": "^a+$"}
+        codex_schema.validate_instance("aaa", schema, schema)
 
     def test_incoming_inventory_covers_open_and_closed_constructs(self):
         bundle = codex_schema.load_bundle("0.146.0")
