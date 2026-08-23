@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Iterable, Iterator, NoReturn
+from urllib.parse import unquote, urldefrag, urljoin
 
 
 GENERATOR_NAME = "lark-codex-bridge/codex-schema"
@@ -95,6 +96,12 @@ class OperationBudget:
     work: int = 0
     changes: int = 0
     regex_worker: BoundedRegexWorker | None = field(default=None, init=False, repr=False)
+    reference_indexes: dict[int, tuple[Any, Any]] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    reference_fingerprints: dict[
+        tuple[int, int], tuple[tuple[str, str], ...]
+    ] = field(default_factory=dict, init=False, repr=False)
 
     def checkpoint(self, units: int = 1) -> None:
         if units < 0:
@@ -2069,13 +2076,212 @@ def branches_provably_disjoint(left: Any, right: Any) -> bool:
     )
 
 
+REFERENCE_KEYWORDS = ("$ref", "$dynamicRef", "$recursiveRef")
+SYNTHETIC_ROOT_URI = "https://lark-codex.invalid/__root__.json"
+
+
+def json_pointer_token(value: str) -> str:
+    return value.replace("~", "~0").replace("/", "~1")
+
+
+def schema_child_locations(
+    schema: dict[str, Any]
+) -> Iterator[tuple[tuple[str, ...], Any]]:
+    """Yield recognized child schemas and their JSON Pointer path components."""
+    for keyword in sorted(SCHEMA_MAP_KEYWORDS & schema.keys()):
+        mapping = schema[keyword]
+        if isinstance(mapping, dict):
+            for name in sorted(mapping):
+                active_budget().checkpoint()
+                yield (keyword, name), mapping[name]
+    dependencies = schema.get("dependencies")
+    if isinstance(dependencies, dict):
+        for name in sorted(dependencies):
+            active_budget().checkpoint()
+            child = dependencies[name]
+            if isinstance(child, (dict, bool)):
+                yield ("dependencies", name), child
+    for keyword in sorted(SCHEMA_VALUE_KEYWORDS & schema.keys()):
+        yield (keyword,), schema[keyword]
+    items = schema.get("items")
+    if isinstance(items, list):
+        for index, child in enumerate(items):
+            active_budget().checkpoint()
+            yield ("items", str(index)), child
+    elif isinstance(items, (dict, bool)):
+        yield ("items",), items
+    prefix_items = schema.get("prefixItems")
+    if isinstance(prefix_items, list):
+        for index, child in enumerate(prefix_items):
+            active_budget().checkpoint()
+            yield ("prefixItems", str(index)), child
+    for keyword in sorted(SCHEMA_ARRAY_KEYWORDS & schema.keys()):
+        variants = schema[keyword]
+        if isinstance(variants, list):
+            for index, child in enumerate(variants):
+                active_budget().checkpoint()
+                yield (keyword, str(index)), child
+
+
+@dataclass
+class SchemaReferenceIndex:
+    root: Any
+    root_digest: str
+    node_bases: dict[int, str | None]
+    resources: dict[str, Any]
+    ambiguous_resources: set[str]
+    anchors: dict[str, Any]
+    ambiguous_anchors: set[str]
+
+
+def register_reference_target(
+    targets: dict[str, Any], ambiguous: set[str], uri: str, schema: Any
+) -> None:
+    if uri in ambiguous:
+        return
+    existing = targets.get(uri)
+    if existing is None:
+        targets[uri] = schema
+    elif existing is not schema:
+        targets.pop(uri, None)
+        ambiguous.add(uri)
+
+
 @budgeted
-def schema_reference_dependencies(schema: Any, root: Any) -> tuple[tuple[str, bytes], ...]:
-    """Fingerprint the local reference closure of one schema fragment."""
+def build_reference_index(root: Any) -> SchemaReferenceIndex:
+    """Index bounded Draft-07 identifier scopes without fetching external data."""
+    digest = sha256_bytes(canonical_bytes(root))
+    node_bases: dict[int, str | None] = {}
+    resources: dict[str, Any] = {}
+    ambiguous_resources: set[str] = set()
+    anchors: dict[str, Any] = {}
+    ambiguous_anchors: set[str] = set()
+    register_reference_target(
+        resources, ambiguous_resources, SYNTHETIC_ROOT_URI, root
+    )
+    pending: list[tuple[Any, str, str, tuple[str, ...]]] = [
+        (root, SYNTHETIC_ROOT_URI, SYNTHETIC_ROOT_URI, ())
+    ]
+    visited: set[tuple[int, str, str, tuple[str, ...]]] = set()
+    while pending:
+        active_budget().checkpoint()
+        current, inherited_base, resource_uri, pointer = pending.pop()
+        if isinstance(current, bool) or not isinstance(current, dict):
+            continue
+        visit = (id(current), inherited_base, resource_uri, pointer)
+        if visit in visited:
+            continue
+        visited.add(visit)
+
+        base_uri = inherited_base
+        identifier = current.get("$id")
+        if isinstance(identifier, str):
+            base_uri = urljoin(inherited_base, identifier)
+            identifier_resource, identifier_fragment = urldefrag(base_uri)
+            if identifier_resource and identifier_resource != resource_uri:
+                resource_uri = identifier_resource
+                pointer = ()
+                register_reference_target(
+                    resources, ambiguous_resources, resource_uri, current
+                )
+            if identifier_fragment:
+                register_reference_target(
+                    anchors, ambiguous_anchors, base_uri, current
+                )
+            elif identifier_resource:
+                register_reference_target(
+                    resources, ambiguous_resources, identifier_resource, current
+                )
+
+        identity = id(current)
+        existing_base = node_bases.get(identity, base_uri)
+        node_bases[identity] = base_uri if existing_base == base_uri else None
+
+        for keyword in ("$anchor", "$dynamicAnchor"):
+            anchor = current.get(keyword)
+            if isinstance(anchor, str):
+                document_uri, _ = urldefrag(base_uri)
+                register_reference_target(
+                    anchors,
+                    ambiguous_anchors,
+                    f"{document_uri}#{anchor}",
+                    current,
+                )
+
+        for child_tokens, child in schema_child_locations(current):
+            if not isinstance(child, (dict, bool)):
+                continue
+            child_pointer = pointer + tuple(
+                json_pointer_token(token) for token in child_tokens
+            )
+            pending.append((child, base_uri, resource_uri, child_pointer))
+    return SchemaReferenceIndex(
+        root=root,
+        root_digest=digest,
+        node_bases=node_bases,
+        resources=resources,
+        ambiguous_resources=ambiguous_resources,
+        anchors=anchors,
+        ambiguous_anchors=ambiguous_anchors,
+    )
+
+
+def reference_index(root: Any) -> SchemaReferenceIndex:
+    budget = active_budget()
+    key = id(root)
+    cached = budget.reference_indexes.get(key)
+    if cached is not None and cached[0] is root:
+        return cached[1]
+    index = build_reference_index(root)
+    budget.reference_indexes[key] = (root, index)
+    return index
+
+
+def resolve_indexed_reference(
+    index: SchemaReferenceIndex, source: Any, reference: str
+) -> tuple[str, Any]:
+    base_uri = index.node_bases.get(id(source))
+    if base_uri is None:
+        raise ValidationFailure("schema reference base is ambiguous")
+    absolute = urljoin(base_uri, reference)
+    resource_uri, fragment = urldefrag(absolute)
+    if resource_uri in index.ambiguous_resources:
+        raise ValidationFailure("schema reference resource is ambiguous")
+    resource = index.resources.get(resource_uri)
+    if not fragment:
+        if not isinstance(resource, (dict, bool)):
+            raise ValidationFailure("schema reference resource is unresolved")
+        return absolute, resource
+    if fragment.startswith("/"):
+        if not isinstance(resource, (dict, bool)):
+            raise ValidationFailure("schema reference resource is unresolved")
+        return absolute, resolve_pointer(resource, f"#{unquote(fragment)}")
+    if absolute in index.ambiguous_anchors:
+        raise ValidationFailure("schema reference anchor is ambiguous")
+    target = index.anchors.get(absolute)
+    if not isinstance(target, (dict, bool)):
+        raise ValidationFailure("schema reference anchor is unresolved")
+    return absolute, target
+
+
+@budgeted
+def schema_reference_dependencies(schema: Any, root: Any) -> tuple[tuple[str, str], ...]:
+    """Return compact fingerprints for the transitive reference closure.
+
+    Static Draft-07 URI references are resolved within the selected root. Dynamic,
+    recursive, ambiguous, and external references are deliberately tied to a
+    compact whole-root digest so any potentially retargeting edit fails closed.
+    """
+    budget = active_budget()
+    cache_key = (id(schema), id(root))
+    cached = budget.reference_fingerprints.get(cache_key)
+    if cached is not None:
+        return cached
+    index = reference_index(root)
     pending = [schema]
     visited_objects: set[int] = set()
-    visited_references: set[str] = set()
-    dependencies: dict[str, bytes] = {}
+    visited_references: set[tuple[int, str, str]] = set()
+    dependencies: dict[str, str] = {}
     while pending:
         active_budget().checkpoint()
         current = pending.pop()
@@ -2089,46 +2295,34 @@ def schema_reference_dependencies(schema: Any, root: Any) -> tuple[tuple[str, by
             continue
         visited_objects.add(identity)
 
-        reference = current.get("$ref")
-        if isinstance(reference, str) and reference not in visited_references:
-            visited_references.add(reference)
-            if isinstance(root, dict):
-                try:
-                    target = resolve_pointer(root, reference)
-                except ValidationFailure:
-                    dependencies[reference] = b"<unresolved>"
-                else:
-                    dependencies[reference] = canonical_bytes(target)
-                    pending.append(target)
+        for keyword in REFERENCE_KEYWORDS:
+            reference = current.get(keyword)
+            reference_key = (identity, keyword, reference)
+            if not isinstance(reference, str) or reference_key in visited_references:
+                continue
+            visited_references.add(reference_key)
+            try:
+                absolute, target = resolve_indexed_reference(index, current, reference)
+            except ValidationFailure:
+                absolute = urljoin(
+                    index.node_bases.get(identity) or SYNTHETIC_ROOT_URI,
+                    reference,
+                )
+                dependencies[f"{keyword}:{absolute}"] = index.root_digest
+                continue
+            dependency_key = f"{keyword}:{absolute}"
+            if keyword in {"$dynamicRef", "$recursiveRef"}:
+                dependencies[dependency_key] = index.root_digest
             else:
-                dependencies[reference] = b"<unresolved>"
+                dependencies[dependency_key] = sha256_bytes(canonical_bytes(target))
+            pending.append(target)
 
-        for keyword in SCHEMA_MAP_KEYWORDS & current.keys():
-            mapping = current[keyword]
-            if isinstance(mapping, dict):
-                pending.extend(mapping.values())
-        raw_dependencies = current.get("dependencies")
-        if isinstance(raw_dependencies, dict):
-            pending.extend(
-                value
-                for value in raw_dependencies.values()
-                if isinstance(value, (dict, bool))
-            )
-        for keyword in SCHEMA_VALUE_KEYWORDS & current.keys():
-            pending.append(current[keyword])
-        items = current.get("items")
-        if isinstance(items, list):
-            pending.extend(items)
-        elif isinstance(items, (dict, bool)):
-            pending.append(items)
-        prefix_items = current.get("prefixItems")
-        if isinstance(prefix_items, list):
-            pending.extend(prefix_items)
-        for keyword in SCHEMA_ARRAY_KEYWORDS & current.keys():
-            variants = current[keyword]
-            if isinstance(variants, list):
-                pending.extend(variants)
-    return tuple(sorted(dependencies.items()))
+        for _, child in schema_child_locations(current):
+            if isinstance(child, (dict, bool)):
+                pending.append(child)
+    result = tuple(sorted(dependencies.items()))
+    budget.reference_fingerprints[cache_key] = result
+    return result
 
 
 def open_incoming_fallback(path: str, *, tagged: bool = False) -> str | None:
@@ -2137,6 +2331,34 @@ def open_incoming_fallback(path: str, *, tagged: bool = False) -> str | None:
     if any(f"/definitions/{name}" in path for name in ("TurnStatus", "MessagePhase")):
         return "unknown_generated_enum_values_fail_soft_at_the_stable_boundary"
     return None
+
+
+@budgeted
+def optional_property_addition_is_additive(
+    before: dict[str, Any], name: str, after_child: Any
+) -> bool:
+    """Prove that declaring an optional property cannot reject an old instance."""
+    if after_child is True or after_child == {}:
+        return True
+    patterns = before.get("patternProperties", {})
+    if isinstance(patterns, dict):
+        for pattern in sorted(patterns):
+            active_budget().checkpoint()
+            try:
+                if bounded_regex_search(pattern, name):
+                    return False
+            except (TypeError, ValidationFailure):
+                return False
+    old_additional = before.get("additionalProperties", True)
+    if old_additional is False:
+        # A non-pattern-matched property was impossible before and is merely
+        # admitted (subject to its new schema) afterward.
+        return True
+    if isinstance(old_additional, dict) and isinstance(after_child, dict):
+        # Replacing the applicable additionalProperties schema with the exact
+        # same property schema is semantically neutral.
+        return canonical_bytes(old_additional) == canonical_bytes(after_child)
+    return False
 
 
 @budgeted
@@ -2178,7 +2400,6 @@ def compare_combinator(
     )
     reference_dependencies_changed = (
         combinator == "oneOf"
-        and old_counts == new_counts
         and schema_reference_dependencies(old, before_root)
         != schema_reference_dependencies(new, after_root)
     )
@@ -2399,6 +2620,19 @@ def compare_named_schemas(
         else:
             changes.append(change("breaking", "reference_invalid_or_changed", path))
 
+    before_identifier = before.get("$id")
+    after_identifier = after.get("$id")
+    if before_identifier != after_identifier or (
+        ("$id" in before) != ("$id" in after)
+    ):
+        if "$id" not in before:
+            kind = "schema_identifier_added"
+        elif "$id" not in after:
+            kind = "schema_identifier_removed"
+        else:
+            kind = "schema_identifier_changed"
+        changes.append(change("breaking", kind, path))
+
     before_draft = before.get("$schema")
     after_draft = after.get("$schema")
     if before_draft != after_draft or (("$schema" in before) != ("$schema" in after)):
@@ -2491,8 +2725,18 @@ def compare_named_schemas(
         for name in sorted(before_props.keys() - after_props.keys()):
             changes.append(change("breaking", "property_removed", f"{path}/properties/{name}"))
         for name in sorted(after_props.keys() - before_props.keys()):
-            classification = "breaking" if name in after_required else "additive"
-            kind = "required_property_added" if name in after_required else "optional_property_added"
+            required = name in after_required
+            classification = (
+                "breaking"
+                if required
+                or not optional_property_addition_is_additive(
+                    before, name, after_props[name]
+                )
+                else "additive"
+            )
+            kind = (
+                "required_property_added" if required else "optional_property_added"
+            )
             changes.append(change(classification, kind, f"{path}/properties/{name}"))
         for name in sorted(before_props.keys() & after_props.keys()):
             before_child = before_props[name]
@@ -2630,10 +2874,35 @@ def compare_named_schemas(
         if before.get(key) != after.get(key):
             classification = "additive" if key == "not" and key in before and key not in after else "breaking"
             changes.append(change(classification, f"{key}_constraint_changed", path))
+        elif isinstance(before.get(key), (dict, bool)) and isinstance(
+            after.get(key), (dict, bool)
+        ):
+            before_dependencies = schema_reference_dependencies(
+                before[key], before_root
+            )
+            after_dependencies = schema_reference_dependencies(
+                after[key], after_root
+            )
+            if before_dependencies != after_dependencies:
+                changes.append(
+                    change(
+                        "breaking",
+                        f"{key}_reference_dependency_changed_unproven",
+                        path,
+                    )
+                )
 
-    annotations = {"$id", "title", "description", "default", "examples", "deprecated", "readOnly", "writeOnly"}
+    annotations = {
+        "title",
+        "description",
+        "default",
+        "examples",
+        "deprecated",
+        "readOnly",
+        "writeOnly",
+    }
     handled = annotations | {
-        "$ref", "$schema", "type", "enum", "const", "properties", "required", "definitions",
+        "$id", "$ref", "$schema", "type", "enum", "const", "properties", "required", "definitions",
         "additionalProperties", "items", "anyOf", "oneOf", "allOf", "not", "if", "then", "else",
         "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf",
         "minLength", "maxLength", "pattern", "format", "minItems", "maxItems", "uniqueItems",
@@ -2808,7 +3077,11 @@ def instance_type_matches(instance: Any, expected: str) -> bool:
 
 
 @budgeted
-def resolve_pointer(root: dict[str, Any], reference: str) -> Any:
+def resolve_pointer(root: Any, reference: str) -> Any:
+    if reference == "#":
+        if not isinstance(root, (dict, bool)):
+            raise ValidationFailure("schema reference is not a schema")
+        return root
     if not reference.startswith("#/"):
         raise ValidationFailure("external references are not permitted")
     current: Any = root
@@ -2824,7 +3097,9 @@ def resolve_pointer(root: dict[str, Any], reference: str) -> Any:
 
 
 @budgeted
-def validate_instance(instance: Any, schema: Any, root: dict[str, Any], *, depth: int = 0) -> None:
+def validate_instance(
+    instance: Any, schema: Any, root: Any, *, depth: int = 0
+) -> None:
     active_budget().checkpoint()
     if depth > SCHEMA_VALIDATION_RECURSION_LIMIT:
         raise ValidationFailure("schema validation nesting limit exceeded")
@@ -2832,10 +3107,14 @@ def validate_instance(instance: Any, schema: Any, root: dict[str, Any], *, depth
         return
     if schema is False or not isinstance(schema, dict):
         raise ValidationFailure("boolean schema constraint failed")
-    reference = schema.get("$ref")
-    if isinstance(reference, str):
-        validate_instance(instance, resolve_pointer(root, reference), root, depth=depth + 1)
-        return
+    for reference_keyword in REFERENCE_KEYWORDS:
+        reference = schema.get(reference_keyword)
+        if isinstance(reference, str):
+            _, target = resolve_indexed_reference(
+                reference_index(root), schema, reference
+            )
+            validate_instance(instance, target, root, depth=depth + 1)
+            return
     if "const" in schema and semantic_json_key(instance) != semantic_json_key(schema["const"]):
         raise ValidationFailure("constant constraint failed")
     if isinstance(schema.get("enum"), list) and semantic_json_key(instance) not in {
@@ -2904,9 +3183,9 @@ def validate_instance(instance: Any, schema: Any, root: dict[str, Any], *, depth
             for key, value in instance.items():
                 active_budget().checkpoint()
                 child = properties.get(key)
+                declared_property = isinstance(child, (dict, bool))
                 if isinstance(child, (dict, bool)):
                     validate_instance(value, child, root, depth=depth + 1)
-                    continue
                 matched_pattern = False
                 patterns = schema.get("patternProperties", {})
                 if isinstance(patterns, dict):
@@ -2919,7 +3198,7 @@ def validate_instance(instance: Any, schema: Any, root: dict[str, Any], *, depth
                         if matches_pattern and isinstance(pattern_schema, (dict, bool)):
                             matched_pattern = True
                             validate_instance(value, pattern_schema, root, depth=depth + 1)
-                if matched_pattern:
+                if declared_property or matched_pattern:
                     continue
                 additional = schema.get("additionalProperties", True)
                 if additional is False:

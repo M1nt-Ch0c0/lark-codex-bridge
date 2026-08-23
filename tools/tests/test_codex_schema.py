@@ -31,6 +31,7 @@ class CodexSchemaTests(unittest.TestCase):
     def test_diff_separates_optional_additions_from_breaking_changes(self):
         before = {
             "type": "object",
+            "additionalProperties": False,
             "required": ["mode"],
             "properties": {
                 "mode": {"type": ["string", "null"], "enum": ["known"]},
@@ -39,6 +40,7 @@ class CodexSchemaTests(unittest.TestCase):
         }
         after = {
             "type": "object",
+            "additionalProperties": False,
             "required": ["mode", "requiredNew"],
             "properties": {
                 "mode": {"type": "string", "enum": ["known", "future"]},
@@ -204,6 +206,20 @@ class CodexSchemaTests(unittest.TestCase):
                 kinds, _ = self.classified(before, after)
                 self.assertIn(("breaking", expected), kinds)
 
+        identifier_cases = (
+            ({}, {"$id": "next.json"}, "schema_identifier_added"),
+            ({"$id": "old.json"}, {}, "schema_identifier_removed"),
+            (
+                {"$id": "old.json"},
+                {"$id": "next.json"},
+                "schema_identifier_changed",
+            ),
+        )
+        for before, after, expected in identifier_cases:
+            with self.subTest(expected=expected):
+                kinds, _ = self.classified(before, after)
+                self.assertIn(("breaking", expected), kinds)
+
         # Draft-07 ignores siblings next to $ref. Removing the reference can
         # therefore activate a previously ignored narrowing constraint.
         kinds, changes = self.classified(
@@ -225,6 +241,366 @@ class CodexSchemaTests(unittest.TestCase):
                 for item in changes
             )
         )
+
+    def test_identifier_swap_and_reference_context_changes_fail_closed(self):
+        before_swap = {
+            "$id": "https://schemas.example/root.json",
+            "$ref": "value",
+            "definitions": {
+                "text": {"$id": "value", "type": "string"},
+                "number": {"$id": "other", "type": "integer"},
+            },
+        }
+        after_swap = {
+            "$id": "https://schemas.example/root.json",
+            "$ref": "value",
+            "definitions": {
+                "text": {"$id": "other", "type": "string"},
+                "number": {"$id": "value", "type": "integer"},
+            },
+        }
+        self.assertTrue(
+            codex_schema.instance_valid("text", before_swap, before_swap, 0)
+        )
+        self.assertFalse(
+            codex_schema.instance_valid("text", after_swap, after_swap, 0)
+        )
+        kinds, _ = self.classified(before_swap, after_swap)
+        self.assertIn(("breaking", "schema_identifier_changed"), kinds)
+
+        before_relative_one_of = {
+            "$id": "https://schemas.example/root.json",
+            "definitions": {
+                "relative": {"$id": "relative", "type": "string"},
+            },
+            "oneOf": [{"$ref": "relative"}, {"type": "integer"}],
+        }
+        after_relative_one_of = {
+            "$id": "https://schemas.example/root.json",
+            "definitions": {
+                "relative": {
+                    "$id": "relative",
+                    "type": ["string", "integer"],
+                },
+            },
+            "oneOf": [{"$ref": "relative"}, {"type": "integer"}],
+        }
+        self.assertTrue(
+            codex_schema.instance_valid(
+                1, before_relative_one_of, before_relative_one_of, 0
+            )
+        )
+        self.assertFalse(
+            codex_schema.instance_valid(
+                1, after_relative_one_of, after_relative_one_of, 0
+            )
+        )
+        kinds, _ = self.classified(
+            before_relative_one_of, after_relative_one_of
+        )
+        self.assertIn(
+            ("breaking", "one_of_global_exclusivity_changed_unproven"), kinds
+        )
+
+        before_not = {
+            "definitions": {"blocked": {"type": "string"}},
+            "not": {"$ref": "#/definitions/blocked"},
+        }
+        after_not = {
+            "definitions": {
+                "blocked": {"type": ["string", "integer"]},
+            },
+            "not": {"$ref": "#/definitions/blocked"},
+        }
+        self.assertTrue(codex_schema.instance_valid(1, before_not, before_not, 0))
+        self.assertFalse(codex_schema.instance_valid(1, after_not, after_not, 0))
+        kinds, _ = self.classified(before_not, after_not)
+        self.assertIn(
+            ("breaking", "not_reference_dependency_changed_unproven"), kinds
+        )
+
+        before_conditional = {
+            "definitions": {"condition": {"type": "string"}},
+            "if": {"$ref": "#/definitions/condition"},
+            "then": False,
+        }
+        after_conditional = {
+            "definitions": {
+                "condition": {"type": ["string", "integer"]},
+            },
+            "if": {"$ref": "#/definitions/condition"},
+            "then": False,
+        }
+        self.assertTrue(
+            codex_schema.instance_valid(
+                1, before_conditional, before_conditional, 0
+            )
+        )
+        self.assertFalse(
+            codex_schema.instance_valid(
+                1, after_conditional, after_conditional, 0
+            )
+        )
+        kinds, _ = self.classified(before_conditional, after_conditional)
+        self.assertIn(
+            ("breaking", "if_reference_dependency_changed_unproven"), kinds
+        )
+
+        for branch, condition in (("then", True), ("else", False)):
+            before_branch = {
+                "definitions": {"value": {"type": "string"}},
+                "if": condition,
+                branch: {"$ref": "#/definitions/value"},
+            }
+            after_branch = {
+                "definitions": {
+                    "value": {"type": ["string", "integer"]},
+                },
+                "if": condition,
+                branch: {"$ref": "#/definitions/value"},
+            }
+            branch_kinds, _ = self.classified(before_branch, after_branch)
+            self.assertIn(
+                (
+                    "breaking",
+                    f"{branch}_reference_dependency_changed_unproven",
+                ),
+                branch_kinds,
+            )
+
+    def test_reference_fingerprints_cover_transitive_recursive_and_dynamic_refs(self):
+        before_recursive = {
+            "definitions": {
+                "node": {
+                    "type": "object",
+                    "properties": {
+                        "next": {"$ref": "#/definitions/node"},
+                        "value": {
+                            "not": {"$ref": "#/definitions/blocked"},
+                        },
+                    },
+                },
+                "blocked": {"type": "string"},
+            },
+            "$ref": "#/definitions/node",
+        }
+        after_recursive = json.loads(json.dumps(before_recursive))
+        after_recursive["definitions"]["blocked"]["type"] = [
+            "string",
+            "integer",
+        ]
+        instance = {"next": {"value": True}, "value": 1}
+        self.assertTrue(
+            codex_schema.instance_valid(
+                instance, before_recursive, before_recursive, 0
+            )
+        )
+        self.assertFalse(
+            codex_schema.instance_valid(
+                instance, after_recursive, after_recursive, 0
+            )
+        )
+        kinds, changes = self.classified(before_recursive, after_recursive)
+        self.assertIn(
+            ("breaking", "not_reference_dependency_changed_unproven"), kinds
+        )
+        self.assertTrue(
+            any(item["path"].endswith("/properties/value") for item in changes),
+            changes,
+        )
+
+        for keyword in ("$ref", "$dynamicRef", "$recursiveRef"):
+            before = {
+                "not": {keyword: "https://external.example/schema#target"},
+                "description": "before",
+            }
+            after = {
+                "not": {keyword: "https://external.example/schema#target"},
+                "description": "after",
+            }
+            before_fingerprint = codex_schema.schema_reference_dependencies(
+                before["not"], before
+            )
+            after_fingerprint = codex_schema.schema_reference_dependencies(
+                after["not"], after
+            )
+            self.assertNotEqual(before_fingerprint, after_fingerprint)
+            self.assertTrue(
+                all(
+                    len(digest) == 64
+                    and set(digest) <= set("0123456789abcdef")
+                    for _, digest in before_fingerprint + after_fingerprint
+                )
+            )
+            kinds, _ = self.classified(before, after)
+            self.assertIn(
+                ("breaking", "not_reference_dependency_changed_unproven"),
+                kinds,
+            )
+
+    def test_optional_property_additions_require_a_non_narrowing_proof(self):
+        open_before = {"type": "object"}
+        typed_after = {
+            "type": "object",
+            "properties": {"x": {"type": "integer"}},
+        }
+        self.assertTrue(
+            codex_schema.instance_valid({"x": "text"}, open_before, open_before, 0)
+        )
+        self.assertFalse(
+            codex_schema.instance_valid({"x": "text"}, typed_after, typed_after, 0)
+        )
+        kinds, _ = self.classified(open_before, typed_after)
+        self.assertIn(("breaking", "optional_property_added"), kinds)
+
+        closed_before = {"type": "object", "additionalProperties": False}
+        closed_after = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"x": {"type": "integer"}},
+        }
+        kinds, _ = self.classified(closed_before, closed_after)
+        self.assertIn(("additive", "optional_property_added"), kinds)
+
+        patterned_before = {
+            "type": "object",
+            "additionalProperties": False,
+            "patternProperties": {"^x$": {"type": "string"}},
+        }
+        patterned_after = {
+            **patterned_before,
+            "properties": {"x": {"type": "integer"}},
+        }
+        self.assertTrue(
+            codex_schema.instance_valid(
+                {"x": "text"}, patterned_before, patterned_before, 0
+            )
+        )
+        self.assertFalse(
+            codex_schema.instance_valid(
+                {"x": "text"}, patterned_after, patterned_after, 0
+            )
+        )
+        kinds, _ = self.classified(patterned_before, patterned_after)
+        self.assertIn(("breaking", "optional_property_added"), kinds)
+
+        same_additional_before = {
+            "type": "object",
+            "additionalProperties": {"type": "integer"},
+        }
+        same_additional_after = {
+            **same_additional_before,
+            "properties": {"x": {"type": "integer"}},
+        }
+        kinds, _ = self.classified(
+            same_additional_before, same_additional_after
+        )
+        self.assertIn(("additive", "optional_property_added"), kinds)
+
+        unconstrained_after = {
+            "type": "object",
+            "properties": {"x": True},
+        }
+        kinds, _ = self.classified(open_before, unconstrained_after)
+        self.assertIn(("additive", "optional_property_added"), kinds)
+
+    def test_optional_property_reference_matrix_has_no_false_additive_shrinks(self):
+        absent = object()
+        additional_schemas = (
+            absent,
+            True,
+            False,
+            {},
+            {"type": "string"},
+            {"type": "integer"},
+        )
+        pattern_configurations = (
+            {},
+            {"^x$": True},
+            {"^x$": False},
+            {"^x$": {"type": "string"}},
+            {"^z$": {"type": "string"}},
+            {
+                "^x": {"type": "string"},
+                "x$": {"type": "integer"},
+            },
+        )
+        property_configurations = (
+            absent,
+            True,
+            {},
+            False,
+            {"type": "string"},
+            {"type": "integer"},
+        )
+        instances = (
+            {},
+            {"x": "text"},
+            {"x": 1},
+            {"x": 1.5},
+            {"x": True},
+            {"y": "text"},
+            {"z": "text"},
+            {"z": 1},
+            {"xx": "text"},
+            {"xx": 1},
+        )
+
+        schemas = []
+        for additional, patterns, child in itertools.product(
+            additional_schemas,
+            pattern_configurations,
+            property_configurations,
+        ):
+            schema = {"type": "object"}
+            if additional is not absent:
+                schema["additionalProperties"] = additional
+            if patterns:
+                schema["patternProperties"] = patterns
+            if child is not absent:
+                schema["properties"] = {"x": child}
+            schemas.append(schema)
+
+        # Full ordered transitions exercise both property-addition and removal
+        # directions across the independent review's 5,208 false-positive family:
+        # default/boolean/schema additional behavior, matching/nonmatching/multiple
+        # patterns, and absent/unrestricted/typed/false declared properties.
+        self.assertEqual(len(schemas), 216)
+        with codex_schema.operation_budget():
+            accepted = [
+                {
+                    index
+                    for index, instance in enumerate(instances)
+                    if codex_schema.instance_valid(instance, schema, schema, 0)
+                }
+                for schema in schemas
+            ]
+        transition_count = 0
+        shrink_count = 0
+        # Chunk the exhaustive matrix so its test accounting exercises, but
+        # never relaxes, the production per-operation change/work bounds.
+        for first_before in range(0, len(schemas), 8):
+            with codex_schema.operation_budget():
+                for before_index, after_index in itertools.product(
+                    range(first_before, min(first_before + 8, len(schemas))),
+                    range(len(schemas)),
+                ):
+                    transition_count += 1
+                    if not accepted[before_index] - accepted[after_index]:
+                        continue
+                    shrink_count += 1
+                    _, changes = self.classified(
+                        schemas[before_index], schemas[after_index]
+                    )
+                    self.assertTrue(
+                        any(
+                            change["classification"] == "breaking"
+                            for change in changes
+                        ),
+                        (schemas[before_index], schemas[after_index], changes),
+                    )
+        self.assertEqual(transition_count, 46_656)
+        self.assertEqual(shrink_count, 30_290)
 
     def test_known_keyword_shapes_are_rejected_recursively(self):
         malformed = {
@@ -437,6 +813,7 @@ class CodexSchemaTests(unittest.TestCase):
             "oneOf": [
                 {
                     "type": "object",
+                    "additionalProperties": False,
                     "properties": {"kind": {"const": "a"}},
                     "required": ["kind"],
                 }
@@ -446,6 +823,7 @@ class CodexSchemaTests(unittest.TestCase):
             "oneOf": [
                 {
                     "type": "object",
+                    "additionalProperties": False,
                     "properties": {
                         "kind": {"const": "a"},
                         "note": {"type": "string"},

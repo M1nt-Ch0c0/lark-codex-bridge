@@ -60,11 +60,15 @@ The JSON report is the machine-readable source of truth. Its conservative
 comparison covers type relationships (including integer as a subset of number),
 finite enum/const sets, object/array/string/numeric constraints, and JSON Schema
 combinators. Reference and schema-draft changes, including boolean schemas at any
-selected position, are classified explicitly. JSON numbers use exact integer or
-binary-rational identities rather than floating-point coercion. An incoming enum
-or union addition is breaking unless the generated audit points to a tested open
-fallback. Changes the comparator cannot prove safe are blocking, not silently
-additive.
+selected position, are classified explicitly. Draft-07 identifier scopes and the
+bounded transitive reference closure are fingerprinted so indirect edits in
+exclusive, negative, or conditional contexts fail closed. Optional property
+additions are additive only when prior `additionalProperties` and
+`patternProperties` behavior proves that declaring the name cannot reject an old
+instance. JSON numbers use exact integer or binary-rational identities rather than
+floating-point coercion. An incoming enum or union addition is breaking unless the
+generated audit points to a tested open fallback. Changes the comparator cannot
+prove safe are blocking, not silently additive.
 
 Promotion requires adding an append-only support-history record, moving the version
 to `supportedVersions`, adding its explicit `WireAdapter` branch, and passing offline
