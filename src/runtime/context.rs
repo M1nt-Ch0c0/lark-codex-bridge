@@ -24,6 +24,9 @@ use crate::lark::{
         ResourceDesc,
     },
 };
+use crate::limits::{
+    ATTACHMENT_MAX_BYTES, ATTACHMENT_MAX_PER_MESSAGE, ATTACHMENT_TURN_TOTAL_BYTES,
+};
 
 const DEFAULT_CONTEXT_TTL: Duration = Duration::from_secs(10 * 60);
 const DEFAULT_MAX_CONTEXTS: usize = 4_096;
@@ -38,6 +41,12 @@ pub struct ContextRegistryConfig {
     pub max_contexts: usize,
     /// Maximum number of typed parts accepted for a single message.
     pub max_parts_per_context: usize,
+    /// Maximum attempted media reads charged to one turn.
+    pub max_media_reads_per_turn: usize,
+    /// Aggregate media bytes charged to one turn.
+    pub max_media_read_bytes_per_turn: u64,
+    /// Pessimistic reservation for a not-yet-materialized media handle.
+    pub max_media_read_bytes_per_item: u64,
 }
 
 impl Default for ContextRegistryConfig {
@@ -46,6 +55,9 @@ impl Default for ContextRegistryConfig {
             ttl: DEFAULT_CONTEXT_TTL,
             max_contexts: DEFAULT_MAX_CONTEXTS,
             max_parts_per_context: DEFAULT_MAX_PARTS,
+            max_media_reads_per_turn: ATTACHMENT_MAX_PER_MESSAGE,
+            max_media_read_bytes_per_turn: ATTACHMENT_TURN_TOTAL_BYTES,
+            max_media_read_bytes_per_item: u64::try_from(ATTACHMENT_MAX_BYTES).unwrap_or(u64::MAX),
         }
     }
 }
@@ -821,7 +833,6 @@ pub struct RegisteredContext {
 }
 
 /// A descriptor returned only after context, thread, turn, and handle checks.
-#[derive(Clone)]
 pub struct AuthorizedResource {
     /// Lark message that owns the resource.
     pub message_id: String,
@@ -838,6 +849,7 @@ pub struct AuthorizedResource {
     /// Cancellation tied to the exact context/turn capability. This is kept
     /// crate-private so callers cannot mint or replace lifecycle authority.
     pub(crate) cancellation: CancellationToken,
+    read_charge: Option<ReadCharge>,
 }
 
 impl AuthorizedResource {
@@ -845,6 +857,15 @@ impl AuthorizedResource {
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.cancellation.is_cancelled()
+    }
+
+    /// Replaces this attempt's pessimistic byte reservation with the exact
+    /// materialized size. Failed attempts deliberately retain their charge so
+    /// retries cannot bypass the turn budget.
+    pub(crate) fn settle_read(&mut self, actual_bytes: u64) {
+        if let Some(charge) = self.read_charge.as_mut() {
+            charge.settle(actual_bytes);
+        }
     }
 }
 
@@ -889,6 +910,77 @@ struct ResourceGrant {
     duration_ms: Option<u64>,
 }
 
+struct TurnReadMeter {
+    reads: usize,
+    charged_bytes: u64,
+    observed_bytes: HashMap<MediaHandle, u64>,
+    max_reads: usize,
+    max_bytes: u64,
+}
+
+impl TurnReadMeter {
+    fn new(config: ContextRegistryConfig) -> Self {
+        Self {
+            reads: 0,
+            charged_bytes: 0,
+            observed_bytes: HashMap::new(),
+            max_reads: config.max_media_reads_per_turn,
+            max_bytes: config.max_media_read_bytes_per_turn,
+        }
+    }
+
+    fn reserve(
+        &mut self,
+        handle: &MediaHandle,
+        max_unobserved_bytes: u64,
+    ) -> Result<u64, ContextError> {
+        let reserved_bytes = self
+            .observed_bytes
+            .get(handle)
+            .copied()
+            .unwrap_or(max_unobserved_bytes);
+        if self.reads >= self.max_reads
+            || self.charged_bytes.saturating_add(reserved_bytes) > self.max_bytes
+        {
+            return Err(error(
+                ContextErrorCode::CapacityExceeded,
+                "turn media read budget is exhausted",
+                false,
+            ));
+        }
+        self.reads = self.reads.saturating_add(1);
+        self.charged_bytes = self.charged_bytes.saturating_add(reserved_bytes);
+        Ok(reserved_bytes)
+    }
+}
+
+struct ReadCharge {
+    meter: Arc<Mutex<TurnReadMeter>>,
+    handle: MediaHandle,
+    reserved_bytes: u64,
+    settled: bool,
+}
+
+impl ReadCharge {
+    fn settle(&mut self, actual_bytes: u64) {
+        if self.settled {
+            return;
+        }
+        let mut meter = self
+            .meter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        meter.charged_bytes = meter
+            .charged_bytes
+            .saturating_sub(self.reserved_bytes)
+            .saturating_add(actual_bytes);
+        meter
+            .observed_bytes
+            .insert(self.handle.clone(), actual_bytes);
+        self.settled = true;
+    }
+}
+
 enum EntryState {
     Pending,
     Active { codex_turn_id: String },
@@ -901,6 +993,7 @@ struct ContextEntry {
     expires_at: Instant,
     snapshot: ContextSnapshot,
     grants: HashMap<MediaHandle, ResourceGrant>,
+    read_meter: Arc<Mutex<TurnReadMeter>>,
     cancellation: CancellationToken,
 }
 
@@ -933,7 +1026,14 @@ impl ContextRegistry {
     ///
     /// Returns `invalid_request` when any bound or the TTL is zero.
     pub fn new(config: ContextRegistryConfig) -> Result<Self, ContextError> {
-        if config.ttl.is_zero() || config.max_contexts == 0 || config.max_parts_per_context == 0 {
+        if config.ttl.is_zero()
+            || config.max_contexts == 0
+            || config.max_parts_per_context == 0
+            || config.max_media_reads_per_turn == 0
+            || config.max_media_read_bytes_per_turn == 0
+            || config.max_media_read_bytes_per_item == 0
+            || config.max_media_read_bytes_per_item > config.max_media_read_bytes_per_turn
+        {
             return Err(error(
                 ContextErrorCode::InvalidRequest,
                 "context registry limits must be non-zero",
@@ -976,6 +1076,14 @@ impl ContextRegistry {
         })?;
         let mut state = self.lock();
         make_capacity(&mut state, self.config.max_contexts, now)?;
+        let read_meter = state
+            .entries
+            .values()
+            .find(|entry| entry.pending_binding == binding)
+            .map_or_else(
+                || Arc::new(Mutex::new(TurnReadMeter::new(self.config))),
+                |entry| Arc::clone(&entry.read_meter),
+            );
         let context_id = unique_context_id(&state);
         let mut grants = HashMap::new();
         let message_id = draft.message_id.clone();
@@ -1018,6 +1126,7 @@ impl ContextRegistry {
                 expires_at,
                 snapshot,
                 grants,
+                read_meter,
                 cancellation: CancellationToken::new(),
             },
         );
@@ -1129,12 +1238,13 @@ impl ContextRegistry {
         let mut state = self.lock();
         let entry = state.entries.get_mut(context_id).ok_or_else(not_found)?;
         authorize_entry(entry, caller, now)?;
-        authorized_resource(entry, handle)
+        authorized_resource(entry, handle, self.config.max_media_read_bytes_per_item)
     }
 
     /// Authorizes media from the trusted `threadId`/`turnId` tool envelope.
-    /// Like [`Self::resolve_for_tool`], this safely handles a tool call that
-    /// races ahead of explicit activation.
+    /// `max_materialized_bytes` must be the same single-object cap enforced by
+    /// the downstream attachment cache. Like [`Self::resolve_for_tool`], this
+    /// safely handles a tool call that races ahead of explicit activation.
     ///
     /// # Errors
     ///
@@ -1146,13 +1256,14 @@ impl ContextRegistry {
         handle: &MediaHandle,
         codex_thread_id: &str,
         codex_turn_id: &str,
+        max_materialized_bytes: u64,
     ) -> Result<AuthorizedResource, ContextError> {
         validate_tool_binding(codex_thread_id, codex_turn_id)?;
         let now = Instant::now();
         let mut state = self.lock();
         let entry = state.entries.get_mut(context_id).ok_or_else(not_found)?;
         authorize_entry_for_tool(entry, codex_thread_id, codex_turn_id, now)?;
-        authorized_resource(entry, handle)
+        authorized_resource(entry, handle, max_materialized_bytes)
     }
 
     /// Revokes a single context and erases all underlying resource grants.
@@ -1380,6 +1491,7 @@ fn authorize_entry_for_tool(
 fn authorized_resource(
     entry: &ContextEntry,
     handle: &MediaHandle,
+    max_unobserved_bytes: u64,
 ) -> Result<AuthorizedResource, ContextError> {
     let grant = entry.grants.get(handle).ok_or_else(|| {
         error(
@@ -1388,6 +1500,11 @@ fn authorized_resource(
             false,
         )
     })?;
+    let reserved_bytes = entry
+        .read_meter
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .reserve(handle, max_unobserved_bytes)?;
     Ok(AuthorizedResource {
         message_id: grant.message_id.clone(),
         media_kind: grant.kind,
@@ -1396,6 +1513,12 @@ fn authorized_resource(
         transcript: grant.transcript.clone(),
         duration_ms: grant.duration_ms,
         cancellation: entry.cancellation.clone(),
+        read_charge: Some(ReadCharge {
+            meter: Arc::clone(&entry.read_meter),
+            handle: handle.clone(),
+            reserved_bytes,
+            settled: false,
+        }),
     })
 }
 

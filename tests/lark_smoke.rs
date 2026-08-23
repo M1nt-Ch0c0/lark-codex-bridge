@@ -10,9 +10,16 @@
 //! → reply in one run. It never fakes a pass: any failure, including missing
 //! credentials, fails the test with an actionable diagnostic.
 
+mod fakecodex;
+
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
+use futures_util::future::BoxFuture;
+use lark_codex_bridge::codex::process::{CodexProcessConfig, ProcessError};
+use lark_codex_bridge::codex::supervisor::AppServerSupervisor;
+use lark_codex_bridge::config::{BridgeConfig, WorkspacePolicy};
 use lark_codex_bridge::lark::api::LarkApi;
 use lark_codex_bridge::lark::bridge::LarkBridge;
 use lark_codex_bridge::lark::config::{LarkEndpoints, TenantBrand};
@@ -20,11 +27,67 @@ use lark_codex_bridge::lark::credentials::LarkCredentials;
 use lark_codex_bridge::lark::http::LarkHttp;
 use lark_codex_bridge::lark::normalize::{InboundEvent, ScopeKey};
 use lark_codex_bridge::lark::token::TenantTokenProvider;
+use lark_codex_bridge::runtime::attachments::{
+    AttachmentCache, AttachmentLimits, LarkResourceDownloader,
+};
+use lark_codex_bridge::runtime::context::{
+    ContextDraft, ContextRegistry, DraftPart, MediaHandle, PendingBinding, RevocationReason,
+    TypedPart,
+};
+use lark_codex_bridge::runtime::intake::TenantNamespace;
+use lark_codex_bridge::runtime::policy::{AccessDecision, AccessPolicy};
+use lark_codex_bridge::runtime::quote::{LarkQuoteResolver, QuoteRequest, QuoteResolver};
+use lark_codex_bridge::runtime::router::{Router, RouterSettings};
+use lark_codex_bridge::runtime::scope::{DurableReplySink, ReplySinkError, TurnFinalization};
+use lark_codex_bridge::store::{
+    DedupOutcome, InboundEventState, InboundRejectionKind, NewOutboxRow, NewTurnRow, StoreHandle,
+    TurnState,
+};
 use secrecy::SecretString;
+use semver::Version;
+use tempfile::tempdir;
 use tokio::time::timeout;
+
+use fakecodex::{FakeFactory, FakeOutcome};
 
 const ROUND_TRIP_TIMEOUT: Duration = Duration::from_secs(180);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct SmokeSink;
+
+impl DurableReplySink for SmokeSink {
+    fn rejection_notice(
+        &self,
+        event: &InboundEvent,
+        _reason: InboundRejectionKind,
+    ) -> Result<NewOutboxRow, ReplySinkError> {
+        Ok(NewOutboxRow {
+            idempotency_key: format!("{}:mobile-smoke-rejection", event.event_id),
+            scope_key: event.scope.to_string(),
+            kind: "notice".to_owned(),
+            payload_json: "{\"text\":\"mobile smoke rejected\"}".to_owned(),
+            next_retry_ms: 0,
+        })
+    }
+
+    fn finalize(&self, _turn: TurnFinalization) -> BoxFuture<'static, Result<(), ReplySinkError>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+async fn degraded_supervisor() -> lark_codex_bridge::codex::supervisor::SupervisorHandle {
+    AppServerSupervisor::start_with_factory(
+        CodexProcessConfig::default(),
+        Arc::new(FakeFactory::new([FakeOutcome::Error(
+            ProcessError::UnsupportedVersion {
+                found: Version::new(0, 145, 0),
+            },
+        )])),
+        lark_codex_bridge::codex::supervisor::SupervisorSettings::default(),
+    )
+    .await
+    .expect("degraded smoke supervisor")
+}
 
 #[tokio::test]
 #[ignore = "requires real Feishu/Lark app credentials"]
@@ -121,6 +184,7 @@ async fn run_smoke() -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_mobile_quote_smoke() -> Result<()> {
     let app_id = required_env("LARK_E2E_APP_ID");
     let app_secret = required_env("LARK_E2E_APP_SECRET");
@@ -132,6 +196,9 @@ async fn run_mobile_quote_smoke() -> Result<()> {
     let http = LarkHttp::new(LarkEndpoints::for_tenant(tenant))
         .context("unable to build the Lark HTTP client")?;
     let api = LarkApi::new(http.clone(), TenantTokenProvider::new(http, creds.clone()));
+    let (handle, mut events) = LarkBridge::start(creds.clone())
+        .await
+        .context("unable to start the Lark bridge")?;
     let marker = format!(
         "bridge-media-smoke-{}",
         SystemTime::now()
@@ -140,49 +207,249 @@ async fn run_mobile_quote_smoke() -> Result<()> {
             .as_secs()
     );
     eprintln!(
-        "Mobile action required in group {chat_id}: send one image/video/file/audio, then reply \
-         directly to it with `@bot {marker}`. Do not reply through a forwarded/history card."
+        "Mobile action required in group {chat_id}: send one standalone image/video/file/audio \
+         without mentioning the bot, then reply directly to that exact message with \
+         `@bot {marker}`. Do not reply through a forwarded/history card."
     );
-    let (handle, mut events) = LarkBridge::start(creds)
-        .await
-        .context("unable to start the Lark bridge")?;
     let outcome = timeout(ROUND_TRIP_TIMEOUT, async {
+        let mut standalone = None;
         loop {
-            let event = events
+            let queued = events
                 .recv()
                 .await
-                .context("inbound stream closed before the mobile quote arrived")?
-                .into_event();
+                .context("inbound stream closed before the mobile quote arrived")?;
+            let event = &queued.event;
+            if event.chat_id == chat_id
+                && !event.mentions_bot
+                && matches!(
+                    event.message_type.as_str(),
+                    "image" | "video" | "media" | "file" | "audio"
+                )
+                && standalone.is_none()
+            {
+                standalone = Some(queued);
+                continue;
+            }
             if event.chat_id == chat_id && event.mentions_bot && event.text.contains(&marker) {
-                return Ok::<InboundEvent, anyhow::Error>(event);
+                let standalone = standalone.context(
+                    "mobile quote arrived before a captured unmentioned standalone media event",
+                )?;
+                return Ok::<_, anyhow::Error>((standalone, queued));
             }
         }
     })
     .await
     .context("timed out waiting for the mobile @bot quote action")?;
     handle.shutdown().await;
-    let event = outcome?;
+    let (standalone, trigger) = outcome?;
+    let event = &trigger.event;
     let parent_id = event
         .reply_to_message_id
+        .clone()
         .context("mobile quote event did not carry parent_id")?;
-    let parent = api
-        .get_message(&parent_id)
+    if standalone.event.message_id != parent_id {
+        return Err(anyhow!(
+            "mobile trigger did not quote the captured standalone media message"
+        ));
+    }
+
+    let workspace = std::env::current_dir().context("current workspace")?;
+    let mut config = BridgeConfig {
+        owners: vec![event.sender_id.clone()],
+        allowed_groups: vec![chat_id.clone()],
+        default_workspace: Some(workspace.clone()),
+        workspace: WorkspacePolicy {
+            allow_roots: vec![workspace],
+            ..WorkspacePolicy::default()
+        },
+        ..BridgeConfig::default()
+    };
+    config.validate().context("mobile smoke policy config")?;
+    let policy = AccessPolicy::from_config(&config).context("mobile smoke policy")?;
+    if policy.decide(event) != AccessDecision::Allow {
+        return Err(anyhow!(
+            "mobile @bot trigger did not pass sender/group/mention policy"
+        ));
+    }
+
+    let namespace = TenantNamespace::from_credentials(&creds);
+    let store = StoreHandle::open_in_memory().await.context("smoke store")?;
+    match store
+        .register_inbound(&namespace, &standalone.event)
         .await
-        .context("unable to fetch the direct quoted parent")?;
-    if parent.chat_id != chat_id || parent.message_id != parent_id {
-        return Err(anyhow!("quoted parent identity did not match the trigger"));
+        .context("register standalone media")?
+    {
+        DedupOutcome::New(_) => {}
+        _ => return Err(anyhow!("standalone media was not a new durable row")),
     }
-    if parent.deleted || parent.content.is_none() {
-        return Err(anyhow!("quoted parent is deleted or has no body"));
+    let temp = tempdir().context("smoke cache tempdir")?;
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &temp.path().join("mobile-media-cache"),
+            store.clone(),
+            Arc::new(LarkResourceDownloader::new(api.clone())),
+            AttachmentLimits::default(),
+        )
+        .context("smoke attachment cache")?,
+    );
+    let contexts = Arc::new(ContextRegistry::default());
+    let router = Router::start_with_contexts(
+        store.clone(),
+        namespace.clone(),
+        policy.clone(),
+        RouterSettings::from_config(&config),
+        degraded_supervisor().await,
+        Arc::new(SmokeSink),
+        Arc::clone(&cache),
+        Arc::clone(&contexts),
+    )
+    .await
+    .context("smoke router")?;
+    let standalone_scope = standalone.event.scope.clone();
+    let standalone_event_id = standalone.event.event_id.clone();
+    router
+        .route(standalone)
+        .await
+        .context("route standalone group media")?;
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if store
+                .inbound_state(&namespace, &standalone_event_id)
+                .await
+                .ok()
+                .flatten()
+                == Some(InboundEventState::Completed)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("standalone group media did not settle without a turn")?;
+    if router
+        .scope_snapshot(&standalone_scope)
+        .await
+        .context("standalone scope snapshot")?
+        .is_some()
+        || contexts.stats().total != 0
+        || !store
+            .list_attachments()
+            .await
+            .context("standalone attachment rows")?
+            .is_empty()
+    {
+        return Err(anyhow!(
+            "standalone unmentioned group media created actor/context/cache work"
+        ));
     }
-    if !matches!(
-        parent.message_type.as_str(),
-        "image" | "video" | "media" | "file" | "audio"
-    ) {
-        return Err(anyhow!("quoted parent is not a supported media type"));
+
+    let quote = LarkQuoteResolver::new(api, policy)
+        .resolve(QuoteRequest {
+            parent_message_id: parent_id,
+            chat_id: chat_id.clone(),
+        })
+        .await;
+    if quote.status != lark_codex_bridge::runtime::context::QuoteStatus::Available {
+        return Err(anyhow!(
+            "authorized direct parent did not resolve as available media"
+        ));
     }
-    // Deliberately stop at metadata resolution: this smoke proves the mobile
-    // event/parent path without downloading bytes or printing resource keys.
+    let resource_key = quote
+        .parts
+        .iter()
+        .find_map(|part| match part {
+            DraftPart::Media { resource, .. } => Some(resource.key.clone()),
+            _ => None,
+        })
+        .context("resolved direct parent carried no readable media")?;
+    let mut draft = ContextDraft::from_inbound(event);
+    draft.quote = Some(quote);
+    let turn_row_id = store
+        .record_turn(NewTurnRow {
+            scope_key: event.scope.to_string(),
+            client_message_id: "mobile-smoke-local-turn".to_owned(),
+            codex_thread_id: Some("mobile-smoke-thread".to_owned()),
+            state: TurnState::Starting,
+        })
+        .await
+        .context("record smoke turn")?;
+    store
+        .set_turn_state(
+            turn_row_id,
+            TurnState::Running,
+            Some("mobile-smoke-codex-turn"),
+        )
+        .await
+        .context("activate smoke turn row")?;
+    let binding = PendingBinding {
+        codex_thread_id: "mobile-smoke-thread".to_owned(),
+        local_turn_row_id: turn_row_id,
+    };
+    let registered = contexts
+        .register_pending(binding.clone(), draft)
+        .context("register smoke context")?;
+    let snapshot = contexts
+        .resolve_for_tool(
+            &registered.context_id,
+            "mobile-smoke-thread",
+            "mobile-smoke-codex-turn",
+        )
+        .context("resolve opaque smoke context")?;
+    let serialized = serde_json::to_string(&snapshot).context("serialize smoke context")?;
+    if serialized.contains(&resource_key) {
+        return Err(anyhow!(
+            "bridge_context.resolve exposed a plaintext Lark resource key"
+        ));
+    }
+    let handle = snapshot
+        .quote
+        .as_ref()
+        .into_iter()
+        .flat_map(|quote| &quote.parts)
+        .find_map(|part| match part {
+            TypedPart::Media { handle, .. } => Some(handle.clone()),
+            _ => None,
+        })
+        .context("opaque quote handle missing")?;
+    if handle == MediaHandle::from_external(resource_key.clone()) {
+        return Err(anyhow!("opaque handle reused the Lark resource key"));
+    }
+    let authorized = contexts
+        .authorize_media_for_tool(
+            &registered.context_id,
+            &handle,
+            "mobile-smoke-thread",
+            "mobile-smoke-codex-turn",
+            u64::try_from(cache.limits().max_attachment_bytes).unwrap_or(u64::MAX),
+        )
+        .context("authorize opaque smoke media handle")?;
+    let cached = cache
+        .fetch(
+            &authorized.message_id,
+            &authorized.resource,
+            authorized.local_turn_row_id,
+        )
+        .await
+        .context("read quoted media through the bounded cache")?;
+    if cached.bytes == 0 || !cached.path.is_file() {
+        return Err(anyhow!("quoted media read produced no bounded cache file"));
+    }
+    cache
+        .release_turn(turn_row_id)
+        .await
+        .context("release smoke media lease")?;
+    assert_eq!(
+        contexts.revoke_turn(&binding, RevocationReason::Completed),
+        1
+    );
+    store
+        .set_turn_state(turn_row_id, TurnState::Completed, None)
+        .await
+        .context("complete smoke turn")?;
+    router.shutdown().await.context("shutdown smoke router")?;
+    drop(cache);
+    store.shutdown().await.context("shutdown smoke store")?;
     Ok(())
 }
 

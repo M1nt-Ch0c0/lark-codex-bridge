@@ -2,11 +2,12 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::task::{Context, Poll, Waker};
 
-use lark_codex_bridge::lark::api::ChatMode;
+use lark_codex_bridge::lark::api::{ChatMode, ResourceKind};
 use lark_codex_bridge::lark::config::TenantBrand;
 use lark_codex_bridge::lark::credentials::LarkCredentials;
 use lark_codex_bridge::lark::normalize::{
-    InboundEvent, MediaMetadata, MediaPart, MentionIdentity, MessagePart, PartStatus, ScopeKey,
+    InboundEvent, MediaMetadata, MediaPart, MentionIdentity, MessagePart, PartStatus, ResourceDesc,
+    ScopeKey,
 };
 use lark_codex_bridge::limits::{
     OUTBOX_TERMINAL_MAX_ROWS, STORE_OUTBOX_CLAIM_MAX_BYTES, STORE_OUTBOX_MAX_QUEUED_BYTES,
@@ -68,6 +69,28 @@ fn turn(message_id: &str, state: TurnState) -> NewTurnRow {
 
 fn tenant_namespace(app_id: &str) -> TenantNamespace {
     TenantNamespace::from_credentials(&credentials_for(app_id))
+}
+
+fn assert_sqlite_files_exclude(path: &std::path::Path, sentinels: &[&str]) {
+    let file_name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .expect("test database filename");
+    for suffix in ["", "-wal", "-shm"] {
+        let candidate = path.with_file_name(format!("{file_name}{suffix}"));
+        let Ok(bytes) = std::fs::read(&candidate) else {
+            continue;
+        };
+        for sentinel in sentinels {
+            assert!(
+                !bytes
+                    .windows(sentinel.len())
+                    .any(|window| window == sentinel.as_bytes()),
+                "SQLite file {} retained a forbidden plaintext sentinel",
+                candidate.display()
+            );
+        }
+    }
 }
 
 fn credentials_for(app_id: &str) -> LarkCredentials {
@@ -235,7 +258,7 @@ async fn migration_two_persists_strict_inbound_payload_columns() {
     let temp = tempdir().expect("tempdir");
     let path = temp.path().join("store.sqlite");
     let store = StoreHandle::open(&path).await.expect("open");
-    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 5);
+    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 6);
     store.shutdown().await.expect("shutdown");
 
     let connection = rusqlite::Connection::open(&path).expect("inspect");
@@ -392,6 +415,211 @@ async fn extended_inbound_payload_v1_round_trips_mentions_parts_and_metadata() {
 }
 
 #[tokio::test]
+async fn sqlite_and_wal_never_receive_plaintext_resource_keys_or_transcripts() {
+    const KEY: &str = "issue20_key_sentinel_5aa85c7131";
+    const TRANSCRIPT: &str = "issue20_transcript_sentinel_291f44e91a";
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("privacy.sqlite");
+    let tenant = tenant_namespace("cli_store_privacy_sentinel");
+    let store = StoreHandle::open(&path).await.expect("open");
+    let mut rich = event("event-private-media", "message-private-media");
+    rich.message_type = "audio".to_owned();
+    rich.text.clear();
+    rich.parts = vec![MessagePart::Audio(MediaPart {
+        key: Some(KEY.to_owned()),
+        thumbnail_key: None,
+        metadata: MediaMetadata {
+            transcript: Some(TRANSCRIPT.to_owned()),
+            ..MediaMetadata::default()
+        },
+        status: PartStatus::Available,
+    })];
+    rich.resources = vec![ResourceDesc {
+        kind: ResourceKind::File,
+        key: KEY.to_owned(),
+    }];
+
+    let retained = store
+        .register_inbound(&tenant, &rich)
+        .await
+        .expect("register private media");
+    let DedupOutcome::New(retained) = retained else {
+        panic!("new private media row")
+    };
+    assert_eq!(
+        retained.event(),
+        &rich,
+        "live path keeps in-memory capability"
+    );
+    assert_sqlite_files_exclude(&path, &[KEY, TRANSCRIPT]);
+
+    let begun = store
+        .begin_turn_and_claim_inbound(
+            turn("privacy-turn", TurnState::Starting),
+            &[InboundKey::new(
+                tenant.clone(),
+                "event-private-media".to_owned(),
+            )],
+        )
+        .await
+        .expect("claim secret-free descriptor");
+    let BeginTurnOutcome::Started {
+        turn_row_id,
+        claimed,
+        ..
+    } = begun
+    else {
+        panic!("privacy turn starts")
+    };
+    assert!(matches!(
+        claimed[0].retained.event().parts.as_slice(),
+        [MessagePart::Audio(MediaPart {
+            key: None,
+            metadata: MediaMetadata {
+                transcript: None,
+                ..
+            },
+            status: PartStatus::Unavailable,
+            ..
+        })]
+    ));
+    assert_sqlite_files_exclude(&path, &[KEY, TRANSCRIPT]);
+
+    store
+        .resolve_turn_and_finish_inbound_batch(
+            turn_row_id,
+            TurnResolution::Failed,
+            InboundTerminal::Rejected,
+        )
+        .await
+        .expect("terminalize privacy row");
+    assert_sqlite_files_exclude(&path, &[KEY, TRANSCRIPT]);
+    store.shutdown().await.expect("shutdown");
+    assert_sqlite_files_exclude(&path, &[KEY, TRANSCRIPT]);
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn v5_upgrade_scrubs_historical_plaintext_from_database_and_wal_pages() {
+    const KEY: &str = "issue20_upgrade_key_sentinel_d415f82";
+    const TRANSCRIPT: &str = "issue20_upgrade_transcript_sentinel_f0cc31";
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("privacy-upgrade.sqlite");
+    let tenant = tenant_namespace("cli_store_privacy_upgrade");
+    let store = StoreHandle::open(&path).await.expect("seed store");
+    store
+        .register_inbound(
+            &tenant,
+            &event("event-private-upgrade", "message-private-upgrade"),
+        )
+        .await
+        .expect("seed row");
+    store.shutdown().await.expect("shutdown seed");
+
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "event_id": "event-private-upgrade",
+        "message_id": "message-private-upgrade",
+        "chat_id": "oc_test",
+        "sender_id": "ou_test",
+        "chat_type": "group",
+        "thread_id": null,
+        "root_id": null,
+        "reply_to_message_id": null,
+        "text": "",
+        "mentions_bot": true,
+        "mention_all": false,
+        "sender_is_human": true,
+        "mentions": [],
+        "parts": [{
+            "kind": "audio",
+            "value": {
+                "key": KEY,
+                "thumbnail_key": null,
+                "metadata": {
+                    "file_name": null,
+                    "mime_type": null,
+                    "size_bytes": null,
+                    "duration_ms": null,
+                    "transcript": TRANSCRIPT
+                },
+                "status": "available"
+            }
+        }],
+        "resources": [{"kind": "file", "key": KEY}],
+        "message_type": "audio",
+        "create_time_ms": 1,
+        "scope": {"kind": "chat", "chat_id": "oc_test", "thread_id": null}
+    }))
+    .expect("legacy payload");
+    let payload_bytes = i64::try_from(payload.len()).expect("payload length");
+    {
+        let connection = rusqlite::Connection::open(&path).expect("open legacy database");
+        connection
+            .execute(
+                "UPDATE inbound_events
+                 SET payload_blob = ?1, payload_bytes = ?2
+                 WHERE event_id = 'event-private-upgrade'",
+                rusqlite::params![payload, payload_bytes],
+            )
+            .expect("write legacy secret payload");
+        connection
+            .pragma_update(None, "user_version", 5_u32)
+            .expect("rewind version");
+    }
+
+    let store = StoreHandle::open(&path).await.expect("privacy migration");
+    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 6);
+    let recovered = store.recover_received(&tenant).await.expect("recover");
+    assert!(matches!(
+        recovered[0].event().parts.as_slice(),
+        [MessagePart::Audio(MediaPart {
+            key: None,
+            metadata: MediaMetadata {
+                transcript: None,
+                ..
+            },
+            status: PartStatus::Unavailable,
+            ..
+        })]
+    ));
+    assert_sqlite_files_exclude(&path, &[KEY, TRANSCRIPT]);
+    store.shutdown().await.expect("shutdown");
+    assert_sqlite_files_exclude(&path, &[KEY, TRANSCRIPT]);
+
+    // Model a crash after the scrub/compaction completed but before the v6
+    // marker transaction committed. Re-running the data migration over an
+    // already-sanitized v5 payload must be harmless and advance normally.
+    {
+        let connection = rusqlite::Connection::open(&path).expect("reopen scrubbed v5 database");
+        connection
+            .pragma_update(None, "user_version", 5_u32)
+            .expect("rewind privacy marker");
+    }
+    let store = StoreHandle::open(&path)
+        .await
+        .expect("retry idempotent privacy migration");
+    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 6);
+    let recovered = store
+        .recover_received(&tenant)
+        .await
+        .expect("recover after retry");
+    assert!(matches!(
+        recovered[0].event().parts.as_slice(),
+        [MessagePart::Audio(MediaPart {
+            key: None,
+            metadata: MediaMetadata {
+                transcript: None,
+                ..
+            },
+            status: PartStatus::Unavailable,
+            ..
+        })]
+    ));
+    store.shutdown().await.expect("shutdown migration retry");
+    assert_sqlite_files_exclude(&path, &[KEY, TRANSCRIPT]);
+}
+
+#[tokio::test]
 async fn payload_v1_is_read_and_upgraded_to_typed_parts() {
     let temp = tempdir().expect("tempdir");
     let path = temp.path().join("payload-v1.sqlite");
@@ -456,7 +684,7 @@ async fn file_store_applies_pragmas_and_persists_every_typed_table() {
     assert!(pragmas.foreign_keys);
     assert_eq!(pragmas.busy_timeout_ms, 5_000);
     assert_eq!(pragmas.synchronous, 1);
-    assert_eq!(pragmas.user_version, 5);
+    assert_eq!(pragmas.user_version, 6);
     store
         .upsert_scope(&scope, temp.path(), "fp")
         .await
@@ -492,7 +720,7 @@ async fn file_store_applies_pragmas_and_persists_every_typed_table() {
     store.shutdown().await.expect("shutdown");
 
     let store = StoreHandle::open(&path).await.expect("reopen");
-    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 5);
+    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 6);
     assert!(store.scope_row(&scope).await.expect("scope").is_some());
     assert_eq!(
         store
@@ -537,7 +765,7 @@ async fn rejects_future_schema_versions_without_mutating_the_database() {
     {
         let connection = rusqlite::Connection::open(&path).expect("seed");
         connection
-            .pragma_update(None, "user_version", 6_u32)
+            .pragma_update(None, "user_version", 7_u32)
             .expect("version");
     }
     assert!(matches!(
@@ -548,7 +776,7 @@ async fn rejects_future_schema_versions_without_mutating_the_database() {
     let version: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .expect("version");
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
 }
 
 #[tokio::test]

@@ -21,6 +21,7 @@ fn config(max_contexts: usize, ttl: Duration) -> ContextRegistryConfig {
         ttl,
         max_contexts,
         max_parts_per_context: 8,
+        ..ContextRegistryConfig::default()
     }
 }
 
@@ -175,6 +176,63 @@ fn media_key_is_hidden_and_handle_is_bound_to_exact_context_and_turn() {
 }
 
 #[test]
+fn media_read_count_is_shared_across_contexts_and_charges_repeated_attempts() {
+    let registry = ContextRegistry::new(ContextRegistryConfig {
+        ttl: Duration::from_secs(60),
+        max_contexts: 4,
+        max_parts_per_context: 8,
+        max_media_reads_per_turn: 2,
+        max_media_read_bytes_per_turn: 30,
+        max_media_read_bytes_per_item: 10,
+    })
+    .expect("registry");
+    let binding = pending(71);
+    let first = registry
+        .register_pending(binding.clone(), draft("om_count_one"))
+        .expect("first context");
+    let second = registry
+        .register_pending(binding.clone(), draft("om_count_two"))
+        .expect("second context in the same turn");
+    registry
+        .activate(&first.context_id, &binding, "turn-a")
+        .expect("activate first");
+    registry
+        .activate(&second.context_id, &binding, "turn-a")
+        .expect("activate second");
+    let first_snapshot = registry
+        .resolve(&first.context_id, &active(71))
+        .expect("first snapshot");
+    let second_snapshot = registry
+        .resolve(&second.context_id, &active(71))
+        .expect("second snapshot");
+    let TypedPart::Media {
+        handle: first_handle,
+        ..
+    } = &first_snapshot.parts[1]
+    else {
+        panic!("first media handle")
+    };
+    let TypedPart::Media {
+        handle: second_handle,
+        ..
+    } = &second_snapshot.parts[1]
+    else {
+        panic!("second media handle")
+    };
+
+    let _first = registry
+        .authorize_media(&first.context_id, first_handle, &active(71))
+        .expect("first attempt");
+    let _second = registry
+        .authorize_media(&second.context_id, second_handle, &active(71))
+        .expect("second distinct context attempt");
+    let error = registry
+        .authorize_media(&first.context_id, first_handle, &active(71))
+        .expect_err("a repeated third attempt must hit the shared count bound");
+    assert_eq!(error.code, ContextErrorCode::CapacityExceeded);
+}
+
+#[test]
 fn quoted_media_handle_reads_from_the_parent_and_debug_redacts_keys_and_text() {
     let registry = ContextRegistry::new(config(4, Duration::from_secs(60))).expect("registry");
     let mut context = draft("om_trigger");
@@ -308,11 +366,23 @@ fn inbound_rich_parts_become_opaque_typed_context_parts() {
         panic!("video with thumbnail")
     };
     let video = registry
-        .authorize_media_for_tool(&registered.context_id, handle, "thread-a", "turn-rich")
+        .authorize_media_for_tool(
+            &registered.context_id,
+            handle,
+            "thread-a",
+            "turn-rich",
+            1024,
+        )
         .expect("video grant");
     assert_eq!(video.media_kind, MediaKind::Video);
     let thumbnail = registry
-        .authorize_media_for_tool(&registered.context_id, thumbnail, "thread-a", "turn-rich")
+        .authorize_media_for_tool(
+            &registered.context_id,
+            thumbnail,
+            "thread-a",
+            "turn-rich",
+            1024,
+        )
         .expect("thumbnail grant");
     assert_eq!(thumbnail.media_kind, MediaKind::Image);
     assert!(matches!(snapshot.parts[1], TypedPart::Unsupported { .. }));

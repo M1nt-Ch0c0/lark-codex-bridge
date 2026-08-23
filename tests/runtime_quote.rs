@@ -2,6 +2,7 @@ mod larkstub;
 
 use std::sync::Arc;
 
+use lark_codex_bridge::config::{BridgeConfig, WorkspacePolicy};
 use lark_codex_bridge::lark::api::LarkApi;
 use lark_codex_bridge::lark::config::{LarkEndpoints, TenantBrand};
 use lark_codex_bridge::lark::credentials::LarkCredentials;
@@ -9,6 +10,7 @@ use lark_codex_bridge::lark::http::LarkHttp;
 use lark_codex_bridge::lark::token::TenantTokenProvider;
 use lark_codex_bridge::limits::QUOTE_CONTENT_MAX_BYTES;
 use lark_codex_bridge::runtime::context::{DraftPart, MediaKind, QuoteStatus};
+use lark_codex_bridge::runtime::policy::AccessPolicy;
 use lark_codex_bridge::runtime::quote::{LarkQuoteResolver, QuoteRequest, QuoteResolver};
 use larkstub::{Handler, RecordedRequest, StubResponse, StubServer};
 use secrecy::SecretString;
@@ -55,6 +57,27 @@ fn message_response(
     content: Option<&str>,
     deleted: bool,
 ) -> StubResponse {
+    message_response_from(
+        message_id,
+        chat_id,
+        message_type,
+        content,
+        deleted,
+        Some("ou_parent"),
+        Some("user"),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn message_response_from(
+    message_id: &str,
+    chat_id: &str,
+    message_type: &str,
+    content: Option<&str>,
+    deleted: bool,
+    sender_id: Option<&str>,
+    sender_type: Option<&str>,
+) -> StubResponse {
     let body = content.map(|content| json!({"content": content}));
     StubResponse::json(
         200,
@@ -64,6 +87,7 @@ fn message_response(
                 "message_id": message_id,
                 "chat_id": chat_id,
                 "chat_type": "group",
+                "sender": {"id": sender_id, "sender_type": sender_type},
                 "msg_type": message_type,
                 "deleted": deleted,
                 "body": body,
@@ -71,6 +95,24 @@ fn message_response(
         })
         .to_string(),
     )
+}
+
+fn policy() -> AccessPolicy {
+    let workspace = std::env::current_dir().expect("current workspace");
+    let config = BridgeConfig {
+        owners: vec!["ou_parent".to_owned()],
+        default_workspace: Some(workspace.clone()),
+        workspace: WorkspacePolicy {
+            allow_roots: vec![workspace],
+            ..WorkspacePolicy::default()
+        },
+        ..BridgeConfig::default()
+    };
+    AccessPolicy::from_config(&config).expect("quote policy")
+}
+
+fn resolver(server: &StubServer) -> LarkQuoteResolver {
+    LarkQuoteResolver::new(api_for(server), policy())
 }
 
 fn request() -> QuoteRequest {
@@ -92,7 +134,7 @@ async fn one_hop_image_quote_normalizes_to_a_redacted_media_draft() {
         )
     }))
     .await;
-    let resolver = LarkQuoteResolver::new(api_for(&server));
+    let resolver = resolver(&server);
 
     let quote = resolver.resolve(request()).await;
 
@@ -125,9 +167,7 @@ async fn one_hop_audio_quote_preserves_a_lazy_file_descriptor() {
     }))
     .await;
 
-    let quote = LarkQuoteResolver::new(api_for(&server))
-        .resolve(request())
-        .await;
+    let quote = resolver(&server).resolve(request()).await;
 
     assert_eq!(quote.status, QuoteStatus::Available);
     let DraftPart::Media {
@@ -193,9 +233,7 @@ async fn deleted_mismatched_oversize_and_unsupported_quotes_have_stable_states()
     for (name, response, expected) in cases {
         let response = response.clone();
         let server = StubServer::start(with_token(move |_| response.clone())).await;
-        let quote = LarkQuoteResolver::new(api_for(&server))
-            .resolve(request())
-            .await;
+        let quote = resolver(&server).resolve(request()).await;
         assert_eq!(quote.status, expected, "case {name}");
     }
 
@@ -204,9 +242,7 @@ async fn deleted_mismatched_oversize_and_unsupported_quotes_have_stable_states()
         message_response("om_parent", "oc_allowed", "text", Some(&content), false)
     }))
     .await;
-    let quote = LarkQuoteResolver::new(api_for(&server))
-        .resolve(request())
-        .await;
+    let quote = resolver(&server).resolve(request()).await;
     assert_eq!(quote.status, QuoteStatus::Oversize);
     assert!(quote.parts.is_empty());
 }
@@ -217,15 +253,70 @@ async fn missing_body_and_http_authorization_failures_do_not_expose_content() {
         message_response("om_parent", "oc_allowed", "image", None, false)
     }))
     .await;
-    let quote = LarkQuoteResolver::new(api_for(&missing))
-        .resolve(request())
-        .await;
+    let quote = resolver(&missing).resolve(request()).await;
     assert_eq!(quote.status, QuoteStatus::Unavailable);
 
     let denied = StubServer::start(with_token(|_| StubResponse::text(403, "private body"))).await;
-    let quote = LarkQuoteResolver::new(api_for(&denied))
-        .resolve(request())
-        .await;
+    let quote = resolver(&denied).resolve(request()).await;
     assert_eq!(quote.status, QuoteStatus::Unauthorized);
     assert!(!format!("{quote:?}").contains("private body"));
+}
+
+#[tokio::test]
+async fn parent_sender_is_independently_authorized_before_media_is_exposed() {
+    let server = StubServer::start(with_token(|_| {
+        message_response_from(
+            "om_parent",
+            "oc_allowed",
+            "image",
+            Some(r#"{"image_key":"unauthorized_parent_secret"}"#),
+            false,
+            Some("ou_stranger"),
+            Some("user"),
+        )
+    }))
+    .await;
+
+    let quote = resolver(&server).resolve(request()).await;
+
+    assert_eq!(quote.status, QuoteStatus::Unauthorized);
+    assert!(quote.parts.is_empty());
+    let requests = server.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path.contains("/im/v1/messages/om_parent"))
+            .count(),
+        1
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.path.contains("/resources/"))
+    );
+    assert!(!format!("{quote:?}").contains("unauthorized_parent_secret"));
+}
+
+#[tokio::test]
+async fn documented_lark_message_envelopes_degrade_conservatively() {
+    for (code, expected) in [
+        (230_002, QuoteStatus::Unauthorized),
+        (230_006, QuoteStatus::Unauthorized),
+        (230_027, QuoteStatus::Unauthorized),
+        (230_050, QuoteStatus::Unauthorized),
+        (230_011, QuoteStatus::Deleted),
+        (230_001, QuoteStatus::Unavailable),
+    ] {
+        let server = StubServer::start(with_token(move |_| {
+            StubResponse::json(
+                200,
+                &json!({"code": code, "msg": "must not escape"}).to_string(),
+            )
+        }))
+        .await;
+        let quote = resolver(&server).resolve(request()).await;
+        assert_eq!(quote.status, expected, "Lark envelope code {code}");
+        assert!(quote.parts.is_empty());
+        assert!(!format!("{quote:?}").contains("must not escape"));
+    }
 }

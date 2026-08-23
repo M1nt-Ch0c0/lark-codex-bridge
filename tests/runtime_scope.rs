@@ -17,7 +17,8 @@ use lark_codex_bridge::lark::bridge::QueuedInboundEvent;
 use lark_codex_bridge::lark::config::TenantBrand;
 use lark_codex_bridge::lark::credentials::LarkCredentials;
 use lark_codex_bridge::lark::normalize::{
-    InboundEvent, MediaMetadata, MediaPart, MessagePart, PartStatus, ResourceDesc, ScopeKey,
+    InboundEvent, MediaMetadata, MediaPart, MentionIdentity, MessagePart, PartStatus, ResourceDesc,
+    ScopeKey,
 };
 use lark_codex_bridge::limits::{
     ROUTER_ACTIVE_TURN_HARD_LIMIT, ROUTER_COMMAND_BYTE_BUDGET, ROUTER_RETRY_CAPACITY,
@@ -27,15 +28,15 @@ use lark_codex_bridge::runtime::attachments::{
     AttachError, AttachmentCache, AttachmentLimits, ResourceDownloader,
 };
 use lark_codex_bridge::runtime::context::{
-    ContextRegistry, DraftPart, MediaKind, MediaMetadata as ContextMediaMetadata, QuoteDraft,
-    QuoteStatus,
+    ContextRegistry, ContextRegistryConfig, DraftPart, MediaKind,
+    MediaMetadata as ContextMediaMetadata, QuoteDraft, QuoteStatus,
 };
 use lark_codex_bridge::runtime::intake::TenantNamespace;
 use lark_codex_bridge::runtime::policy::AccessPolicy;
 use lark_codex_bridge::runtime::quote::{QuoteRequest, QuoteResolver};
 use lark_codex_bridge::runtime::router::{RouteError, Router, RouterSettings};
 use lark_codex_bridge::runtime::scope::{
-    DurableReplySink, InterruptOutcome, ReplySinkError, TurnFinalization, TurnProgress,
+    DurableReplySink, InterruptOutcome, ReplySinkError, ScopeState, TurnFinalization, TurnProgress,
 };
 use lark_codex_bridge::store::{
     BeginTurnOutcome, DedupOutcome, InboundEventState, InboundKey, InboundRejectionKind,
@@ -79,6 +80,11 @@ struct StaticAttachmentDownloader;
 
 #[derive(Default)]
 struct RecordingAttachmentDownloader {
+    calls: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+#[derive(Default)]
+struct MeteredAttachmentDownloader {
     calls: Arc<Mutex<Vec<(String, String)>>>,
 }
 
@@ -135,6 +141,26 @@ impl ResourceDownloader for RecordingAttachmentDownloader {
             .expect("download calls")
             .push((message_id.to_owned(), key.to_owned()));
         async { Ok(Bytes::from_static(b"quoted-or-pending-image")) }.boxed()
+    }
+}
+
+impl ResourceDownloader for MeteredAttachmentDownloader {
+    fn download(
+        &self,
+        message_id: &str,
+        key: &str,
+        _kind: ResourceKind,
+    ) -> BoxFuture<'static, Result<Bytes, AttachError>> {
+        self.calls
+            .lock()
+            .expect("download calls")
+            .push((message_id.to_owned(), key.to_owned()));
+        let bytes = match key {
+            "meter_key_0" => Bytes::from_static(b"0000"),
+            "meter_key_1" => Bytes::from_static(b"1111"),
+            _ => Bytes::from_static(b"2222"),
+        };
+        async move { Ok(bytes) }.boxed()
     }
 }
 
@@ -460,6 +486,185 @@ fn validated_config() -> BridgeConfig {
     };
     config.validate().expect("valid runtime config");
     config
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DebounceInvalidator {
+    ExplicitQuote,
+    ResetCommand,
+    ControlInterrupt,
+}
+
+#[allow(clippy::too_many_lines)]
+async fn assert_debounce_invalidates_reserved_media(mode: DebounceInvalidator) {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config).with_test_timings(
+        Duration::from_millis(300),
+        Duration::from_secs(60),
+        Duration::from_millis(10),
+    );
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let temp = tempdir().expect("tempdir");
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &temp.path().join("debounce-invalidation-cache"),
+            store.clone(),
+            Arc::new(StaticAttachmentDownloader),
+            AttachmentLimits::default(),
+        )
+        .expect("cache"),
+    );
+    let contexts = Arc::new(ContextRegistry::default());
+    let resolver = Arc::new(RecordingQuoteResolver::default());
+    let quote_calls = Arc::clone(&resolver.calls);
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start_with_contexts_and_quotes(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        Arc::new(RecordingSink::default()),
+        Arc::clone(&cache),
+        contexts,
+        resolver,
+    )
+    .await
+    .expect("router");
+    let scope = ScopeKey::Chat("chat-runtime-scope".to_owned());
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                image_event("debounce-reserved-media", "debounce_reserved_key"),
+            )
+            .await,
+        )
+        .await
+        .expect("stage media");
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["debounce-reserved-media"],
+        InboundEventState::Completed,
+    )
+    .await;
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("debounce-reserving-trigger", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("route reserving trigger");
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if router
+                .scope_snapshot(&scope)
+                .await
+                .expect("snapshot")
+                .is_some_and(|snapshot| {
+                    snapshot.state == ScopeState::Debouncing && snapshot.pending_media == 0
+                })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("ordinary text holds the reservation during debounce");
+
+    let invalidator_id = match mode {
+        DebounceInvalidator::ExplicitQuote => {
+            let mut explicit = event("debounce-explicit-quote", "owner-runtime-scope");
+            "prefer this explicit quote".clone_into(&mut explicit.text);
+            explicit.reply_to_message_id = Some("om_parent".to_owned());
+            router
+                .route(queued_registered(&store, &namespace, explicit).await)
+                .await
+                .expect("route explicit quote");
+            Some("debounce-explicit-quote")
+        }
+        DebounceInvalidator::ResetCommand => {
+            let mut reset = event("debounce-reset-command", "owner-runtime-scope");
+            "/new".clone_into(&mut reset.text);
+            router
+                .route(queued_registered(&store, &namespace, reset).await)
+                .await
+                .expect("route reset");
+            Some("debounce-reset-command")
+        }
+        DebounceInvalidator::ControlInterrupt => {
+            assert_eq!(
+                router.interrupt(&scope).await.expect("interrupt"),
+                InterruptOutcome::NoActiveTurn
+            );
+            None
+        }
+    };
+
+    let start_thread = control.next_request().await;
+    control
+        .respond(
+            &start_thread,
+            thread_result("thread-debounce-invalidation", &workspace),
+        )
+        .await;
+    let start_turn = control.next_request().await;
+    let context_references = start_turn["params"]["input"]
+        .as_array()
+        .expect("inputs")
+        .iter()
+        .filter_map(|input| input["text"].as_str())
+        .filter_map(|text| {
+            text.strip_prefix("<bridge_context>")
+                .and_then(|value| value.strip_suffix("</bridge_context>"))
+        })
+        .map(|reference| serde_json::from_str::<Value>(reference).expect("context JSON"))
+        .collect::<Vec<_>>();
+    assert!(
+        context_references
+            .iter()
+            .all(|reference| reference["wake"] != "pending_media"),
+        "{mode:?} must invalidate the reservation already held by the batch"
+    );
+    assert_eq!(
+        quote_calls.lock().expect("quote calls").len(),
+        usize::from(matches!(mode, DebounceInvalidator::ExplicitQuote))
+    );
+    respond_turn_started(&control, &start_turn, "turn-debounce-invalidation").await;
+    send_turn_completed(
+        &control,
+        "thread-debounce-invalidation",
+        "turn-debounce-invalidation",
+        "completed",
+    )
+    .await;
+    let mut completed = vec!["debounce-reserving-trigger"];
+    if let Some(invalidator_id) = invalidator_id {
+        completed.push(invalidator_id);
+    }
+    wait_for_inbound_states(&store, &namespace, &completed, InboundEventState::Completed).await;
+    assert_eq!(
+        router
+            .scope_snapshot(&scope)
+            .await
+            .expect("snapshot")
+            .expect("actor")
+            .pending_media,
+        0
+    );
+    router.shutdown().await.expect("shutdown");
+    drop(cache);
+    store.shutdown().await.expect("store shutdown");
 }
 
 async fn degraded_supervisor() -> lark_codex_bridge::codex::supervisor::SupervisorHandle {
@@ -1315,6 +1520,203 @@ async fn lazy_context_resolves_metadata_and_fetches_media_only_on_tool_call() {
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
+async fn bridge_media_read_meters_distinct_and_repeated_handles_before_cache_or_lease() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let temp = tempdir().expect("tempdir");
+    let downloader = Arc::new(MeteredAttachmentDownloader::default());
+    let calls = Arc::clone(&downloader.calls);
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &temp.path().join("metered-media"),
+            store.clone(),
+            downloader,
+            AttachmentLimits {
+                max_attachment_bytes: 8,
+                ..AttachmentLimits::default()
+            },
+        )
+        .expect("cache"),
+    );
+    let contexts = Arc::new(
+        ContextRegistry::new(ContextRegistryConfig {
+            max_media_reads_per_turn: 5,
+            max_media_read_bytes_per_turn: 13,
+            // Deliberately smaller than the cache cap: the production tool
+            // path must reserve the downstream cache maximum, not trust this
+            // direct-authorization fallback.
+            max_media_read_bytes_per_item: 1,
+            ..ContextRegistryConfig::default()
+        })
+        .expect("metered registry"),
+    );
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start_with_contexts(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        Arc::new(RecordingSink::default()),
+        Arc::clone(&cache),
+        contexts,
+    )
+    .await
+    .expect("router");
+
+    let mut inbound = event("event-metered-media", "owner-runtime-scope");
+    inbound.parts = ["meter_key_0", "meter_key_1", "meter_key_2"]
+        .into_iter()
+        .map(|key| {
+            MessagePart::Image(MediaPart {
+                key: Some(key.to_owned()),
+                thumbnail_key: None,
+                metadata: MediaMetadata::default(),
+                status: PartStatus::Available,
+            })
+        })
+        .collect();
+    router
+        .route(queued_registered(&store, &namespace, inbound).await)
+        .await
+        .expect("route media event");
+    let start_thread = control.next_request().await;
+    control
+        .respond(
+            &start_thread,
+            thread_result("thread-metered-media", &workspace),
+        )
+        .await;
+    let start_turn = control.next_request().await;
+    let reference = start_turn["params"]["input"]
+        .as_array()
+        .expect("inputs")
+        .iter()
+        .filter_map(|input| input["text"].as_str())
+        .find_map(|text| {
+            text.strip_prefix("<bridge_context>")
+                .and_then(|value| value.strip_suffix("</bridge_context>"))
+        })
+        .expect("context reference");
+    let reference: Value = serde_json::from_str(reference).expect("context reference JSON");
+    let context_id = reference["id"].as_str().expect("context id").to_owned();
+    respond_turn_started(&control, &start_turn, "turn-metered-media").await;
+    control
+        .send_json(json!({
+            "id": "resolve-metered-media",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-metered-media",
+                "turnId": "turn-metered-media",
+                "callId": "resolve-metered-media",
+                "namespace": "bridge_context",
+                "tool": "resolve",
+                "arguments": {"id": context_id}
+            }
+        }))
+        .await;
+    let resolved = control.next_request().await;
+    let body: Value = serde_json::from_str(
+        resolved["result"]["contentItems"][0]["text"]
+            .as_str()
+            .expect("resolved context"),
+    )
+    .expect("resolved JSON");
+    let handles = body["parts"]
+        .as_array()
+        .expect("parts")
+        .iter()
+        .map(|part| part["handle"].as_str().expect("media handle").to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(handles.len(), 3);
+
+    for (request_id, handle) in [
+        ("read-meter-0", handles[0].as_str()),
+        ("read-meter-1", handles[1].as_str()),
+        ("read-meter-1-repeat", handles[1].as_str()),
+    ] {
+        let response = read_media(
+            &control,
+            "thread-metered-media",
+            "turn-metered-media",
+            request_id,
+            &context_id,
+            handle,
+        )
+        .await;
+        assert_eq!(response["result"]["success"], true, "{request_id}");
+    }
+    assert_eq!(
+        calls.lock().expect("calls").len(),
+        3,
+        "the repeated handle is independently materialized and charged"
+    );
+
+    for (request_id, handle) in [
+        ("read-meter-distinct-denied", handles[2].as_str()),
+        ("read-meter-repeat-denied", handles[0].as_str()),
+    ] {
+        let response = read_media(
+            &control,
+            "thread-metered-media",
+            "turn-metered-media",
+            request_id,
+            &context_id,
+            handle,
+        )
+        .await;
+        assert_eq!(response["result"]["success"], false, "{request_id}");
+        let error: Value = serde_json::from_str(
+            response["result"]["contentItems"][0]["text"]
+                .as_str()
+                .expect("error body"),
+        )
+        .expect("error JSON");
+        assert_eq!(error["error"]["code"], "capacity_exceeded");
+    }
+    assert_eq!(
+        calls.lock().expect("calls").len(),
+        3,
+        "over-budget reads fail before downloader I/O"
+    );
+    let attachments = store.list_attachments().await.expect("attachments");
+    assert_eq!(attachments.len(), 2, "denied handle creates no cache row");
+    for attachment in &attachments {
+        assert_eq!(
+            store
+                .attachment_leases(&attachment.sha256)
+                .await
+                .expect("leases")
+                .len(),
+            1
+        );
+    }
+
+    send_turn_completed(
+        &control,
+        "thread-metered-media",
+        "turn-metered-media",
+        "completed",
+    )
+    .await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-metered-media"],
+        InboundEventState::Completed,
+    )
+    .await;
+    router.shutdown().await.expect("shutdown");
+    drop(cache);
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn p2p_media_stages_without_a_turn_and_next_text_consumes_it_once_lazily() {
     let config = validated_config();
     let workspace = config.default_workspace.clone().expect("workspace");
@@ -1625,6 +2027,94 @@ async fn pending_media_is_restored_when_the_consuming_turn_is_not_started() {
             .pending_media,
         0
     );
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn uncertain_turn_start_commits_pending_media_instead_of_restoring_it() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RecordingSink::default());
+    let (supervisor, first_control, second_control) = restarting_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink.clone(),
+    )
+    .await
+    .expect("router");
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                image_event("pending-uncertain", "pending_uncertain_key"),
+            )
+            .await,
+        )
+        .await
+        .expect("stage image");
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["pending-uncertain"],
+        InboundEventState::Completed,
+    )
+    .await;
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("pending-uncertain-trigger", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("route uncertain trigger");
+    let start_thread = first_control.next_request().await;
+    first_control
+        .respond(
+            &start_thread,
+            thread_result("thread-pending-uncertain", &workspace),
+        )
+        .await;
+    let start_turn = first_control.next_request().await;
+    assert_eq!(start_turn["method"], "turn/start");
+    first_control.unexpected_exit();
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["pending-uncertain-trigger"],
+        InboundEventState::Rejected,
+    )
+    .await;
+    assert_eq!(
+        sink.finalizations.lock().expect("finalizations")[0].1,
+        TurnResolution::Uncertain
+    );
+    let scope = ScopeKey::Chat("chat-runtime-scope".to_owned());
+    assert_eq!(
+        router
+            .scope_snapshot(&scope)
+            .await
+            .expect("snapshot")
+            .expect("actor")
+            .pending_media,
+        0,
+        "an ambiguously applied association is never replayed"
+    );
+    second_control
+        .expect_no_request_for(Duration::from_millis(100))
+        .await;
     router.shutdown().await.expect("shutdown");
     store.shutdown().await.expect("store shutdown");
 }
@@ -1995,6 +2485,135 @@ async fn pending_media_count_ttl_and_interrupt_bounds_clear_metadata() {
 }
 
 #[tokio::test]
+async fn debounce_quote_reset_and_control_interrupt_invalidate_held_pending_reservations() {
+    for mode in [
+        DebounceInvalidator::ExplicitQuote,
+        DebounceInvalidator::ResetCommand,
+        DebounceInvalidator::ControlInterrupt,
+    ] {
+        assert_debounce_invalidates_reserved_media(mode).await;
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn pending_media_ttl_remains_truthful_while_an_unrelated_turn_is_active() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config)
+        .with_test_timings(
+            Duration::from_millis(300),
+            Duration::from_secs(60),
+            Duration::from_millis(10),
+        )
+        .with_test_pending_media_limits(Duration::from_millis(400), 2, 16 * 1024);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        Arc::new(RecordingSink::default()),
+    )
+    .await
+    .expect("router");
+    let scope = ScopeKey::Chat("chat-runtime-scope".to_owned());
+
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("active-ttl-trigger", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("route trigger");
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if router
+                .scope_snapshot(&scope)
+                .await
+                .expect("snapshot")
+                .is_some_and(|snapshot| snapshot.state == ScopeState::Debouncing)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("trigger enters debounce");
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                image_event("active-ttl-media", "active_ttl_key"),
+            )
+            .await,
+        )
+        .await
+        .expect("stage during debounce");
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["active-ttl-media"],
+        InboundEventState::Completed,
+    )
+    .await;
+    let start_thread = control.next_request().await;
+    control
+        .respond(
+            &start_thread,
+            thread_result("thread-active-ttl", &workspace),
+        )
+        .await;
+    let start_turn = control.next_request().await;
+    respond_turn_started(&control, &start_turn, "turn-active-ttl").await;
+    assert_eq!(
+        router
+            .scope_snapshot(&scope)
+            .await
+            .expect("snapshot")
+            .expect("actor")
+            .pending_media,
+        1
+    );
+
+    sleep(Duration::from_millis(450)).await;
+    let expired = router
+        .scope_snapshot(&scope)
+        .await
+        .expect("snapshot")
+        .expect("actor");
+    assert_eq!((expired.pending_media, expired.pending_media_bytes), (0, 0));
+    assert!(matches!(expired.state, ScopeState::Running { .. }));
+
+    send_turn_completed(
+        &control,
+        "thread-active-ttl",
+        "turn-active-ttl",
+        "completed",
+    )
+    .await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["active-ttl-trigger"],
+        InboundEventState::Completed,
+    )
+    .await;
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
 async fn pending_media_metadata_byte_bound_drops_an_oversize_descriptor() {
     let config = validated_config();
     let policy = AccessPolicy::from_config(&config).expect("policy");
@@ -2026,10 +2645,22 @@ async fn pending_media_metadata_byte_bound_drops_an_oversize_descriptor() {
         )
         .await
         .expect("settle oversize descriptor");
+    let mut oversized_mention = image_event("pending-mention-oversize", "short_key");
+    oversized_mention.mentions = vec![MentionIdentity {
+        key: Some("@_user_1".to_owned()),
+        open_id: Some("ou_mentioned".to_owned()),
+        user_id: Some("user_mentioned".to_owned()),
+        union_id: Some("on_mentioned".to_owned()),
+        name: Some("m".repeat(256)),
+    }];
+    router
+        .route(queued_registered(&store, &namespace, oversized_mention).await)
+        .await
+        .expect("settle oversize retained mention");
     wait_for_inbound_states(
         &store,
         &namespace,
-        &["pending-metadata-oversize"],
+        &["pending-metadata-oversize", "pending-mention-oversize"],
         InboundEventState::Completed,
     )
     .await;

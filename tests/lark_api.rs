@@ -390,6 +390,11 @@ async fn get_message_preserves_the_thread_id() {
     assert_eq!(message.chat_type, "group");
     assert_eq!(message.message_type, "text");
     assert_eq!(
+        message.sender_id.as_deref(),
+        Some("ou_155184d1e73cb1458973df8d9e3000a")
+    );
+    assert_eq!(message.sender_type.as_deref(), Some("user"));
+    assert_eq!(
         message.root_id.as_deref(),
         Some("om_x100b5496d4b93cc0c73c1df0dc00001")
     );

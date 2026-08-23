@@ -138,7 +138,8 @@ fn open_and_migrate(location: &StoreLocation) -> Result<Connection, StoreError> 
 fn apply_pragmas(connection: &Connection) -> Result<(), StoreError> {
     connection
         .execute_batch(
-            "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL;",
+            "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL;
+             PRAGMA secure_delete = ON;",
         )
         .map_err(|error| sqlite_error("applying store pragmas", &error))?;
     let busy_timeout_ms = i64::try_from(STORE_BUSY_TIMEOUT.as_millis()).unwrap_or(i64::MAX);
@@ -163,6 +164,30 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
         .iter()
         .filter(|migration| migration.version > current)
     {
+        if migration.version == 6 {
+            super::dedup::scrub_persisted_inbound_secrets(connection).map_err(
+                |error| match error {
+                    StoreError::Sqlite { .. } => StoreError::Migration {
+                        version: migration.version,
+                        name: migration.name,
+                    },
+                    other => other,
+                },
+            )?;
+            // Updating a row is insufficient: old bytes can remain in free
+            // pages or WAL frames. Compact before advancing `user_version`;
+            // a failure therefore retries this cleanup on the next open.
+            connection
+                .execute_batch(
+                    "PRAGMA wal_checkpoint(TRUNCATE);
+                     VACUUM;
+                     PRAGMA wal_checkpoint(TRUNCATE);",
+                )
+                .map_err(|_| StoreError::Migration {
+                    version: migration.version,
+                    name: migration.name,
+                })?;
+        }
         let apply = |connection: &mut Connection| -> Result<(), StoreError> {
             let transaction = connection
                 .transaction()

@@ -319,6 +319,24 @@ impl AccessPolicy {
         Self::mention_gate(event)
     }
 
+    /// Authorizes the sender of a directly quoted parent after Lark has
+    /// returned its identity. Parent messages do not need to mention the bot,
+    /// but they must independently satisfy the human sender/owner/group
+    /// policy; authorization of the quoting child is not transitive.
+    #[must_use]
+    pub(crate) fn allows_quoted_parent(
+        &self,
+        sender_id: &str,
+        sender_is_human: bool,
+        chat_id: &str,
+        chat_type: ChatMode,
+    ) -> bool {
+        sender_is_human
+            && (self.is_owner(sender_id)
+                || self.is_allowed_sender(sender_id)
+                || (chat_type != ChatMode::P2p && self.is_allowed_group(chat_id)))
+    }
+
     fn is_owner(&self, sender_id: &str) -> bool {
         self.owners.iter().any(|owner| owner.as_str() == sender_id)
     }

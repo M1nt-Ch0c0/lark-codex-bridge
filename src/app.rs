@@ -231,7 +231,7 @@ where
         return Err(AppError::Attachments);
     }
     let context_registry = Arc::new(ContextRegistry::default());
-    let quote_resolver = Arc::new(LarkQuoteResolver::new(api.clone()));
+    let quote_resolver = Arc::new(LarkQuoteResolver::new(api.clone(), policy.clone()));
     let Ok(intake) = DurableIntake::prepare(store.clone(), &credentials).await else {
         stop_store_after_error(store).await;
         return Err(AppError::Lark);

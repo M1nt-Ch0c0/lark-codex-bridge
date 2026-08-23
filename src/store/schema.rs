@@ -205,4 +205,12 @@ ALTER TABLE threads ADD COLUMN context_tools_version INTEGER NOT NULL DEFAULT 0
     CHECK (context_tools_version >= 0);
 ",
     },
+    Migration {
+        version: 6,
+        name: "remove durable media capabilities and transcripts",
+        // The data rewrite is implemented by the writer immediately before
+        // this marker migration because it must decode and validate the
+        // versioned application payload rather than mutate JSON in SQL.
+        sql: "SELECT 1;",
+    },
 ];

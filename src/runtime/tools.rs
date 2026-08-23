@@ -172,11 +172,19 @@ async fn read_media(
         })?;
     let context_id = ContextId::from_external(arguments.context_id);
     let handle = MediaHandle::from_external(arguments.handle);
-    let authorized = contexts
-        .authorize_media_for_tool(&context_id, &handle, &params.thread_id, &params.turn_id)
+    let max_materialized_bytes =
+        u64::try_from(attachments.limits().max_attachment_bytes).unwrap_or(u64::MAX);
+    let mut authorized = contexts
+        .authorize_media_for_tool(
+            &context_id,
+            &handle,
+            &params.thread_id,
+            &params.turn_id,
+            max_materialized_bytes,
+        )
         .map_err(context_error)?;
     if authorized.media_kind == MediaKind::Audio {
-        return read_audio(attachments, asr, &authorized).await;
+        return read_audio(attachments, asr, &mut authorized).await;
     }
     let cached = attachments
         .fetch_cancellable(
@@ -195,6 +203,7 @@ async fn read_media(
         }
         return Err(asr_error(AsrError::Cancelled));
     }
+    authorized.settle_read(cached.bytes);
     let path = cached.path.to_str().ok_or_else(|| {
         tool_error(
             "media_unavailable",
@@ -216,7 +225,7 @@ async fn read_media(
 async fn read_audio(
     attachments: &AttachmentCache,
     asr: &AsrSection,
-    authorized: &crate::runtime::context::AuthorizedResource,
+    authorized: &mut crate::runtime::context::AuthorizedResource,
 ) -> Result<Value, Value> {
     if authorized.is_cancelled() {
         return Err(asr_error(AsrError::Cancelled));
@@ -225,11 +234,13 @@ async fn read_audio(
         let transcript =
             crate::lark::normalize::normalize_transcript(inbound, asr.max_transcript_bytes)
                 .ok_or_else(|| asr_error(AsrError::TranscriptTooLarge))?;
-        return Ok(audio_transcript_value(
+        let value = audio_transcript_value(
             &transcript,
             TranscriptSource::Inbound,
             authorized.duration_ms,
-        ));
+        );
+        authorized.settle_read(0);
+        return Ok(value);
     }
     if authorized
         .duration_ms
@@ -267,6 +278,7 @@ async fn read_audio(
         }
         result = &mut transcription => result.map_err(asr_error)?,
     };
+    authorized.settle_read(cached.bytes);
     Ok(audio_transcript_value(
         &transcript,
         TranscriptSource::Sidecar,

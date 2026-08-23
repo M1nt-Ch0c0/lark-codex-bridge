@@ -309,12 +309,26 @@ impl PendingMediaQueue {
             return;
         }
         let now = Instant::now();
-        for item in items {
-            if item.expires_at <= now {
-                continue;
-            }
-            self.metadata_bytes = self.metadata_bytes.saturating_add(item.metadata_bytes);
-            self.items.push_back(item);
+        self.expire(now);
+        // Reserved items necessarily predate anything staged while the
+        // reservation was held. Put them first so stable expiry sorting also
+        // preserves FIFO order when two `Instant`s compare equal.
+        let mut merged = items
+            .into_iter()
+            .chain(self.items.drain(..))
+            .collect::<Vec<_>>();
+        merged.retain(|item| item.expires_at > now);
+        merged.sort_by_key(|item| item.expires_at);
+        self.metadata_bytes = merged
+            .iter()
+            .map(|item| item.metadata_bytes)
+            .fold(0_usize, usize::saturating_add);
+        self.items = merged.into();
+        while self.items.len() > self.max_count || self.metadata_bytes > self.max_metadata_bytes {
+            let Some(evicted) = self.items.pop_front() else {
+                break;
+            };
+            self.metadata_bytes = self.metadata_bytes.saturating_sub(evicted.metadata_bytes);
         }
     }
 
@@ -340,7 +354,8 @@ impl PendingMediaQueue {
         self.generation = self.generation.wrapping_add(1);
     }
 
-    fn stats(&self) -> (usize, usize) {
+    fn stats(&mut self) -> (usize, usize) {
+        self.expire(Instant::now());
         (self.items.len(), self.metadata_bytes)
     }
 }
@@ -353,12 +368,27 @@ struct PendingMediaReservation {
 
 impl PendingMediaReservation {
     fn drafts(&self) -> Vec<ContextDraft> {
-        self.items
+        let pending = self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending.generation != self.generation {
+            return Vec::new();
+        }
+        let now = Instant::now();
+        let drafts = self
+            .items
             .as_deref()
             .unwrap_or_default()
             .iter()
+            .filter(|item| item.expires_at > now)
             .map(|item| item.draft.clone())
-            .collect()
+            .collect();
+        // Keep the generation check and copy linearized against a concurrent
+        // control-lane interrupt. Once `clear()` returns, this reservation can
+        // no longer materialize into a later turn assembly.
+        drop(pending);
+        drafts
     }
 
     fn commit(&mut self) {
@@ -386,31 +416,57 @@ fn pending_metadata_bytes(event: &InboundEvent) -> usize {
         event.sender_id.len(),
         event.thread_id.as_deref().map_or(0, str::len),
         event.root_id.as_deref().map_or(0, str::len),
+        event.reply_to_message_id.as_deref().map_or(0, str::len),
         event.message_type.len(),
     ]
     .into_iter()
     .fold(0_usize, usize::saturating_add);
-    event.parts.iter().fold(identifiers, |total, part| {
-        let bytes = match part {
-            MessagePart::Image(media)
-            | MessagePart::File(media)
-            | MessagePart::Sticker(media)
-            | MessagePart::Audio(media)
-            | MessagePart::Video(media) => media
-                .key
-                .as_deref()
-                .map_or(0, str::len)
-                .saturating_add(media.thumbnail_key.as_deref().map_or(0, str::len))
-                .saturating_add(media.metadata.file_name.as_deref().map_or(0, str::len))
-                .saturating_add(media.metadata.mime_type.as_deref().map_or(0, str::len))
-                .saturating_add(media.metadata.transcript.as_deref().map_or(0, str::len)),
-            MessagePart::Text { text } => text.len(),
-            MessagePart::Forward { message_id, .. } => message_id.as_deref().map_or(0, str::len),
-            MessagePart::Unsupported { message_type, .. } => message_type.len(),
-            MessagePart::Card { .. } => 0,
-        };
-        total.saturating_add(bytes)
-    })
+    let mentions = event.mentions.iter().fold(0_usize, |total, mention| {
+        [
+            mention.key.as_deref(),
+            mention.open_id.as_deref(),
+            mention.user_id.as_deref(),
+            mention.union_id.as_deref(),
+            mention.name.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(str::len)
+        .fold(total, usize::saturating_add)
+    });
+    let resources = event
+        .resources
+        .iter()
+        .map(|resource| resource.key.len())
+        .fold(0_usize, usize::saturating_add);
+    event.parts.iter().fold(
+        identifiers
+            .saturating_add(mentions)
+            .saturating_add(resources),
+        |total, part| {
+            let bytes = match part {
+                MessagePart::Image(media)
+                | MessagePart::File(media)
+                | MessagePart::Sticker(media)
+                | MessagePart::Audio(media)
+                | MessagePart::Video(media) => media
+                    .key
+                    .as_deref()
+                    .map_or(0, str::len)
+                    .saturating_add(media.thumbnail_key.as_deref().map_or(0, str::len))
+                    .saturating_add(media.metadata.file_name.as_deref().map_or(0, str::len))
+                    .saturating_add(media.metadata.mime_type.as_deref().map_or(0, str::len))
+                    .saturating_add(media.metadata.transcript.as_deref().map_or(0, str::len)),
+                MessagePart::Text { text } => text.len(),
+                MessagePart::Forward { message_id, .. } => {
+                    message_id.as_deref().map_or(0, str::len)
+                }
+                MessagePart::Unsupported { message_type, .. } => message_type.len(),
+                MessagePart::Card { .. } => 0,
+            };
+            total.saturating_add(bytes)
+        },
+    )
 }
 
 struct TurnInbound {
@@ -530,7 +586,7 @@ impl ScopeActorHandle {
         let (pending_media, pending_media_bytes) = self
             .pending_media
             .lock()
-            .map_or((0, 0), |pending| pending.stats());
+            .map_or((0, 0), |mut pending| pending.stats());
         ScopeSnapshot {
             state: self.state(),
             queued_messages: self.sender.max_capacity() - self.sender.capacity(),
@@ -920,19 +976,19 @@ async fn process_batch(
             )
         })
         .collect::<HashMap<_, _>>();
-    let keys = batch
+    let live_events = batch
         .iter()
-        .map(|item| item.inbound.key.clone())
+        .map(|item| (item.inbound.key.clone(), item.inbound.queued.event.clone()))
         .collect::<Vec<_>>();
     let begun = store
-        .begin_turn_and_claim_inbound(
+        .begin_turn_and_claim_inbound_live(
             NewTurnRow {
                 scope_key: scope.to_string(),
                 client_message_id: client_message_id.clone(),
                 codex_thread_id: Some(thread_id.clone()),
                 state: TurnState::Starting,
             },
-            &keys,
+            live_events,
         )
         .await
         .map_err(|_| ScopeFailureKind::Store)?;
@@ -1024,6 +1080,10 @@ async fn process_batch(
             return Ok(());
         }
         None | Some(Err(_)) => {
+            // The request may have reached Codex even though the response was
+            // lost. Restoring its implicit media would risk submitting the
+            // same attachment association in a later turn.
+            commit_pending_media(&mut batch);
             finalize_uncertain_and_settle_attachments(
                 store,
                 sink.as_ref(),
@@ -1040,11 +1100,7 @@ async fn process_batch(
             return Ok(());
         }
     };
-    for item in &mut batch {
-        if let Some(pending) = item.pending_media.as_mut() {
-            pending.commit();
-        }
-    }
+    commit_pending_media(&mut batch);
     if let Some(lease) = context_lease.as_ref() {
         if lease.activate(&started.id).is_err() {
             finalize_uncertain_and_settle_attachments(
@@ -1211,6 +1267,14 @@ async fn process_batch(
         release_attachments(attachments, turn_row_id).await?;
     }
     Ok(())
+}
+
+fn commit_pending_media(batch: &mut [TurnInbound]) {
+    for item in batch {
+        if let Some(pending) = item.pending_media.as_mut() {
+            pending.commit();
+        }
+    }
 }
 
 fn event_belongs_to_turn(event: &AppServerEvent, turn_id: &str) -> bool {
@@ -1902,4 +1966,100 @@ fn set_active_turn(
     let mut current = active_turn.write().map_err(|_| ScopeFailureKind::Client)?;
     *current = next;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    fn pending_event(event_id: &str, key: &str) -> InboundEvent {
+        InboundEvent {
+            event_id: event_id.to_owned(),
+            message_id: format!("message-{event_id}"),
+            chat_id: "oc_pending_test".to_owned(),
+            sender_id: "ou_pending_owner".to_owned(),
+            chat_type: ChatMode::P2p,
+            thread_id: None,
+            root_id: None,
+            reply_to_message_id: None,
+            text: String::new(),
+            mentions_bot: false,
+            mention_all: false,
+            sender_is_human: true,
+            mentions: Vec::new(),
+            parts: vec![MessagePart::Image(crate::lark::normalize::MediaPart {
+                key: Some(key.to_owned()),
+                thumbnail_key: None,
+                metadata: crate::lark::normalize::MediaMetadata::default(),
+                status: crate::lark::normalize::PartStatus::Available,
+            })],
+            resources: Vec::new(),
+            message_type: "image".to_owned(),
+            create_time_ms: 1,
+            scope: ScopeKey::Chat("oc_pending_test".to_owned()),
+        }
+    }
+
+    fn queue(ttl: Duration, max_count: usize, max_metadata_bytes: usize) -> PendingMediaQueue {
+        PendingMediaQueue {
+            items: VecDeque::new(),
+            metadata_bytes: 0,
+            ttl,
+            max_count,
+            max_metadata_bytes,
+            generation: 0,
+        }
+    }
+
+    #[test]
+    fn reservation_restore_merges_chronologically_under_count_and_byte_caps() {
+        let first = pending_event("restore-a", "key-a");
+        let second = pending_event("restore-b", "key-b");
+        let third = pending_event("restore-c", "key-c");
+        let two_items = pending_metadata_bytes(&second) + pending_metadata_bytes(&third);
+        let mut pending = queue(Duration::from_secs(60), 2, two_items);
+        pending.stage(&first);
+        pending.stage(&second);
+        let (generation, mut reserved) = pending.reserve_all();
+        pending.stage(&third);
+        let tied_expiry = Instant::now() + Duration::from_secs(30);
+        for item in &mut reserved {
+            item.expires_at = tied_expiry;
+        }
+        pending.items[0].expires_at = tied_expiry;
+
+        pending.restore(generation, reserved);
+
+        let event_ids = pending
+            .items
+            .iter()
+            .map(|item| item.draft.event_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(event_ids, ["restore-b", "restore-c"]);
+        assert_eq!(pending.items.len(), 2);
+        assert!(pending.metadata_bytes <= two_items);
+        assert!(pending.items[0].expires_at <= pending.items[1].expires_at);
+    }
+
+    #[test]
+    fn reservation_restore_never_extends_ttl_or_survives_generation_clear() {
+        let old = pending_event("restore-expired", "key-old");
+        let fresh = pending_event("restore-fresh", "key-fresh");
+        let mut pending = queue(Duration::from_millis(10), 2, usize::MAX);
+        pending.stage(&old);
+        let (generation, reserved) = pending.reserve_all();
+        std::thread::sleep(Duration::from_millis(20));
+        pending.stage(&fresh);
+        pending.restore(generation, reserved);
+        assert_eq!(pending.items.len(), 1);
+        assert_eq!(pending.items[0].draft.event_id, "restore-fresh");
+
+        let (generation, reserved) = pending.reserve_all();
+        pending.clear();
+        pending.restore(generation, reserved);
+        assert!(pending.items.is_empty());
+        assert_eq!(pending.stats(), (0, 0));
+    }
 }
