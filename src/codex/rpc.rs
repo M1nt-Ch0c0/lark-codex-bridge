@@ -874,6 +874,21 @@ impl RpcConnection {
         self.exit = Some(exit);
         exit
     }
+
+    /// Abruptly drops this connection epoch without waiting for an orderly transport close. This
+    /// is used for crash-path verification; it never reaches through the transport to a server
+    /// process.
+    pub fn abort(&mut self) -> TransportExit {
+        if let Some(exit) = self.exit {
+            return exit;
+        }
+        if let Some(actor) = self.actor.take() {
+            actor.abort();
+        }
+        self.cancellation.cancel();
+        self.exit = Some(TransportExit::Aborted);
+        TransportExit::Aborted
+    }
 }
 
 impl Drop for RpcConnection {
@@ -888,6 +903,32 @@ pub fn spawn_rpc(
     transport: TransportHandle,
     epoch: ConnectionEpoch,
     parent_cancellation: CancellationToken,
+) -> RpcConnection {
+    spawn_rpc_with_policy(
+        transport,
+        epoch,
+        parent_cancellation,
+        RpcProtocolPolicy::Permissive,
+    )
+}
+
+/// Inbound protocol policy selected by the connection owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RpcProtocolPolicy {
+    /// Preserve the existing spawned-stdio behavior: surface unknown traffic as protocol drift.
+    Permissive,
+    /// External observe-only connections fault on stale/duplicate responses, server requests,
+    /// notifications, and malformed transport records.
+    FailClosedExternalObserve,
+}
+
+/// Starts the sole RPC owner with an explicit inbound protocol policy.
+#[must_use]
+pub fn spawn_rpc_with_policy(
+    transport: TransportHandle,
+    epoch: ConnectionEpoch,
+    parent_cancellation: CancellationToken,
+    policy: RpcProtocolPolicy,
 ) -> RpcConnection {
     let cancellation = parent_cancellation.child_token();
     drop(parent_cancellation);
@@ -938,6 +979,7 @@ pub fn spawn_rpc(
             pending_count,
             protocol_drift_count,
             dropped_notification_count,
+            policy,
             actor_cancel,
         )
         .await
@@ -977,6 +1019,7 @@ async fn run_actor(
     pending_count: Arc<AtomicUsize>,
     protocol_drift_count: Arc<AtomicU64>,
     dropped_notification_count: Arc<AtomicU64>,
+    policy: RpcProtocolPolicy,
     cancellation: CancellationToken,
 ) -> TransportExit {
     let (pump_high_tx, pump_high_rx) = mpsc::channel(RPC_HIGH_CAPACITY);
@@ -1026,15 +1069,21 @@ async fn run_actor(
                             &pending_count,
                             &protocol_drift_count,
                             &dropped_notification_count,
+                            policy,
                         ).await {
                             break if cancellation.is_cancelled() {
                                 TransportExit::Cancelled
+                            } else if policy == RpcProtocolPolicy::FailClosedExternalObserve {
+                                TransportExit::ProtocolViolation
                             } else {
                                 TransportExit::TaskFailed
                             };
                         }
                     }
                     Some(TransportEvent::ProtocolError(_)) => {
+                        if policy == RpcProtocolPolicy::FailClosedExternalObserve {
+                            break TransportExit::ProtocolViolation;
+                        }
                         increment_saturating(&protocol_drift_count);
                         if !try_emit_small_event(
                             RpcEvent::ProtocolDrift,
@@ -1048,6 +1097,10 @@ async fn run_actor(
                     Some(TransportEvent::ReadError(error)) => break TransportExit::ReadError(error.kind),
                     Some(TransportEvent::WriteError(error)) => break TransportExit::WriteError(error.kind),
                     Some(TransportEvent::StdoutEof) => break TransportExit::StdoutEof,
+                    Some(TransportEvent::WebSocketClosed(report)) => {
+                        break TransportExit::WebSocketClosed(report);
+                    }
+                    Some(TransportEvent::ConnectionError) => break TransportExit::ConnectionFailed,
                     Some(TransportEvent::Cancelled) => break TransportExit::Cancelled,
                     Some(TransportEvent::StderrLine { .. }) => {}
                     None => break transport.shutdown().await,
@@ -1116,6 +1169,7 @@ async fn run_actor(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 async fn handle_inbound(
     message: InboundMessage,
     transport_budget: OwnedSemaphorePermit,
@@ -1131,6 +1185,7 @@ async fn handle_inbound(
     pending_count: &AtomicUsize,
     protocol_drift_count: &AtomicU64,
     dropped_notification_count: &AtomicU64,
+    policy: RpcProtocolPolicy,
 ) -> bool {
     match message {
         InboundMessage::Response { id, result } => {
@@ -1141,6 +1196,9 @@ async fn handle_inbound(
                 }));
             } else {
                 drop(transport_budget);
+                if policy == RpcProtocolPolicy::FailClosedExternalObserve {
+                    return false;
+                }
                 increment_saturating(protocol_drift_count);
                 return try_emit_small_event(
                     RpcEvent::ProtocolDrift,
@@ -1158,6 +1216,9 @@ async fn handle_inbound(
                     code: error.code,
                 }));
             } else {
+                if policy == RpcProtocolPolicy::FailClosedExternalObserve {
+                    return false;
+                }
                 increment_saturating(protocol_drift_count);
                 return try_emit_small_event(
                     RpcEvent::ProtocolDrift,
@@ -1168,6 +1229,9 @@ async fn handle_inbound(
             }
         }
         InboundMessage::Request { id, method, params } => {
+            if policy == RpcProtocolPolicy::FailClosedExternalObserve {
+                return false;
+            }
             if server_pending.len() >= RPC_SERVER_REQUEST_CAPACITY
                 || !server_pending.insert(id.clone())
             {
@@ -1192,6 +1256,9 @@ async fn handle_inbound(
             .await;
         }
         InboundMessage::Notification { method, params } => {
+            if policy == RpcProtocolPolicy::FailClosedExternalObserve {
+                return false;
+            }
             let authoritative = is_authoritative_notification(&method);
             let event = RpcEvent::Notification { method, params };
             let emitted = if authoritative {
