@@ -33,7 +33,10 @@ resume/read reconciliation，并已具备显式 `mutate_shared` / `queue_shared`
 [`docs/external-codex-transport.md`](docs/external-codex-transport.md)，恢复语义与验收见
 [`docs/external-codex-reconciliation.md`](docs/external-codex-reconciliation.md)，共享写入、
 审批与不重放语义见
-[`docs/external-codex-write-coordination.md`](docs/external-codex-write-coordination.md)。
+[`docs/external-codex-write-coordination.md`](docs/external-codex-write-coordination.md)。另已完成
+Codex 0.149.0 Unix-socket listener 的原始 WebSocket 握手 RFC/双 Unix 平台门禁；当前运行时仍
+明确拒绝 `unix://`，不会把它别名为 JSONL、stdio 或 TCP，结论与复现见
+[`docs/codex-unix-websocket-contract.md`](docs/codex-unix-websocket-contract.md)。
 `/stop`、`/status` 按当前最小试用范围明确暂缓；`/new`、`/cd`、`/help` 目前也只有
 解析与 help 元数据，还未进入运行时。启动时会预装有界的 `Received` 行，但尚无周期性
 重扫。首次启动 onboarding 已恢复参考实现的一命令体验：扫码注册后自动携带创建者身份、
@@ -106,6 +109,9 @@ smoke，见 [`docs/external-codex-transport.md`](docs/external-codex-transport.m
 [`docs/external-codex-reconciliation.md`](docs/external-codex-reconciliation.md#verification)。
 两客户端写入竞争、queue、单审批路由和不重放的真实 smoke 见
 [`docs/external-codex-write-coordination.md`](docs/external-codex-write-coordination.md#verification)。
+Unix-socket 上的原始 HTTP/WebSocket Upgrade、peer credential、路径碰撞、stale socket 与
+清理策略的精确 binary smoke 见
+[`docs/codex-unix-websocket-contract.md`](docs/codex-unix-websocket-contract.md#committed-reproduction)。
 
 ## 授权角色（owner / sender / group）
 
