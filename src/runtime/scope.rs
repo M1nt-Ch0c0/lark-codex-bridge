@@ -1482,6 +1482,7 @@ async fn assemble_turn_inputs(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn register_context_input(
     inputs: &mut Vec<UserInput>,
     registry: &ContextRegistry,

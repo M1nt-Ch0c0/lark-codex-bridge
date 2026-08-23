@@ -1475,6 +1475,23 @@ mod tests {
             .expect("descendant pid handshake")
     }
 
+    async fn read_pid_marker(path: &Path, context: &'static str) -> u32 {
+        timeout(Duration::from_secs(30), async {
+            loop {
+                if let Ok(contents) = fs::read_to_string(path) {
+                    if let Ok(pid) = contents.trim().parse::<u32>() {
+                        if pid != 0 {
+                            return pid;
+                        }
+                    }
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect(context)
+    }
+
     #[cfg(unix)]
     async fn wait_for_process_exit(pid: u32, context: &'static str) {
         timeout(Duration::from_secs(30), async {
@@ -1963,6 +1980,9 @@ mod tests {
             .await
         });
 
+        #[cfg(unix)]
+        let grandchild_pid = read_pid_marker(&marker, "ffmpeg starts").await;
+        #[cfg(not(unix))]
         timeout(Duration::from_secs(5), async {
             while !marker.exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1999,11 +2019,6 @@ mod tests {
             );
         }
 
-        #[cfg(unix)]
-        let grandchild_pid = fs::read_to_string(&marker)
-            .expect("ffmpeg grandchild marker")
-            .parse::<u32>()
-            .expect("ffmpeg grandchild pid");
         cancellation.cancel();
         assert_eq!(
             task.await.expect("transcription task joins"),
@@ -2066,17 +2081,7 @@ mod tests {
             )
             .await
         });
-        timeout(Duration::from_secs(5), async {
-            while !pid_marker.exists() {
-                sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("sidecar starts");
-        let pid = fs::read_to_string(&pid_marker)
-            .expect("pid marker")
-            .parse::<u32>()
-            .expect("pid");
+        let pid = read_pid_marker(&pid_marker, "sidecar starts").await;
 
         shutdown.cancel();
         assert_eq!(task.await.expect("task joins"), Err(AsrError::Cancelled));
@@ -2130,10 +2135,7 @@ mod tests {
             .await
             .expect("normal sidecar result");
         assert_eq!(transcript, "bounded transcript");
-        let pid = fs::read_to_string(&pid_marker)
-            .expect("pid marker")
-            .parse::<u32>()
-            .expect("pid");
+        let pid = read_pid_marker(&pid_marker, "sidecar writes descendant pid").await;
         assert!(
             !std::process::Command::new("kill")
                 .args(["-0", &pid.to_string()])
@@ -2616,13 +2618,7 @@ mod tests {
             .kill_on_drop(true);
         let mut process = SupervisedProcess::spawn(&mut command, AsrError::SidecarFailed)
             .expect("spawn Job Object tree");
-        timeout(Duration::from_secs(5), async {
-            while !marker.exists() {
-                sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("Windows descendant starts");
+        let pid = read_pid_marker(&marker, "Windows descendant starts").await;
         let turn = CancellationToken::new();
         let shutdown = CancellationToken::new();
         assert_eq!(
@@ -2637,14 +2633,14 @@ mod tests {
                 .await,
             Err(AsrError::SidecarFailed)
         );
-        let pid = fs::read_to_string(&marker).expect("pid");
+        let pid = pid.to_string();
         let status = std::process::Command::new("powershell.exe")
             .args([
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
                 "if (Get-Process -Id $args[0] -ErrorAction SilentlyContinue) { exit 9 } else { exit 0 }",
-                pid.trim(),
+                pid.as_str(),
             ])
             .status()
             .expect("query descendant");
