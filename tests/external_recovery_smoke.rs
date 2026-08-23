@@ -9,6 +9,10 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -32,7 +36,14 @@ use lark_codex_bridge::{
 };
 use semver::Version;
 use serde_json::{Value, json};
-use tokio::{net::TcpStream, process::Command, time::timeout};
+use tokio::{
+    io::AsyncReadExt,
+    net::{TcpListener, TcpStream},
+    process::Command,
+    sync::Notify,
+    task::JoinHandle,
+    time::timeout,
+};
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{Message, client::IntoClientRequest, http::HeaderValue},
@@ -46,6 +57,99 @@ const CHILD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct ChildGuard {
     child: tokio::process::Child,
+}
+
+struct StalledResponsesServer {
+    base_url: String,
+    request_seen: Arc<AtomicBool>,
+    request_notify: Arc<Notify>,
+    cancel: CancellationToken,
+    task: JoinHandle<()>,
+}
+
+impl StalledResponsesServer {
+    async fn start() -> Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .context("unable to start the local Responses API stub")?;
+        let address = listener
+            .local_addr()
+            .context("unable to inspect the local Responses API stub")?;
+        let request_seen = Arc::new(AtomicBool::new(false));
+        let request_notify = Arc::new(Notify::new());
+        let cancel = CancellationToken::new();
+        let task_request_seen = request_seen.clone();
+        let task_request_notify = request_notify.clone();
+        let task_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let accepted = tokio::select! {
+                    () = task_cancel.cancelled() => break,
+                    accepted = listener.accept() => accepted,
+                };
+                let Ok((mut stream, _)) = accepted else {
+                    break;
+                };
+                let connection_seen = task_request_seen.clone();
+                let connection_notify = task_request_notify.clone();
+                let connection_cancel = task_cancel.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 1024];
+                    loop {
+                        let read = tokio::select! {
+                            () = connection_cancel.cancelled() => return,
+                            read = stream.read(&mut chunk) => read,
+                        };
+                        let Ok(read) = read else {
+                            return;
+                        };
+                        if read == 0 || request.len().saturating_add(read) > 64 * 1024 {
+                            return;
+                        }
+                        request.extend_from_slice(&chunk[..read]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            if request.starts_with(b"POST /v1/responses ") {
+                                connection_seen.store(true, Ordering::SeqCst);
+                                connection_notify.notify_waiters();
+                                connection_cancel.cancelled().await;
+                            }
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        Ok(Self {
+            base_url: format!("http://{address}/v1"),
+            request_seen,
+            request_notify,
+            cancel,
+            task,
+        })
+    }
+
+    async fn wait_for_request(&self) -> Result<()> {
+        timeout(STARTUP_TIMEOUT, async {
+            loop {
+                let notified = self.request_notify.notified();
+                if self.request_seen.load(Ordering::SeqCst) {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .context("turn did not reach the local Responses API stub")?;
+        Ok(())
+    }
+}
+
+impl Drop for StalledResponsesServer {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.task.abort();
+    }
 }
 
 impl ChildGuard {
@@ -115,6 +219,8 @@ async fn real_exact_binary_reconciles_across_socket_and_operator_server_restarts
     let scratch = tempfile::tempdir().context("unable to create smoke scratch directory")?;
     let codex_home = scratch.path().join("codex-home");
     std::fs::create_dir(&codex_home).context("unable to create isolated Codex home")?;
+    let model_stub = StalledResponsesServer::start().await?;
+    write_model_provider_config(&codex_home, &model_stub.base_url)?;
     let workspace = scratch.path().join("workspace");
     std::fs::create_dir(&workspace).context("unable to create isolated workspace")?;
     let token_path = scratch.path().join("reconciliation-bearer");
@@ -137,7 +243,8 @@ async fn real_exact_binary_reconciles_across_socket_and_operator_server_restarts
     exact_health(port).await?;
 
     // The operator harness alone creates the thread. Production recovery has no thread/start API.
-    let (thread_id, seeded_turn_id) = operator_start_thread(&endpoint, &token, &workspace).await?;
+    let (thread_id, seeded_turn_id) =
+        operator_start_thread(&endpoint, &token, &workspace, &model_stub).await?;
     let gate = configured_gate(&endpoint, &expected_version, &token_path)?;
     let endpoint_label = gate.endpoint_label().as_str().to_owned();
     let store = StoreHandle::open(&store_path)
@@ -312,6 +419,8 @@ fn spawn_server(
         .arg("--ws-token-file")
         .arg(token_path)
         .env("CODEX_HOME", codex_home)
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -325,15 +434,26 @@ async fn operator_start_thread(
     endpoint: &str,
     token: &str,
     cwd: &Path,
+    model_stub: &StalledResponsesServer,
 ) -> Result<(String, String)> {
     let mut socket = operator_connect(endpoint, token).await?;
     let result = operator_request(
         &mut socket,
         2,
         "thread/start",
-        json!({"cwd": cwd, "ephemeral": false, "historyMode": "paginated"}),
+        json!({
+            "cwd": cwd,
+            "ephemeral": false,
+            "historyMode": "paginated",
+            "model": "gpt-5.4",
+            "modelProvider": "reconciliation-smoke"
+        }),
     )
     .await?;
+    ensure!(
+        result["modelProvider"] == "reconciliation-smoke",
+        "operator thread/start did not select the isolated smoke model provider"
+    );
     let thread_id = result["thread"]["id"]
         .as_str()
         .context("operator thread/start response omitted thread id")?
@@ -353,7 +473,7 @@ async fn operator_start_thread(
         .as_str()
         .context("operator turn/start response omitted turn id")?
         .to_owned();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_model_request(&mut socket, model_stub).await?;
     operator_request(
         &mut socket,
         4,
@@ -363,6 +483,39 @@ async fn operator_start_thread(
     .await?;
     close_operator(socket).await;
     Ok((thread_id, turn_id))
+}
+
+async fn wait_for_model_request<S>(
+    socket: &mut tokio_tungstenite::WebSocketStream<S>,
+    model_stub: &StalledResponsesServer,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let request = model_stub.wait_for_request();
+    tokio::pin!(request);
+    loop {
+        tokio::select! {
+            result = &mut request => return result,
+            message = socket.next() => {
+                let message = message.context("operator socket closed while awaiting the model request")??;
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                let value: Value = serde_json::from_str(&text)
+                    .context("operator notification was not JSON")?;
+                if value["method"] == "turn/completed" {
+                    let status = value["params"]["turn"]["status"]
+                        .as_str()
+                        .unwrap_or("unknown");
+                    let message = value["params"]["turn"]["error"]["message"]
+                        .as_str()
+                        .unwrap_or("unspecified turn error");
+                    bail!("turn completed before interrupt status={status} message={message}");
+                }
+            }
+        }
+    }
 }
 
 async fn operator_list_threads(endpoint: &str, token: &str) -> Result<Vec<String>> {
@@ -482,10 +635,16 @@ where
             let value: Value = serde_json::from_str(&text)
                 .with_context(|| format!("operator {method} response was not JSON"))?;
             if value["id"] == id {
-                ensure!(
-                    value.get("error").is_none(),
-                    "operator {method} returned an error"
-                );
+                if let Some(error) = value.get("error") {
+                    let code = error.get("code").and_then(Value::as_i64);
+                    let message = error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unspecified protocol error");
+                    anyhow::bail!(
+                        "operator {method} returned protocol error code={code:?} message={message}"
+                    );
+                }
                 return value
                     .get("result")
                     .cloned()
@@ -588,6 +747,24 @@ fn write_private_token(path: &Path, token: &str) -> Result<()> {
         .context("unable to write smoke bearer")?;
     file.sync_all().context("unable to sync smoke bearer")?;
     Ok(())
+}
+
+fn write_model_provider_config(codex_home: &Path, base_url: &str) -> Result<()> {
+    let config = format!(
+        r#"model = "gpt-5.4"
+model_provider = "reconciliation-smoke"
+
+[model_providers.reconciliation-smoke]
+name = "Reconciliation smoke"
+base_url = "{base_url}"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+requires_openai_auth = false
+"#
+    );
+    std::fs::write(codex_home.join("config.toml"), config)
+        .context("unable to write isolated smoke model-provider config")
 }
 
 async fn wait_until_listening(port: u16) -> Result<()> {
