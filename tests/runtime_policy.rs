@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use lark_codex_bridge::codex::types::{ApprovalPolicy, GranularApprovalPolicy, SandboxMode};
 use lark_codex_bridge::config::{
-    BridgeConfig, CodexSection, ConcurrencyConfig, PathsSection, WorkspacePolicy,
+    BridgeConfig, ChannelTransport, CodexSection, ConcurrencyConfig, PathsSection, WorkspacePolicy,
 };
 use lark_codex_bridge::lark::api::ChatMode;
 use lark_codex_bridge::lark::normalize::{InboundEvent, ScopeKey};
@@ -87,6 +87,7 @@ fn policy_config(allow_root: PathBuf) -> BridgeConfig {
         },
         concurrency: ConcurrencyConfig::default(),
         codex: CodexSection::default(),
+        channel: lark_codex_bridge::config::ChannelSection::default(),
         paths: PathsSection::default(),
     }
 }
@@ -143,6 +144,13 @@ fn minimal_config_has_safe_defaults_and_resolves_relative_runtime_paths() {
     assert_eq!(config.concurrency.active_turn_permits, 4);
     assert_eq!(config.concurrency.max_scope_actors, 256);
     assert_eq!(config.codex.sandbox, SandboxMode::WorkspaceWrite);
+    assert_eq!(config.channel.transport, ChannelTransport::Native);
+    assert!(config.channel.fallback_to_native);
+    assert_eq!(config.channel.node_binary, PathBuf::from("node"));
+    assert_eq!(
+        config.channel.sidecar_entrypoint,
+        temp.path().join("sidecar/index.cjs")
+    );
     assert_eq!(
         config.codex.approval_policy,
         ApprovalPolicy::Named("never".to_owned())
@@ -200,10 +208,45 @@ fn config_rejects_unknown_keys_at_every_schema_level() {
         "owners = [\"ou_owner_123456\"]\n[workspace]\nunexpected = true",
         "owners = [\"ou_owner_123456\"]\n[concurrency]\nunexpected = true",
         "owners = [\"ou_owner_123456\"]\n[codex]\nunexpected = true",
+        "owners = [\"ou_owner_123456\"]\n[channel]\nunexpected = true",
         "owners = [\"ou_owner_123456\"]\n[paths]\nunexpected = true",
     ] {
         assert!(toml::from_str::<BridgeConfig>(source).is_err());
     }
+}
+
+#[test]
+fn node_sidecar_is_explicit_and_paths_are_resolved_without_expanding_node() {
+    let temp = scratch();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+owners = ["ou_owner_123456"]
+
+[channel]
+transport = "node-sidecar"
+node_binary = "node"
+sidecar_entrypoint = "runtime/channel/index.cjs"
+fallback_to_native = false
+"#,
+    )
+    .expect("fixture should write");
+
+    let config = BridgeConfig::load(Some(&config_path)).expect("sidecar config should load");
+    assert_eq!(config.channel.transport, ChannelTransport::NodeSidecar);
+    assert_eq!(config.channel.node_binary, PathBuf::from("node"));
+    assert_eq!(
+        config.channel.sidecar_entrypoint,
+        temp.path().join("runtime/channel/index.cjs")
+    );
+    assert!(!config.channel.fallback_to_native);
+    assert!(
+        toml::from_str::<BridgeConfig>(
+            "owners = [\"ou_owner_123456\"]\n[channel]\ntransport = \"automatic\""
+        )
+        .is_err()
+    );
 }
 
 #[test]

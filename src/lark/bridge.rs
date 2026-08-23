@@ -34,12 +34,19 @@ use super::http::LarkHttp;
 use super::normalize::{InboundEvent, NormalizeOutcome, Normalizer, ShortId};
 use super::token::TenantTokenProvider;
 use super::transport::{InboundFrameHandler, LarkTransport, TransportConfig, TransportHandle};
+use crate::channel::ChatMessageQuery;
 use crate::limits::{LARK_INBOUND_EVENT_BYTE_BUDGET, LARK_INBOUND_EVENT_CAPACITY};
 use crate::runtime::intake::IntakeRuntime;
 
 /// Durable receipt-boundary hook invoked after normalization.
 pub type IntakeHook = Arc<
     dyn Fn(Box<InboundEvent>) -> BoxFuture<'static, Result<IntakeVerdict, LarkError>> + Send + Sync,
+>;
+
+/// Transport-independent handler for one complete Lark event payload.
+/// Success is returned only after durable intake and bounded enqueue finish.
+pub type InboundEventHandler = Arc<
+    dyn Fn(Bytes) -> BoxFuture<'static, Result<Option<serde_json::Value>, LarkError>> + Send + Sync,
 >;
 
 /// Durable intake decision for one normalized event.
@@ -271,7 +278,66 @@ impl LarkBridge {
         config: BridgeConfig,
         intake: IntakeRuntime,
     ) -> Result<(TransportHandle, mpsc::Receiver<QueuedInboundEvent>), LarkError> {
-        if !intake.matches(&creds) {
+        let http = LarkHttp::new(endpoints)?;
+        let tokens = TenantTokenProvider::new(http.clone(), creds.clone());
+        let api = LarkApi::new(http.clone(), tokens);
+        let info = api.bot_info().await?;
+        let bot_open_id = info
+            .open_id
+            .filter(|open_id| !open_id.is_empty())
+            .ok_or_else(|| LarkError::protocol("bot info response missing open_id"))?;
+        let query: Arc<dyn ChatMessageQuery> =
+            Arc::new(crate::channel::native::NativeChannel::new(api));
+        let normalizer = Arc::new(Normalizer::with_query(query, bot_open_id));
+        let (event_handler, rx) = Self::prepare_durable(&creds, config, intake, normalizer)?;
+        let handle = Self::start_prepared_native(http, creds, config, event_handler);
+        Ok((handle, rx))
+    }
+
+    /// Starts the native WebSocket over an already-prepared durable event
+    /// handler. Card actions remain explicitly unsupported and are answered
+    /// without entering the message pipeline.
+    #[must_use]
+    pub fn start_prepared_native(
+        http: LarkHttp,
+        creds: LarkCredentials,
+        config: BridgeConfig,
+        event_handler: InboundEventHandler,
+    ) -> TransportHandle {
+        let handler: InboundFrameHandler = Arc::new(move |headers, payload: Bytes| {
+            let event_handler = Arc::clone(&event_handler);
+            Box::pin(async move {
+                if matches!(headers.ty(), Some(MessageType::Card)) {
+                    tracing::info!(
+                        message_id = headers.message_id().unwrap_or(""),
+                        "lark card action is unsupported in this milestone; acknowledging"
+                    );
+                    return Ok(Some(json!({ "status": "unsupported" })));
+                }
+                event_handler(payload).await
+            })
+        });
+        LarkTransport::start_with_config(http, creds, handler, config.transport)
+    }
+
+    /// Prepares the transport-independent durable normalization pipeline.
+    ///
+    /// The returned handler is suitable for either the native WebSocket or
+    /// the Node sidecar. A successful result is the upstream acknowledgement
+    /// boundary: normalize → `SQLite` registration → bounded queue reservation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a static classified error for a credential binding mismatch,
+    /// invalid bounds, or an oversized startup recovery set.
+    #[allow(clippy::too_many_lines)]
+    pub fn prepare_durable(
+        creds: &LarkCredentials,
+        config: BridgeConfig,
+        intake: IntakeRuntime,
+        normalizer: Arc<Normalizer>,
+    ) -> Result<(InboundEventHandler, mpsc::Receiver<QueuedInboundEvent>), LarkError> {
+        if !intake.matches(creds) {
             return Err(LarkError::protocol(
                 "durable intake credential binding mismatch",
             ));
@@ -288,15 +354,6 @@ impl LarkBridge {
                 "durable inbound channel bound exceeds Tokio semaphore limits",
             ));
         }
-        let http = LarkHttp::new(endpoints)?;
-        let tokens = TenantTokenProvider::new(http.clone(), creds.clone());
-        let api = LarkApi::new(http.clone(), tokens);
-        let info = api.bot_info().await?;
-        let bot_open_id = info
-            .open_id
-            .filter(|open_id| !open_id.is_empty())
-            .ok_or_else(|| LarkError::protocol("bot info response missing open_id"))?;
-        let normalizer = Arc::new(Normalizer::new(api, bot_open_id));
         let (recovery, hook) = intake.into_parts();
 
         let recovery_count = recovery.len();
@@ -342,19 +399,12 @@ impl LarkBridge {
             });
         }
 
-        let handler: InboundFrameHandler = Arc::new(move |headers, payload: Bytes| {
+        let handler: InboundEventHandler = Arc::new(move |payload: Bytes| {
             let normalizer = Arc::clone(&normalizer);
             let hook = Arc::clone(&hook);
             let tx = tx.clone();
             let budget = Arc::clone(&budget);
             Box::pin(async move {
-                if matches!(headers.ty(), Some(MessageType::Card)) {
-                    tracing::info!(
-                        message_id = headers.message_id().unwrap_or(""),
-                        "lark card action is unsupported in this milestone; acknowledging"
-                    );
-                    return Ok(Some(json!({ "status": "unsupported" })));
-                }
                 let outcome = normalizer.normalize(&payload).await?;
                 let NormalizeOutcome::Event { event, degradation } = outcome else {
                     return Ok(None);
@@ -391,7 +441,6 @@ impl LarkBridge {
                 Ok(None)
             })
         });
-        let handle = LarkTransport::start_with_config(http, creds, handler, config.transport);
-        Ok((handle, rx))
+        Ok((handler, rx))
     }
 }

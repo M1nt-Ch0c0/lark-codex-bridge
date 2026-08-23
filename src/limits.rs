@@ -131,6 +131,24 @@ pub const LARK_INBOUND_EVENT_CAPACITY: usize = 256;
 /// exact persisted normalized payload bytes. Permits are held until drop.
 pub const LARK_INBOUND_EVENT_BYTE_BUDGET: usize = 8 * 1024 * 1024;
 
+/// Maximum bytes before the newline of one Rust↔Node sidecar frame. This is
+/// deliberately no larger than one native reassembled event.
+pub const CHANNEL_SIDECAR_FRAME_BYTES: usize = LARK_FRAGMENT_MESSAGE_BYTES;
+/// Events admitted by the Rust wire reader but not yet decided by the durable
+/// intake hook. Saturation returns an explicit negative ack.
+pub const CHANNEL_SIDECAR_EVENT_CAPACITY: usize = 64;
+/// Frames waiting for the child stdin writer.
+pub const CHANNEL_SIDECAR_WRITE_CAPACITY: usize = 128;
+/// Deadline for protocol/version/capability configuration.
+pub const CHANNEL_SIDECAR_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Deadline shared with the Node handler before upstream must receive failure.
+pub const CHANNEL_SIDECAR_HANDLER_TIMEOUT: Duration = LARK_HANDLER_TIMEOUT;
+/// Extra time for a negative handler-timeout ack to reach Node before Node
+/// independently rejects the pending SDK handler.
+pub const CHANNEL_SIDECAR_ACK_GRACE: Duration = Duration::from_secs(5);
+/// Grace for a correlated shutdown response and clean child exit.
+pub const CHANNEL_SIDECAR_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
 /// Count bound of the single-writer store command channel. Every store
 /// request (reads included) travels this channel to the one blocking writer
 /// task; a full channel fails the caller fast instead of growing an

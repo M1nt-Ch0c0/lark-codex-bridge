@@ -2,7 +2,7 @@
 //! `uncertain_delivery`, and graceful shutdown.
 //!
 //! The pump only drains rows while the Lark transport reports
-//! [`TransportState::Connected`]; while disconnected, rows stay `pending` in
+//! [`ConnectionState::Connected`]; while disconnected, rows stay `pending` in
 //! the store (design §13.2). On reconnect it resumes in deterministic `id`
 //! order. A send whose outcome is unknown is recorded as
 //! `uncertain_delivery` and never blindly re-sent.
@@ -10,6 +10,7 @@
 #![allow(clippy::doc_markdown)]
 
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -18,9 +19,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::payload::OutboxOperation;
-use crate::lark::api::LarkApi;
+use crate::channel::{
+    ConnectionState, DeliveryError, DeliveryFailureClass, OutboundDelivery, OutboundRequest,
+};
 use crate::lark::error::LarkError;
-use crate::lark::transport::TransportState;
 use crate::limits::{
     OUTBOX_POLL_INTERVAL, OUTBOX_RETRY_BASE, OUTBOX_RETRY_MAX, OUTBOX_SWEEP_BATCH,
     OUTBOX_SWEEP_INTERVAL, OUTBOX_TERMINAL_RETENTION_MS, STORE_OUTBOX_CLAIM_MAX_BATCH,
@@ -78,7 +80,7 @@ enum ProcessOutcome {
 }
 
 enum SendFailure {
-    Delivery(LarkError),
+    Delivery(DeliveryError),
     Store(StoreError),
     DependencyPending,
     DependencyPermanent,
@@ -113,17 +115,37 @@ impl Default for OutboxPumpConfig {
 pub struct OutboxPump;
 
 impl OutboxPump {
-    /// Starts the pump actor over a shared store and Lark API client, gated by
-    /// the given transport state subscription.
+    /// Starts the pump actor over a provider-neutral delivery capability,
+    /// gated by the given connection-state subscription.
     #[must_use]
-    pub fn spawn(
+    pub fn spawn<D>(
         store: StoreHandle,
-        api: LarkApi,
-        transport: watch::Receiver<TransportState>,
+        delivery: D,
+        transport: watch::Receiver<ConnectionState>,
+        config: OutboxPumpConfig,
+    ) -> OutboxHandle
+    where
+        D: OutboundDelivery + 'static,
+    {
+        Self::spawn_shared(store, Arc::new(delivery), transport, config)
+    }
+
+    /// Starts the pump over an already-shared delivery capability.
+    #[must_use]
+    pub fn spawn_shared(
+        store: StoreHandle,
+        delivery: Arc<dyn OutboundDelivery>,
+        transport: watch::Receiver<ConnectionState>,
         config: OutboxPumpConfig,
     ) -> OutboxHandle {
         let shutdown = CancellationToken::new();
-        let task = tokio::spawn(run(store.clone(), api, transport, config, shutdown.clone()));
+        let task = tokio::spawn(run(
+            store.clone(),
+            delivery,
+            transport,
+            config,
+            shutdown.clone(),
+        ));
         OutboxHandle {
             store,
             shutdown,
@@ -162,8 +184,8 @@ impl OutboxHandle {
 
 async fn run(
     store: StoreHandle,
-    api: LarkApi,
-    mut transport: watch::Receiver<TransportState>,
+    delivery: Arc<dyn OutboundDelivery>,
+    mut transport: watch::Receiver<ConnectionState>,
     config: OutboxPumpConfig,
     shutdown: CancellationToken,
 ) {
@@ -215,7 +237,8 @@ async fn run(
                 release_tail(&store, &batch[cursor..]).await;
                 break;
             }
-            let outcome = process_row(&store, &api, &batch[cursor], config, &shutdown).await;
+            let outcome =
+                process_row(&store, delivery.as_ref(), &batch[cursor], config, &shutdown).await;
             cursor += 1;
             if matches!(outcome, ProcessOutcome::Deferred) {
                 // The retry receipt transaction already returned the claimed
@@ -232,7 +255,7 @@ async fn run(
 
 async fn process_row(
     store: &StoreHandle,
-    api: &LarkApi,
+    delivery: &dyn OutboundDelivery,
     row: &OutboxRow,
     config: OutboxPumpConfig,
     shutdown: &CancellationToken,
@@ -259,7 +282,7 @@ async fn process_row(
             return ProcessOutcome::Resolved;
         }
     };
-    match send(store, api, row, &operation).await {
+    match send(store, delivery, row, &operation).await {
         Ok(message_id) => {
             if message_id.is_empty() {
                 // The receipt contract (design §9) requires a non-empty
@@ -284,7 +307,11 @@ async fn process_row(
             ProcessOutcome::Resolved
         }
         Err(SendFailure::Delivery(error)) => {
-            let class = classify_delivery(&error);
+            let class = match error.class() {
+                DeliveryFailureClass::Retryable => DeliveryClass::Retryable,
+                DeliveryFailureClass::Uncertain => DeliveryClass::Uncertain,
+                DeliveryFailureClass::Definitive => DeliveryClass::Permanent,
+            };
             record_failure(store, row, class, config, &error, shutdown).await
         }
         Err(SendFailure::Store(store_error)) => {
@@ -293,45 +320,45 @@ async fn process_row(
                 outbox_id = row.id,
                 "progress dependency lookup failed"
             );
-            record_failure(
+            record_classified_failure(
                 store,
                 row,
                 DeliveryClass::Retryable,
                 config,
-                &LarkError::retryable("resolving a progress dependency"),
+                "resolving a progress dependency",
                 shutdown,
             )
             .await
         }
         Err(SendFailure::DependencyPending) => {
-            record_failure(
+            record_classified_failure(
                 store,
                 row,
                 DeliveryClass::Retryable,
                 config,
-                &LarkError::retryable("waiting for a progress dependency"),
+                "waiting for a progress dependency",
                 shutdown,
             )
             .await
         }
         Err(SendFailure::DependencyPermanent) => {
-            record_failure(
+            record_classified_failure(
                 store,
                 row,
                 DeliveryClass::Permanent,
                 config,
-                &LarkError::exhausted("progress dependency is unavailable", 0),
+                "resolving an unavailable progress dependency",
                 shutdown,
             )
             .await
         }
         Err(SendFailure::DependencyUncertain) => {
-            record_failure(
+            record_classified_failure(
                 store,
                 row,
                 DeliveryClass::Uncertain,
                 config,
-                &LarkError::protocol("progress dependency delivery is uncertain"),
+                "resolving an uncertain progress dependency",
                 shutdown,
             )
             .await
@@ -341,56 +368,55 @@ async fn process_row(
 
 async fn send(
     store: &StoreHandle,
-    api: &LarkApi,
+    delivery: &dyn OutboundDelivery,
     row: &OutboxRow,
     operation: &OutboxOperation,
 ) -> Result<String, SendFailure> {
     match operation {
         OutboxOperation::ReplyText {
             message_id,
-            thread_id: Some(_),
+            thread_id,
             text,
-        } => api
-            .reply_text_in_thread(message_id.as_str(), text.as_str())
+        } => {
+            deliver(
+                delivery,
+                OutboundRequest::ReplyText {
+                    message_id: message_id.clone(),
+                    in_thread: thread_id.is_some(),
+                    text: text.clone(),
+                },
+            )
             .await
-            .map(|message| message.message_id)
-            .map_err(SendFailure::Delivery),
-        OutboxOperation::ReplyText {
-            message_id,
-            thread_id: None,
-            text,
-        } => api
-            .reply_text(message_id.as_str(), text.as_str())
-            .await
-            .map(|message| message.message_id)
-            .map_err(SendFailure::Delivery),
+        }
         OutboxOperation::ReplyProgressCard {
             message_id,
-            thread_id: Some(_),
+            thread_id,
             text,
-        } => api
-            .reply_card_in_thread(message_id, progress_card(text))
+        } => {
+            deliver(
+                delivery,
+                OutboundRequest::ReplyCard {
+                    message_id: message_id.clone(),
+                    in_thread: thread_id.is_some(),
+                    card: progress_card(text),
+                },
+            )
             .await
-            .map(|message| message.message_id)
-            .map_err(SendFailure::Delivery),
-        OutboxOperation::ReplyProgressCard {
-            message_id,
-            thread_id: None,
-            text,
-        } => api
-            .reply_card(message_id, progress_card(text))
-            .await
-            .map(|message| message.message_id)
-            .map_err(SendFailure::Delivery),
+        }
         OutboxOperation::UpdateProgressCard { anchor_key, text } => {
             let anchor =
                 progress_anchor(store, row, anchor_key, ProgressDependency::Update).await?;
             match anchor {
-                ProgressAnchor::Delivered(message_id) => api
-                    .update_card(&message_id, progress_card(text))
+                ProgressAnchor::Delivered(message_id) => {
+                    deliver(
+                        delivery,
+                        OutboundRequest::UpdateCard {
+                            message_id,
+                            card: progress_card(text),
+                        },
+                    )
                     .await
-                    .map(|()| message_id)
-                    .map_err(SendFailure::Delivery),
+                }
                 ProgressAnchor::Pending => Err(SendFailure::DependencyPending),
                 ProgressAnchor::Failed => Err(SendFailure::DependencyPermanent),
                 ProgressAnchor::Uncertain => Err(SendFailure::DependencyUncertain),
@@ -405,26 +431,43 @@ async fn send(
             let anchor =
                 progress_anchor(store, row, anchor_key, ProgressDependency::Finalize).await?;
             match anchor {
-                ProgressAnchor::Delivered(receipt) => api
-                    .update_card(&receipt, progress_card(text))
+                ProgressAnchor::Delivered(receipt) => {
+                    deliver(
+                        delivery,
+                        OutboundRequest::UpdateCard {
+                            message_id: receipt,
+                            card: progress_card(text),
+                        },
+                    )
                     .await
-                    .map(|()| receipt)
-                    .map_err(SendFailure::Delivery),
-                ProgressAnchor::Failed if thread_id.is_some() => api
-                    .reply_text_in_thread(message_id, text)
+                }
+                ProgressAnchor::Failed => {
+                    deliver(
+                        delivery,
+                        OutboundRequest::ReplyText {
+                            message_id: message_id.clone(),
+                            in_thread: thread_id.is_some(),
+                            text: text.clone(),
+                        },
+                    )
                     .await
-                    .map(|message| message.message_id)
-                    .map_err(SendFailure::Delivery),
-                ProgressAnchor::Failed => api
-                    .reply_text(message_id, text)
-                    .await
-                    .map(|message| message.message_id)
-                    .map_err(SendFailure::Delivery),
+                }
                 ProgressAnchor::Pending => Err(SendFailure::DependencyPending),
                 ProgressAnchor::Uncertain => Err(SendFailure::DependencyUncertain),
             }
         }
     }
+}
+
+async fn deliver(
+    delivery: &dyn OutboundDelivery,
+    request: OutboundRequest,
+) -> Result<String, SendFailure> {
+    delivery
+        .deliver(request)
+        .await
+        .map(|receipt| receipt.message_id)
+        .map_err(SendFailure::Delivery)
 }
 
 enum ProgressAnchor {
@@ -520,7 +563,7 @@ async fn record_failure(
     row: &OutboxRow,
     class: DeliveryClass,
     config: OutboxPumpConfig,
-    error: &LarkError,
+    error: &(dyn std::fmt::Display + Sync),
     shutdown: &CancellationToken,
 ) -> ProcessOutcome {
     let attempts = row.attempts.saturating_add(1);
@@ -564,6 +607,30 @@ async fn record_failure(
     } else {
         ProcessOutcome::Resolved
     }
+}
+
+async fn record_classified_failure(
+    store: &StoreHandle,
+    row: &OutboxRow,
+    class: DeliveryClass,
+    config: OutboxPumpConfig,
+    context: &'static str,
+    shutdown: &CancellationToken,
+) -> ProcessOutcome {
+    let provider_class = match class {
+        DeliveryClass::Retryable => DeliveryFailureClass::Retryable,
+        DeliveryClass::Uncertain => DeliveryFailureClass::Uncertain,
+        DeliveryClass::Permanent => DeliveryFailureClass::Definitive,
+    };
+    record_failure(
+        store,
+        row,
+        class,
+        config,
+        &DeliveryError::new(provider_class, context),
+        shutdown,
+    )
+    .await
 }
 
 async fn release_tail(store: &StoreHandle, tail: &[OutboxRow]) {
@@ -624,7 +691,7 @@ fn retry_delay_ms(attempts: u32, config: OutboxPumpConfig) -> i64 {
 }
 
 async fn wait_until_connected(
-    transport: &mut watch::Receiver<TransportState>,
+    transport: &mut watch::Receiver<ConnectionState>,
     shutdown: &CancellationToken,
 ) -> bool {
     loop {
@@ -651,8 +718,8 @@ async fn sleep_or_shutdown(duration: Duration, shutdown: &CancellationToken) -> 
     }
 }
 
-fn is_connected(transport: &watch::Receiver<TransportState>) -> bool {
-    matches!(*transport.borrow(), TransportState::Connected)
+fn is_connected(transport: &watch::Receiver<ConnectionState>) -> bool {
+    matches!(*transport.borrow(), ConnectionState::Connected)
 }
 
 #[cfg(test)]

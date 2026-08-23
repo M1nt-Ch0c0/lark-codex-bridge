@@ -3,6 +3,7 @@
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::channel::MediaKind as ResourceKind;
 use crate::codex::{
     client::AppServerClient,
     rpc::ServerRequest,
@@ -12,7 +13,6 @@ use crate::codex::{
         DynamicToolSpec,
     },
 };
-use crate::lark::api::ResourceKind;
 use crate::runtime::{
     attachments::{AttachError, AttachmentCache, DownloadKind},
     context::{ContextError, ContextErrorCode, ContextId, ContextRegistry, MediaHandle},

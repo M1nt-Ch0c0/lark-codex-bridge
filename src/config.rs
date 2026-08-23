@@ -101,6 +101,7 @@ pub struct BridgeConfig {
     pub workspace: WorkspacePolicy,
     pub concurrency: ConcurrencyConfig,
     pub codex: CodexSection,
+    pub channel: ChannelSection,
     pub paths: PathsSection,
 }
 
@@ -118,6 +119,7 @@ impl fmt::Debug for BridgeConfig {
             .field("workspace", &self.workspace)
             .field("concurrency", &self.concurrency)
             .field("codex", &self.codex)
+            .field("channel", &self.channel)
             .field("paths", &self.paths)
             .finish()
     }
@@ -212,6 +214,11 @@ impl BridgeConfig {
         {
             return Err(ConfigError::AllowRootsTooLarge);
         }
+        if self.channel.node_binary.as_os_str().is_empty()
+            || self.channel.sidecar_entrypoint.as_os_str().is_empty()
+        {
+            return Err(ConfigError::InvalidRuntimePath);
+        }
         Ok(())
     }
 
@@ -226,6 +233,9 @@ impl BridgeConfig {
         };
         self.paths.database = resolve_relative_path(&parent, &self.paths.database)?;
         self.paths.attachment_cache = resolve_relative_path(&parent, &self.paths.attachment_cache)?;
+        self.channel.node_binary = resolve_command_path(&parent, &self.channel.node_binary)?;
+        self.channel.sidecar_entrypoint =
+            resolve_relative_path(&parent, &self.channel.sidecar_entrypoint)?;
         Ok(())
     }
 }
@@ -451,6 +461,55 @@ impl fmt::Debug for CodexSection {
     }
 }
 
+/// Inbound transport selected for production application assembly.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ChannelTransport {
+    /// Native Rust WebSocket transport (default and fallback).
+    #[default]
+    Native,
+    /// Official Node SDK sidecar for inbound WebSocket events.
+    NodeSidecar,
+}
+
+/// Channel transport configuration. Queue/frame/time bounds are fixed in the
+/// binary and are intentionally not operator-tunable.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ChannelSection {
+    /// Explicit inbound implementation.
+    pub transport: ChannelTransport,
+    /// Node executable used only for `node-sidecar`.
+    pub node_binary: PathBuf,
+    /// Checked-in/deployed sidecar entrypoint used only for `node-sidecar`.
+    pub sidecar_entrypoint: PathBuf,
+    /// If the initial sidecar handshake fails, retain the native transport.
+    pub fallback_to_native: bool,
+}
+
+impl Default for ChannelSection {
+    fn default() -> Self {
+        Self {
+            transport: ChannelTransport::Native,
+            node_binary: PathBuf::from("node"),
+            sidecar_entrypoint: PathBuf::from("sidecar/index.cjs"),
+            fallback_to_native: true,
+        }
+    }
+}
+
+impl fmt::Debug for ChannelSection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ChannelSection")
+            .field("transport", &self.transport)
+            .field("node_binary", &"[configured]")
+            .field("sidecar_entrypoint", &"[configured]")
+            .field("fallback_to_native", &self.fallback_to_native)
+            .finish()
+    }
+}
+
 /// Local runtime storage locations.
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -490,6 +549,15 @@ fn resolve_relative_path(parent: &Path, path: &Path) -> Result<PathBuf, ConfigEr
         return Err(ConfigError::InvalidRuntimePath);
     }
     Ok(lexical_normalize(&parent.join(path)))
+}
+
+fn resolve_command_path(parent: &Path, path: &Path) -> Result<PathBuf, ConfigError> {
+    if path.components().count() == 1
+        && matches!(path.components().next(), Some(Component::Normal(_)))
+    {
+        return Ok(path.to_path_buf());
+    }
+    resolve_relative_path(parent, path)
 }
 
 /// Validates one identity/chat ID collection against its count and byte caps,

@@ -13,7 +13,8 @@
 
 - Codex app-server 的有界 stdio transport、RPC broker、typed thread/turn client、
   长驻 supervisor、thread 复用、`codex probe` 和门控的真实 Codex smoke；
-- Rust 原生飞书/Lark 凭证登记、OpenAPI、WebSocket transport、事件归一化、
+- Rust 原生飞书/Lark 凭证登记、OpenAPI、WebSocket transport、事件归一化，
+  以及可灰度启用、受 Rust 监督的官方 Node SDK 入站 sidecar；
   `lark probe` 和门控的真实 Lark smoke；
 - SQLite WAL 单写者 store、持久 inbox/outbox、去重、owner/指定 sender/指定群组 allowlist 授权、安全工作区策略、
   scope actor、同 scope 串行 turn 和不同 scope 的有界并发；
@@ -122,6 +123,40 @@ endpointHost、pingIntervalSecs、elapsedMs）；绝不输出 secret、token 或
 ```bash
 LARK_E2E=1 LARK_E2E_APP_ID=… LARK_E2E_APP_SECRET=… LARK_E2E_TENANT=feishu LARK_E2E_CHAT_ID=oc_… \
   cargo test --test lark_smoke --locked -- --ignored --nocapture
+```
+
+### 官方 Node SDK 入站 sidecar（可选）
+
+默认 `native` 行为不变。要只把入站 WebSocket 灰度切到固定版本的官方 Node SDK，先在
+构建/部署阶段安装 lockfile 依赖（运行时不会执行 npm）：
+
+```bash
+npm ci --ignore-scripts --prefix sidecar
+npm run check --prefix sidecar
+```
+
+然后在 `config.toml` 显式选择；相对 `sidecar_entrypoint` 按配置文件目录解析，部署时建议
+使用绝对路径：
+
+```toml
+[channel]
+transport = "node-sidecar"       # 默认 "native"
+node_binary = "node"
+sidecar_entrypoint = "/opt/lark-codex-bridge/sidecar/index.cjs"
+fallback_to_native = true
+```
+
+sidecar 只接收入站事件与连接状态；查询、媒体下载和出站仍走 Rust OpenAPI。Rust 在完成
+SQLite durable intake 和有界队列预留后才回送正 ack；失败、超时或背压都会使 SDK handler
+失败，让上游保留重投语义。协议、脱敏与容量细节见
+[`docs/channel-wire-v1.md`](docs/channel-wire-v1.md)。
+
+真实 sidecar smoke 还要求操作者在连接后发送一条新私聊；未运行或 skip 不算证据：
+
+```bash
+LARK_SIDECAR_E2E=1 LARK_SIDECAR_E2E_APP_ID=… LARK_SIDECAR_E2E_APP_SECRET=… \
+  LARK_SIDECAR_E2E_TENANT=feishu \
+  cargo test --test lark_sidecar_smoke --locked -- --ignored --nocapture
 ```
 
 仓库只跟踪稳定的产品说明；缺陷和遗留项通过 GitHub Issue 与对应 PR 跟踪。实施计划、

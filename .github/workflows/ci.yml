@@ -62,6 +62,20 @@ jobs:
       - run: cargo nextest run --all-targets --profile ci --locked
       - run: cargo test --doc --locked
 
+  sidecar:
+    name: Node sidecar lockfile
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: sidecar/package-lock.json
+      - run: npm ci --ignore-scripts --prefix sidecar
+      - run: npm run check --prefix sidecar
+
   docs:
     name: Docs (rustdoc)
     runs-on: ubuntu-latest
