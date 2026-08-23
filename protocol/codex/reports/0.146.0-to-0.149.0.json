@@ -56,61 +56,6 @@
       "path": "notifications/thread/reverted"
     },
     {
-      "classification": "additive",
-      "kind": "optional_property_added",
-      "path": "roots/initialize.params/definitions/InitializeCapabilities/properties/extensions"
-    },
-    {
-      "classification": "additive",
-      "kind": "optional_property_added",
-      "path": "roots/notification.item.completed/definitions/ThreadItem/oneOf/14/properties/failure"
-    },
-    {
-      "classification": "additive",
-      "kind": "optional_property_added",
-      "path": "roots/notification.item.completed/definitions/ThreadItem/oneOf/14/properties/transparentBackground"
-    },
-    {
-      "classification": "additive",
-      "kind": "optional_property_added",
-      "path": "roots/notification.item.completed/definitions/ThreadItem/oneOf/2/properties/delivery"
-    },
-    {
-      "classification": "additive",
-      "kind": "optional_property_added",
-      "path": "roots/notification.item.completed/definitions/ThreadItem/oneOf/7/properties/readOnlyHint"
-    },
-    {
-      "classification": "additive",
-      "kind": "optional_property_added",
-      "path": "roots/notification.thread.started/definitions/Thread/properties/section"
-    },
-    {
-      "classification": "additive",
-      "kind": "optional_property_added",
-      "path": "roots/notification.thread.started/definitions/Thread/properties/sectionEnteredAt"
-    },
-    {
-      "classification": "additive",
-      "kind": "optional_property_added",
-      "path": "roots/thread.list.params/properties/projectId"
-    },
-    {
-      "classification": "additive",
-      "kind": "optional_property_added",
-      "path": "roots/thread.list.params/properties/sectionId"
-    },
-    {
-      "classification": "additive",
-      "kind": "optional_property_added",
-      "path": "roots/thread.resume.params/definitions/ResponseItem/oneOf/4/properties/encrypted_function_args"
-    },
-    {
-      "classification": "additive",
-      "kind": "optional_property_added",
-      "path": "roots/thread.start.params/properties/projectId"
-    },
-    {
       "classification": "breaking",
       "kind": "incoming_closed_values_added",
       "path": "roots/notification.error/definitions/CodexErrorInfo/oneOf/0",
@@ -176,6 +121,61 @@
     },
     {
       "classification": "breaking",
+      "kind": "optional_property_added",
+      "path": "roots/initialize.params/definitions/InitializeCapabilities/properties/extensions"
+    },
+    {
+      "classification": "breaking",
+      "kind": "optional_property_added",
+      "path": "roots/notification.item.completed/definitions/ThreadItem/oneOf/14/properties/failure"
+    },
+    {
+      "classification": "breaking",
+      "kind": "optional_property_added",
+      "path": "roots/notification.item.completed/definitions/ThreadItem/oneOf/14/properties/transparentBackground"
+    },
+    {
+      "classification": "breaking",
+      "kind": "optional_property_added",
+      "path": "roots/notification.item.completed/definitions/ThreadItem/oneOf/2/properties/delivery"
+    },
+    {
+      "classification": "breaking",
+      "kind": "optional_property_added",
+      "path": "roots/notification.item.completed/definitions/ThreadItem/oneOf/7/properties/readOnlyHint"
+    },
+    {
+      "classification": "breaking",
+      "kind": "optional_property_added",
+      "path": "roots/notification.thread.started/definitions/Thread/properties/section"
+    },
+    {
+      "classification": "breaking",
+      "kind": "optional_property_added",
+      "path": "roots/notification.thread.started/definitions/Thread/properties/sectionEnteredAt"
+    },
+    {
+      "classification": "breaking",
+      "kind": "optional_property_added",
+      "path": "roots/thread.list.params/properties/projectId"
+    },
+    {
+      "classification": "breaking",
+      "kind": "optional_property_added",
+      "path": "roots/thread.list.params/properties/sectionId"
+    },
+    {
+      "classification": "breaking",
+      "kind": "optional_property_added",
+      "path": "roots/thread.resume.params/definitions/ResponseItem/oneOf/4/properties/encrypted_function_args"
+    },
+    {
+      "classification": "breaking",
+      "kind": "optional_property_added",
+      "path": "roots/thread.start.params/properties/projectId"
+    },
+    {
+      "classification": "breaking",
       "kind": "property_removed",
       "path": "roots/notification.thread.started/definitions/Thread/properties/isPinned"
     },
@@ -199,8 +199,8 @@
   "formatVersion": 1,
   "protocolFamily": "codex-app-server-jsonrpc/v1+v2-experimental",
   "summary": {
-    "additive": 21,
-    "breaking": 12,
+    "additive": 10,
+    "breaking": 23,
     "total": 33
   }
 }

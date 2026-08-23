@@ -99,8 +99,10 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-      - run: cargo nextest run --all-targets --profile ci --locked
-      - run: cargo test --doc --locked
+      - run: cargo nextest run --all-targets --all-features --profile ci --locked
+      - run: cargo test --doc --all-features --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   docs:
     name: Docs (rustdoc)
@@ -126,7 +128,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv
-      - run: cargo check --all-targets --locked
+      - run: cargo check --all-targets --all-features --locked
 
   build:
     name: Release build (Linux)
@@ -224,10 +226,17 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-      - run: cargo nextest run --all-targets --profile ci --locked
+      - name: Exercise portable Codex schema safety boundaries
+        run: python -m unittest discover -s tools/tests -p 'test_*.py'
+      - name: Verify committed Codex schema artifacts offline
+        run: python tools/codex_schema.py verify
+      - run: cargo nextest run --all-targets --all-features --profile ci --locked
       - run: cargo build --locked

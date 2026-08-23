@@ -500,8 +500,10 @@ fn candidate_only_section_position_remains_unknown_in_the_stable_domain() {
         serde_json::to_value(stable).expect("unknown sort key should remain serializable"),
         json!("section_position")
     );
-    let mut params = types::ThreadListParams::default();
-    params.sort_key = Some(types::ThreadSortKey::Unknown("section_position".to_owned()));
+    let params = types::ThreadListParams {
+        sort_key: Some(types::ThreadSortKey::Unknown("section_position".to_owned())),
+        ..types::ThreadListParams::default()
+    };
     assert!(
         WireAdapter::V0_146_0.thread_list_params(&params).is_err(),
         "candidate-only sort keys must not leak onto the supported 0.146 wire"
@@ -511,8 +513,10 @@ fn candidate_only_section_position_remains_unknown_in_the_stable_domain() {
 #[test]
 fn supported_adapter_rejects_outgoing_values_outside_the_0_146_schema() {
     let adapter = WireAdapter::V0_146_0;
-    let mut start = types::ThreadStartParams::default();
-    start.approval_policy = Some(types::ApprovalPolicy::Named("future-policy".to_owned()));
+    let start = types::ThreadStartParams {
+        approval_policy: Some(types::ApprovalPolicy::Named("future-policy".to_owned())),
+        ..types::ThreadStartParams::default()
+    };
     assert!(adapter.thread_start_params(&start).is_err());
 
     let mut turn = types::TurnStartParams::new("thread-contract-1", vec![]);
