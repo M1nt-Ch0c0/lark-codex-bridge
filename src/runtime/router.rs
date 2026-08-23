@@ -836,7 +836,7 @@ async fn retry_one(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
 async fn route_one(
     store: &StoreHandle,
     tenant: &TenantNamespace,
