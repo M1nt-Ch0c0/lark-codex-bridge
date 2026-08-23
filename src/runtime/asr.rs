@@ -2615,13 +2615,11 @@ mod tests {
             dir.path(),
             "windows-job-tree",
             "",
-            &format!(
-                "@echo off\r\npowershell.exe -NoProfile -NonInteractive -Command \"$p=Start-Process ping.exe -ArgumentList '-t','127.0.0.1' -PassThru; Set-Content -LiteralPath '{}' -Value $p.Id; Wait-Process -Id $p.Id\"\r\n",
-                marker.display()
-            ),
+            "@echo off\r\npowershell.exe -NoProfile -NonInteractive -Command \"$p=Start-Process ping.exe -ArgumentList '-t','127.0.0.1' -PassThru; Set-Content -LiteralPath $env:LCB_JOB_TEST_MARKER -Encoding ascii -Value $p.Id; Wait-Process -Id $p.Id\"\r\n",
         );
         let mut command = Command::new(script);
         command
+            .env("LCB_JOB_TEST_MARKER", &marker)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -2643,18 +2641,22 @@ mod tests {
                 .await,
             Err(AsrError::SidecarFailed)
         );
-        let pid = pid.to_string();
-        let status = std::process::Command::new("powershell.exe")
+        let output = std::process::Command::new("powershell.exe")
             .args([
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                "if (Get-Process -Id $args[0] -ErrorAction SilentlyContinue) { exit 9 } else { exit 0 }",
-                pid.as_str(),
+                "$targetPid = [uint32]0; if (-not [uint32]::TryParse($env:LCB_JOB_TEST_PID, [ref]$targetPid) -or $targetPid -eq 0) { Write-Error 'invalid descendant pid'; exit 8 }; if (Get-Process -Id $targetPid -ErrorAction SilentlyContinue) { exit 9 } else { exit 0 }",
             ])
-            .status()
+            .env("LCB_JOB_TEST_PID", pid.to_string())
+            .output()
             .expect("query descendant");
-        assert!(status.success(), "Job Object must terminate the descendant");
+        assert!(
+            output.status.success(),
+            "Job Object must terminate the descendant (status: {}; stderr: {})",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
 
     #[cfg(unix)]
