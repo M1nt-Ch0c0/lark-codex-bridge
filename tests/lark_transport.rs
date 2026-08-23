@@ -842,7 +842,7 @@ async fn shutdown_is_bounded_even_with_a_stuck_handler() {
 #[tokio::test]
 async fn malformed_bootstrap_response_degrades_without_retry() {
     // A malformed endpoint response is a protocol violation; retrying the
-    // same unparseable body cannot succeed, so the transport fails closed.
+    // same unparsable body cannot succeed, so the transport fails closed.
     let stub = StubServer::start(Arc::new(|_| {
         StubResponse::json(200, r#"{"code":0,"msg":"ok"}"#)
     }))

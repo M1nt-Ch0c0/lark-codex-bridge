@@ -370,7 +370,7 @@ fn ensure_success(status: StatusCode, context: &'static str) -> Result<(), LarkE
     // nothing was sent. Keep the `ProtocolViolation` kind (so the transport
     // still treats an explicit bootstrap rejection as fatal) but carry the
     // HTTP status as a `code` so the delivery classifier can tell a rejected
-    // (safe-to-retry, bounded) send from an unparseable response.
+    // (safe-to-retry, bounded) send from an unparsable response.
     Err(LarkError::ProtocolViolation { context, code })
 }
 

@@ -36,6 +36,14 @@ roots and their transitive definitions, canonicalizes JSON, and writes:
 The manifest contains no timestamp, host path, or binary path. Re-running `--check`
 with the same binary must be byte-for-byte identical.
 
+Both the version probe and export run from the same disposable private workspace.
+They receive a fresh `CODEX_HOME`, home, configuration, cache, temp directory, and
+working directory (mode `0700` on POSIX), plus only a small platform environment
+allowlist. The real profile, repository working directory, credentials, proxy
+settings, and language-runtime option variables are not inherited. POSIX process
+groups and Windows kill-on-close Job Objects own the complete subprocess tree, and
+the private workspace is removed after success or failure.
+
 ## Review a candidate
 
 Add the exact version to `candidateVersions`, sync it, add a versioned contract
@@ -51,9 +59,16 @@ python3 tools/codex_schema.py verify
 The JSON report is the machine-readable source of truth. Its conservative
 comparison covers type relationships (including integer as a subset of number),
 finite enum/const sets, object/array/string/numeric constraints, and JSON Schema
-combinators. An incoming enum or union addition is breaking unless the generated
-audit points to a tested open fallback. Changes the comparator cannot prove safe
-are blocking, not silently additive.
+combinators. Reference and schema-draft changes, including boolean schemas at any
+selected position, are classified explicitly. Draft-07 identifier scopes and the
+bounded transitive reference closure are fingerprinted so indirect edits in
+exclusive, negative, or conditional contexts fail closed. Optional property
+additions are additive only when prior `additionalProperties` and
+`patternProperties` behavior proves that declaring the name cannot reject an old
+instance. JSON numbers use exact integer or binary-rational identities rather than
+floating-point coercion. An incoming enum or union addition is breaking unless the
+generated audit points to a tested open fallback. Changes the comparator cannot
+prove safe are blocking, not silently additive.
 
 Promotion requires adding an append-only support-history record, moving the version
 to `supportedVersions`, adding its explicit `WireAdapter` branch, and passing offline
@@ -70,6 +85,10 @@ Rust tests drive those records through the production wire adapter, JSONL
 encoder/decoder bounds, notification mapping, and actual retry classifier; the
 Python validator checks the records against their selected schemas. Tool errors
 identify only a contract/root label and never echo fixture or remote payload text.
+Every maintenance command also shares one deadline and aggregate byte, JSON-node,
+work, and classified-change budget; each input has its own byte, node, and nesting
+limit. Non-regular files and over-budget artifacts fail closed before they can be
+trusted.
 
 At runtime the supervisor probes the exact binary version before initialization and
 selects only a promoted adapter. Every outgoing request and reverse response is

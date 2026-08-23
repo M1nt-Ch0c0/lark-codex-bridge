@@ -116,7 +116,8 @@ impl CodexProcess {
     ///
     /// # Errors
     ///
-    /// Returns [`ProcessError::MissingStdio`] if the pipes were already taken.
+    /// Returns [`ProcessError::StdioAlreadyTaken`] if the pipes were transferred,
+    /// or [`ProcessError::StdioUnavailable`] for an incomplete pipe set.
     pub fn take_stdio(&mut self) -> Result<(ChildStdout, ChildStdin, ChildStderr), ProcessError> {
         if self.stdout.is_none() && self.stdin.is_none() && self.stderr.is_none() {
             return Err(ProcessError::StdioAlreadyTaken);

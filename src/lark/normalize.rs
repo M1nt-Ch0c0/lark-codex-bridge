@@ -1004,6 +1004,10 @@ struct EventMention {
 }
 
 #[derive(Default, Deserialize)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "the field names mirror the Feishu/Lark wire object"
+)]
 struct EventMentionId {
     open_id: Option<String>,
     user_id: Option<String>,

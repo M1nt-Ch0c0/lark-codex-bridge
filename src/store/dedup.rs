@@ -943,6 +943,10 @@ fn encode_event(event: &InboundEvent) -> Result<Vec<u8>, StoreError> {
     Ok(payload)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the complete inbound invariant set remains auditable in one validator"
+)]
 fn validate_event(event: &InboundEvent) -> Result<(), StoreError> {
     validate_incoming_key(event)?;
     validate_id(&event.chat_id, "validating an inbound chat ID")?;
