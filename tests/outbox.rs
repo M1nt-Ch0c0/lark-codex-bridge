@@ -20,12 +20,12 @@ use lark_codex_bridge::lark::http::LarkHttp;
 use lark_codex_bridge::lark::normalize::{InboundEvent, ScopeKey};
 use lark_codex_bridge::lark::token::TenantTokenProvider;
 use lark_codex_bridge::lark::transport::TransportState;
-use lark_codex_bridge::limits::STORE_OUTBOX_MAX_ATTEMPTS;
+use lark_codex_bridge::limits::{LARK_CARD_MARKDOWN_ELEMENT_MAX_BYTES, STORE_OUTBOX_MAX_ATTEMPTS};
 use lark_codex_bridge::outbox::{
     AppliedCertainty, DeliveryClass, OutboxError, OutboxOperation, OutboxPump, OutboxPumpConfig,
     OutboxReplySink, Retryability, classify_delivery, delivery_decision,
 };
-use lark_codex_bridge::render::ProjectedReply;
+use lark_codex_bridge::render::{ProjectedReply, card_markdown_element_wire_len};
 use lark_codex_bridge::runtime::scope::{
     DurableReplySink, TurnFinalization, TurnProgress, TurnSource,
 };
@@ -35,6 +35,7 @@ use lark_codex_bridge::store::{
 use larkstub::{Handler, RecordedRequest, StubResponse, StubServer};
 use secrecy::SecretString;
 use serde_json::Map;
+use tempfile::tempdir;
 use tokio::sync::watch;
 use url::Url;
 
@@ -129,6 +130,35 @@ fn card_markdown(request: &RecordedRequest) -> String {
         .as_str()
         .expect("card should carry Markdown")
         .to_owned()
+}
+
+fn card_fences_are_balanced(markdown: &str) -> bool {
+    let mut open: Option<(char, usize)> = None;
+    for line in markdown.lines() {
+        let trimmed = line.trim().trim_start_matches('>').trim_start();
+        let Some(marker @ ('`' | '~')) = trimmed.chars().next() else {
+            continue;
+        };
+        let run = trimmed
+            .chars()
+            .take_while(|character| *character == marker)
+            .count();
+        if run < 3 {
+            continue;
+        }
+        match open {
+            Some((current, length))
+                if current == marker
+                    && run >= length
+                    && trimmed.chars().skip(run).all(char::is_whitespace) =>
+            {
+                open = None;
+            }
+            None => open = Some((marker, run)),
+            _ => {}
+        }
+    }
+    open.is_none()
 }
 
 fn fast_config() -> OutboxPumpConfig {
@@ -439,6 +469,25 @@ fn delivery_classification_distinguishes_the_three_outcomes() {
     assert_eq!(
         classify_delivery(&LarkError::Retryable {
             context: "send",
+            code: Some(500),
+        }),
+        DeliveryClass::Uncertain,
+        "an HTTP 5xx can follow an applied POST"
+    );
+    assert_eq!(
+        delivery_decision(&LarkError::Retryable {
+            context: "send",
+            code: Some(502),
+        }),
+        lark_codex_bridge::outbox::DeliveryDecision {
+            applied: AppliedCertainty::Uncertain,
+            retryability: Retryability::Retryable,
+        },
+        "5xx usefulness for idempotent PATCH is separate from POST certainty"
+    );
+    assert_eq!(
+        classify_delivery(&LarkError::Retryable {
+            context: "send",
             code: None,
         }),
         DeliveryClass::Uncertain
@@ -687,6 +736,117 @@ async fn progress_cards_are_created_updated_and_finalized_through_the_outbox() {
 }
 
 #[tokio::test]
+async fn card2_projection_and_element_cap_cover_v2_and_v1_create_update_final_replay() {
+    let server = StubServer::start(token_plus(|request| {
+        if request.method == "POST" {
+            ok_message("om_progress")
+        } else {
+            StubResponse::json(200, r#"{"code":0,"data":{}}"#)
+        }
+    }))
+    .await;
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let raw = format!(
+        "```text\n{}\n```\n&lt;at id=\"ou_encoded\"&gt;hidden&lt;/at&gt;",
+        "界\"\\\n".repeat(8_000)
+    );
+
+    let sink = OutboxReplySink::new(store.clone());
+    sink.progress(TurnProgress {
+        turn_row_id: 201,
+        scope_key: "im:oc_chat".to_owned(),
+        source: source("evt_1", "om_parent"),
+        sequence: 0,
+        text: raw.clone(),
+    })
+    .await
+    .expect("v2 create");
+    sink.progress(TurnProgress {
+        turn_row_id: 201,
+        scope_key: "im:oc_chat".to_owned(),
+        source: source("evt_1", "om_parent"),
+        sequence: 1,
+        text: raw.clone(),
+    })
+    .await
+    .expect("v2 update");
+    sink.finalize_projected(
+        completed_finalization(201, "ignored"),
+        ProjectedReply::ProgressFinal { text: raw.clone() },
+    )
+    .await
+    .expect("v2 final");
+
+    for (key, kind, payload) in [
+        (
+            "202:progress",
+            "progress",
+            serde_json::json!({
+                "version": 1,
+                "op": "reply_progress_card",
+                "message_id": "om_parent",
+                "text": raw.clone(),
+            }),
+        ),
+        (
+            "202:progress:1",
+            "progress",
+            serde_json::json!({
+                "version": 1,
+                "op": "update_progress_card",
+                "anchor_key": "202:progress",
+                "text": raw.clone(),
+            }),
+        ),
+        (
+            "202:progress:final",
+            "final",
+            serde_json::json!({
+                "version": 1,
+                "op": "finalize_progress_card",
+                "message_id": "om_parent",
+                "anchor_key": "202:progress",
+                "text": raw.clone(),
+            }),
+        ),
+    ] {
+        store
+            .enqueue_outbox(NewOutboxRow {
+                idempotency_key: key.to_owned(),
+                scope_key: "im:oc_chat".to_owned(),
+                kind: kind.to_owned(),
+                payload_json: serde_json::to_string(&payload).expect("legacy payload"),
+                next_retry_ms: 0,
+            })
+            .await
+            .expect("enqueue legacy replay");
+    }
+
+    let (_, rx) = watch::channel(TransportState::Connected);
+    let pump = OutboxPump::spawn(store.clone(), api_for(&server), rx, fast_config());
+    wait_for_state(&store, 6, OutboxState::Sent).await;
+    let requests = reply_requests(&server);
+    assert_eq!(requests.len(), 6);
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.method.as_str())
+            .collect::<Vec<_>>(),
+        ["POST", "PATCH", "PATCH", "POST", "PATCH", "PATCH"]
+    );
+    for request in &requests {
+        let markdown = card_markdown(request);
+        assert!(markdown.ends_with("…[truncated]"));
+        assert!(!markdown.contains("<at"));
+        assert!(!markdown.contains("ou_encoded"));
+        assert!(markdown.len() <= LARK_CARD_MARKDOWN_ELEMENT_MAX_BYTES);
+        assert!(card_markdown_element_wire_len(&markdown) <= LARK_CARD_MARKDOWN_ELEMENT_MAX_BYTES);
+        assert!(card_fences_are_balanced(&markdown));
+    }
+    pump.shutdown().await;
+}
+
+#[tokio::test]
 async fn permanent_final_patch_failure_persists_one_deterministic_post_fallback() {
     let server = StubServer::start(token_plus(|request| {
         if request.method == "PATCH" {
@@ -840,6 +1000,147 @@ async fn malformed_final_patch_response_is_uncertain_and_never_falls_back() {
     let requests = reply_requests(&server);
     assert_eq!(requests.len(), 2, "uncertain PATCH must not trigger a post");
     assert_eq!(requests[1].method, "PATCH");
+    pump.shutdown().await;
+}
+
+#[tokio::test]
+async fn applied_then_5xx_final_patch_exhaustion_is_uncertain_across_restart() {
+    let patches = Arc::new(AtomicUsize::new(0));
+    let server = StubServer::start(token_plus({
+        let patches = Arc::clone(&patches);
+        move |request| {
+            if request.method == "PATCH" {
+                let attempt = patches.fetch_add(1, Ordering::SeqCst);
+                // The stub models a server that applied the idempotent update
+                // and then lost the successful response behind a 500/502.
+                let status = if attempt % 2 == 0 { 500 } else { 502 };
+                StubResponse::json(status, r#"{"code":0,"data":{}}"#)
+            } else {
+                ok_message("om_progress")
+            }
+        }
+    }))
+    .await;
+    let temp = tempdir().expect("tempdir");
+    let db = temp.path().join("patch-restart.sqlite");
+    let store = StoreHandle::open(&db).await.expect("store");
+    let sink = OutboxReplySink::new(store.clone());
+    sink.progress(TurnProgress {
+        turn_row_id: 94,
+        scope_key: "im:oc_chat".to_owned(),
+        source: source("evt_1", "om_parent"),
+        sequence: 0,
+        text: "working".to_owned(),
+    })
+    .await
+    .expect("progress");
+    sink.finalize_projected(
+        completed_finalization(94, "ignored"),
+        ProjectedReply::ProgressFinal {
+            text: "complete".to_owned(),
+        },
+    )
+    .await
+    .expect("finalize");
+
+    let (_, rx) = watch::channel(TransportState::Connected);
+    let pump = OutboxPump::spawn(store.clone(), api_for(&server), rx, fast_config());
+    let row = wait_for_state(&store, 2, OutboxState::UncertainDelivery).await;
+    assert_eq!(row.attempts, STORE_OUTBOX_MAX_ATTEMPTS);
+    let requests = reply_requests(&server);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == "PATCH")
+            .count(),
+        usize::try_from(STORE_OUTBOX_MAX_ATTEMPTS).unwrap()
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == "POST")
+            .count(),
+        1,
+        "only the initial card create is a POST; no fallback may follow 5xx"
+    );
+    pump.shutdown().await;
+    drop(sink);
+    store.shutdown().await.expect("close store");
+
+    let before_restart = reply_requests(&server).len();
+    let reopened = StoreHandle::open(&db).await.expect("reopen store");
+    let (_, rx) = watch::channel(TransportState::Connected);
+    let restarted = OutboxPump::spawn(reopened.clone(), api_for(&server), rx, fast_config());
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    assert_eq!(
+        reply_requests(&server).len(),
+        before_restart,
+        "uncertain final PATCH is never replayed or converted after restart"
+    );
+    assert_eq!(
+        reopened
+            .outbox_row(2)
+            .await
+            .expect("row")
+            .expect("exists")
+            .state,
+        OutboxState::UncertainDelivery
+    );
+    restarted.shutdown().await;
+    reopened.shutdown().await.expect("close reopened store");
+}
+
+#[tokio::test]
+async fn applied_then_5xx_progress_update_retries_idempotently_then_stays_uncertain() {
+    let server = StubServer::start(token_plus(|request| {
+        if request.method == "PATCH" {
+            StubResponse::json(502, r#"{"code":0,"data":{}}"#)
+        } else {
+            ok_message("om_progress")
+        }
+    }))
+    .await;
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = OutboxReplySink::new(store.clone());
+    let progress_source = source("evt_1", "om_parent");
+    sink.progress(TurnProgress {
+        turn_row_id: 95,
+        scope_key: "im:oc_chat".to_owned(),
+        source: progress_source.clone(),
+        sequence: 0,
+        text: "working".to_owned(),
+    })
+    .await
+    .expect("create");
+    sink.progress(TurnProgress {
+        turn_row_id: 95,
+        scope_key: "im:oc_chat".to_owned(),
+        source: progress_source,
+        sequence: 1,
+        text: "still working".to_owned(),
+    })
+    .await
+    .expect("update");
+
+    let (_, rx) = watch::channel(TransportState::Connected);
+    let pump = OutboxPump::spawn(store.clone(), api_for(&server), rx, fast_config());
+    let row = wait_for_state(&store, 2, OutboxState::UncertainDelivery).await;
+    assert_eq!(row.attempts, STORE_OUTBOX_MAX_ATTEMPTS);
+    let requests = reply_requests(&server);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == "PATCH")
+            .count(),
+        usize::try_from(STORE_OUTBOX_MAX_ATTEMPTS).unwrap()
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == "POST")
+            .count(),
+        1
+    );
     pump.shutdown().await;
 }
 
@@ -1202,6 +1503,49 @@ async fn explicit_http_4xx_validation_rejection_is_permanent_not_uncertain() {
     );
 
     pump.shutdown().await;
+}
+
+#[tokio::test]
+async fn applied_then_http_500_post_is_uncertain_and_never_replayed_after_restart() {
+    let server = StubServer::start(token_plus(|_| {
+        // Model a non-idempotent reply that was committed before an upstream
+        // proxy replaced the success response with HTTP 500.
+        StubResponse::json(500, r#"{"code":0,"data":{}}"#)
+    }))
+    .await;
+    let temp = tempdir().expect("tempdir");
+    let db = temp.path().join("post-restart.sqlite");
+    let store = StoreHandle::open(&db).await.expect("store");
+    let id = enqueue_reply(&store, "1:final:evt_1", "om_parent", None, "the answer").await;
+    let (_, rx) = watch::channel(TransportState::Connected);
+    let pump = OutboxPump::spawn(store.clone(), api_for(&server), rx, fast_config());
+
+    let row = wait_for_state(&store, id, OutboxState::UncertainDelivery).await;
+    assert_eq!(row.attempts, 1);
+    assert_eq!(
+        reply_requests(&server).len(),
+        1,
+        "a POST that receives 5xx must not be blindly retried"
+    );
+    pump.shutdown().await;
+    store.shutdown().await.expect("close store");
+
+    let reopened = StoreHandle::open(&db).await.expect("reopen store");
+    let (_, rx) = watch::channel(TransportState::Connected);
+    let restarted = OutboxPump::spawn(reopened.clone(), api_for(&server), rx, fast_config());
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    assert_eq!(reply_requests(&server).len(), 1);
+    assert_eq!(
+        reopened
+            .outbox_row(id)
+            .await
+            .expect("row")
+            .expect("exists")
+            .state,
+        OutboxState::UncertainDelivery
+    );
+    restarted.shutdown().await;
+    reopened.shutdown().await.expect("close reopened store");
 }
 
 #[tokio::test]

@@ -5,7 +5,9 @@
 //! readable, and closes fenced code blocks before any snapshot is sent.
 
 use crate::lark::api::post_markdown_reply_body_len;
-use crate::limits::REPLY_TRUNCATION_MARKER;
+use crate::limits::{LARK_CARD_MARKDOWN_ELEMENT_MAX_BYTES, REPLY_TRUNCATION_MARKER};
+
+const MAX_SAFE_FENCE_MARKER_CHARS: usize = 64;
 
 /// Converts model-produced Markdown into the deterministic subset carried by
 /// a Lark `post` element with `tag=md`.
@@ -22,7 +24,7 @@ pub fn render_lark_markdown(input: &str) -> String {
     project_markdown(input, MarkdownCarrier::Post)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MarkdownCarrier {
     Post,
     Card2,
@@ -35,59 +37,61 @@ fn project_markdown(input: &str, carrier: MarkdownCarrier) -> String {
     let mut index = 0;
 
     while index < lines.len() {
-        let line = lines[index];
-        if let Some(source_fence) = parse_opening_fence(line) {
+        let line = parse_container_line(lines[index]);
+        if let Some(source_fence) = parse_opening_fence(line.body) {
             let mut end = index + 1;
-            while end < lines.len() && !is_closing_fence(lines[end], &source_fence) {
+            while end < lines.len() {
+                let candidate = parse_container_line(lines[end]);
+                if candidate.quoted == line.quoted
+                    && is_closing_fence(candidate.body, &source_fence)
+                {
+                    break;
+                }
                 end += 1;
             }
-            let marker_len = lines[index + 1..end]
+            let content = lines[index + 1..end]
                 .iter()
-                .map(|content| longest_run(content, '`'))
-                .max()
-                .unwrap_or(0)
-                .saturating_add(1)
-                .max(3);
-            let canonical = Fence {
-                marker: '`',
-                length: marker_len,
-                language: source_fence.language,
-            };
-            push_line(&mut rendered, canonical.opening_line());
-            for content in &lines[index + 1..end] {
-                push_line(&mut rendered, (*content).to_owned());
+                .map(|content| parse_container_line(content).body.to_owned())
+                .collect::<Vec<_>>();
+            let (canonical, content) = canonical_fence(content, source_fence.language);
+            push_line(
+                &mut rendered,
+                quote_line(line.quoted, canonical.opening_line()),
+            );
+            for content_line in content {
+                push_line(&mut rendered, quote_line(line.quoted, content_line));
             }
-            push_line(&mut rendered, canonical.closing_line());
+            push_line(
+                &mut rendered,
+                quote_line(line.quoted, canonical.closing_line()),
+            );
             index = if end < lines.len() { end + 1 } else { end };
             continue;
         }
 
-        if index + 1 < lines.len()
-            && contains_table_pipe(line)
-            && is_table_delimiter(lines[index + 1])
-        {
+        if index + 1 < lines.len() && contains_table_pipe(line.body) && {
+            let delimiter = parse_container_line(lines[index + 1]);
+            delimiter.quoted == line.quoted && is_table_delimiter(delimiter.body)
+        } {
             let mut table = Vec::new();
-            while index < lines.len() && contains_table_pipe(lines[index]) {
-                table.push(sanitize_inline(lines[index], carrier).trim().to_owned());
+            while index < lines.len() {
+                let candidate = parse_container_line(lines[index]);
+                if candidate.quoted != line.quoted || !contains_table_pipe(candidate.body) {
+                    break;
+                }
+                table.push(sanitize_inline(candidate.body, carrier).trim().to_owned());
                 index += 1;
             }
-            let marker_len = table
-                .iter()
-                .map(|line| longest_run(line, '`'))
-                .max()
-                .unwrap_or(0)
-                .saturating_add(1)
-                .max(3);
-            let marker = "`".repeat(marker_len);
-            push_line(&mut rendered, format!("{marker}text"));
+            let (fence, table) = canonical_fence(table, "text".to_owned());
+            push_line(&mut rendered, quote_line(line.quoted, fence.opening_line()));
             for table_line in table {
-                push_line(&mut rendered, table_line);
+                push_line(&mut rendered, quote_line(line.quoted, table_line));
             }
-            push_line(&mut rendered, marker);
+            push_line(&mut rendered, quote_line(line.quoted, fence.closing_line()));
             continue;
         }
 
-        push_line(&mut rendered, normalize_line(line, carrier));
+        push_line(&mut rendered, normalize_line(lines[index], carrier));
         index += 1;
     }
 
@@ -102,7 +106,20 @@ fn project_markdown(input: &str, carrier: MarkdownCarrier) -> String {
 /// complete the original fence naturally.
 #[must_use]
 pub fn stabilize_streaming_markdown(input: &str) -> String {
-    project_markdown(input, MarkdownCarrier::Card2)
+    let projected = project_markdown(input, MarkdownCarrier::Card2);
+    bound_card_markdown(&projected)
+}
+
+/// Returns the exact serialized byte length of one Card 2.0 Markdown element.
+/// This is the inner card element object Lark parses after decoding the outer
+/// `content` string, including JSON escaping and the `tag`/`content` keys.
+#[must_use]
+pub fn card_markdown_element_wire_len(markdown: &str) -> usize {
+    serde_json::to_vec(&serde_json::json!({
+        "tag": "markdown",
+        "content": markdown,
+    }))
+    .map_or(usize::MAX, |wire| wire.len())
 }
 
 /// Splits already-rendered Lark Markdown into independently valid post parts.
@@ -198,11 +215,12 @@ fn preferred_boundary(text: &str, count: usize) -> usize {
     let exact = char_boundary(text, count);
     let prefix = &text[..exact];
     let minimum = count / 2;
-    prefix
+    let preferred = prefix
         .rfind('\n')
         .map(|newline| newline + 1)
         .filter(|byte| prefix[..*byte].chars().count() >= minimum)
-        .unwrap_or(exact)
+        .unwrap_or(exact);
+    atomic_fence_boundary(text, preferred)
 }
 
 fn char_boundary(text: &str, count: usize) -> usize {
@@ -227,6 +245,88 @@ fn close_and_reopen(prefix: &str, suffix: &str) -> (String, String) {
     (part, tail)
 }
 
+fn bound_card_markdown(text: &str) -> String {
+    if card_markdown_fits(text) {
+        return text.to_owned();
+    }
+
+    let overhead = card_markdown_element_wire_len("").saturating_sub(2);
+    let suffix = format!("\n{REPLY_TRUNCATION_MARKER}");
+    let reserve = json_string_content_len(&suffix)
+        .saturating_add(MAX_SAFE_FENCE_MARKER_CHARS)
+        .saturating_add(4); // optional quote prefix plus a closing newline
+    let prefix_budget = LARK_CARD_MARKDOWN_ELEMENT_MAX_BYTES
+        .saturating_sub(overhead)
+        .saturating_sub(reserve);
+    let mut encoded = 0_usize;
+    let mut boundary = 0_usize;
+    for (index, character) in text.char_indices() {
+        let next = encoded.saturating_add(json_character_len(character));
+        if next > prefix_budget {
+            break;
+        }
+        encoded = next;
+        boundary = index + character.len_utf8();
+    }
+    boundary = atomic_fence_boundary(text, boundary);
+
+    loop {
+        let mut candidate = close_fence(&text[..boundary]);
+        if !candidate.is_empty() && !candidate.ends_with('\n') {
+            candidate.push('\n');
+        }
+        candidate.push_str(REPLY_TRUNCATION_MARKER);
+        if card_markdown_fits(&candidate) {
+            return candidate;
+        }
+        let Some((previous, _)) = text[..boundary].char_indices().next_back() else {
+            panic!("Card Markdown limit cannot hold the truncation marker");
+        };
+        boundary = atomic_fence_boundary(text, previous);
+    }
+}
+
+fn card_markdown_fits(text: &str) -> bool {
+    text.len() <= LARK_CARD_MARKDOWN_ELEMENT_MAX_BYTES
+        && card_markdown_element_wire_len(text) <= LARK_CARD_MARKDOWN_ELEMENT_MAX_BYTES
+}
+
+fn json_string_content_len(text: &str) -> usize {
+    text.chars().map(json_character_len).sum()
+}
+
+fn json_character_len(character: char) -> usize {
+    match character {
+        '"' | '\\' | '\u{0008}' | '\t' | '\n' | '\u{000c}' | '\r' => 2,
+        '\u{0000}'..='\u{001f}' => 6,
+        _ => character.len_utf8(),
+    }
+}
+
+fn atomic_fence_boundary(text: &str, boundary: usize) -> usize {
+    if boundary == 0 || boundary >= text.len() {
+        return boundary;
+    }
+    let line_start = text[..boundary].rfind('\n').map_or(0, |index| index + 1);
+    let line_end = text[boundary..]
+        .find('\n')
+        .map_or(text.len(), |offset| boundary + offset);
+    if boundary == line_start || boundary == line_end {
+        return boundary;
+    }
+    let line = parse_container_line(&text[line_start..line_end]);
+    let active = open_fence_at_end(&text[..line_start]);
+    let delimiter_is_atomic = active.as_ref().map_or_else(
+        || parse_opening_fence(line.body).is_some(),
+        |open| line.quoted == open.quoted && is_closing_fence(line.body, &open.fence),
+    );
+    if delimiter_is_atomic {
+        line_start
+    } else {
+        boundary
+    }
+}
+
 fn close_fence(prefix: &str) -> String {
     let Some(open) = open_fence_at_end(prefix) else {
         return prefix.to_owned();
@@ -244,6 +344,138 @@ struct Fence {
     marker: char,
     length: usize,
     language: String,
+}
+
+struct OpenFence {
+    fence: Fence,
+    quoted: bool,
+}
+
+impl OpenFence {
+    fn opening_line(&self) -> String {
+        quote_line(self.quoted, self.fence.opening_line())
+    }
+
+    fn closing_line(&self) -> String {
+        quote_line(self.quoted, self.fence.closing_line())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ListContainer<'a> {
+    Unordered,
+    Ordered(&'a str),
+}
+
+#[derive(Clone, Copy)]
+struct ContainerLine<'a> {
+    quoted: bool,
+    list: Option<ListContainer<'a>>,
+    body: &'a str,
+}
+
+fn parse_container_line(line: &str) -> ContainerLine<'_> {
+    let mut body = line.trim_start();
+    let mut quoted = false;
+    let mut list = None;
+    loop {
+        if let Some(rest) = body.strip_prefix('>') {
+            quoted = true;
+            body = rest.trim_start();
+            continue;
+        }
+        if let Some(rest) = ["- ", "* ", "+ "]
+            .iter()
+            .find_map(|prefix| body.strip_prefix(prefix))
+        {
+            list.get_or_insert(ListContainer::Unordered);
+            body = rest.trim_start();
+            continue;
+        }
+        let digits = body.chars().take_while(char::is_ascii_digit).count();
+        if digits > 0 {
+            let number = &body[..digits];
+            let rest = &body[digits..];
+            if let Some(rest) = rest.strip_prefix(". ").or_else(|| rest.strip_prefix(") ")) {
+                list.get_or_insert(ListContainer::Ordered(number));
+                body = rest.trim_start();
+                continue;
+            }
+        }
+        break;
+    }
+    ContainerLine { quoted, list, body }
+}
+
+fn quote_line(quoted: bool, line: String) -> String {
+    if !quoted {
+        return line;
+    }
+    if line.is_empty() {
+        ">".to_owned()
+    } else {
+        format!("> {line}")
+    }
+}
+
+fn canonical_fence(mut content: Vec<String>, language: String) -> (Fence, Vec<String>) {
+    let backticks = required_fence_length(&content, '`');
+    let tildes = required_fence_length(&content, '~');
+    let (marker, length) = if backticks <= tildes {
+        ('`', backticks)
+    } else {
+        ('~', tildes)
+    };
+    if length <= MAX_SAFE_FENCE_MARKER_CHARS {
+        return (
+            Fence {
+                marker,
+                length,
+                language,
+            },
+            content,
+        );
+    }
+
+    // Pathological content can contain delimiter-only lines longer than the
+    // complete Card2 element budget. Prefixing only such lines keeps them
+    // readable while guaranteeing one small, atomic fence delimiter.
+    for line in &mut content {
+        if delimiter_only_run(line, '`') >= 3 {
+            line.insert_str(0, "│ ");
+        }
+    }
+    (
+        Fence {
+            marker: '`',
+            length: 3,
+            language,
+        },
+        content,
+    )
+}
+
+fn required_fence_length(content: &[String], marker: char) -> usize {
+    content
+        .iter()
+        .map(|line| delimiter_only_run(line, marker))
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
+        .max(3)
+}
+
+fn delimiter_only_run(line: &str, marker: char) -> usize {
+    let trimmed = line.trim();
+    let run = trimmed
+        .chars()
+        .take_while(|character| *character == marker)
+        .count();
+    if run >= 3 && trimmed.chars().skip(run).all(char::is_whitespace) {
+        run
+    } else {
+        0
+    }
 }
 
 impl Fence {
@@ -305,31 +537,29 @@ fn is_closing_fence(line: &str, open: &Fence) -> bool {
     count >= open.length && trimmed.chars().skip(count).all(char::is_whitespace)
 }
 
-fn open_fence_at_end(text: &str) -> Option<Fence> {
-    let mut open: Option<Fence> = None;
+fn open_fence_at_end(text: &str) -> Option<OpenFence> {
+    let mut open: Option<OpenFence> = None;
     for line in text.lines() {
+        let parsed = parse_container_line(line);
         if let Some(current) = open.as_ref() {
-            if is_closing_fence(line, current) {
+            if parsed.quoted == current.quoted && is_closing_fence(parsed.body, &current.fence) {
                 open = None;
             }
         } else {
-            open = parse_opening_fence(line);
+            open = parse_opening_fence(parsed.body).map(|fence| OpenFence {
+                fence,
+                quoted: parsed.quoted,
+            });
         }
     }
     open
 }
 
 fn normalize_line(line: &str, carrier: MarkdownCarrier) -> String {
-    let mut body = line.trim();
+    let parsed = parse_container_line(line);
+    let body = parsed.body.trim();
     if body.is_empty() {
         return String::new();
-    }
-
-    let quoted = body.starts_with('>');
-    if quoted {
-        while let Some(rest) = body.strip_prefix('>') {
-            body = rest.trim_start();
-        }
     }
 
     let normalized = if let Some((identifier, text)) = footnote_definition(body) {
@@ -341,22 +571,21 @@ fn normalize_line(line: &str, carrier: MarkdownCarrier) -> String {
         )
     } else if let Some(heading) = heading_text(body) {
         format!("**{}**", sanitize_inline(heading, carrier))
-    } else if let Some((checked, text)) = task_item(body) {
+    } else if let Some((checked, text)) = task_state(body).filter(|_| parsed.list.is_some()) {
         let marker = if checked { '☑' } else { '☐' };
         format!("- {marker} {}", sanitize_inline(text, carrier))
-    } else if let Some(text) = unordered_item(body) {
-        format!("- {}", sanitize_inline(text, carrier))
-    } else if let Some((number, text)) = ordered_item(body) {
-        format!("{number}. {}", sanitize_inline(text, carrier))
+    } else if let Some(list) = parsed.list {
+        match list {
+            ListContainer::Unordered => format!("- {}", sanitize_inline(body, carrier)),
+            ListContainer::Ordered(number) => {
+                format!("{number}. {}", sanitize_inline(body, carrier))
+            }
+        }
     } else {
         sanitize_inline(body, carrier)
     };
 
-    if quoted {
-        format!("> {normalized}")
-    } else {
-        normalized
-    }
+    quote_line(parsed.quoted, normalized)
 }
 
 fn heading_text(line: &str) -> Option<&str> {
@@ -372,39 +601,15 @@ fn heading_text(line: &str) -> Option<&str> {
         .map(str::trim)
 }
 
-fn task_item(line: &str) -> Option<(bool, &str)> {
-    for prefix in ["- [", "* [", "+ ["] {
-        if let Some(rest) = line.strip_prefix(prefix) {
-            let mut chars = rest.chars();
-            let state = chars.next()?;
-            if !matches!(state, ' ' | 'x' | 'X') || chars.next()? != ']' {
-                continue;
-            }
-            let text = chars.as_str().strip_prefix(char::is_whitespace)?.trim();
-            return Some((matches!(state, 'x' | 'X'), text));
-        }
-    }
-    None
-}
-
-fn unordered_item(line: &str) -> Option<&str> {
-    ["- ", "* ", "+ "]
-        .iter()
-        .find_map(|prefix| line.strip_prefix(prefix))
-        .map(str::trim)
-}
-
-fn ordered_item(line: &str) -> Option<(&str, &str)> {
-    let digits = line.chars().take_while(char::is_ascii_digit).count();
-    if digits == 0 {
+fn task_state(line: &str) -> Option<(bool, &str)> {
+    let rest = line.strip_prefix('[')?;
+    let mut chars = rest.chars();
+    let state = chars.next()?;
+    if !matches!(state, ' ' | 'x' | 'X') || chars.next()? != ']' {
         return None;
     }
-    let number = &line[..digits];
-    let rest = &line[digits..];
-    let rest = rest
-        .strip_prefix(". ")
-        .or_else(|| rest.strip_prefix(") "))?;
-    Some((number, rest.trim()))
+    let text = chars.as_str().strip_prefix(char::is_whitespace)?.trim();
+    Some((matches!(state, 'x' | 'X'), text))
 }
 
 fn footnote_definition(line: &str) -> Option<(&str, &str)> {
@@ -446,20 +651,6 @@ fn is_table_delimiter(line: &str) -> bool {
             let cell = cell.trim().trim_matches(':').trim();
             cell.len() >= 3 && cell.chars().all(|character| character == '-')
         })
-}
-
-fn longest_run(text: &str, needle: char) -> usize {
-    let mut longest = 0;
-    let mut current = 0;
-    for character in text.chars() {
-        if character == needle {
-            current += 1;
-            longest = longest.max(current);
-        } else {
-            current = 0;
-        }
-    }
-    longest
 }
 
 fn sanitize_text(input: &str) -> String {
@@ -559,15 +750,26 @@ fn sanitize_inline(text: &str, carrier: MarkdownCarrier) -> String {
             continue;
         }
 
+        if rest.starts_with('&') {
+            if let Some((rendered, consumed)) = sanitize_entity(rest, carrier) {
+                output.push_str(&rendered);
+                cursor += consumed;
+                continue;
+            }
+        }
+
         if rest.starts_with('<') {
             if let Some(end) = rest.find('>') {
                 let inner = &rest[1..end];
-                if is_http_autolink(inner) {
+                if safe_link_target(inner, carrier) {
                     output.push('[');
                     output.push_str(inner);
                     output.push_str("](");
                     output.push_str(inner);
                     output.push(')');
+                } else if looks_like_url_target(inner) {
+                    output.push_str(inner);
+                    output.push_str(" (unsafe link target)");
                 } else if !looks_like_html_tag(inner) {
                     // Not an HTML tag, but raw angle syntax is outside both
                     // Lark carriers' supported subset. Keep it readable using
@@ -625,25 +827,32 @@ fn degrade_image(rest: &str, carrier: MarkdownCarrier) -> Option<(String, usize)
     if rest.as_bytes().get(after) == Some(&b'(') {
         if let Some(end) = find_closing_paren(rest, after) {
             let target = rest[after + 1..end].trim();
-            if !target.is_empty() {
+            if safe_link_target(target, carrier) {
                 output.push_str(" (");
                 output.push_str(target);
                 output.push(')');
+            } else if !target.is_empty() {
+                output.push_str(" (unsafe image target)");
             }
             return Some((output, end + 1));
         }
-        output.push_str(" (invalid image target)");
-        return Some((output, rest.len()));
+        output.push_str(" (invalid image target) ");
+        // Consume only the syntactic opener. The malformed target and every
+        // following byte remain visible instead of being swallowed to EOL.
+        return Some((output, after + 1));
     }
     if rest.as_bytes().get(after) == Some(&b'[') {
         if let Some(reference_end) = find_unescaped(rest, after + 1, b']') {
             let identifier = &rest[after + 1..reference_end];
             output.push_str(" (reference ");
-            output.push_str(if identifier.is_empty() {
-                &rest[2..label_end]
-            } else {
-                identifier
-            });
+            output.push_str(&sanitize_inline(
+                if identifier.is_empty() {
+                    &rest[2..label_end]
+                } else {
+                    identifier
+                },
+                carrier,
+            ));
             output.push(')');
             return Some((output, reference_end + 1));
         }
@@ -658,9 +867,15 @@ fn preserve_or_degrade_link(rest: &str, carrier: MarkdownCarrier) -> Option<(Str
     if rest.as_bytes().get(after) == Some(&b'(') {
         if let Some(end) = find_closing_paren(rest, after) {
             let target = &rest[after + 1..end];
-            return Some((format!("[{label}]({target})"), end + 1));
+            if safe_link_target(target, carrier) {
+                return Some((format!("[{label}]({target})"), end + 1));
+            }
+            return Some((format!("{label} (unsafe link target)"), end + 1));
         }
-        return Some((format!("[{label}] (invalid link target)"), rest.len()));
+        // Preserve all bytes after the malformed opener as inert/readable
+        // trailing text. Consuming the whole remainder would silently delete
+        // unrelated output after a missing `)`.
+        return Some((format!("[{label}] (invalid link target) "), after + 1));
     }
     if rest.as_bytes().get(after) == Some(&b'[') {
         if let Some(reference_end) = find_unescaped(rest, after + 1, b']') {
@@ -671,7 +886,10 @@ fn preserve_or_degrade_link(rest: &str, carrier: MarkdownCarrier) -> Option<(Str
                 identifier
             };
             return Some((
-                format!("{label} (reference {identifier})"),
+                format!(
+                    "{label} (reference {})",
+                    sanitize_inline(identifier, carrier)
+                ),
                 reference_end + 1,
             ));
         }
@@ -712,9 +930,152 @@ fn find_closing_paren(text: &str, opening: usize) -> Option<usize> {
     None
 }
 
-fn is_http_autolink(inner: &str) -> bool {
-    (inner.starts_with("https://") || inner.starts_with("http://"))
-        && !inner.chars().any(char::is_whitespace)
+fn safe_link_target(target: &str, carrier: MarkdownCarrier) -> bool {
+    let target = target.trim();
+    if target.is_empty()
+        || target.chars().any(|character| {
+            character.is_control()
+                || is_unicode_format_control(character)
+                || matches!(character, '<' | '>' | '"' | '\'' | '\\')
+                || character.is_whitespace()
+        })
+        || target.contains('&')
+        || decoded_url_has_unsafe_controls(target)
+    {
+        return false;
+    }
+    let Ok(url) = url::Url::parse(target) else {
+        return false;
+    };
+    match carrier {
+        MarkdownCarrier::Post => matches!(url.scheme(), "https" | "http" | "mailto"),
+        MarkdownCarrier::Card2 => url.scheme() == "https",
+    }
+}
+
+fn looks_like_url_target(target: &str) -> bool {
+    let Some((scheme, _)) = target.split_once(':') else {
+        return false;
+    };
+    !scheme.is_empty()
+        && scheme.chars().enumerate().all(|(index, character)| {
+            character.is_ascii_alphabetic()
+                || (index > 0 && matches!(character, '+' | '-' | '.' | '0'..='9'))
+        })
+}
+
+fn decoded_url_has_unsafe_controls(target: &str) -> bool {
+    let bytes = target.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'%' {
+            let Some(hex) = bytes.get(cursor + 1..cursor + 3) else {
+                return true;
+            };
+            let Ok(hex) = std::str::from_utf8(hex) else {
+                return true;
+            };
+            let Ok(byte) = u8::from_str_radix(hex, 16) else {
+                return true;
+            };
+            decoded.push(byte);
+            cursor += 3;
+        } else {
+            decoded.push(bytes[cursor]);
+            cursor += 1;
+        }
+    }
+    let Ok(decoded) = std::str::from_utf8(&decoded) else {
+        return true;
+    };
+    decoded.chars().any(|character| {
+        character.is_control() || is_unicode_format_control(character) || character == '\u{7f}'
+    })
+}
+
+fn sanitize_entity(rest: &str, carrier: MarkdownCarrier) -> Option<(String, usize)> {
+    let (decoded, consumed) = decode_entity(rest)?;
+    if decoded == '<' {
+        if let Some((inner, end)) = encoded_tag(rest, consumed) {
+            if looks_like_html_tag(&inner) {
+                return Some((String::new(), end));
+            }
+            return Some((format!("‹{}›", sanitize_inline(&inner, carrier)), end));
+        }
+        return Some(("‹".to_owned(), consumed));
+    }
+    if is_unicode_format_control(decoded)
+        || (decoded.is_control() && !matches!(decoded, '\n' | '\t'))
+        || decoded == '\u{7f}'
+    {
+        return Some((String::new(), consumed));
+    }
+    let rendered = match decoded {
+        // Never permit a second HTML entity decoding pass to reconstruct an
+        // active `<at>` tag or a numeric format control.
+        '&' => "＆".to_owned(),
+        '>' => "›".to_owned(),
+        character => character.to_string(),
+    };
+    Some((rendered, consumed))
+}
+
+fn encoded_tag(rest: &str, opening_len: usize) -> Option<(String, usize)> {
+    let mut cursor = opening_len;
+    while cursor < rest.len() {
+        if rest.as_bytes()[cursor] == b'>' {
+            return Some((rest[opening_len..cursor].to_owned(), cursor + 1));
+        }
+        if rest.as_bytes()[cursor] == b'&' {
+            if let Some(('>', consumed)) = decode_entity(&rest[cursor..]) {
+                return Some((rest[opening_len..cursor].to_owned(), cursor + consumed));
+            }
+        }
+        cursor += rest[cursor..]
+            .chars()
+            .next()
+            .expect("cursor is below entity-tag length")
+            .len_utf8();
+    }
+    None
+}
+
+fn decode_entity(rest: &str) -> Option<(char, usize)> {
+    let end = rest.get(1..)?.find(';')?.saturating_add(1);
+    if end > 32 {
+        return None;
+    }
+    let body = &rest[1..end];
+    let decoded = match body {
+        "lt" | "LT" => '<',
+        "gt" | "GT" => '>',
+        "amp" | "AMP" => '&',
+        "quot" | "QUOT" => '"',
+        "apos" => '\'',
+        "shy" => '\u{00ad}',
+        "lrm" => '\u{200e}',
+        "rlm" => '\u{200f}',
+        "zwnj" => '\u{200c}',
+        "zwj" => '\u{200d}',
+        "ZeroWidthSpace"
+        | "NegativeMediumSpace"
+        | "NegativeThickSpace"
+        | "NegativeThinSpace"
+        | "NegativeVeryThinSpace" => '\u{200b}',
+        "NoBreak" => '\u{2060}',
+        "ApplyFunction" => '\u{2061}',
+        "InvisibleTimes" => '\u{2062}',
+        "InvisibleComma" => '\u{2063}',
+        "Tab" => '\t',
+        "NewLine" => '\n',
+        numeric if numeric.starts_with("#x") || numeric.starts_with("#X") => {
+            char::from_u32(u32::from_str_radix(&numeric[2..], 16).ok()?)?
+        }
+        numeric if numeric.starts_with('#') => numeric[1..].parse::<u32>().ok()?.try_into().ok()?,
+        _ => return None,
+    };
+    Some((decoded, end + 1))
 }
 
 fn looks_like_html_tag(inner: &str) -> bool {

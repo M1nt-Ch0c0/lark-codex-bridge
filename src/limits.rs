@@ -48,6 +48,10 @@ pub const TOKEN_REFRESH_SKEW: Duration = Duration::from_secs(3 * 60);
 /// Hard cap on one outbound Lark message/card request body (serialized JSON,
 /// envelope included). Oversize sends are refused before any request I/O.
 pub const LARK_MAX_SEND_BODY_BYTES: usize = 256 * 1024;
+/// Exact serialized-byte cap for one Card 2.0 Markdown element. Lark's Card
+/// 2.0 contract documents this as approximately 30 KiB; the bridge treats
+/// 30*1024 bytes as a hard element-object wire bound after JSON escaping.
+pub const LARK_CARD_MARKDOWN_ELEMENT_MAX_BYTES: usize = 30 * 1024;
 /// Hard cap on one downloaded Lark message resource (image/file). The
 /// download stream is aborted mid-body once the cap is exceeded instead of
 /// buffering an unbounded response.

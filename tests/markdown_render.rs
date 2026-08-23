@@ -1,8 +1,10 @@
 //! Deterministic Lark Markdown projection and wire-aware splitting.
 
 use lark_codex_bridge::lark::api::post_markdown_reply_body_len;
+use lark_codex_bridge::limits::LARK_CARD_MARKDOWN_ELEMENT_MAX_BYTES;
 use lark_codex_bridge::render::{
-    render_lark_markdown, split_lark_markdown, stabilize_streaming_markdown,
+    card_markdown_element_wire_len, render_lark_markdown, split_lark_markdown,
+    stabilize_streaming_markdown,
 };
 
 #[test]
@@ -122,9 +124,9 @@ fn unsupported_images_references_and_tilde_fences_have_explicit_degradation() {
             "Image: logo (reference asset)\n",
             "guide (reference docs)\n",
             "Reference docs: https://example.com/docs\n",
-            "````rust\n",
+            "```rust\n",
             "let literal = \"```\";\n",
-            "````",
+            "```",
         )
     );
 }
@@ -142,10 +144,168 @@ fn malformed_inline_and_html_constructs_degrade_without_cross_line_swallowing() 
         concat!(
             "> ‹div class=\"unfinished\"\n",
             "> still quoted\n",
-            "[broken] (invalid link target)\n",
+            "[broken] (invalid link target) https://example.com\n",
             "[https://example.com/path](https://example.com/path)",
         )
     );
+}
+
+#[test]
+fn nested_quote_and_list_containers_keep_fences_and_tables_structural() {
+    let source = concat!(
+        "> - ```rust\n",
+        ">   let answer = 42;\n",
+        "> - ```\n",
+        "> - | name | state |\n",
+        ">   | --- | --- |\n",
+        ">   | bridge | ready |\n",
+        "- ~~~text\n",
+        "  plain\n",
+        "  ~~~\n",
+    );
+    assert_eq!(
+        render_lark_markdown(source),
+        concat!(
+            "> ```rust\n",
+            "> let answer = 42;\n",
+            "> ```\n",
+            "> ```text\n",
+            "> | name | state |\n",
+            "> | --- | --- |\n",
+            "> | bridge | ready |\n",
+            "> ```\n",
+            "```text\n",
+            "plain\n",
+            "```",
+        )
+    );
+}
+
+#[test]
+fn encoded_tags_and_format_controls_are_inert_outside_code() {
+    let source = concat!(
+        "&lt;at id=\"ou_entity\"&gt;entity name&lt;/at&gt; ",
+        "&#x3c;at user_id=\"ou_numeric\"&#x3e;numeric name&#60;/at&#62; ",
+        "&LT;at id=\"ou_upper\"&GT;upper name&LT;/at&GT; ",
+        "&#x202e;&rlm;&#8203;&NoBreak;&InvisibleTimes; ",
+        "`&lt;at id=\"literal\"&gt;code&lt;/at&gt; &#x202e;`",
+    );
+    let rendered = render_lark_markdown(source);
+    assert_eq!(
+        rendered,
+        concat!(
+            "entity name numeric name upper name  ",
+            "`&lt;at id=\"literal\"&gt;code&lt;/at&gt; &#x202e;`",
+        )
+    );
+    assert!(!rendered.contains("ou_entity"));
+    assert!(!rendered.contains("ou_numeric"));
+    assert!(!rendered.contains("ou_upper"));
+    assert!(!rendered.contains('\u{202e}'));
+    assert!(!rendered.contains('\u{200f}'));
+    assert!(!rendered.contains('\u{200b}'));
+}
+
+#[test]
+fn carriers_apply_explicit_safe_url_schemes_and_keep_malformed_tails() {
+    let source = concat!(
+        "[secure](https://example.com/a_(b)) ",
+        "[plain](http://example.com) ",
+        "[mail](mailto:user@example.com) ",
+        "[script](javascript:alert(1)) ",
+        "[bidi](https://example.com/%E2%80%AEtxt) ",
+        "<http://example.com/plain> ",
+        "![bad](data:image/png;base64,AAAA)\n",
+        "[broken](https://example.com trailing words\n",
+        "![broken](https://example.com/image.png trailing image words",
+    );
+    let post = render_lark_markdown(source);
+    assert!(post.contains("[secure](https://example.com/a_(b))"));
+    assert!(post.contains("[plain](http://example.com)"));
+    assert!(post.contains("[mail](mailto:user@example.com)"));
+    assert!(post.contains("script (unsafe link target)"));
+    assert!(post.contains("bidi (unsafe link target)"));
+    assert!(post.contains("[http://example.com/plain](http://example.com/plain)"));
+    assert!(post.contains("Image: bad (unsafe image target)"));
+    assert!(post.contains("https://example.com trailing words"));
+    assert!(post.contains("https://example.com/image.png trailing image words"));
+
+    let card = stabilize_streaming_markdown(source);
+    assert!(card.contains("[secure](https://example.com/a_(b))"));
+    assert!(card.contains("plain (unsafe link target)"));
+    assert!(card.contains("mail (unsafe link target)"));
+    assert!(card.contains("http://example.com/plain (unsafe link target)"));
+    assert!(!card.contains("[plain](http://"));
+    assert!(!card.contains("[mail](mailto:"));
+}
+
+#[test]
+fn pathological_fence_delimiters_are_atomic_and_bounded() {
+    let delimiter = "`".repeat(40_000);
+    let source = format!("{delimiter}\nbody\n{delimiter}");
+    let rendered = render_lark_markdown(&source);
+    assert_eq!(rendered, "```\nbody\n```");
+
+    let hostile_content = format!("~~~text\n{}\nbody\n~~~", "`".repeat(40_000));
+    let card = stabilize_streaming_markdown(&hostile_content);
+    assert!(card_markdown_element_wire_len(&card) <= LARK_CARD_MARKDOWN_ELEMENT_MAX_BYTES);
+    assert!(card.ends_with("…[truncated]"));
+    assert!(fences_are_balanced(&card));
+    let opening = card.lines().next().expect("opening fence");
+    assert!(opening.starts_with("~~~text"));
+    assert!(
+        opening
+            .chars()
+            .take_while(|character| *character == '~')
+            .count()
+            <= 64
+    );
+    let parts = split_lark_markdown(&render_lark_markdown(&hostile_content), 512, 1_024, 100);
+    assert!(parts.len() > 2);
+    assert!(parts.iter().all(|part| fences_are_balanced(part)));
+}
+
+#[test]
+fn card2_element_cap_is_exact_after_sanitizing_and_json_escaping() {
+    let overhead = card_markdown_element_wire_len("");
+    let exact = "a".repeat(LARK_CARD_MARKDOWN_ELEMENT_MAX_BYTES - overhead);
+    let at_limit = stabilize_streaming_markdown(&exact);
+    assert_eq!(
+        at_limit.len(),
+        exact.len(),
+        "projected len {}, exact len {}, projected wire {}, empty wire {}",
+        at_limit.len(),
+        exact.len(),
+        card_markdown_element_wire_len(&at_limit),
+        card_markdown_element_wire_len("")
+    );
+    assert_eq!(at_limit, exact);
+    assert_eq!(
+        card_markdown_element_wire_len(&at_limit),
+        LARK_CARD_MARKDOWN_ELEMENT_MAX_BYTES
+    );
+
+    let over = stabilize_streaming_markdown(&format!("{exact}a"));
+    assert!(over.ends_with("…[truncated]"));
+    assert!(card_markdown_element_wire_len(&over) <= LARK_CARD_MARKDOWN_ELEMENT_MAX_BYTES);
+
+    let expansion = format!(
+        "```text\n{}\n```",
+        "界\"\\\n".repeat(LARK_CARD_MARKDOWN_ELEMENT_MAX_BYTES)
+    );
+    let bounded = stabilize_streaming_markdown(&expansion);
+    assert!(bounded.ends_with("…[truncated]"));
+    assert!(fences_are_balanced(&bounded));
+    assert!(bounded.is_char_boundary(bounded.len()));
+    assert!(bounded.len() <= LARK_CARD_MARKDOWN_ELEMENT_MAX_BYTES);
+    assert!(card_markdown_element_wire_len(&bounded) <= LARK_CARD_MARKDOWN_ELEMENT_MAX_BYTES);
+
+    let controls = format!(
+        "{}visible",
+        "&lt;at id=\"ou_attacker\"&gt;&lt;/at&gt;".repeat(2_000)
+    );
+    let sanitized_first = stabilize_streaming_markdown(&controls);
+    assert_eq!(sanitized_first, "visible");
 }
 
 #[test]

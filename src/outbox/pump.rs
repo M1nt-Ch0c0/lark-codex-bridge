@@ -75,10 +75,11 @@ pub struct DeliveryDecision {
 /// Classifies a send failure into the three-way delivery semantics.
 ///
 /// The existing [`LarkError`] taxonomy carries a server `code` when the peer
-/// responded (either a Lark envelope code or an HTTP status). Such a response
-/// proves non-application, but only documented transient codes are retried;
-/// validation/business rejections are permanent. No response means the write
-/// may have reached Lark before the connection dropped.
+/// responded (either a Lark envelope code or an HTTP status). An explicit
+/// validation/business rejection proves non-application, but an HTTP 5xx does
+/// not: a proxy or application server can return 5xx after committing a POST.
+/// Consequently POST-like operations never replay a 5xx blindly. Idempotent
+/// card PATCH handling is deliberately operation-specific below.
 #[must_use]
 pub fn classify_delivery(error: &LarkError) -> DeliveryClass {
     let decision = delivery_decision(error);
@@ -94,13 +95,23 @@ pub fn classify_delivery(error: &LarkError) -> DeliveryClass {
 }
 
 /// Separates proof of non-application from whether a repeated call is useful.
-/// Only HTTP 429/5xx and Lark's documented application-frequency code are
-/// retryable. Validation, card-format, missing-chat, and recalled-message
-/// business codes are explicit permanent rejections. A malformed or missing
-/// response after a write remains uncertain regardless of its likely cause.
+/// Only HTTP 429 and Lark's documented application-frequency code are both a
+/// definite rejection and retryable for a non-idempotent send. HTTP 5xx,
+/// malformed responses, and missing responses after a write remain uncertain.
+/// Validation, card-format, missing-chat, and recalled-message business codes
+/// are explicit permanent rejections.
 #[must_use]
 pub fn delivery_decision(error: &LarkError) -> DeliveryDecision {
     match error {
+        LarkError::Retryable {
+            code: Some(code), ..
+        } if is_http_server_error(*code) => DeliveryDecision {
+            applied: AppliedCertainty::Uncertain,
+            // Retrying can be useful for an idempotent PATCH, while a
+            // non-idempotent POST must still stop because applied certainty
+            // is orthogonal and takes precedence in `classify_delivery`.
+            retryability: Retryability::Retryable,
+        },
         LarkError::Retryable {
             code: Some(code), ..
         } if is_documented_transient(*code) => DeliveryDecision {
@@ -124,7 +135,19 @@ pub fn delivery_decision(error: &LarkError) -> DeliveryDecision {
 }
 
 fn is_documented_transient(code: i64) -> bool {
-    code == 429 || (500..=599).contains(&code) || code == 99_991_400
+    code == 429 || code == 99_991_400
+}
+
+fn is_http_server_error(code: i64) -> bool {
+    (500..=599).contains(&code)
+}
+
+fn is_idempotent_patch_retryable(error: &LarkError) -> bool {
+    matches!(
+        error,
+        LarkError::Retryable { code: Some(code), .. }
+            if is_documented_transient(*code) || is_http_server_error(*code)
+    )
 }
 
 /// Result of processing one claimed row, telling the batch loop whether it may
@@ -141,7 +164,7 @@ enum ProcessOutcome {
 
 enum SendFailure {
     Delivery(LarkError),
-    FinalCardPatch(LarkError),
+    CardPatch(LarkError),
     Store(StoreError),
     DependencyPending,
     DependencyPermanent,
@@ -350,8 +373,8 @@ async fn process_row(
             let class = classify_delivery(&error);
             record_failure(store, row, class, config, &error, shutdown).await
         }
-        Err(SendFailure::FinalCardPatch(error)) => {
-            record_final_card_patch_failure(store, row, &operation, config, &error, shutdown).await
+        Err(SendFailure::CardPatch(error)) => {
+            record_card_patch_failure(store, row, &operation, config, &error, shutdown).await
         }
         Err(SendFailure::Store(store_error)) => {
             tracing::warn!(
@@ -435,7 +458,7 @@ async fn send(
                     .update_card(&message_id, progress_card(text))
                     .await
                     .map(|()| message_id)
-                    .map_err(SendFailure::Delivery),
+                    .map_err(SendFailure::CardPatch),
                 ProgressAnchor::Pending => Err(SendFailure::DependencyPending),
                 ProgressAnchor::Failed => Err(SendFailure::DependencyPermanent),
                 ProgressAnchor::Uncertain => Err(SendFailure::DependencyUncertain),
@@ -455,7 +478,7 @@ async fn send(
                     .update_card(&receipt, progress_card(text))
                     .await
                     .map(|()| receipt)
-                    .map_err(SendFailure::FinalCardPatch),
+                    .map_err(SendFailure::CardPatch),
                 ProgressAnchor::Failed if thread_id.is_some() => api
                     .reply_post_markdown_in_thread(message_id, fallback_markdown)
                     .await
@@ -621,9 +644,25 @@ async fn record_final_card_patch_failure(
     shutdown: &CancellationToken,
 ) -> ProcessOutcome {
     let decision = delivery_decision(error);
+    let attempts = row.attempts.saturating_add(1);
+    if is_idempotent_patch_retryable(error) && attempts < STORE_OUTBOX_MAX_ATTEMPTS {
+        return record_failure(
+            store,
+            row,
+            DeliveryClass::Retryable,
+            config,
+            error,
+            shutdown,
+        )
+        .await;
+    }
+
     if decision.applied == AppliedCertainty::Uncertain {
-        // A fallback could duplicate a final card update that Lark applied but
-        // whose response was lost or malformed.
+        // PATCH is idempotent, so an explicit 5xx may be retried with the same
+        // body. Exhaustion is still uncertain: Lark could have committed any
+        // attempt before returning 5xx. A standalone POST here could duplicate
+        // the visible final, so it is forbidden just like a malformed or lost
+        // response.
         return record_failure(
             store,
             row,
@@ -635,7 +674,6 @@ async fn record_final_card_patch_failure(
         .await;
     }
 
-    let attempts = row.attempts.saturating_add(1);
     if decision.retryability == Retryability::Retryable && attempts < STORE_OUTBOX_MAX_ATTEMPTS {
         return record_failure(
             store,
@@ -707,6 +745,41 @@ async fn record_final_card_patch_failure(
             ProcessOutcome::Resolved
         }
     }
+}
+
+async fn record_card_patch_failure(
+    store: &StoreHandle,
+    row: &OutboxRow,
+    operation: &OutboxOperation,
+    config: OutboxPumpConfig,
+    error: &LarkError,
+    shutdown: &CancellationToken,
+) -> ProcessOutcome {
+    if matches!(operation, OutboxOperation::FinalizeProgressCard { .. }) {
+        return record_final_card_patch_failure(store, row, operation, config, error, shutdown)
+            .await;
+    }
+
+    let attempts = row.attempts.saturating_add(1);
+    if is_idempotent_patch_retryable(error) && attempts < STORE_OUTBOX_MAX_ATTEMPTS {
+        return record_failure(
+            store,
+            row,
+            DeliveryClass::Retryable,
+            config,
+            error,
+            shutdown,
+        )
+        .await;
+    }
+
+    let decision = delivery_decision(error);
+    let class = if decision.applied == AppliedCertainty::Uncertain {
+        DeliveryClass::Uncertain
+    } else {
+        DeliveryClass::Permanent
+    };
+    record_failure(store, row, class, config, error, shutdown).await
 }
 
 async fn record_failure(

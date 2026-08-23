@@ -40,7 +40,10 @@ use crate::limits::{
 
 mod markdown;
 
-pub use markdown::{render_lark_markdown, split_lark_markdown, stabilize_streaming_markdown};
+pub use markdown::{
+    card_markdown_element_wire_len, render_lark_markdown, split_lark_markdown,
+    stabilize_streaming_markdown,
+};
 
 /// Tunables for one [`ReplyProjector`]; defaults match the production limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
