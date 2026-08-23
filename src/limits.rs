@@ -50,6 +50,12 @@ pub const EXTERNAL_WS_MESSAGE_BYTES: usize = MAX_JSONL_LINE_BYTES;
 pub const EXTERNAL_WS_IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum time spent waiting for the peer half of a WebSocket close handshake.
 pub const EXTERNAL_WS_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Overall write-coordinator shutdown deadline. This covers the sequential close-frame write and
+/// peer-handshake deadlines, plus a small scheduling margin for the owning actor to acknowledge
+/// completion.
+pub const EXTERNAL_WRITE_SHUTDOWN_TIMEOUT: Duration = EXTERNAL_WS_IO_TIMEOUT
+    .saturating_add(EXTERNAL_WS_CLOSE_TIMEOUT)
+    .saturating_add(Duration::from_secs(1));
 /// Maximum number of persisted thread subscriptions managed by one external endpoint.
 pub const EXTERNAL_MANAGED_THREAD_CAPACITY: usize = 64;
 /// Maximum terminal/status events buffered for one thread while its authoritative snapshot is

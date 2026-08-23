@@ -63,6 +63,11 @@ atomically updates the durable fences, orderly closes the old coordinator, and
 requires a new coordinator configured with the new actor. A busy or uncertain
 endpoint cannot be reassigned.
 
+Coordinator shutdown is bounded by an outer deadline that covers the
+transport's sequential close-frame write and peer-handshake deadlines, plus a
+small scheduling margin. The actor acknowledges shutdown only after marking the
+epoch stopped and completing that socket-only transport shutdown.
+
 ## Verification
 
 Deterministic SQLite and two-WebSocket fake-server tests cover simultaneous

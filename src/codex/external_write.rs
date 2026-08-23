@@ -33,7 +33,9 @@ use crate::{
             TurnInterruptParams, TurnStartParams, TurnStatus, TurnSteerParams,
         },
     },
-    limits::{EXTERNAL_WS_CLOSE_TIMEOUT, MAX_OUTBOUND_VALUE_WIRE_BYTES, ROUTING_ID_BYTE_LIMIT},
+    limits::{
+        EXTERNAL_WRITE_SHUTDOWN_TIMEOUT, MAX_OUTBOUND_VALUE_WIRE_BYTES, ROUTING_ID_BYTE_LIMIT,
+    },
     runtime::policy::AuthorizedLarkActor,
     store::{
         ExternalApprovalClaimOutcome, ExternalApprovalKind, ExternalApprovalReassignmentOutcome,
@@ -539,9 +541,10 @@ impl ExternalWriteCoordinator {
         let (reply, wait) = oneshot::channel();
         let sent = self.commands.send(WriteCommand::Shutdown { reply }).await;
         let orderly = if sent.is_ok() {
-            tokio::time::timeout(EXTERNAL_WS_CLOSE_TIMEOUT, wait)
-                .await
-                .is_ok()
+            matches!(
+                tokio::time::timeout(EXTERNAL_WRITE_SHUTDOWN_TIMEOUT, wait).await,
+                Ok(Ok(()))
+            )
         } else {
             false
         };

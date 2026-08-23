@@ -30,6 +30,7 @@ use lark_codex_bridge::{
         api::ChatMode,
         normalize::{InboundEvent, ScopeKey},
     },
+    limits::{EXTERNAL_WRITE_SHUTDOWN_TIMEOUT, EXTERNAL_WS_CLOSE_TIMEOUT, EXTERNAL_WS_IO_TIMEOUT},
     runtime::policy::{AccessPolicy, AuthorizedLarkActor},
     store::{
         ExternalApprovalState, ExternalEndpointState, ExternalMutationState,
@@ -627,6 +628,42 @@ async fn seeded_coordinator(
     .expect("write coordinator connects");
     assert!(!format!("{source:?}{recipient:?}{coordinator:?}").contains("ou_"));
     (store, coordinator, label)
+}
+
+#[tokio::test]
+async fn orderly_shutdown_covers_transport_deadlines_and_leaves_server_available() {
+    assert!(
+        EXTERNAL_WRITE_SHUTDOWN_TIMEOUT
+            > EXTERNAL_WS_IO_TIMEOUT.saturating_add(EXTERNAL_WS_CLOSE_TIMEOUT),
+        "coordinator deadline must outlive its sequential transport deadlines"
+    );
+
+    let server = FakeWriteServer::start().await;
+    let scratch = tempfile::tempdir().expect("scratch");
+    let token_path = scratch.path().join("bearer");
+    write_token(&token_path);
+    let (source, recipient) = actors(scratch.path());
+    let (store, coordinator, label) =
+        seeded_coordinator(&server, &token_path, &source, &recipient).await;
+
+    timeout(EXTERNAL_WRITE_SHUTDOWN_TIMEOUT, coordinator.shutdown())
+        .await
+        .expect("coordinator shutdown remains bounded")
+        .expect("coordinator shuts down orderly");
+    assert_eq!(
+        store
+            .external_endpoint_epoch(&label)
+            .await
+            .expect("endpoint read")
+            .expect("endpoint")
+            .state,
+        ExternalEndpointState::Stopped
+    );
+
+    let operator = connect_operator(&server.endpoint).await;
+    drop(operator);
+    store.shutdown().await.expect("store shutdown");
+    server.finish().await;
 }
 
 #[tokio::test]
