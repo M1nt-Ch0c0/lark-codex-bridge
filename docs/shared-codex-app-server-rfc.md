@@ -626,7 +626,7 @@ turn id belongs in evidence output.
 | Clients | Raw WebSocket clients A/B with one RPC per text frame; official CLI where named |
 | Initialization | Both clients sent `initialize`, validated a response, then sent `initialized` |
 | Logging | Result categories and booleans only; protocol payloads discarded |
-| Bounds | Every raw handshake/RPC was deadline-bounded; the committed read-only probe uses five seconds per step |
+| Bounds | Recorded experiments were deadline-bounded; E17 additionally caps each text message at 256 KiB, aggregate inbound text at 1 MiB, messages at 64 per client, JSON at depth 64 / 8,192 nodes, and user-agent text at 1 KiB |
 
 The exact CLI surface can be checked without contacting a server:
 
@@ -662,45 +662,91 @@ server flags. Direct `wss://` listener input was rejected.
 | E14 | Try raw JSON, HTTP Upgrade, ws+unix, and proxy approaches to advertised Unix transport | No usable response within the bounded attempts | Local-0.149; negative and incomplete |
 | E15 | Resume one profile thread from two separate server processes | Second server returned active-writer conflict under generic `-32600` | Local-0.149 |
 | E16 | Unsubscribe the subscribed client, then retry writer acquisition elsewhere | Reported unsubscribed; writer remained until owning server exited | Local-0.149 |
-| E17 | Connect two read-only clients, close both, call health, connect a third client | Both initialized; health remained true; fresh client initialized; external server remained alive | Local-0.149, committed probe |
+| E17 | Verify exact server version/profile; connect two read-only clients; require an observed peer disconnect for both; require exact HTTP 200 health; connect and disconnect a third client | Identity matched; all three clients initialized and disconnected; health remained exact-200; external server remained alive; Node observed 1006/unclean rather than a server close reply | Local-0.149, committed probe and fake-peer tests |
 
 E14 does not prove Unix transport is broken. It proves only that the attempted
 client approaches are insufficient, so the bridge must reject Unix instead of
 guessing a framing or URL convention.
+
+E1-E16 are recorded, sanitized local observations from the investigation. They
+are not represented as committed executable tests by this RFC. E17 is the only
+real-server reproduction committed here; its fake-peer suite commits the
+negative protocol and lifecycle cases described below. That distinction keeps
+the evidence claim narrower than the exploratory work.
 
 ### Committed read-only lifecycle probe
 
 [`tools/codex_shared_server_probe.mjs`](../tools/codex_shared_server_probe.mjs)
 has no runtime dependency installation and performs only initialize plus a
 one-row `thread/list`. It requires Node 26's built-in WebSocket client, a literal
-loopback endpoint, and an explicit isolated-profile acknowledgement. It emits
-only booleans or a fixed failure stage.
+loopback endpoint, one exact semantic version, and an absolute canonical private
+profile containing the probe marker. Every initialize response must report that
+same canonical `codexHome` and exactly one matching version token in
+`userAgent`; an empty initialize result cannot pass. It emits only booleans or a
+fixed `configuration`, `protocol`, or `health` failure stage.
+
+The probe rejects binary frames, oversized or over-budget input, excessive JSON
+depth/work, unknown or duplicate response ids, and more than 64 inbound messages
+per client. A client-initiated close succeeds only after a peer disconnect event
+arrives before the deadline; a peer that ignores close fails. Clean code-1000
+handshakes and the current 0.149.0 code-1006/unclean observation are reported as
+different booleans rather than conflated. The latter is a negative interoperability
+finding, not an acceptable production close contract. The health request disables
+redirects and accepts status 200 exactly. The no-dependency fake WebSocket peer
+suite exercises these failure paths in CI:
+
+```bash
+node --test tools/tests/test_codex_shared_server_probe.mjs
+```
 
 In one shell, start an isolated server and keep that shell as its owner:
 
 ```bash
+set -eu
 task_probe_home="$(mktemp -d)"
-CODEX_HOME="$task_probe_home" codex app-server --listen ws://127.0.0.1:45152
+task_probe_home="$(cd "$task_probe_home" && pwd -P)"
+cleanup_issue8_probe() {
+  if [ -n "${task_probe_home:-}" ] &&
+     [ "$task_probe_home" != / ] &&
+     [ -f "$task_probe_home/.lark-codex-bridge-issue8-isolated-v1" ]; then
+    rm -rf -- "$task_probe_home"
+  fi
+}
+trap cleanup_issue8_probe EXIT
+trap 'exit 130' HUP INT TERM
+umask 077
+printf '%s\n' 'lark-codex-bridge issue8 isolated profile v1' \
+  > "$task_probe_home/.lark-codex-bridge-issue8-isolated-v1"
+chmod 700 "$task_probe_home"
+chmod 600 "$task_probe_home/.lark-codex-bridge-issue8-isolated-v1"
+test "$(codex --version)" = 'codex-cli 0.149.0'
+printf 'Copy this isolated profile path into the second shell: %s\n' \
+  "$task_probe_home"
+CODEX_HOME="$task_probe_home" \
+  codex app-server --listen ws://127.0.0.1:45152
 ```
 
-In another shell:
+In another shell, replace the placeholder with the path printed by the first:
 
 ```bash
-CODEX_SHARED_PROBE_ISOLATED=1 \
 CODEX_SHARED_PROBE_ENDPOINT=ws://127.0.0.1:45152 \
+CODEX_SHARED_PROBE_EXPECTED_VERSION=0.149.0 \
+CODEX_SHARED_PROBE_EXPECTED_HOME=/absolute/path/printed-by-first-shell \
 node tools/codex_shared_server_probe.mjs
 ```
 
 Expected sanitized result:
 
 ```json
-{"ok":true,"twoClientsInitialized":true,"healthAfterClientDisconnect":true,"freshClientInitialized":true}
+{"ok":true,"exactVersionVerified":true,"isolatedProfileVerified":true,"twoClientsInitializedAndDisconnected":true,"twoClientCloseHandshakesClean":false,"healthAfterClientDisconnect":true,"freshClientInitializedAndDisconnected":true,"freshClientCloseHandshakeClean":false}
 ```
 
 The operator-owned server remained alive after all probe clients closed. The
 probe cannot send a process signal because it receives no PID or process handle.
 This is read-only lifecycle evidence, not the production external connector or
-an authentication test.
+an authentication test. After recording the result, press Ctrl-C in the first
+shell. That stops the exact operator-owned server; the EXIT trap then removes
+only the freshly created, marker-bearing profile.
 
 ## Proving external process non-ownership
 

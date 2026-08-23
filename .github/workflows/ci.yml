@@ -21,6 +21,17 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  shared-server-probe:
+    name: Shared server probe safety (Node 26)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+      - run: node --test tools/tests/test_codex_shared_server_probe.mjs
+
   codex-schema-contracts:
     name: Codex schema contracts (offline)
     runs-on: ubuntu-latest
