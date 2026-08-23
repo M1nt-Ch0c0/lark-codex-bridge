@@ -30,6 +30,16 @@ pub enum OutboxOperation {
         /// Already-masked reply text.
         text: String,
     },
+    /// Reply to a message with a Lark `post` containing one `tag=md` element.
+    /// The Markdown has already passed the platform projection and splitter.
+    ReplyMarkdownPost {
+        /// Target parent message ID.
+        message_id: String,
+        /// Topic thread ID when the reply belongs to a thread.
+        thread_id: Option<String>,
+        /// Deterministic Lark-subset Markdown.
+        markdown: String,
+    },
     /// Creates the first visible progress card for a turn.
     ReplyProgressCard {
         /// Target parent message ID.
@@ -57,6 +67,9 @@ pub enum OutboxOperation {
         thread_id: Option<String>,
         /// Complete, already-masked fallback answer.
         text: String,
+        /// Platform-projected Markdown used only if the initial card failed
+        /// permanently and a standalone final must be sent instead.
+        fallback_markdown: String,
     },
 }
 
@@ -83,6 +96,16 @@ impl fmt::Debug for OutboxOperation {
                 .field("in_thread", &thread_id.is_some())
                 .field("text_chars", &text.chars().count())
                 .finish_non_exhaustive(),
+            Self::ReplyMarkdownPost {
+                message_id,
+                thread_id,
+                markdown,
+            } => formatter
+                .debug_struct("ReplyMarkdownPost")
+                .field("message_id_len", &message_id.len())
+                .field("in_thread", &thread_id.is_some())
+                .field("markdown_chars", &markdown.chars().count())
+                .finish_non_exhaustive(),
             Self::UpdateProgressCard { anchor_key, text } => formatter
                 .debug_struct("UpdateProgressCard")
                 .field("anchor_key_len", &anchor_key.len())
@@ -93,12 +116,17 @@ impl fmt::Debug for OutboxOperation {
                 message_id,
                 thread_id,
                 text,
+                fallback_markdown,
             } => formatter
                 .debug_struct("FinalizeProgressCard")
                 .field("anchor_key_len", &anchor_key.len())
                 .field("message_id_len", &message_id.len())
                 .field("in_thread", &thread_id.is_some())
                 .field("text_chars", &text.chars().count())
+                .field(
+                    "fallback_markdown_chars",
+                    &fallback_markdown.chars().count(),
+                )
                 .finish_non_exhaustive(),
         }
     }
@@ -189,87 +217,108 @@ impl OutboxOperation {
                 version: dto.version,
             });
         }
-        match dto.op.as_str() {
-            "reply_text" | "reply_progress_card" => {
-                let Some(message_id) = dto.message_id else {
-                    return Err(OutboxError::Invalid {
-                        context: "empty reply message_id",
-                    });
-                };
-                if message_id.is_empty() || dto.anchor_key.is_some() {
-                    return Err(OutboxError::Invalid {
-                        context: "invalid reply target",
-                    });
-                }
-                if dto.text.is_empty() {
-                    return Err(OutboxError::Invalid {
-                        context: "empty reply text",
-                    });
-                }
-                if dto.thread_id.as_deref().is_some_and(str::is_empty) {
-                    return Err(OutboxError::Invalid {
-                        context: "empty reply thread_id",
-                    });
-                }
-                if dto.op == "reply_text" {
-                    Ok(Self::ReplyText {
-                        message_id,
-                        thread_id: dto.thread_id,
-                        text: dto.text,
-                    })
-                } else {
-                    Ok(Self::ReplyProgressCard {
-                        message_id,
-                        thread_id: dto.thread_id,
-                        text: dto.text,
-                    })
-                }
-            }
-            "update_progress_card" => {
-                let Some(anchor_key) = dto.anchor_key else {
-                    return Err(OutboxError::Invalid {
-                        context: "empty progress anchor_key",
-                    });
-                };
-                if anchor_key.is_empty()
-                    || dto.message_id.is_some()
-                    || dto.thread_id.is_some()
-                    || dto.text.is_empty()
-                {
-                    return Err(OutboxError::Invalid {
-                        context: "invalid progress update",
-                    });
-                }
-                Ok(Self::UpdateProgressCard {
-                    anchor_key,
-                    text: dto.text,
-                })
-            }
-            "finalize_progress_card" => {
-                let (Some(anchor_key), Some(message_id)) = (dto.anchor_key, dto.message_id) else {
-                    return Err(OutboxError::Invalid {
-                        context: "missing progress finalization target",
-                    });
-                };
-                if anchor_key.is_empty() || message_id.is_empty() || dto.text.is_empty() {
-                    return Err(OutboxError::Invalid {
-                        context: "invalid progress finalization",
-                    });
-                }
-                if dto.thread_id.as_deref().is_some_and(str::is_empty) {
-                    return Err(OutboxError::Invalid {
-                        context: "empty reply thread_id",
-                    });
-                }
-                Ok(Self::FinalizeProgressCard {
-                    anchor_key,
-                    message_id,
-                    thread_id: dto.thread_id,
-                    text: dto.text,
-                })
-            }
+        let operation = dto.op.clone();
+        match operation.as_str() {
+            "reply_text" | "reply_markdown_post" | "reply_progress_card" => decode_reply(dto),
+            "update_progress_card" => decode_progress_update(dto),
+            "finalize_progress_card" => decode_progress_finalization(dto),
             _ => Err(OutboxError::UnknownOperation),
         }
+    }
+}
+
+fn decode_reply(dto: PayloadDto) -> Result<OutboxOperation, OutboxError> {
+    let Some(message_id) = dto.message_id else {
+        return Err(OutboxError::Invalid {
+            context: "empty reply message_id",
+        });
+    };
+    if message_id.is_empty() || dto.anchor_key.is_some() || dto.fallback_markdown.is_some() {
+        return Err(OutboxError::Invalid {
+            context: "invalid reply target",
+        });
+    }
+    if dto.text.is_empty() {
+        return Err(OutboxError::Invalid {
+            context: "empty reply text",
+        });
+    }
+    validate_thread_id(dto.thread_id.as_deref())?;
+    match dto.op.as_str() {
+        "reply_text" => Ok(OutboxOperation::ReplyText {
+            message_id,
+            thread_id: dto.thread_id,
+            text: dto.text,
+        }),
+        "reply_markdown_post" => Ok(OutboxOperation::ReplyMarkdownPost {
+            message_id,
+            thread_id: dto.thread_id,
+            markdown: dto.text,
+        }),
+        "reply_progress_card" => Ok(OutboxOperation::ReplyProgressCard {
+            message_id,
+            thread_id: dto.thread_id,
+            text: dto.text,
+        }),
+        _ => Err(OutboxError::UnknownOperation),
+    }
+}
+
+fn decode_progress_update(dto: PayloadDto) -> Result<OutboxOperation, OutboxError> {
+    let Some(anchor_key) = dto.anchor_key else {
+        return Err(OutboxError::Invalid {
+            context: "empty progress anchor_key",
+        });
+    };
+    if anchor_key.is_empty()
+        || dto.message_id.is_some()
+        || dto.thread_id.is_some()
+        || dto.fallback_markdown.is_some()
+        || dto.text.is_empty()
+    {
+        return Err(OutboxError::Invalid {
+            context: "invalid progress update",
+        });
+    }
+    Ok(OutboxOperation::UpdateProgressCard {
+        anchor_key,
+        text: dto.text,
+    })
+}
+
+fn decode_progress_finalization(dto: PayloadDto) -> Result<OutboxOperation, OutboxError> {
+    let (Some(anchor_key), Some(message_id)) = (dto.anchor_key, dto.message_id) else {
+        return Err(OutboxError::Invalid {
+            context: "missing progress finalization target",
+        });
+    };
+    if anchor_key.is_empty()
+        || message_id.is_empty()
+        || dto.text.is_empty()
+        || dto.fallback_markdown.as_deref().is_some_and(str::is_empty)
+    {
+        return Err(OutboxError::Invalid {
+            context: "invalid progress finalization",
+        });
+    }
+    validate_thread_id(dto.thread_id.as_deref())?;
+    let fallback_markdown = dto.fallback_markdown.unwrap_or_else(|| dto.text.clone());
+    Ok(OutboxOperation::FinalizeProgressCard {
+        anchor_key,
+        message_id,
+        thread_id: dto.thread_id,
+        text: dto.text,
+        fallback_markdown,
+    })
+}
+
+fn validate_thread_id(thread_id: Option<&str>) -> Result<(), OutboxError> {
+    if thread_id.is_some_and(str::is_empty) {
+        Err(OutboxError::Invalid {
+            context: "empty reply thread_id",
+        })
+    } else {
+        Ok(())
     }
 }
 
@@ -287,6 +336,8 @@ struct PayloadDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     anchor_key: Option<String>,
     text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fallback_markdown: Option<String>,
 }
 
 impl From<&OutboxOperation> for PayloadDto {
@@ -303,6 +354,20 @@ impl From<&OutboxOperation> for PayloadDto {
                 thread_id: thread_id.clone(),
                 anchor_key: None,
                 text: text.clone(),
+                fallback_markdown: None,
+            },
+            OutboxOperation::ReplyMarkdownPost {
+                message_id,
+                thread_id,
+                markdown,
+            } => Self {
+                version: OUTBOX_PAYLOAD_VERSION,
+                op: "reply_markdown_post".to_owned(),
+                message_id: Some(message_id.clone()),
+                thread_id: thread_id.clone(),
+                anchor_key: None,
+                text: markdown.clone(),
+                fallback_markdown: None,
             },
             OutboxOperation::ReplyProgressCard {
                 message_id,
@@ -315,6 +380,7 @@ impl From<&OutboxOperation> for PayloadDto {
                 thread_id: thread_id.clone(),
                 anchor_key: None,
                 text: text.clone(),
+                fallback_markdown: None,
             },
             OutboxOperation::UpdateProgressCard { anchor_key, text } => Self {
                 version: OUTBOX_PAYLOAD_VERSION,
@@ -323,12 +389,14 @@ impl From<&OutboxOperation> for PayloadDto {
                 thread_id: None,
                 anchor_key: Some(anchor_key.clone()),
                 text: text.clone(),
+                fallback_markdown: None,
             },
             OutboxOperation::FinalizeProgressCard {
                 anchor_key,
                 message_id,
                 thread_id,
                 text,
+                fallback_markdown,
             } => Self {
                 version: OUTBOX_PAYLOAD_VERSION,
                 op: "finalize_progress_card".to_owned(),
@@ -336,6 +404,7 @@ impl From<&OutboxOperation> for PayloadDto {
                 thread_id: thread_id.clone(),
                 anchor_key: Some(anchor_key.clone()),
                 text: text.clone(),
+                fallback_markdown: Some(fallback_markdown.clone()),
             },
         }
     }

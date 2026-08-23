@@ -124,6 +124,52 @@ LARK_E2E=1 LARK_E2E_APP_ID=… LARK_E2E_APP_SECRET=… LARK_E2E_TENANT=feishu LA
   cargo test --test lark_smoke --locked -- --ignored --nocapture
 ```
 
+## 回复显示与 Markdown 验收
+
+输出层显式保留语义载体，不会根据字符串中是否出现 Markdown 符号来猜消息类型：
+
+- 无进度卡的独立终答使用飞书/Lark `msg_type=post`，内容固定包装成
+  `zh_cn.content -> [[{tag: "md", text: …}]]`；
+- 流式中间态和终态始终是同一条 Card 2.0 `interactive` 消息，正文元素保持
+  `tag=markdown`。每次发送的快照会临时补齐未闭合代码围栏，后续增量仍基于未修改的原文；
+- 拒绝、过载、失败、中断等短通知继续使用 `msg_type=text`。
+
+独立终答支持并保留段落、无序/有序列表、引用、行内代码、fenced code、粗体、
+斜体、删除线和行内链接。标题稳定降级为粗体段落；表格固定降级为 `text` fenced
+code（不依赖客户端不一致的表格支持）；HTML 标签/注释会移除，任务列表变成
+Unicode 复选框，脚注变成带标签的普通文本，复杂嵌套会展开成单层可读结构，连续空行会压缩。
+畸形或未闭合的 fenced code 会在终态补齐。
+
+转换先于分片。每个 `post` 分片同时检查 4,000 个 Unicode 标量上限和最终 Lark
+reply JSON 的精确序列化字节数（包括内层 JSON 转义与话题回复标记），最多 8 片；在
+代码块内切分时会闭合当前片并在下一片重新打开相同围栏，超出总预算则显式附加
+`…[truncated]`。
+
+真实桌面端/移动端 Markdown 验收是单独的显式门控测试。先在目标会话发送一条可供
+机器人回复的消息并取得其 `message_id`，准备三个不纳入 Git 的本地路径，然后运行：
+
+```bash
+LARK_MARKDOWN_E2E=1 \
+LARK_E2E_APP_ID=… LARK_E2E_APP_SECRET=… LARK_E2E_TENANT=feishu \
+LARK_MARKDOWN_E2E_PARENT_MESSAGE_ID=om_… \
+LARK_MARKDOWN_E2E_DESKTOP_SCREENSHOT=/tmp/lark-markdown-desktop.png \
+LARK_MARKDOWN_E2E_MOBILE_SCREENSHOT=/tmp/lark-markdown-mobile.png \
+LARK_MARKDOWN_E2E_ATTESTATION=/tmp/lark-markdown-attestation.json \
+  cargo test --test lark_markdown_smoke --locked -- --ignored --nocapture
+```
+
+测试发出覆盖全部子集及表格降级的真实 `post` 后会打印回复 `message_id`，默认等待
+5 分钟。在飞书桌面端和移动端分别打开该回复、确认排版可读且表格显示为 fenced text，
+再把两张新截图保存到上述路径，并写入同样是新生成的验收文件：
+
+```json
+{"message_id":"om_测试打印的回复ID","desktop":"pass","mobile":"pass","table":"fenced"}
+```
+
+测试会校验两张截图是本次发送后生成的 PNG/JPEG/WebP，并要求验收文件中的消息 ID
+精确匹配；缺任一端证据、复用旧文件或只看到 gate skip 均不算通过。截图可能包含会话
+信息，因此只作为操作者保存的外部验收证据，不应提交仓库。
+
 仓库只跟踪稳定的产品说明；缺陷和遗留项通过 GitHub Issue 与对应 PR 跟踪。实施计划、
 实时进度、Agent 接管记录和临时测试证据属于本地开发材料，不发布到 Git。
 

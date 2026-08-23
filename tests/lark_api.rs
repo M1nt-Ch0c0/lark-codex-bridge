@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use lark_codex_bridge::lark::api::{ChatMode, LarkApi, ResourceKind};
+use lark_codex_bridge::lark::api::{ChatMode, LarkApi, ResourceKind, post_markdown_reply_body_len};
 use lark_codex_bridge::lark::config::{LarkEndpoints, TenantBrand};
 use lark_codex_bridge::lark::credentials::LarkCredentials;
 use lark_codex_bridge::lark::error::{LarkError, LarkErrorKind};
@@ -154,6 +154,54 @@ async fn reply_text_in_thread_sets_the_flag() {
             "reply_in_thread": true,
         })
     );
+}
+
+#[tokio::test]
+async fn reply_markdown_post_uses_the_exact_lark_post_shape() {
+    let server = StubServer::start(token_plus(|_| ok_message("om_post"))).await;
+    let api = api_for(&server);
+    let markdown = "**Result**\n\n- one\n- two";
+
+    api.reply_post_markdown("om_parent", markdown)
+        .await
+        .expect("Markdown post should succeed");
+    api.reply_post_markdown_in_thread("om_parent", markdown)
+        .await
+        .expect("thread Markdown post should succeed");
+
+    let requests = requests_to(&server, MESSAGES_PATH);
+    let plain: serde_json::Value =
+        serde_json::from_str(&requests[0].body_text()).expect("post body should be JSON");
+    assert_eq!(
+        requests[0].body.len(),
+        post_markdown_reply_body_len(markdown, false),
+        "the splitter's size function must match the actual HTTP body"
+    );
+    assert_eq!(plain["msg_type"], "post");
+    assert!(plain.get("reply_in_thread").is_none());
+    let plain_content: serde_json::Value = serde_json::from_str(
+        plain["content"]
+            .as_str()
+            .expect("post content should be a JSON string"),
+    )
+    .expect("post content should be JSON");
+    assert_eq!(
+        plain_content,
+        serde_json::json!({
+            "zh_cn": {
+                "content": [[{"tag": "md", "text": markdown}]],
+            },
+        })
+    );
+
+    let threaded: serde_json::Value =
+        serde_json::from_str(&requests[1].body_text()).expect("post body should be JSON");
+    assert_eq!(
+        requests[1].body.len(),
+        post_markdown_reply_body_len(markdown, true)
+    );
+    assert_eq!(threaded["msg_type"], "post");
+    assert_eq!(threaded["reply_in_thread"], true);
 }
 
 #[tokio::test]

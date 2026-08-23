@@ -26,6 +26,7 @@ use crate::limits::{
     OUTBOX_SWEEP_INTERVAL, OUTBOX_TERMINAL_RETENTION_MS, STORE_OUTBOX_CLAIM_MAX_BATCH,
     STORE_RECEIPT_WRITE_ATTEMPTS,
 };
+use crate::render::stabilize_streaming_markdown;
 use crate::store::{OutboxDepth, OutboxRow, OutboxState, StoreError, StoreHandle, now_ms};
 
 /// How one failed send must be handled.
@@ -348,40 +349,19 @@ async fn send(
     match operation {
         OutboxOperation::ReplyText {
             message_id,
-            thread_id: Some(_),
+            thread_id,
             text,
-        } => api
-            .reply_text_in_thread(message_id.as_str(), text.as_str())
-            .await
-            .map(|message| message.message_id)
-            .map_err(SendFailure::Delivery),
-        OutboxOperation::ReplyText {
+        } => send_text_reply(api, message_id, text, thread_id.is_some()).await,
+        OutboxOperation::ReplyMarkdownPost {
             message_id,
-            thread_id: None,
-            text,
-        } => api
-            .reply_text(message_id.as_str(), text.as_str())
-            .await
-            .map(|message| message.message_id)
-            .map_err(SendFailure::Delivery),
+            thread_id,
+            markdown,
+        } => send_markdown_reply(api, message_id, markdown, thread_id.is_some()).await,
         OutboxOperation::ReplyProgressCard {
             message_id,
-            thread_id: Some(_),
+            thread_id,
             text,
-        } => api
-            .reply_card_in_thread(message_id, progress_card(text))
-            .await
-            .map(|message| message.message_id)
-            .map_err(SendFailure::Delivery),
-        OutboxOperation::ReplyProgressCard {
-            message_id,
-            thread_id: None,
-            text,
-        } => api
-            .reply_card(message_id, progress_card(text))
-            .await
-            .map(|message| message.message_id)
-            .map_err(SendFailure::Delivery),
+        } => send_progress_reply(api, message_id, text, thread_id.is_some()).await,
         OutboxOperation::UpdateProgressCard { anchor_key, text } => {
             let anchor =
                 progress_anchor(store, row, anchor_key, ProgressDependency::Update).await?;
@@ -401,6 +381,7 @@ async fn send(
             message_id,
             thread_id,
             text,
+            fallback_markdown,
         } => {
             let anchor =
                 progress_anchor(store, row, anchor_key, ProgressDependency::Finalize).await?;
@@ -411,12 +392,12 @@ async fn send(
                     .map(|()| receipt)
                     .map_err(SendFailure::Delivery),
                 ProgressAnchor::Failed if thread_id.is_some() => api
-                    .reply_text_in_thread(message_id, text)
+                    .reply_post_markdown_in_thread(message_id, fallback_markdown)
                     .await
                     .map(|message| message.message_id)
                     .map_err(SendFailure::Delivery),
                 ProgressAnchor::Failed => api
-                    .reply_text(message_id, text)
+                    .reply_post_markdown(message_id, fallback_markdown)
                     .await
                     .map(|message| message.message_id)
                     .map_err(SendFailure::Delivery),
@@ -425,6 +406,56 @@ async fn send(
             }
         }
     }
+}
+
+async fn send_text_reply(
+    api: &LarkApi,
+    message_id: &str,
+    text: &str,
+    in_thread: bool,
+) -> Result<String, SendFailure> {
+    let result = if in_thread {
+        api.reply_text_in_thread(message_id, text).await
+    } else {
+        api.reply_text(message_id, text).await
+    };
+    result
+        .map(|message| message.message_id)
+        .map_err(SendFailure::Delivery)
+}
+
+async fn send_markdown_reply(
+    api: &LarkApi,
+    message_id: &str,
+    markdown: &str,
+    in_thread: bool,
+) -> Result<String, SendFailure> {
+    let result = if in_thread {
+        api.reply_post_markdown_in_thread(message_id, markdown)
+            .await
+    } else {
+        api.reply_post_markdown(message_id, markdown).await
+    };
+    result
+        .map(|message| message.message_id)
+        .map_err(SendFailure::Delivery)
+}
+
+async fn send_progress_reply(
+    api: &LarkApi,
+    message_id: &str,
+    text: &str,
+    in_thread: bool,
+) -> Result<String, SendFailure> {
+    let card = progress_card(text);
+    let result = if in_thread {
+        api.reply_card_in_thread(message_id, card).await
+    } else {
+        api.reply_card(message_id, card).await
+    };
+    result
+        .map(|message| message.message_id)
+        .map_err(SendFailure::Delivery)
 }
 
 enum ProgressAnchor {
@@ -504,12 +535,13 @@ fn valid_progress_dependency(
 }
 
 fn progress_card(text: &str) -> Value {
+    let stable = stabilize_streaming_markdown(text);
     json!({
         "schema": "2.0",
         "body": {
             "elements": [{
                 "tag": "markdown",
-                "content": text,
+                "content": stable,
             }],
         },
     })

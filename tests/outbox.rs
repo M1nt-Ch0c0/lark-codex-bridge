@@ -102,6 +102,35 @@ fn reply_text(request: &RecordedRequest) -> String {
         .to_owned()
 }
 
+fn reply_markdown(request: &RecordedRequest) -> String {
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&request.body).expect("reply request should be JSON");
+    assert_eq!(envelope["msg_type"], "post");
+    let content = envelope["content"]
+        .as_str()
+        .expect("reply request should carry a content string");
+    let content: serde_json::Value =
+        serde_json::from_str(content).expect("post content should be JSON");
+    content["zh_cn"]["content"][0][0]["text"]
+        .as_str()
+        .expect("post should carry one Markdown element")
+        .to_owned()
+}
+
+fn card_markdown(request: &RecordedRequest) -> String {
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&request.body).expect("card request should be JSON");
+    let content = envelope["content"]
+        .as_str()
+        .expect("card request should carry a content string");
+    let card: serde_json::Value =
+        serde_json::from_str(content).expect("card content should be JSON");
+    card["body"]["elements"][0]["content"]
+        .as_str()
+        .expect("card should carry Markdown")
+        .to_owned()
+}
+
 fn fast_config() -> OutboxPumpConfig {
     OutboxPumpConfig {
         retry_base: Duration::from_millis(1),
@@ -293,6 +322,19 @@ fn payload_roundtrips_and_redacts_text() {
 }
 
 #[test]
+fn markdown_post_payload_roundtrips_without_losing_its_semantic_type() {
+    let operation = OutboxOperation::ReplyMarkdownPost {
+        message_id: "om_parent".to_owned(),
+        thread_id: Some("omt_thread".to_owned()),
+        markdown: "**private result**".to_owned(),
+    };
+    let json = operation.encode().expect("encode");
+    assert!(json.contains("\"op\":\"reply_markdown_post\""));
+    assert_eq!(OutboxOperation::decode(&json).expect("decode"), operation);
+    assert!(!format!("{operation:?}").contains("private result"));
+}
+
+#[test]
 fn payload_rejects_unknown_fields() {
     let json = r#"{"version":1,"op":"reply_text","message_id":"m","text":"t","bogus":1}"#;
     assert!(matches!(
@@ -406,14 +448,35 @@ async fn finalize_enqueues_the_final_row() {
     assert_eq!(row.kind, "final");
     let decoded = OutboxOperation::decode(&row.payload_json).expect("decode");
     match decoded {
-        OutboxOperation::ReplyText {
-            message_id, text, ..
+        OutboxOperation::ReplyMarkdownPost {
+            message_id,
+            markdown,
+            ..
         } => {
             assert_eq!(message_id, "om_parent");
-            assert_eq!(text, "user[at]example.com");
+            assert_eq!(markdown, "user[at]example.com");
         }
-        _ => panic!("expected a text final"),
+        _ => panic!("expected a Markdown-post final"),
     }
+}
+
+#[tokio::test]
+async fn standalone_final_is_delivered_as_a_markdown_post() {
+    let server = StubServer::start(token_plus(|_| ok_message("om_final"))).await;
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = OutboxReplySink::new(store.clone());
+    sink.finalize(completed_finalization(1, "# Result\n\n- done"))
+        .await
+        .expect("finalize");
+
+    let (_, receiver) = watch::channel(TransportState::Connected);
+    let pump = OutboxPump::spawn(store.clone(), api_for(&server), receiver, fast_config());
+    wait_for_state(&store, 1, OutboxState::Sent).await;
+
+    let requests = reply_requests(&server);
+    assert_eq!(requests.len(), 1);
+    assert_eq!(reply_markdown(&requests[0]), "**Result**\n\n- done");
+    pump.shutdown().await;
 }
 
 #[tokio::test]
@@ -453,7 +516,7 @@ async fn progress_cards_are_created_updated_and_finalized_through_the_outbox() {
         scope_key: "im:oc_chat".to_owned(),
         source: progress_source.clone(),
         sequence: 0,
-        text: "working".to_owned(),
+        text: "working\n```rust\nlet x = 1;".to_owned(),
     })
     .await
     .expect("first progress");
@@ -462,14 +525,14 @@ async fn progress_cards_are_created_updated_and_finalized_through_the_outbox() {
         scope_key: "im:oc_chat".to_owned(),
         source: progress_source,
         sequence: 1,
-        text: "working more".to_owned(),
+        text: "working\n```rust\nlet x = 1;\nlet y = 2;".to_owned(),
     })
     .await
     .expect("progress update");
     sink.finalize_projected(
         completed_finalization(9, "ignored final-only projection"),
         ProjectedReply::ProgressFinal {
-            text: "working more done".to_owned(),
+            text: "working\n```rust\nlet x = 1;\nlet y = 2;\n```".to_owned(),
         },
     )
     .await
@@ -506,6 +569,18 @@ async fn progress_cards_are_created_updated_and_finalized_through_the_outbox() {
     assert_eq!(requests[1].path, "/open-apis/im/v1/messages/om_progress");
     assert_eq!(requests[2].method, "PATCH");
     assert_eq!(requests[2].path, "/open-apis/im/v1/messages/om_progress");
+    assert_eq!(
+        card_markdown(&requests[0]),
+        "working\n```rust\nlet x = 1;\n```"
+    );
+    assert_eq!(
+        card_markdown(&requests[1]),
+        "working\n```rust\nlet x = 1;\nlet y = 2;\n```"
+    );
+    assert_eq!(
+        card_markdown(&requests[2]),
+        "working\n```rust\nlet x = 1;\nlet y = 2;\n```"
+    );
 
     pump.shutdown().await;
 }
@@ -547,6 +622,7 @@ async fn same_scope_cross_turn_progress_anchor_is_rejected_before_patch() {
         message_id: "om_parent".to_owned(),
         thread_id: None,
         text: "wrong turn final".to_owned(),
+        fallback_markdown: "wrong turn final".to_owned(),
     };
     let bad_final_id = match store
         .enqueue_outbox(NewOutboxRow {
@@ -617,7 +693,7 @@ async fn failed_initial_progress_card_falls_back_to_a_standalone_final() {
     );
     let requests = reply_requests(&server);
     assert_eq!(
-        reply_text(requests.last().expect("fallback request")),
+        reply_markdown(requests.last().expect("fallback request")),
         "complete fallback"
     );
     pump.shutdown().await;
@@ -705,10 +781,10 @@ async fn final_rows_reply_only_to_the_last_source_bounded_by_parts() {
     assert_eq!(first.kind, "final");
     let decoded = OutboxOperation::decode(&first.payload_json).expect("decode");
     match decoded {
-        OutboxOperation::ReplyText { message_id, .. } => {
+        OutboxOperation::ReplyMarkdownPost { message_id, .. } => {
             assert_eq!(message_id, "om_63", "the reply targets the last source");
         }
-        _ => panic!("expected a text final"),
+        _ => panic!("expected a Markdown-post final"),
     }
 
     let last = store.outbox_row(8).await.expect("row").expect("exists");

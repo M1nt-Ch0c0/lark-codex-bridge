@@ -34,9 +34,13 @@ use std::time::{Duration, Instant};
 use crate::codex::client::{AppServerEvent, TurnOutcome};
 use crate::codex::types::{MessagePhase, ThreadItem};
 use crate::limits::{
-    REPLY_MAX_SPLITS, REPLY_MESSAGE_MAX_CHARS, REPLY_TRUNCATION_MARKER, REPLY_UPDATE_MIN_CHARS,
-    REPLY_UPDATE_MIN_INTERVAL,
+    LARK_MAX_SEND_BODY_BYTES, REPLY_MAX_SPLITS, REPLY_MESSAGE_MAX_CHARS, REPLY_TRUNCATION_MARKER,
+    REPLY_UPDATE_MIN_CHARS, REPLY_UPDATE_MIN_INTERVAL,
 };
+
+mod markdown;
+
+pub use markdown::{render_lark_markdown, split_lark_markdown, stabilize_streaming_markdown};
 
 /// Tunables for one [`ReplyProjector`]; defaults match the production limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,7 +69,8 @@ impl Default for ProjectorConfig {
 /// One terminal projection result.
 #[derive(Clone, PartialEq, Eq)]
 pub enum ProjectedReply {
-    /// Standalone final answer, masked and split into bounded parts.
+    /// Standalone final answer, projected as Lark `post` Markdown and split
+    /// into bounded, independently valid parts.
     Final {
         /// Bounded, already-masked message parts, in deterministic order.
         parts: Vec<String>,
@@ -375,7 +380,11 @@ impl ReplyProjector {
         self.render_final(&extracted.text)
     }
 
-    /// Masks agent-generated text and splits it into bounded parts.
+    /// Masks agent-generated text and splits it into bounded plain-text parts.
+    ///
+    /// This compatibility helper is not used for standalone final delivery;
+    /// final replies go through [`render_lark_markdown`] and
+    /// [`split_lark_markdown`].
     #[must_use]
     pub fn mask_and_split(&self, text: &str) -> Vec<String> {
         split_text(
@@ -391,8 +400,17 @@ impl ReplyProjector {
         if trimmed.is_empty() {
             ProjectedReply::Empty
         } else {
+            let markdown = render_lark_markdown(trimmed);
+            if markdown.is_empty() {
+                return ProjectedReply::Empty;
+            }
             ProjectedReply::Final {
-                parts: split_text(trimmed, self.config.max_chars, self.config.max_splits),
+                parts: split_lark_markdown(
+                    &markdown,
+                    self.config.max_chars,
+                    LARK_MAX_SEND_BODY_BYTES,
+                    self.config.max_splits,
+                ),
             }
         }
     }
