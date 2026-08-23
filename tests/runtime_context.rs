@@ -10,8 +10,8 @@ use lark_codex_bridge::{
     },
     runtime::context::{
         ActiveBinding, ChatKind, ChatSnapshot, ContextDraft, ContextErrorCode, ContextRegistry,
-        ContextRegistryConfig, DraftPart, MediaKind, MediaMetadata, PendingBinding,
-        RevocationReason, SenderSnapshot, ThreadSnapshot, TypedPart,
+        ContextRegistryConfig, DraftPart, MediaKind, MediaMetadata, PendingBinding, QuoteDraft,
+        QuoteStatus, RevocationReason, SenderSnapshot, ThreadSnapshot, TypedPart,
     },
 };
 use tokio::sync::Barrier;
@@ -172,6 +172,54 @@ fn media_key_is_hidden_and_handle_is_bound_to_exact_context_and_turn() {
         resource.is_cancelled(),
         "revocation must cancel already-authorized media work"
     );
+}
+
+#[test]
+fn quoted_media_handle_reads_from_the_parent_and_debug_redacts_keys_and_text() {
+    let registry = ContextRegistry::new(config(4, Duration::from_secs(60))).expect("registry");
+    let mut context = draft("om_trigger");
+    context.parts = vec![DraftPart::Text("trigger secret text".to_owned())];
+    context.quote = Some(QuoteDraft {
+        message_id: "om_parent".to_owned(),
+        message_type: Some("image".to_owned()),
+        status: QuoteStatus::Available,
+        parts: vec![DraftPart::Media {
+            kind: MediaKind::Image,
+            resource: ResourceDesc {
+                kind: ResourceKind::Image,
+                key: "quoted_secret_key".to_owned(),
+            },
+            thumbnail: None,
+            metadata: MediaMetadata::default(),
+        }],
+    });
+    let debug = format!("{context:?}");
+    assert!(!debug.contains("trigger secret text"));
+    assert!(!debug.contains("quoted_secret_key"));
+
+    let registered = registry
+        .register_pending(pending(41), context)
+        .expect("register quoted context");
+    registry
+        .activate(&registered.context_id, &pending(41), "turn-a")
+        .expect("activate quoted context");
+    let snapshot = registry
+        .resolve(&registered.context_id, &active(41))
+        .expect("resolve quoted context");
+    assert_eq!(
+        snapshot.quote.as_ref().expect("quote").status,
+        QuoteStatus::Available
+    );
+    let TypedPart::Media { handle, .. } = &snapshot.quote.as_ref().expect("quote").parts[0] else {
+        panic!("quoted media handle")
+    };
+    let json = serde_json::to_string(&snapshot).expect("serialize");
+    assert!(!json.contains("quoted_secret_key"));
+    let authorized = registry
+        .authorize_media(&registered.context_id, handle, &active(41))
+        .expect("authorize quoted media");
+    assert_eq!(authorized.message_id, "om_parent");
+    assert_eq!(authorized.resource.key, "quoted_secret_key");
 }
 
 #[test]

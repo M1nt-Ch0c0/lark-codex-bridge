@@ -258,12 +258,94 @@ pub struct ThreadSnapshot {
     pub root_message_id: Option<String>,
 }
 
-/// Immediate quoted/replied-to message metadata.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+/// Stable outcome of resolving one directly quoted message.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuoteStatus {
+    /// The direct parent was fetched and normalized.
+    Available,
+    /// Lark reports that the direct parent was deleted or no longer exists.
+    Deleted,
+    /// The app is not authorized to read the direct parent.
+    Unauthorized,
+    /// The parent body or descriptor metadata exceeds a local bound.
+    Oversize,
+    /// The parent message kind is not supported by this bridge version.
+    Unsupported,
+    /// The parent could not be resolved at this time.
+    Unavailable,
+}
+
+/// Immediate quoted/replied-to message snapshot.
+#[derive(Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QuoteSnapshot {
     /// Immediate parent message ID.
     pub message_id: String,
+    /// Open Lark wire type, omitted when the parent could not be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_type: Option<String>,
+    /// Stable resolution/degradation state.
+    pub status: QuoteStatus,
+    /// Sanitized parent parts. Resource keys are replaced with opaque handles.
+    pub parts: Vec<TypedPart>,
+}
+
+impl fmt::Debug for QuoteSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("QuoteSnapshot")
+            .field("message_id_len", &self.message_id.len())
+            .field(
+                "message_type_len",
+                &self.message_type.as_deref().map_or(0, str::len),
+            )
+            .field("status", &self.status)
+            .field("part_count", &self.parts.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Input form of a quote before opaque resource handles are minted.
+#[derive(Clone, PartialEq)]
+pub struct QuoteDraft {
+    /// Immediate parent message ID from the trusted receive event.
+    pub message_id: String,
+    /// Open Lark wire type, when known.
+    pub message_type: Option<String>,
+    /// Stable resolution/degradation state.
+    pub status: QuoteStatus,
+    /// Sanitized parent parts, containing resource descriptors only while the
+    /// context is pending registration.
+    pub parts: Vec<DraftPart>,
+}
+
+impl fmt::Debug for QuoteDraft {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("QuoteDraft")
+            .field("message_id_len", &self.message_id.len())
+            .field(
+                "message_type_len",
+                &self.message_type.as_deref().map_or(0, str::len),
+            )
+            .field("status", &self.status)
+            .field("part_count", &self.parts.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl QuoteDraft {
+    /// Builds the stable unresolved form used when no resolver is installed.
+    #[must_use]
+    pub fn unavailable(message_id: String) -> Self {
+        Self {
+            message_id,
+            message_type: None,
+            status: QuoteStatus::Unavailable,
+            parts: Vec::new(),
+        }
+    }
 }
 
 /// Semantic media kind exposed to the model.
@@ -283,7 +365,7 @@ pub enum MediaKind {
 }
 
 /// Optional, non-authoritative metadata for one media part.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Default, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaMetadata {
     /// Safe display name selected by the bridge.
@@ -299,12 +381,34 @@ pub struct MediaMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
     /// Client-supplied recognition text, if the inbound payload included it.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// This remains capability-internal and is never exposed by
+    /// `bridge_context.resolve`; `bridge_media.read` applies the configured
+    /// transcript cap before returning it.
+    #[serde(skip)]
     pub transcript: Option<String>,
 }
 
+impl fmt::Debug for MediaMetadata {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MediaMetadata")
+            .field("name_len", &self.name.as_deref().map_or(0, str::len))
+            .field(
+                "mime_type_len",
+                &self.mime_type.as_deref().map_or(0, str::len),
+            )
+            .field("size_bytes", &self.size_bytes)
+            .field("duration_ms", &self.duration_ms)
+            .field(
+                "transcript_len",
+                &self.transcript.as_deref().map_or(0, str::len),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
 /// Typed part returned by context resolution. Resource keys never appear here.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TypedPart {
     /// Plain normalized text.
@@ -347,8 +451,45 @@ pub enum TypedPart {
     },
 }
 
+impl fmt::Debug for TypedPart {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text { text } => formatter
+                .debug_struct("Text")
+                .field("text_len", &text.len())
+                .finish(),
+            Self::Media {
+                kind,
+                handle,
+                thumbnail_handle,
+                metadata,
+            } => formatter
+                .debug_struct("Media")
+                .field("kind", kind)
+                .field("handle", handle)
+                .field("thumbnail_handle", thumbnail_handle)
+                .field("metadata", metadata)
+                .finish(),
+            Self::Card { .. } => formatter.write_str("Card([REDACTED])"),
+            Self::Forward { message_id, status } => formatter
+                .debug_struct("Forward")
+                .field("message_id_len", &message_id.as_deref().map_or(0, str::len))
+                .field("status", status)
+                .finish(),
+            Self::Unsupported {
+                message_type,
+                reason,
+            } => formatter
+                .debug_struct("Unsupported")
+                .field("message_type_len", &message_type.len())
+                .field("reason", reason)
+                .finish(),
+        }
+    }
+}
+
 /// Input part accepted during registration, before opaque handles are minted.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum DraftPart {
     /// Plain normalized text.
     Text(String),
@@ -381,6 +522,43 @@ pub enum DraftPart {
     },
 }
 
+impl fmt::Debug for DraftPart {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text(text) => formatter
+                .debug_tuple("Text")
+                .field(&format_args!("len={}", text.len()))
+                .finish(),
+            Self::Media {
+                kind,
+                resource,
+                thumbnail,
+                metadata,
+            } => formatter
+                .debug_struct("Media")
+                .field("kind", kind)
+                .field("resource", resource)
+                .field("thumbnail", thumbnail)
+                .field("metadata", metadata)
+                .finish(),
+            Self::Card(_) => formatter.write_str("Card([REDACTED])"),
+            Self::Forward { message_id, status } => formatter
+                .debug_struct("Forward")
+                .field("message_id_len", &message_id.as_deref().map_or(0, str::len))
+                .field("status", status)
+                .finish(),
+            Self::Unsupported {
+                message_type,
+                reason,
+            } => formatter
+                .debug_struct("Unsupported")
+                .field("message_type_len", &message_type.len())
+                .field("reason", reason)
+                .finish(),
+        }
+    }
+}
+
 /// Availability of a typed part that does not carry a downloadable handle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -409,7 +587,7 @@ pub struct ContextDraft {
     /// Topic and reply-root metadata.
     pub thread: ThreadSnapshot,
     /// Immediate quoted/replied-to message, if any.
-    pub quote: Option<QuoteSnapshot>,
+    pub quote: Option<QuoteDraft>,
     /// Open Lark wire message type.
     pub message_type: String,
     /// Lark create time in milliseconds since the Unix epoch.
@@ -508,9 +686,7 @@ impl ContextDraft {
             quote: event
                 .reply_to_message_id
                 .as_ref()
-                .map(|message_id| QuoteSnapshot {
-                    message_id: message_id.clone(),
-                }),
+                .map(|message_id| QuoteDraft::unavailable(message_id.clone())),
             message_type: event.message_type.clone(),
             create_time_ms: event.create_time_ms,
             parts,
@@ -518,7 +694,7 @@ impl ContextDraft {
     }
 }
 
-fn draft_part_from_inbound(part: &MessagePart) -> DraftPart {
+pub(crate) fn draft_part_from_inbound(part: &MessagePart) -> DraftPart {
     match part {
         MessagePart::Text { text } => DraftPart::Text(text.clone()),
         MessagePart::Image(media) => draft_media_part(MediaKind::Image, ResourceKind::Image, media),
@@ -706,6 +882,7 @@ pub struct ContextRegistryStats {
 
 #[derive(Clone)]
 struct ResourceGrant {
+    message_id: String,
     kind: MediaKind,
     resource: ResourceDesc,
     transcript: Option<String>,
@@ -780,7 +957,8 @@ impl ContextRegistry {
         binding: PendingBinding,
         draft: ContextDraft,
     ) -> Result<RegisteredContext, ContextError> {
-        if draft.parts.len() > self.config.max_parts_per_context {
+        let quote_parts = draft.quote.as_ref().map_or(0, |quote| quote.parts.len());
+        if draft.parts.len().saturating_add(quote_parts) > self.config.max_parts_per_context {
             return Err(error(
                 ContextErrorCode::InvalidRequest,
                 "context contains too many typed parts",
@@ -800,11 +978,26 @@ impl ContextRegistry {
         make_capacity(&mut state, self.config.max_contexts, now)?;
         let context_id = unique_context_id(&state);
         let mut grants = HashMap::new();
+        let message_id = draft.message_id.clone();
         let parts = draft
             .parts
             .into_iter()
-            .map(|part| materialize_part(part, &mut grants))
+            .map(|part| materialize_part(part, &message_id, &mut grants))
             .collect();
+        let quote = draft.quote.map(|quote| {
+            let quote_message_id = quote.message_id.clone();
+            let parts = quote
+                .parts
+                .into_iter()
+                .map(|part| materialize_part(part, &quote_message_id, &mut grants))
+                .collect();
+            QuoteSnapshot {
+                message_id: quote.message_id,
+                message_type: quote.message_type,
+                status: quote.status,
+                parts,
+            }
+        });
         let snapshot = ContextSnapshot {
             event_id: draft.event_id,
             message_id: draft.message_id,
@@ -812,7 +1005,7 @@ impl ContextRegistry {
             chat: draft.chat,
             mentions: draft.mentions,
             thread: draft.thread,
-            quote: draft.quote,
+            quote,
             message_type: draft.message_type,
             create_time_ms: draft.create_time_ms,
             parts,
@@ -1039,6 +1232,7 @@ impl Default for ContextRegistry {
 
 fn materialize_part(
     part: DraftPart,
+    message_id: &str,
     grants: &mut HashMap<MediaHandle, ResourceGrant>,
 ) -> TypedPart {
     match part {
@@ -1053,6 +1247,7 @@ fn materialize_part(
             grants.insert(
                 handle.clone(),
                 ResourceGrant {
+                    message_id: message_id.to_owned(),
                     kind,
                     resource,
                     transcript: metadata.transcript.clone(),
@@ -1064,6 +1259,7 @@ fn materialize_part(
                 grants.insert(
                     thumbnail_handle.clone(),
                     ResourceGrant {
+                        message_id: message_id.to_owned(),
                         kind: MediaKind::Image,
                         resource,
                         transcript: None,
@@ -1193,7 +1389,7 @@ fn authorized_resource(
         )
     })?;
     Ok(AuthorizedResource {
-        message_id: entry.snapshot.message_id.clone(),
+        message_id: grant.message_id.clone(),
         media_kind: grant.kind,
         local_turn_row_id: entry.pending_binding.local_turn_row_id,
         resource: grant.resource.clone(),

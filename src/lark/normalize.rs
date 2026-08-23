@@ -869,6 +869,17 @@ fn extract_message_content(
     }
 }
 
+/// Parses one already-fetched message body through the exact same typed,
+/// sanitizing content path used for receive events. This narrow crate-local
+/// seam lets the authorized one-hop quote resolver avoid duplicating wire
+/// parsing or retaining the raw JSON beyond resolution.
+pub(crate) fn normalize_message_parts(
+    message_type: &str,
+    content: &str,
+) -> Result<Vec<MessagePart>, LarkError> {
+    extract_message_content(message_type, content).map(|extracted| extracted.parts)
+}
+
 fn rich_media_content(value: &Value, wrap: fn(MediaPart) -> MessagePart) -> ExtractedContent {
     let key = content_string(value, "file_key");
     ExtractedContent {

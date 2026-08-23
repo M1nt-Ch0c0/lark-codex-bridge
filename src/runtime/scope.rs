@@ -1,9 +1,9 @@
 //! One-scope runtime contracts shared by the router and reply projector.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant as StdInstant, SystemTime, UNIX_EPOCH};
 
 use futures_util::future::BoxFuture;
@@ -18,9 +18,10 @@ use crate::codex::types::{
     SandboxMode, ThreadResumeParams, ThreadStartParams, TurnSandboxPolicy, TurnStartParams,
     TurnStatus, UserInput,
 };
+use crate::lark::api::ChatMode;
 use crate::lark::api::ResourceKind;
 use crate::lark::bridge::QueuedInboundEvent;
-use crate::lark::normalize::{InboundEvent, ScopeKey};
+use crate::lark::normalize::{InboundEvent, MessagePart, ScopeKey};
 use crate::limits::{
     REPLY_MESSAGE_MAX_CHARS, SCOPE_MAILBOX_BYTE_BUDGET, SCOPE_MAILBOX_CAPACITY,
     TURN_BATCH_MAX_MESSAGES, TURN_BATCH_TEXT_BYTE_BUDGET,
@@ -31,6 +32,7 @@ use crate::runtime::context::{
     ContextDraft, ContextId, ContextRegistry, PendingBinding, RevocationReason,
 };
 use crate::runtime::policy::AccessPolicy;
+use crate::runtime::quote::{QuoteRequest, QuoteResolver};
 use crate::runtime::router::RouterSettings;
 use crate::runtime::tools::{CONTEXT_TOOLS_VERSION, bridge_dynamic_tools};
 use crate::store::{
@@ -201,6 +203,10 @@ pub struct ScopeSnapshot {
     /// Inbound messages waiting in the actor mailbox; the item currently
     /// executing is represented by `state` rather than this count.
     pub queued_messages: usize,
+    /// P2P attachment descriptors waiting for ordinary text.
+    pub pending_media: usize,
+    /// Aggregate variable metadata bytes in the pending queue.
+    pub pending_media_bytes: usize,
 }
 
 /// Static scope failure category safe for snapshots and logs.
@@ -238,6 +244,180 @@ pub(crate) struct ActorInbound {
     pub(crate) _mailbox_permit: OwnedSemaphorePermit,
 }
 
+#[derive(Clone)]
+struct PendingMediaItem {
+    draft: ContextDraft,
+    metadata_bytes: usize,
+    expires_at: Instant,
+}
+
+struct PendingMediaQueue {
+    items: VecDeque<PendingMediaItem>,
+    metadata_bytes: usize,
+    ttl: std::time::Duration,
+    max_count: usize,
+    max_metadata_bytes: usize,
+    generation: u64,
+}
+
+impl PendingMediaQueue {
+    fn new(settings: &RouterSettings) -> Self {
+        Self {
+            items: VecDeque::new(),
+            metadata_bytes: 0,
+            ttl: settings.pending_media_ttl,
+            max_count: settings.pending_media_max_count,
+            max_metadata_bytes: settings.pending_media_max_metadata_bytes,
+            generation: 0,
+        }
+    }
+
+    fn stage(&mut self, event: &InboundEvent) {
+        self.expire(Instant::now());
+        let metadata_bytes = pending_metadata_bytes(event);
+        if metadata_bytes > self.max_metadata_bytes {
+            return;
+        }
+        while self.items.len() >= self.max_count
+            || self.metadata_bytes.saturating_add(metadata_bytes) > self.max_metadata_bytes
+        {
+            let Some(evicted) = self.items.pop_front() else {
+                break;
+            };
+            self.metadata_bytes = self.metadata_bytes.saturating_sub(evicted.metadata_bytes);
+        }
+        let mut draft = ContextDraft::from_inbound(event);
+        // Pending association is implicit media only. A reply attached to the
+        // media message itself must not become a second quote traversal.
+        draft.quote = None;
+        self.items.push_back(PendingMediaItem {
+            draft,
+            metadata_bytes,
+            expires_at: Instant::now() + self.ttl,
+        });
+        self.metadata_bytes = self.metadata_bytes.saturating_add(metadata_bytes);
+    }
+
+    fn reserve_all(&mut self) -> (u64, Vec<PendingMediaItem>) {
+        self.expire(Instant::now());
+        self.metadata_bytes = 0;
+        (self.generation, self.items.drain(..).collect())
+    }
+
+    fn restore(&mut self, generation: u64, items: Vec<PendingMediaItem>) {
+        if generation != self.generation {
+            return;
+        }
+        let now = Instant::now();
+        for item in items {
+            if item.expires_at <= now {
+                continue;
+            }
+            self.metadata_bytes = self.metadata_bytes.saturating_add(item.metadata_bytes);
+            self.items.push_back(item);
+        }
+    }
+
+    fn expire(&mut self, now: Instant) {
+        while self
+            .items
+            .front()
+            .is_some_and(|item| now >= item.expires_at)
+        {
+            if let Some(expired) = self.items.pop_front() {
+                self.metadata_bytes = self.metadata_bytes.saturating_sub(expired.metadata_bytes);
+            }
+        }
+    }
+
+    fn next_expiry(&self) -> Option<Instant> {
+        self.items.front().map(|item| item.expires_at)
+    }
+
+    fn clear(&mut self) {
+        self.items.clear();
+        self.metadata_bytes = 0;
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    fn stats(&self) -> (usize, usize) {
+        (self.items.len(), self.metadata_bytes)
+    }
+}
+
+struct PendingMediaReservation {
+    queue: Arc<Mutex<PendingMediaQueue>>,
+    generation: u64,
+    items: Option<Vec<PendingMediaItem>>,
+}
+
+impl PendingMediaReservation {
+    fn drafts(&self) -> Vec<ContextDraft> {
+        self.items
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|item| item.draft.clone())
+            .collect()
+    }
+
+    fn commit(&mut self) {
+        self.items = None;
+    }
+}
+
+impl Drop for PendingMediaReservation {
+    fn drop(&mut self) {
+        let Some(items) = self.items.take() else {
+            return;
+        };
+        self.queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .restore(self.generation, items);
+    }
+}
+
+fn pending_metadata_bytes(event: &InboundEvent) -> usize {
+    let identifiers = [
+        event.event_id.len(),
+        event.message_id.len(),
+        event.chat_id.len(),
+        event.sender_id.len(),
+        event.thread_id.as_deref().map_or(0, str::len),
+        event.root_id.as_deref().map_or(0, str::len),
+        event.message_type.len(),
+    ]
+    .into_iter()
+    .fold(0_usize, usize::saturating_add);
+    event.parts.iter().fold(identifiers, |total, part| {
+        let bytes = match part {
+            MessagePart::Image(media)
+            | MessagePart::File(media)
+            | MessagePart::Sticker(media)
+            | MessagePart::Audio(media)
+            | MessagePart::Video(media) => media
+                .key
+                .as_deref()
+                .map_or(0, str::len)
+                .saturating_add(media.thumbnail_key.as_deref().map_or(0, str::len))
+                .saturating_add(media.metadata.file_name.as_deref().map_or(0, str::len))
+                .saturating_add(media.metadata.mime_type.as_deref().map_or(0, str::len))
+                .saturating_add(media.metadata.transcript.as_deref().map_or(0, str::len)),
+            MessagePart::Text { text } => text.len(),
+            MessagePart::Forward { message_id, .. } => message_id.as_deref().map_or(0, str::len),
+            MessagePart::Unsupported { message_type, .. } => message_type.len(),
+            MessagePart::Card { .. } => 0,
+        };
+        total.saturating_add(bytes)
+    })
+}
+
+struct TurnInbound {
+    inbound: ActorInbound,
+    pending_media: Option<PendingMediaReservation>,
+}
+
 enum ScopeCommand {
     Inbound(Box<ActorInbound>),
 }
@@ -248,6 +428,7 @@ pub(crate) struct ScopeActorHandle {
     budget: Arc<Semaphore>,
     state: Arc<RwLock<ScopeState>>,
     active_turn: Arc<RwLock<Option<ActiveTurn>>>,
+    pending_media: Arc<Mutex<PendingMediaQueue>>,
     store: StoreHandle,
     supervisor: watch::Receiver<SupervisorAccess>,
     shutdown: CancellationToken,
@@ -266,6 +447,7 @@ impl ScopeActorHandle {
         sink: Arc<dyn DurableReplySink>,
         attachments: Option<Arc<AttachmentCache>>,
         contexts: Option<Arc<ContextRegistry>>,
+        quote_resolver: Option<Arc<dyn QuoteResolver>>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel(SCOPE_MAILBOX_CAPACITY);
         let state = Arc::new(RwLock::new(ScopeState::Idle));
@@ -273,6 +455,7 @@ impl ScopeActorHandle {
         let active_turn = Arc::new(RwLock::new(None));
         let task_active_turn = Arc::clone(&active_turn);
         let shutdown = CancellationToken::new();
+        let pending_media = Arc::new(Mutex::new(PendingMediaQueue::new(&settings)));
         let join = tokio::spawn(run_scope_actor(
             scope.clone(),
             receiver,
@@ -284,8 +467,10 @@ impl ScopeActorHandle {
             sink,
             attachments,
             contexts,
+            quote_resolver,
             task_state,
             task_active_turn,
+            Arc::clone(&pending_media),
             shutdown.clone(),
         ));
         Self {
@@ -294,6 +479,7 @@ impl ScopeActorHandle {
             budget: Arc::new(Semaphore::new(SCOPE_MAILBOX_BYTE_BUDGET)),
             state,
             active_turn,
+            pending_media,
             store,
             supervisor,
             shutdown,
@@ -341,13 +527,22 @@ impl ScopeActorHandle {
     }
 
     pub(crate) fn snapshot(&self) -> ScopeSnapshot {
+        let (pending_media, pending_media_bytes) = self
+            .pending_media
+            .lock()
+            .map_or((0, 0), |pending| pending.stats());
         ScopeSnapshot {
             state: self.state(),
             queued_messages: self.sender.max_capacity() - self.sender.capacity(),
+            pending_media,
+            pending_media_bytes,
         }
     }
 
     pub(crate) async fn interrupt(&self) -> Result<InterruptOutcome, ()> {
+        if let Ok(mut pending) = self.pending_media.lock() {
+            pending.clear();
+        }
         let active = self.active_turn.read().map_err(|_| ())?.clone();
         let Some(active) = active else {
             return Ok(InterruptOutcome::NoActiveTurn);
@@ -367,6 +562,9 @@ impl ScopeActorHandle {
     }
 
     pub(crate) async fn shutdown(mut self) {
+        if let Ok(mut pending) = self.pending_media.lock() {
+            pending.clear();
+        }
         self.shutdown.cancel();
         if let Some(join) = self.join.take() {
             let _ = join.await;
@@ -388,7 +586,7 @@ struct ActiveTurn {
     context_binding: Option<(ContextRegistry, PendingBinding)>,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_scope_actor(
     scope: ScopeKey,
     mut receiver: mpsc::Receiver<ScopeCommand>,
@@ -400,28 +598,68 @@ async fn run_scope_actor(
     sink: Arc<dyn DurableReplySink>,
     attachments: Option<Arc<AttachmentCache>>,
     contexts: Option<Arc<ContextRegistry>>,
+    quote_resolver: Option<Arc<dyn QuoteResolver>>,
     state: Arc<RwLock<ScopeState>>,
     active_turn: Arc<RwLock<Option<ActiveTurn>>>,
+    pending_media: Arc<Mutex<PendingMediaQueue>>,
     shutdown: CancellationToken,
 ) {
     let mut deferred = None;
     'actor: loop {
-        let command = if let Some(deferred) = deferred.take() {
-            Some(ScopeCommand::Inbound(deferred))
+        let first = if let Some(deferred) = deferred.take() {
+            Some(deferred)
         } else {
-            tokio::select! {
-                biased;
-                () = shutdown.cancelled() => break,
-                command = receiver.recv() => command,
+            let next_expiry = pending_media
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .next_expiry();
+            let command = if let Some(next_expiry) = next_expiry {
+                tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => break,
+                    command = receiver.recv() => command,
+                    () = sleep_until(next_expiry) => {
+                        pending_media
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .expire(Instant::now());
+                        continue;
+                    }
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => break,
+                    command = receiver.recv() => command,
+                }
+            };
+            let Some(ScopeCommand::Inbound(first)) = command else {
+                break;
+            };
+            match prepare_inbound(
+                *first,
+                &store,
+                &policy,
+                &settings,
+                sink.as_ref(),
+                &pending_media,
+            )
+            .await
+            {
+                Ok(first) => first,
+                Err(kind) => {
+                    set_state(&state, ScopeState::Failed { kind });
+                    continue;
+                }
             }
         };
-        let Some(command) = command else { break };
-        match command {
-            ScopeCommand::Inbound(first) => {
-                let mut batch = vec![*first];
-                let mut text_bytes = batch[0].queued.event.text.len();
-                set_state(&state, ScopeState::Debouncing);
-                let deadline = Instant::now() + settings.debounce;
+        if let Some(first) = first {
+            let first_is_audio = is_audio_event(&first.inbound.queued.event);
+            let mut batch = vec![first];
+            let mut text_bytes = batch[0].inbound.queued.event.text.len();
+            set_state(&state, ScopeState::Debouncing);
+            let deadline = Instant::now() + settings.debounce;
+            if !first_is_audio {
                 loop {
                     if batch.len() >= TURN_BATCH_MAX_MESSAGES
                         || text_bytes >= TURN_BATCH_TEXT_BYTE_BUDGET
@@ -434,7 +672,26 @@ async fn run_scope_actor(
                         () = sleep_until(deadline) => break,
                         command = receiver.recv() => match command {
                             Some(ScopeCommand::Inbound(next)) => {
-                                let next_bytes = next.queued.event.text.len();
+                                let next = match prepare_inbound(
+                                    *next,
+                                    &store,
+                                    &policy,
+                                    &settings,
+                                    sink.as_ref(),
+                                    &pending_media,
+                                ).await {
+                                    Ok(Some(next)) => next,
+                                    Ok(None) => continue,
+                                    Err(kind) => {
+                                        set_state(&state, ScopeState::Failed { kind });
+                                        break 'actor;
+                                    }
+                                };
+                                if is_audio_event(&next.inbound.queued.event) {
+                                    deferred = Some(next);
+                                    break;
+                                }
+                                let next_bytes = next.inbound.queued.event.text.len();
                                 if text_bytes.saturating_add(next_bytes)
                                     > TURN_BATCH_TEXT_BYTE_BUDGET
                                 {
@@ -442,46 +699,133 @@ async fn run_scope_actor(
                                     break;
                                 }
                                 text_bytes = text_bytes.saturating_add(next_bytes);
-                                batch.push(*next);
+                                batch.push(next);
                             }
                             None => return,
                         }
                     }
                 }
-                set_state(&state, ScopeState::WaitingPermit);
-                let result = process_batch(
-                    &scope,
-                    batch,
-                    &store,
-                    &policy,
-                    &settings,
-                    supervisor.clone(),
-                    Arc::clone(&active_turns),
-                    Arc::clone(&sink),
-                    attachments.as_deref(),
-                    contexts.as_deref(),
-                    &state,
-                    &active_turn,
-                    &shutdown,
-                )
-                .await;
-                if shutdown.is_cancelled() {
-                    break;
-                }
-                if let Err(kind) = result {
-                    set_state(&state, ScopeState::Failed { kind });
-                } else {
-                    set_state(&state, ScopeState::Idle);
-                }
+            }
+            set_state(&state, ScopeState::WaitingPermit);
+            let result = process_batch(
+                &scope,
+                batch,
+                &store,
+                &policy,
+                &settings,
+                supervisor.clone(),
+                Arc::clone(&active_turns),
+                Arc::clone(&sink),
+                attachments.as_deref(),
+                contexts.as_deref(),
+                quote_resolver.as_deref(),
+                &state,
+                &active_turn,
+                &shutdown,
+            )
+            .await;
+            if shutdown.is_cancelled() {
+                break;
+            }
+            if let Err(kind) = result {
+                set_state(&state, ScopeState::Failed { kind });
+            } else {
+                set_state(&state, ScopeState::Idle);
             }
         }
     }
 }
 
+async fn prepare_inbound(
+    inbound: ActorInbound,
+    store: &StoreHandle,
+    policy: &AccessPolicy,
+    settings: &RouterSettings,
+    sink: &dyn DurableReplySink,
+    pending_media: &Arc<Mutex<PendingMediaQueue>>,
+) -> Result<Option<TurnInbound>, ScopeFailureKind> {
+    let event = &inbound.queued.event;
+    if is_pending_media_event(event)
+        || (event.chat_type != ChatMode::P2p && is_conversation_media_event(event))
+    {
+        let reason = if is_stale(event, settings.message_max_age) {
+            Some(InboundRejectionKind::Stale)
+        } else {
+            policy.decide(event).rejection_kind()
+        };
+        if let Some(reason) = reason {
+            reject_item(store, sink, &inbound, reason).await?;
+            return Ok(None);
+        }
+        store
+            .complete_received_without_turn(&inbound.key)
+            .await
+            .map_err(|_| ScopeFailureKind::Store)?;
+        if is_pending_media_event(event) {
+            pending_media
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .stage(event);
+        }
+        return Ok(None);
+    }
+
+    let mut pending = pending_media
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    pending.expire(Instant::now());
+    let explicit_quote = event.reply_to_message_id.is_some();
+    let reset = clears_pending_media(&event.text);
+    let pending_media_reservation = if explicit_quote || reset {
+        pending.clear();
+        None
+    } else if event.chat_type == ChatMode::P2p
+        && event.message_type == "text"
+        && !is_audio_event(event)
+    {
+        let (generation, items) = pending.reserve_all();
+        (!items.is_empty()).then(|| PendingMediaReservation {
+            queue: Arc::clone(pending_media),
+            generation,
+            items: Some(items),
+        })
+    } else {
+        None
+    };
+    drop(pending);
+    Ok(Some(TurnInbound {
+        inbound,
+        pending_media: pending_media_reservation,
+    }))
+}
+
+fn is_pending_media_event(event: &InboundEvent) -> bool {
+    event.chat_type == ChatMode::P2p
+        && matches!(
+            event.message_type.as_str(),
+            "image" | "video" | "media" | "file"
+        )
+}
+
+fn is_conversation_media_event(event: &InboundEvent) -> bool {
+    matches!(
+        event.message_type.as_str(),
+        "image" | "video" | "media" | "file" | "audio"
+    )
+}
+
+fn is_audio_event(event: &InboundEvent) -> bool {
+    event.message_type == "audio"
+}
+
+fn clears_pending_media(text: &str) -> bool {
+    matches!(text.trim(), "/cancel" | "/new" | "/stop")
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn process_batch(
     scope: &ScopeKey,
-    batch: Vec<ActorInbound>,
+    batch: Vec<TurnInbound>,
     store: &StoreHandle,
     policy: &AccessPolicy,
     settings: &RouterSettings,
@@ -490,6 +834,7 @@ async fn process_batch(
     sink: Arc<dyn DurableReplySink>,
     attachments: Option<&AttachmentCache>,
     contexts: Option<&ContextRegistry>,
+    quote_resolver: Option<&dyn QuoteResolver>,
     state: &Arc<RwLock<ScopeState>>,
     active_turn: &RwLock<Option<ActiveTurn>>,
     shutdown: &CancellationToken,
@@ -504,15 +849,16 @@ async fn process_batch(
     };
     let mut eligible = Vec::with_capacity(batch.len());
     for item in batch {
-        let reason = if item.queued.event.text.len() > TURN_BATCH_TEXT_BYTE_BUDGET {
+        let event = &item.inbound.queued.event;
+        let reason = if event.text.len() > TURN_BATCH_TEXT_BYTE_BUDGET {
             Some(InboundRejectionKind::Overloaded)
-        } else if is_stale(&item.queued.event, settings.message_max_age) {
+        } else if is_stale(event, settings.message_max_age) {
             Some(InboundRejectionKind::Stale)
         } else {
-            policy.decide(&item.queued.event).rejection_kind()
+            policy.decide(event).rejection_kind()
         };
         if let Some(reason) = reason {
-            reject_item(store, sink.as_ref(), &item, reason).await?;
+            reject_item(store, sink.as_ref(), &item.inbound, reason).await?;
         } else {
             eligible.push(item);
         }
@@ -520,12 +866,18 @@ async fn process_batch(
     if eligible.is_empty() {
         return Ok(());
     }
-    let batch = eligible;
+    let mut batch = eligible;
     let (cwd, fingerprint) = match prepare_workspace(scope, store, policy, settings).await {
         Ok(workspace) => workspace,
         Err(ScopeFailureKind::Policy) => {
             for item in &batch {
-                reject_item(store, sink.as_ref(), item, InboundRejectionKind::Policy).await?;
+                reject_item(
+                    store,
+                    sink.as_ref(),
+                    &item.inbound,
+                    InboundRejectionKind::Policy,
+                )
+                .await?;
             }
             return Ok(());
         }
@@ -557,9 +909,20 @@ async fn process_batch(
         }
     };
     let client_message_id = Uuid::new_v4().to_string();
+    let pending_contexts = batch
+        .iter()
+        .map(|item| {
+            (
+                item.inbound.queued.event.event_id.clone(),
+                item.pending_media
+                    .as_ref()
+                    .map_or_else(Vec::new, PendingMediaReservation::drafts),
+            )
+        })
+        .collect::<HashMap<_, _>>();
     let keys = batch
         .iter()
-        .map(|item| item.key.clone())
+        .map(|item| item.inbound.key.clone())
         .collect::<Vec<_>>();
     let begun = store
         .begin_turn_and_claim_inbound(
@@ -594,6 +957,8 @@ async fn process_batch(
         &claimed,
         attachments,
         contexts,
+        quote_resolver,
+        &pending_contexts,
         &thread_id,
         turn_row_id,
         shutdown,
@@ -675,6 +1040,11 @@ async fn process_batch(
             return Ok(());
         }
     };
+    for item in &mut batch {
+        if let Some(pending) = item.pending_media.as_mut() {
+            pending.commit();
+        }
+    }
     if let Some(lease) = context_lease.as_ref() {
         if lease.activate(&started.id).is_err() {
             finalize_uncertain_and_settle_attachments(
@@ -890,11 +1260,11 @@ fn append_progress_snapshot(current: &str, next: &str) -> String {
     snapshot
 }
 
-fn deduplicate_batch(batch: Vec<ActorInbound>) -> Vec<ActorInbound> {
+fn deduplicate_batch(batch: Vec<TurnInbound>) -> Vec<TurnInbound> {
     let mut unique = HashSet::new();
     let mut retained = Vec::new();
     for item in batch {
-        if !unique.insert(item.key.clone()) {
+        if !unique.insert(item.inbound.key.clone()) {
             continue;
         }
         retained.push(item);
@@ -902,10 +1272,13 @@ fn deduplicate_batch(batch: Vec<ActorInbound>) -> Vec<ActorInbound> {
     retained
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn assemble_turn_inputs(
     claimed: &[ClaimedInbound],
     attachments: Option<&AttachmentCache>,
     contexts: Option<&ContextRegistry>,
+    quote_resolver: Option<&dyn QuoteResolver>,
+    pending_contexts: &HashMap<String, Vec<ContextDraft>>,
     codex_thread_id: &str,
     turn_row_id: i64,
     shutdown: &CancellationToken,
@@ -922,7 +1295,11 @@ async fn assemble_turn_inputs(
     let context_lease = contexts.map(|registry| TurnContextLease {
         registry: registry.clone(),
         binding: binding.clone(),
-        context_ids: Vec::with_capacity(claimed.len()),
+        context_ids: Vec::with_capacity(
+            claimed
+                .len()
+                .saturating_add(pending_contexts.values().map(Vec::len).sum()),
+        ),
         reason: RevocationReason::Failed,
     });
     let mut context_lease = context_lease;
@@ -934,24 +1311,46 @@ async fn assemble_turn_inputs(
         let event = claimed.retained.event();
         inputs.push(UserInput::text(event.text.clone()));
         if let (Some(registry), Some(lease)) = (contexts, context_lease.as_mut()) {
-            let registered = registry
-                .register_pending(binding.clone(), ContextDraft::from_inbound(event))
-                .map_err(|_| AttachmentAssemblyError::Failed)?;
+            if let Some(pending) = pending_contexts.get(&event.event_id) {
+                for draft in pending {
+                    register_context_input(
+                        &mut inputs,
+                        registry,
+                        lease,
+                        &binding,
+                        draft.clone(),
+                        "pending_media",
+                        false,
+                    )?;
+                }
+            }
+            let mut draft = ContextDraft::from_inbound(event);
+            if let (Some(parent_message_id), Some(resolver)) =
+                (event.reply_to_message_id.as_ref(), quote_resolver)
+            {
+                draft.quote = Some(
+                    resolver
+                        .resolve(QuoteRequest {
+                            parent_message_id: parent_message_id.clone(),
+                            chat_id: event.chat_id.clone(),
+                        })
+                        .await,
+                );
+            }
             let wake = if event.mentions_bot {
                 "mention"
             } else {
                 "message"
             };
-            let reference = serde_json::to_string(&serde_json::json!({
-                "id": registered.context_id.as_str(),
-                "wake": wake,
-                "mentioned_self": event.mentions_bot,
-            }))
-            .map_err(|_| AttachmentAssemblyError::Failed)?;
-            inputs.push(UserInput::text(format!(
-                "<bridge_context>{reference}</bridge_context>"
-            )));
-            lease.context_ids.push(registered.context_id);
+            register_context_input(
+                &mut inputs,
+                registry,
+                lease,
+                &binding,
+                draft,
+                wake,
+                event.mentions_bot,
+            )?;
             continue;
         }
         let Some(cache) = attachments else {
@@ -1003,6 +1402,31 @@ async fn assemble_turn_inputs(
         inputs,
         contexts: context_lease,
     })
+}
+
+fn register_context_input(
+    inputs: &mut Vec<UserInput>,
+    registry: &ContextRegistry,
+    lease: &mut TurnContextLease,
+    binding: &PendingBinding,
+    draft: ContextDraft,
+    wake: &'static str,
+    mentioned_self: bool,
+) -> Result<(), AttachmentAssemblyError> {
+    let registered = registry
+        .register_pending(binding.clone(), draft)
+        .map_err(|_| AttachmentAssemblyError::Failed)?;
+    let reference = serde_json::to_string(&serde_json::json!({
+        "id": registered.context_id.as_str(),
+        "wake": wake,
+        "mentioned_self": mentioned_self,
+    }))
+    .map_err(|_| AttachmentAssemblyError::Failed)?;
+    inputs.push(UserInput::text(format!(
+        "<bridge_context>{reference}</bridge_context>"
+    )));
+    lease.context_ids.push(registered.context_id);
+    Ok(())
 }
 
 struct TurnInputAssembly {

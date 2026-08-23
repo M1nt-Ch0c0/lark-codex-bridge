@@ -2338,3 +2338,57 @@ async fn inbound_writer_permits_account_for_the_captured_event_and_payload() {
     drop(pending);
     store.shutdown().await.expect("shutdown");
 }
+
+#[tokio::test]
+async fn no_turn_completion_is_durable_idempotent_and_erases_replay_content() {
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let tenant = tenant_namespace("cli_no_turn_completion");
+    let inbound = event("event-no-turn", "message-no-turn");
+    store
+        .register_inbound(&tenant, &inbound)
+        .await
+        .expect("register");
+    let key = InboundKey::new(tenant.clone(), inbound.event_id.clone());
+
+    assert_eq!(
+        store
+            .complete_received_without_turn(&key)
+            .await
+            .expect("complete without turn"),
+        InboundDisposition::Completed
+    );
+    assert_eq!(
+        store
+            .complete_received_without_turn(&key)
+            .await
+            .expect("idempotent completion"),
+        InboundDisposition::AlreadyCompleted
+    );
+    assert!(
+        store
+            .recover_received(&tenant)
+            .await
+            .expect("recover")
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .inbound_state(&tenant, "event-no-turn")
+            .await
+            .expect("state"),
+        Some(InboundEventState::Completed)
+    );
+    assert!(matches!(
+        store
+            .register_inbound(&tenant, &inbound)
+            .await
+            .expect("terminal duplicate"),
+        DedupOutcome::Duplicate {
+            state: InboundEventState::Completed,
+            turn_row_id: None,
+            ..
+        }
+    ));
+    assert!(store.uncertain_turns().await.expect("turns").is_empty());
+    store.shutdown().await.expect("shutdown");
+}

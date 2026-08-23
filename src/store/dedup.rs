@@ -3,7 +3,9 @@
 //! Inbound event dedup registration and its state machine.
 //!
 //! Legal transitions are `received → accepted → completed|rejected` plus
-//! `received → rejected`; terminal states are final. Anything else is a
+//! `received → completed|rejected`; terminal states are final. The direct
+//! `received → completed` edge settles intentionally staged or ignored work
+//! that must never create a Codex turn. Anything else is a
 //! [`StoreError::InvalidTransition`], so a duplicate redelivery within the
 //! TTL can never restart Codex (design §5.3).
 
@@ -237,6 +239,8 @@ impl InboundRejectionKind {
 /// Result of an idempotent received-row rejection attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InboundDisposition {
+    /// This call completed a received row without associating a turn.
+    Completed,
     /// This call changed received to rejected.
     Rejected,
     /// The same rejection was already committed.
@@ -705,6 +709,82 @@ impl StoreHandle {
             transaction
                 .commit()
                 .map_err(|error| sqlite_error("committing inbound rejection", &error))?;
+            Ok(disposition)
+        })
+        .await
+    }
+
+    /// Idempotently completes one received row without creating a turn.
+    ///
+    /// This is the durable settlement boundary for intentionally staged P2P
+    /// media metadata and ignored group/topic media. The replay payload is
+    /// erased atomically, and no user content or resource key is copied into
+    /// a reason column.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified store error for an unknown/corrupt row, an
+    /// already-claimed row, or a failed SQLite transaction.
+    pub async fn complete_received_without_turn(
+        &self,
+        key: &InboundKey,
+    ) -> Result<InboundDisposition, StoreError> {
+        let key = key.clone();
+        let request_size = key.tenant.as_hex().len() + key.event_id.len();
+        self.run_sized(request_size, move |connection| {
+            let transaction = connection
+                .transaction()
+                .map_err(|error| sqlite_error("starting no-turn inbound completion", &error))?;
+            let tenant = key.tenant.as_hex();
+            let stored = read_inbound_row(&transaction, &tenant, &key.event_id)?.ok_or(
+                StoreError::NotFound {
+                    context: "completing an unknown inbound row without a turn",
+                },
+            )?;
+            let disposition = match stored.state {
+                InboundEventState::Received => {
+                    let _ = retained_from_stored(stored)?;
+                    let changed = transaction
+                        .execute(
+                            "UPDATE inbound_events
+                             SET state = 'completed', payload_version = NULL,
+                                 payload_blob = NULL, payload_bytes = 0, updated_ms = ?3
+                             WHERE tenant = ?1 AND event_id = ?2
+                               AND state = 'received' AND turn_row_id IS NULL",
+                            params![tenant, key.event_id, now_ms()],
+                        )
+                        .map_err(|error| {
+                            sqlite_error("completing a received row without a turn", &error)
+                        })?;
+                    if changed != 1 {
+                        return Err(StoreError::CorruptData {
+                            context: "completing a concurrently changed inbound row",
+                        });
+                    }
+                    InboundDisposition::Completed
+                }
+                InboundEventState::Completed if stored.turn_row_id.is_none() => {
+                    InboundDisposition::AlreadyCompleted
+                }
+                InboundEventState::Accepted => {
+                    if stored.turn_row_id.is_none() {
+                        return Err(StoreError::CorruptData {
+                            context: "completing an unassociated accepted inbound row",
+                        });
+                    }
+                    return Err(StoreError::InvalidTransition {
+                        context: "completing an already-claimed inbound row without a turn",
+                    });
+                }
+                InboundEventState::Completed | InboundEventState::Rejected => {
+                    return Err(StoreError::InvalidTransition {
+                        context: "completing a terminal inbound row without a turn",
+                    });
+                }
+            };
+            transaction
+                .commit()
+                .map_err(|error| sqlite_error("committing no-turn inbound completion", &error))?;
             Ok(disposition)
         })
         .await

@@ -398,6 +398,13 @@ async fn get_message_preserves_the_thread_id() {
         Some("om_x100b5496d4b93cc0c73c1df0dc00002")
     );
     assert_eq!(message.thread_id.as_deref(), Some("omt_1a9c1d74fd104000"));
+    assert_eq!(
+        message.content.as_deref(),
+        Some(r#"{"text":"scrubbed content"}"#)
+    );
+    assert!(!message.deleted);
+    let debug = format!("{message:?}");
+    assert!(!debug.contains("scrubbed content"));
 
     let request = &requests_to(&server, MESSAGES_PATH)[0];
     assert_eq!(request.method, "GET");

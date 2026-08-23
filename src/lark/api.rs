@@ -108,9 +108,10 @@ impl fmt::Debug for ResourceData {
 /// Raw message fields returned by `GET /open-apis/im/v1/messages/{id}`.
 ///
 /// The raw item keeps `thread_id` even when the receive event dropped it,
-/// which the normalization milestone relies on for topic backfill. Message
-/// content is deliberately not retained.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// which normalization relies on for topic backfill. The optional body is
+/// retained only for the authorized, one-hop quote resolver. Its custom
+/// `Debug` implementation exposes lengths and flags, never message content.
+#[derive(Clone, PartialEq, Eq)]
 pub struct RawMessage {
     /// `message_id` (`om_…`).
     pub message_id: String,
@@ -126,6 +127,30 @@ pub struct RawMessage {
     pub parent_id: Option<String>,
     /// Topic `thread_id` (`omt_…`) for messages inside a topic thread.
     pub thread_id: Option<String>,
+    /// Whether Lark marks the message deleted.
+    pub deleted: bool,
+    /// Serialized message body content, when returned by Lark.
+    pub content: Option<String>,
+}
+
+impl fmt::Debug for RawMessage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RawMessage")
+            .field("message_id_len", &self.message_id.len())
+            .field("chat_id_len", &self.chat_id.len())
+            .field("chat_type_len", &self.chat_type.len())
+            .field("message_type_len", &self.message_type.len())
+            .field("has_root", &self.root_id.is_some())
+            .field("has_parent", &self.parent_id.is_some())
+            .field("has_thread", &self.thread_id.is_some())
+            .field("deleted", &self.deleted)
+            .field(
+                "content_bytes",
+                &self.content.as_deref().map_or(0, str::len),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 /// `OpenAPI` client bound to one tenant's endpoints and token cache.
@@ -284,6 +309,13 @@ impl LarkApi {
             root_id: Option<String>,
             parent_id: Option<String>,
             thread_id: Option<String>,
+            #[serde(default)]
+            deleted: bool,
+            body: Option<MessageBody>,
+        }
+        #[derive(Deserialize)]
+        struct MessageBody {
+            content: Option<String>,
         }
 
         check_path_segment(message_id)?;
@@ -316,6 +348,8 @@ impl LarkApi {
             root_id: item.root_id,
             parent_id: item.parent_id,
             thread_id: item.thread_id,
+            deleted: item.deleted,
+            content: item.body.and_then(|body| body.content),
         })
     }
 

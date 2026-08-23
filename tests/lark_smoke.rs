@@ -39,6 +39,21 @@ async fn real_lark_round_trips_a_smoke_message() {
     run_smoke().await.expect("real Lark smoke");
 }
 
+#[tokio::test]
+#[ignore = "requires real Feishu/Lark credentials and a mobile group-chat action"]
+async fn real_mobile_group_quote_resolves_direct_media_parent() {
+    if std::env::var("LARK_MEDIA_E2E").ok().as_deref() != Some("1") {
+        eprintln!(
+            "skipping mobile quote smoke: re-run with LARK_MEDIA_E2E=1 plus the normal \
+             LARK_E2E credentials and LARK_MEDIA_E2E_GROUP_CHAT_ID"
+        );
+        return;
+    }
+    run_mobile_quote_smoke()
+        .await
+        .expect("real mobile group quote smoke");
+}
+
 fn required_env(name: &str) -> String {
     match std::env::var(name) {
         Ok(value) if !value.is_empty() => value,
@@ -103,6 +118,71 @@ async fn run_smoke() -> Result<()> {
         drained.is_ok(),
         "inbound event channel did not close after transport shutdown"
     );
+    Ok(())
+}
+
+async fn run_mobile_quote_smoke() -> Result<()> {
+    let app_id = required_env("LARK_E2E_APP_ID");
+    let app_secret = required_env("LARK_E2E_APP_SECRET");
+    let tenant: TenantBrand = required_env("LARK_E2E_TENANT")
+        .parse()
+        .map_err(|_| anyhow!("LARK_E2E_TENANT must be feishu or lark"))?;
+    let chat_id = required_env("LARK_MEDIA_E2E_GROUP_CHAT_ID");
+    let creds = LarkCredentials::new(app_id, SecretString::from(app_secret), tenant);
+    let http = LarkHttp::new(LarkEndpoints::for_tenant(tenant))
+        .context("unable to build the Lark HTTP client")?;
+    let api = LarkApi::new(http.clone(), TenantTokenProvider::new(http, creds.clone()));
+    let marker = format!(
+        "bridge-media-smoke-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock before Unix epoch")?
+            .as_secs()
+    );
+    eprintln!(
+        "Mobile action required in group {chat_id}: send one image/video/file/audio, then reply \
+         directly to it with `@bot {marker}`. Do not reply through a forwarded/history card."
+    );
+    let (handle, mut events) = LarkBridge::start(creds)
+        .await
+        .context("unable to start the Lark bridge")?;
+    let outcome = timeout(ROUND_TRIP_TIMEOUT, async {
+        loop {
+            let event = events
+                .recv()
+                .await
+                .context("inbound stream closed before the mobile quote arrived")?
+                .into_event();
+            if event.chat_id == chat_id && event.mentions_bot && event.text.contains(&marker) {
+                return Ok::<InboundEvent, anyhow::Error>(event);
+            }
+        }
+    })
+    .await
+    .context("timed out waiting for the mobile @bot quote action")?;
+    handle.shutdown().await;
+    let event = outcome?;
+    let parent_id = event
+        .reply_to_message_id
+        .context("mobile quote event did not carry parent_id")?;
+    let parent = api
+        .get_message(&parent_id)
+        .await
+        .context("unable to fetch the direct quoted parent")?;
+    if parent.chat_id != chat_id || parent.message_id != parent_id {
+        return Err(anyhow!("quoted parent identity did not match the trigger"));
+    }
+    if parent.deleted || parent.content.is_none() {
+        return Err(anyhow!("quoted parent is deleted or has no body"));
+    }
+    if !matches!(
+        parent.message_type.as_str(),
+        "image" | "video" | "media" | "file" | "audio"
+    ) {
+        return Err(anyhow!("quoted parent is not a supported media type"));
+    }
+    // Deliberately stop at metadata resolution: this smoke proves the mobile
+    // event/parent path without downloading bytes or printing resource keys.
     Ok(())
 }
 
