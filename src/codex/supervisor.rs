@@ -25,6 +25,7 @@ use crate::{
         rpc::{ConnectionEpoch, RpcError, initialize_connection_with_dynamic_tools, spawn_rpc},
         transport::spawn_stream_transport,
         types::InitializeResult,
+        wire::SUPPORTED_CODEX_VERSIONS,
     },
     limits::SUPERVISOR_SHUTDOWN_GRACE,
 };
@@ -558,7 +559,8 @@ fn permanent_process_reason(error: &ProcessError) -> Option<String> {
             Some("Codex version output must exactly match `codex-cli X.Y.Z`".to_owned())
         }
         ProcessError::UnsupportedVersion { found } => Some(format!(
-            "Codex {found} is unsupported; expected an exact reviewed version (0.146.0)"
+            "Codex {found} is unsupported; expected an exact reviewed version ({})",
+            SUPPORTED_CODEX_VERSIONS.join(", ")
         )),
         ProcessError::ProbeTimeout(_)
         | ProcessError::ProbeIo { .. }

@@ -1119,6 +1119,82 @@ class CodexSchemaTests(unittest.TestCase):
             with self.assertRaises(codex_schema.SchemaToolError):
                 codex_schema.read_history(path)
 
+    def test_version_scoped_selection_preserves_the_historical_root_set(self):
+        selection = codex_schema.Selection(
+            "test-protocol",
+            ("app-server", "generate-json-schema", "--out", "<temporary-directory>"),
+            (
+                codex_schema.SelectionRoot("base.params", "Base.json"),
+                codex_schema.SelectionRoot(
+                    "shared.params", "Shared.json", "0.149.0"
+                ),
+            ),
+            "ServerNotification.json",
+        )
+        self.assertEqual(
+            [
+                root.name
+                for root in codex_schema.selected_roots_for_version(
+                    selection, "0.146.0"
+                )
+            ],
+            ["base.params"],
+        )
+        self.assertEqual(
+            [
+                root.name
+                for root in codex_schema.selected_roots_for_version(
+                    selection, "0.149.0"
+                )
+            ],
+            ["base.params", "shared.params"],
+        )
+
+    def test_breaking_promotion_review_is_bound_to_the_exact_report(self):
+        report = {
+            "formatVersion": 1,
+            "baselineVersion": "0.146.0",
+            "candidateVersion": "0.149.0",
+            "compatible": False,
+            "summary": {"additive": 1, "breaking": 2, "total": 3},
+            "changes": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reports = root / "reports"
+            reviews = root / "reviews"
+            reports.mkdir()
+            reviews.mkdir()
+            report_path = reports / "0.146.0-to-0.149.0.json"
+            report_bytes = codex_schema.canonical_bytes(report)
+            report_path.write_bytes(report_bytes)
+            review = {
+                "baselineVersion": "0.146.0",
+                "breakingChangeCount": 2,
+                "candidateVersion": "0.149.0",
+                "decision": "supported",
+                "evidence": codex_schema.REQUIRED_COMPATIBILITY_REVIEW_EVIDENCE,
+                "formatVersion": 1,
+                "reportSha256": codex_schema.sha256_bytes(report_bytes),
+            }
+            review_path = reviews / "0.146.0-to-0.149.0.json"
+            review_path.write_bytes(codex_schema.canonical_bytes(review))
+            with mock.patch.object(codex_schema, "REPORTS_ROOT", reports), mock.patch.object(
+                codex_schema, "COMPATIBILITY_REVIEWS_ROOT", reviews
+            ):
+                expected = codex_schema.sha256_bytes(review_path.read_bytes())
+                self.assertEqual(
+                    codex_schema.validate_compatibility_review(
+                        "0.146.0", "0.149.0", report
+                    ),
+                    expected,
+                )
+                report_path.write_bytes(report_bytes + b" ")
+                with self.assertRaises(codex_schema.SchemaToolError):
+                    codex_schema.validate_compatibility_review(
+                        "0.146.0", "0.149.0", report
+                    )
+
     def test_artifact_and_comparison_resource_budgets_fail_closed(self):
         payload_sentinel = "payload-secret-must-not-leak"
         with tempfile.TemporaryDirectory() as directory:

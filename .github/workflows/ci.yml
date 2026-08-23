@@ -30,10 +30,25 @@ jobs:
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - uses: Swatinem/rust-cache@v2
         with:
           key: codex-schema-contracts
       - run: python3 -m unittest discover -s tools/tests -p 'test_*.py'
+      - name: Reproduce exact Codex schema artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          for version in 0.146.0 0.149.0; do
+            install_root=".codex-ci/$version"
+            npm install --prefix "$install_root" --no-audit --no-fund "@openai/codex@$version"
+            codex_binary="$install_root/node_modules/.bin/codex"
+            if [[ "$RUNNER_OS" == "Windows" ]]; then codex_binary="$codex_binary.cmd"; fi
+            python3 tools/codex_schema.py sync \
+              --binary "$codex_binary" --check
+          done
       - name: Enforce append-only Codex support history
         if: github.event_name == 'pull_request'
         env:
@@ -218,6 +233,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
@@ -227,5 +245,17 @@ jobs:
         run: python -m unittest discover -s tools/tests -p 'test_*.py'
       - name: Verify committed Codex schema artifacts offline
         run: python tools/codex_schema.py verify
+      - name: Reproduce exact Codex schema artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          for version in 0.146.0 0.149.0; do
+            install_root=".codex-ci/$version"
+            npm install --prefix "$install_root" --no-audit --no-fund "@openai/codex@$version"
+            codex_binary="$install_root/node_modules/.bin/codex"
+            if [[ "$RUNNER_OS" == "Windows" ]]; then codex_binary="$codex_binary.cmd"; fi
+            python tools/codex_schema.py sync \
+              --binary "$codex_binary" --check
+          done
       - run: cargo nextest run --all-targets --all-features --profile ci --locked
       - run: cargo build --locked

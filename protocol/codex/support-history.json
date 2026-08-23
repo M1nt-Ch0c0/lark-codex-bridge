@@ -9,6 +9,14 @@
       "rustWireSha256": "293b8dfe76516be9cb1e848ea54d5bfa1a4e80d09c5d87f091e672a0c335797a",
       "schemaSha256": "8f949f41d0de731f26d264db686a90469a817837f83050c47487045745a3b3a6",
       "version": "0.146.0"
+    },
+    {
+      "compatibilityReviewSha256": "54db032e367e3dab67d3dae96bde59bcd75e00411e86c3a9f614007c50c38d65",
+      "contractSha256": "27d2d6814acea7152f6d13bedfcf6c89cae5269db4afa1c6934b10fb61b1fc1b",
+      "decision": "supported",
+      "rustWireSha256": "86e1394a5c91584c65e79c1beef99864a8b2b7c24b1c2f02e7c25f79db3f8718",
+      "schemaSha256": "b4da974f1e701e919fd647ebff780463970314e81b2e7676dbfe0acf4140f3a6",
+      "version": "0.149.0"
     }
   ]
 }

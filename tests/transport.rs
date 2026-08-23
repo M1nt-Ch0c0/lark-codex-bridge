@@ -574,16 +574,21 @@ fn fake_app_server() -> (tempfile::TempDir, std::path::PathBuf) {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn version_probe_executes_the_binary_directly_with_version_argument() {
-    let (_directory, binary) = fake_codex("codex-cli 0.146.0");
-    let version = probe_version(&CodexProcessConfig {
-        binary,
-        codex_home: None,
-    })
-    .await
-    .expect("supported version should be accepted");
+async fn version_probe_executes_the_binary_directly_for_each_supported_version() {
+    for (output, expected) in [
+        ("codex-cli 0.146.0", semver::Version::new(0, 146, 0)),
+        ("codex-cli 0.149.0", semver::Version::new(0, 149, 0)),
+    ] {
+        let (_directory, binary) = fake_codex(output);
+        let version = probe_version(&CodexProcessConfig {
+            binary,
+            codex_home: None,
+        })
+        .await
+        .expect("supported version should be accepted");
 
-    assert_eq!(version, semver::Version::new(0, 146, 0));
+        assert_eq!(version, expected);
+    }
 }
 
 #[cfg(unix)]
@@ -593,7 +598,7 @@ async fn version_probe_rejects_malformed_and_unsupported_versions() {
         "codex 0.146.0",
         "codex-cli 0.145.9",
         "codex-cli 0.147.0",
-        "codex-cli 0.149.0",
+        "codex-cli 0.150.0",
     ] {
         let (_directory, binary) = fake_codex(output);
         let result = probe_version(&CodexProcessConfig {

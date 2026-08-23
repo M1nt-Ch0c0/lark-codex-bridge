@@ -1,4 +1,4 @@
-use std::{fmt, path::PathBuf};
+use std::{collections::BTreeMap, fmt, path::PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use serde_json::{Map, Value};
@@ -178,6 +178,8 @@ pub struct ThreadStartParams {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
 }
 
 /// A client-provided function which Codex may call during a turn.
@@ -277,6 +279,7 @@ open_string_enum! {
         CreatedAt => "created_at",
         UpdatedAt => "updated_at",
         RecencyAt => "recency_at",
+        SectionPosition => "section_position",
     }
 }
 
@@ -332,6 +335,10 @@ pub struct ThreadListParams {
     pub archived: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_pinned: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_term: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -587,6 +594,286 @@ impl TurnInterruptParams {
 pub struct TurnInterruptResult {}
 
 pub type TurnInterruptResponse = TurnInterruptResult;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadUnsubscribeParams {
+    pub thread_id: String,
+}
+
+open_string_enum! {
+    pub enum ThreadUnsubscribeStatus {
+        NotLoaded => "notLoaded",
+        NotSubscribed => "notSubscribed",
+        Unsubscribed => "unsubscribed",
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ThreadUnsubscribeResult {
+    pub status: ThreadUnsubscribeStatus,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnSteerParams {
+    pub thread_id: String,
+    pub expected_turn_id: String,
+    pub input: Vec<UserInput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub additional_context: Option<Map<String, Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_user_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responsesapi_client_metadata: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnSteerResult {
+    pub turn_id: String,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadQueueAddParams {
+    pub thread_id: String,
+    pub client_user_message_id: String,
+    pub input: Vec<UserInput>,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueuedSubmission {
+    pub id: String,
+    pub client_user_message_id: String,
+    pub input: Vec<UserInput>,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadQueueAddResult {
+    pub queued_submission: QueuedSubmission,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadQueueListParams {
+    pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadQueueListResult {
+    pub data: Vec<QueuedSubmission>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadQueueStartParams {
+    pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_submission_id: Option<String>,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+pub struct ThreadQueueStartResult {
+    pub turn: Turn,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadTurnsListParams {
+    pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_direction: Option<SortDirection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub items_view: Option<String>,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadTurnsListResult {
+    pub data: Vec<Turn>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    #[serde(default)]
+    pub backwards_cursor: Option<String>,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadItemsListParams {
+    pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_direction: Option<SortDirection>,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadItemsListResult {
+    pub data: Vec<ThreadItemEntry>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    #[serde(default)]
+    pub backwards_cursor: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadItemEntry {
+    pub item: ThreadItem,
+    pub turn_id: String,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadStatusChangedNotification {
+    pub thread_id: String,
+    pub status: Value,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadQueueChangedNotification {
+    pub thread_id: String,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerRequestResolvedNotification {
+    pub thread_id: String,
+    pub request_id: Value,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandExecutionRequestApprovalParams {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub started_at_ms: i64,
+    #[serde(flatten)]
+    pub details: Map<String, Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecpolicyAmendment {
+    pub execpolicy_amendment: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkPolicyAmendment {
+    pub action: NetworkPolicyAction,
+    pub host: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NetworkPolicyAction {
+    Allow,
+    Deny,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkPolicyAmendmentEnvelope {
+    pub network_policy_amendment: NetworkPolicyAmendment,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum SimpleApprovalDecision {
+    #[serde(rename = "accept")]
+    Accept,
+    #[serde(rename = "acceptForSession")]
+    AcceptForSession,
+    #[serde(rename = "decline")]
+    Decline,
+    #[serde(rename = "cancel")]
+    Cancel,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum CommandExecutionApprovalDecision {
+    Simple(SimpleApprovalDecision),
+    AcceptWithExecpolicyAmendment {
+        #[serde(rename = "acceptWithExecpolicyAmendment")]
+        amendment: ExecpolicyAmendment,
+    },
+    ApplyNetworkPolicyAmendment {
+        #[serde(rename = "applyNetworkPolicyAmendment")]
+        amendment: NetworkPolicyAmendmentEnvelope,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CommandExecutionRequestApprovalResult {
+    pub decision: CommandExecutionApprovalDecision,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileChangeRequestApprovalParams {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub started_at_ms: i64,
+    #[serde(flatten)]
+    pub details: Map<String, Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct FileChangeRequestApprovalResult {
+    pub decision: SimpleApprovalDecision,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionsRequestApprovalParams {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub started_at_ms: i64,
+    pub cwd: PathBuf,
+    pub permissions: Value,
+    #[serde(flatten)]
+    pub details: Map<String, Value>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PermissionGrantScope {
+    Turn,
+    Session,
+}
+
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+pub struct PermissionsRequestApprovalResult {
+    pub permissions: Value,
+    #[serde(default)]
+    pub scope: Option<PermissionGrantScope>,
+    #[serde(default, rename = "strictAutoReview")]
+    pub strict_auto_review: Option<bool>,
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]

@@ -33,7 +33,11 @@ from urllib.parse import unquote, urldefrag, urljoin
 
 
 GENERATOR_NAME = "lark-codex-bridge/codex-schema"
-GENERATOR_VERSION = "1.1.0"
+GENERATOR_VERSION = "1.2.0"
+LEGACY_GENERATOR_VERSIONS = {"0.146.0": "1.1.0"}
+LEGACY_TEMPLATE_SHA256 = {
+    "0.146.0": "4d07c5c97841b0c9fb14aa525e611026543e785347c293ff70498c36051de19e"
+}
 MANIFEST_FORMAT_VERSION = 1
 SCHEMA_BUNDLE_FORMAT_VERSION = 1
 CONTRACT_FORMAT_VERSION = 1
@@ -58,6 +62,12 @@ MAX_OPERATION_SECONDS = 180
 MAX_REGEX_SECONDS = 1.0
 MAX_REGEX_PATTERN_CHARACTERS = 64 * 1024
 MAX_REGEX_TEXT_CHARACTERS = MAX_ARTIFACT_BYTES
+REQUIRED_COMPATIBILITY_REVIEW_EVIDENCE = [
+    "exact_schema_sync_reproduces",
+    "shared_contract_matrix_covers_selected_roots",
+    "incoming_open_values_are_preserved_or_rejected",
+    "outgoing_adapter_rejects_unrepresentable_values",
+]
 READ_CHUNK_BYTES = 64 * 1024
 SCHEMA_VALIDATION_RECURSION_LIMIT = MAX_JSON_DEPTH
 VERSION_TIMEOUT_SECONDS = 10
@@ -73,7 +83,9 @@ CONTRACTS_ROOT = PROTOCOL_ROOT / "contracts"
 REPORTS_ROOT = PROTOCOL_ROOT / "reports"
 WIRE_ROOT = REPO_ROOT / "src" / "codex" / "wire"
 WIRE_TEMPLATE_PATH = REPO_ROOT / "tools" / "codex-wire-template.rs"
+SHARED_WIRE_TEMPLATE_PATH = REPO_ROOT / "tools" / "codex-shared-wire-template.rs"
 HISTORY_PATH = PROTOCOL_ROOT / "support-history.json"
+COMPATIBILITY_REVIEWS_ROOT = PROTOCOL_ROOT / "compatibility-reviews"
 
 
 class SchemaToolError(Exception):
@@ -205,6 +217,7 @@ def active_budget() -> OperationBudget:
 class SelectionRoot:
     name: str
     path: str
+    since_version: str | None = None
 
 
 @dataclass(frozen=True)
@@ -918,7 +931,7 @@ def atomic_write(path: Path, content: bytes) -> None:
 @budgeted
 def read_selection() -> Selection:
     raw = load_json(SELECTION_PATH)
-    if not isinstance(raw, dict) or raw.get("formatVersion") != 1:
+    if not isinstance(raw, dict) or raw.get("formatVersion") not in {1, 2}:
         fail("unsupported Codex schema selection format")
     protocol = raw.get("protocolFamily")
     arguments = raw.get("generatorArguments")
@@ -952,11 +965,13 @@ def read_selection() -> Selection:
             fail("schema selection contains an invalid root")
         name = raw_root.get("name")
         relative = raw_root.get("path")
+        since_version = raw_root.get("sinceVersion")
         if (
             not isinstance(name, str)
             or re.fullmatch(r"[a-z][a-z0-9_.]{0,127}", name) is None
             or not isinstance(relative, str)
             or re.fullmatch(r"[A-Za-z0-9_./-]{1,512}", relative) is None
+            or (since_version is not None and not is_version(since_version))
         ):
             fail("schema selection contains an invalid root")
         candidate = Path(relative)
@@ -966,7 +981,7 @@ def read_selection() -> Selection:
             fail("schema selection contains a duplicate root")
         names.add(name)
         paths.add(relative)
-        selected.append(SelectionRoot(name, relative))
+        selected.append(SelectionRoot(name, relative, since_version))
     if (
         not isinstance(catalog, str)
         or re.fullmatch(r"[A-Za-z0-9_.-]{1,255}", catalog) is None
@@ -974,6 +989,17 @@ def read_selection() -> Selection:
     ):
         fail("schema selection has an invalid notification catalog")
     return Selection(protocol, tuple(arguments), tuple(selected), catalog)
+
+
+def selected_roots_for_version(selection: Selection, version: str) -> tuple[SelectionRoot, ...]:
+    if not is_version(version):
+        fail("Codex version is not a stable X.Y.Z value")
+    current = version_key(version)
+    return tuple(
+        root
+        for root in selection.roots
+        if root.since_version is None or version_key(root.since_version) <= current
+    )
 
 
 @budgeted
@@ -1030,6 +1056,12 @@ def read_history(path: Path = HISTORY_PATH) -> dict[str, Any]:
         for key in ("schemaSha256", "contractSha256", "rustWireSha256"):
             if not isinstance(release.get(key), str) or re.fullmatch(r"[0-9a-f]{64}", release[key]) is None:
                 fail(f"Codex support history has an invalid {key}")
+        review_sha = release.get("compatibilityReviewSha256")
+        if review_sha is not None and (
+            not isinstance(review_sha, str)
+            or re.fullmatch(r"[0-9a-f]{64}", review_sha) is None
+        ):
+            fail("Codex support history has an invalid compatibilityReviewSha256")
     baseline = next(
         (release for release in releases if release["version"] == ESTABLISHED_BASELINE_VERSION),
         None,
@@ -1266,9 +1298,9 @@ def notification_methods(schema: Any) -> list[str]:
 
 
 @budgeted
-def make_bundle(export: Path, selection: Selection) -> dict[str, Any]:
+def make_bundle(export: Path, selection: Selection, version: str) -> dict[str, Any]:
     roots: dict[str, Any] = {}
-    for root in selection.roots:
+    for root in selected_roots_for_version(selection, version):
         active_budget().checkpoint()
         source = isolated_export_file(export, root.path)
         roots[root.name] = normalize_schema(load_json(source))
@@ -1379,13 +1411,21 @@ def render_wire(version: str, protocol_family: str, schema_sha: str, bundle: dic
     }
     list_fields = generated_value_fields(list_properties, set(list_schema.get("required", [])), base_list_fields)
 
+    shared_wire = ""
+    if "thread.unsubscribe.params" in roots:
+        try:
+            shared_wire = read_bounded_bytes(SHARED_WIRE_TEMPLATE_PATH).decode("utf-8")
+        except UnicodeError as error:
+            raise SchemaToolError("shared wire template is unavailable") from error
+
     replacements = {
-        "@GENERATOR_VERSION@": GENERATOR_VERSION,
+        "@GENERATOR_VERSION@": LEGACY_GENERATOR_VERSIONS.get(version, GENERATOR_VERSION),
         "@CODEX_VERSION@": version,
         "@PROTOCOL_FAMILY@": protocol_family,
         "@SCHEMA_SHA256@": schema_sha,
         "@THREAD_VERSION_FIELDS@": thread_fields,
         "@THREAD_LIST_VERSION_FIELDS@": list_fields,
+        "@SHARED_WIRE_TYPES@": shared_wire,
     }
     rendered = template
     for marker, value in replacements.items():
@@ -1399,8 +1439,14 @@ def render_wire(version: str, protocol_family: str, schema_sha: str, bundle: dic
 
 
 @budgeted
-def template_sha256() -> str:
-    return sha256_bytes(read_bounded_bytes(WIRE_TEMPLATE_PATH))
+def template_sha256(version: str) -> str:
+    if version in LEGACY_TEMPLATE_SHA256:
+        return LEGACY_TEMPLATE_SHA256[version]
+    return sha256_bytes(
+        read_bounded_bytes(WIRE_TEMPLATE_PATH)
+        + b"\0shared-wire-template\0"
+        + read_bounded_bytes(SHARED_WIRE_TEMPLATE_PATH)
+    )
 
 
 @budgeted
@@ -1426,12 +1472,14 @@ def manifest_for(
         "schemaSha256": sha256_bytes(schema_bytes),
         "generator": {
             "name": GENERATOR_NAME,
-            "version": GENERATOR_VERSION,
-            "templateSha256": template_sha256(),
+            "version": LEGACY_GENERATOR_VERSIONS.get(version, GENERATOR_VERSION),
+            "templateSha256": template_sha256(version),
         },
         "generationArguments": list(selection.generator_arguments),
         "lifecycle": lifecycle,
-        "selectedRoots": [root.name for root in selection.roots],
+        "selectedRoots": [
+            root.name for root in selected_roots_for_version(selection, version)
+        ],
         "artifacts": {
             "incomingAudit": f"protocol/codex/schemas/{version}/incoming-audit.json",
             "normalizedSchema": f"protocol/codex/schemas/{version}/selected.schema.json",
@@ -1538,18 +1586,19 @@ def render_wire_mod(policy: dict[str, Any], versions: Iterable[str]) -> bytes:
         ]
     )
     quoted_versions = ", ".join(f'"{version}"' for version in policy["supportedVersions"])
-    version_patterns = " | ".join(
+    version_tuples = ", ".join(
         f"({major}, {minor}, {patch})"
         for major, minor, patch in (version_key(version) for version in policy["supportedVersions"])
     )
     lines.extend(
         [
             f"pub const SUPPORTED_CODEX_VERSIONS: &[&str] = &[{quoted_versions}];",
+            f"const SUPPORTED_CODEX_VERSION_TRIPLES: &[(u64, u64, u64)] = &[{version_tuples}];",
             "",
             "/// Returns true only for an exact, reviewed schema/contract version.",
             "#[must_use]",
             "pub fn is_supported_codex_version(version: &semver::Version) -> bool {",
-            f"    matches!((version.major, version.minor, version.patch), {version_patterns})",
+            "    SUPPORTED_CODEX_VERSION_TRIPLES.contains(&(version.major, version.minor, version.patch))",
             "        && version.pre.is_empty()",
             "        && version.build.is_empty()",
             "}",
@@ -1847,7 +1896,7 @@ def sync(binary: Path, *, check: bool) -> str:
     policy = read_policy()
     version, export, temporary = generate_schema_directory(binary, selection)
     try:
-        bundle = make_bundle(export, selection)
+        bundle = make_bundle(export, selection, version)
         schema_bytes = canonical_bytes(bundle)
         schema_sha = sha256_bytes(schema_bytes)
         wire_bytes = render_wire(version, selection.protocol_family, schema_sha, bundle)
@@ -3311,6 +3360,16 @@ METHOD_ROOTS = {
     "turn/interrupt": ("turn.interrupt.params", "turn.interrupt.response"),
 }
 
+SHARED_METHOD_ROOTS = {
+    "thread/unsubscribe": ("thread.unsubscribe.params", "thread.unsubscribe.response"),
+    "thread/turns/list": ("thread.turns.list.params", "thread.turns.list.response"),
+    "thread/items/list": ("thread.items.list.params", "thread.items.list.response"),
+    "thread/queue/add": ("thread.queue.add.params", "thread.queue.add.response"),
+    "thread/queue/list": ("thread.queue.list.params", "thread.queue.list.response"),
+    "thread/queue/start": ("thread.queue.start.params", "thread.queue.start.response"),
+    "turn/steer": ("turn.steer.params", "turn.steer.response"),
+}
+
 NOTIFICATION_ROOTS = {
     "thread/started": "notification.thread.started",
     "turn/started": "notification.turn.started",
@@ -3323,9 +3382,93 @@ NOTIFICATION_ROOTS = {
     "turn/completed": "notification.turn.completed",
 }
 
+SHARED_NOTIFICATION_ROOTS = {
+    "thread/status/changed": "notification.thread.status.changed",
+    "thread/queue/changed": "notification.thread.queue.changed",
+    "serverRequest/resolved": "notification.server_request.resolved",
+}
+
 REVERSE_REQUEST_ROOTS = {
     "item/tool/call": ("server_request.dynamic_tool_call.params", "server_request.dynamic_tool_call.response")
 }
+
+SHARED_REVERSE_REQUEST_ROOTS = {
+    "item/commandExecution/requestApproval": (
+        "server_request.command_execution.request_approval.params",
+        "server_request.command_execution.request_approval.response",
+    ),
+    "item/fileChange/requestApproval": (
+        "server_request.file_change.request_approval.params",
+        "server_request.file_change.request_approval.response",
+    ),
+    "item/permissions/requestApproval": (
+        "server_request.permissions.request_approval.params",
+        "server_request.permissions.request_approval.response",
+    ),
+}
+
+REQUIRED_UNKNOWN_CASES = {
+    ("thread/unsubscribe.status", "preserved_unknown"),
+    ("thread/status/changed.status", "preserved_unknown"),
+    ("item/commandExecution/requestApproval.result", "rejected_unknown"),
+    ("item/fileChange/requestApproval.result", "rejected_unknown"),
+    ("item/permissions/requestApproval.result", "rejected_unknown"),
+    ("required.notification.method", "rejected_unknown"),
+}
+
+MUTATION_FAILURE_METHODS = {
+    "turn/steer",
+    "thread/queue/add",
+    "thread/queue/start",
+}
+
+MUTATION_FAILURE_EXPECTATIONS = {
+    "local_validation": "definitely_not_applied",
+    "server_rejection": "definitely_rejected",
+    "timeout": "uncertain",
+    "connection_lost": "uncertain",
+    "malformed_success": "uncertain",
+    "stale_epoch_response": "rejected_stale",
+}
+
+
+def contract_roots(
+    roots: dict[str, Any],
+    base: dict[str, Any],
+    shared: dict[str, Any],
+) -> dict[str, Any]:
+    selected = dict(base)
+    for method, root_names in shared.items():
+        names = (root_names,) if isinstance(root_names, str) else root_names
+        present = [name in roots for name in names]
+        if any(present) and not all(present):
+            fail(f"selected shared Codex method {method} has incomplete roots")
+        if all(present):
+            selected[method] = root_names
+    return selected
+
+
+def verify_required_field_rejections(
+    version: str, contract_name: str, instance: Any, schema: Any
+) -> None:
+    if not isinstance(instance, dict) or not isinstance(schema, dict):
+        fail(f"Codex {version} contract {contract_name} is not an object fixture")
+    required = schema.get("required", [])
+    if not isinstance(required, list):
+        fail(f"Codex {version} contract {contract_name} has invalid required fields")
+    for field in required:
+        active_budget().checkpoint()
+        if not isinstance(field, str) or field not in instance:
+            fail(f"Codex {version} contract {contract_name} omits a required fixture field")
+        invalid = dict(instance)
+        invalid.pop(field)
+        try:
+            validate_instance(invalid, schema, schema)
+        except ValidationFailure:
+            continue
+        fail(
+            f"Codex {version} contract {contract_name} does not reject a missing required field"
+        )
 
 @budgeted
 def validate_contract(version: str) -> None:
@@ -3340,6 +3483,14 @@ def validate_contract(version: str) -> None:
     if contract.get("protocolFamily") != read_selection().protocol_family:
         fail(f"Codex {version} contract records the wrong protocol family")
 
+    method_roots = contract_roots(roots, METHOD_ROOTS, SHARED_METHOD_ROOTS)
+    notification_roots = contract_roots(
+        roots, NOTIFICATION_ROOTS, SHARED_NOTIFICATION_ROOTS
+    )
+    reverse_request_roots = contract_roots(
+        roots, REVERSE_REQUEST_ROOTS, SHARED_REVERSE_REQUEST_ROOTS
+    )
+
     exchanges = contract.get("exchanges")
     if not isinstance(exchanges, list):
         fail(f"Codex {version} contract has no method exchanges")
@@ -3349,16 +3500,22 @@ def validate_contract(version: str) -> None:
         if not isinstance(exchange, dict) or not isinstance(exchange.get("method"), str):
             fail(f"Codex {version} contract contains an invalid exchange")
         method = exchange["method"]
-        if method not in METHOD_ROOTS or method in seen_methods:
+        if method not in method_roots or method in seen_methods:
             fail(f"Codex {version} contract contains an unexpected or duplicate method")
         seen_methods.add(method)
-        params_root, result_root = METHOD_ROOTS[method]
+        params_root, result_root = method_roots[method]
         try:
             validate_instance(exchange.get("params"), roots[params_root], roots[params_root])
             validate_instance(exchange.get("result"), roots[result_root], roots[result_root])
         except (KeyError, ValidationFailure) as error:
             raise SchemaToolError(f"Codex {version} contract violates the selected schema for {method}") from error
-    if seen_methods != set(METHOD_ROOTS):
+        verify_required_field_rejections(
+            version, f"{method} params", exchange.get("params"), roots[params_root]
+        )
+        verify_required_field_rejections(
+            version, f"{method} result", exchange.get("result"), roots[result_root]
+        )
+    if seen_methods != set(method_roots):
         fail(f"Codex {version} contract does not cover every selected method")
 
     notifications = contract.get("notifications")
@@ -3370,39 +3527,48 @@ def validate_contract(version: str) -> None:
         if not isinstance(notification, dict) or not isinstance(notification.get("method"), str):
             fail(f"Codex {version} contract contains an invalid notification")
         method = notification["method"]
-        if method not in NOTIFICATION_ROOTS or method in seen_notifications:
+        if method not in notification_roots or method in seen_notifications:
             fail(f"Codex {version} contract contains an unexpected or duplicate notification")
         seen_notifications.add(method)
         params = notification.get("params")
-        root_name = NOTIFICATION_ROOTS[method]
+        root_name = notification_roots[method]
         try:
             validate_instance(params, roots[root_name], roots[root_name])
         except (KeyError, ValidationFailure) as error:
             raise SchemaToolError(f"Codex {version} contract violates the selected schema for {method}") from error
-    if seen_notifications != set(NOTIFICATION_ROOTS):
+        verify_required_field_rejections(
+            version, f"{method} notification", params, roots[root_name]
+        )
+    if seen_notifications != set(notification_roots):
         fail(f"Codex {version} contract does not cover every consumed notification")
     normal_order = contract.get("normalNotificationOrder")
     if not isinstance(normal_order, list) or not all(isinstance(method, str) for method in normal_order):
         fail(f"Codex {version} contract has an invalid notification-order fixture")
 
     reverse_requests = contract.get("reverseRequests")
-    if not isinstance(reverse_requests, list) or len(reverse_requests) != len(REVERSE_REQUEST_ROOTS):
+    if not isinstance(reverse_requests, list) or len(reverse_requests) != len(reverse_request_roots):
         fail(f"Codex {version} contract has invalid reverse-request coverage")
     seen_reverse: set[str] = set()
     for request in reverse_requests:
         active_budget().checkpoint()
-        if not isinstance(request, dict) or request.get("method") not in REVERSE_REQUEST_ROOTS:
+        if not isinstance(request, dict) or request.get("method") not in reverse_request_roots:
             fail(f"Codex {version} contract has an unexpected reverse request")
         method = request["method"]
         if method in seen_reverse:
             fail(f"Codex {version} contract has a duplicate reverse request")
         seen_reverse.add(method)
-        params_root, result_root = REVERSE_REQUEST_ROOTS[method]
+        params_root, result_root = reverse_request_roots[method]
         try:
             validate_instance(request.get("params"), roots[params_root], roots[params_root])
             validate_instance(request.get("result"), roots[result_root], roots[result_root])
         except (KeyError, ValidationFailure) as error:
             raise SchemaToolError(f"Codex {version} contract violates the selected schema for {method}") from error
+        verify_required_field_rejections(
+            version, f"{method} params", request.get("params"), roots[params_root]
+        )
+        verify_required_field_rejections(
+            version, f"{method} result", request.get("result"), roots[result_root]
+        )
 
     failures = contract.get("failureCases")
     if not isinstance(failures, list) or not failures:
@@ -3417,6 +3583,55 @@ def validate_contract(version: str) -> None:
         if not isinstance(source, str) or not isinstance(expected, str) or source in observed_failure_sources:
             fail(f"Codex {version} contract contains an invalid failure classification")
         observed_failure_sources.add(source)
+
+    if "thread/unsubscribe" in method_roots:
+        unknown_cases = contract.get("unknownValueCases")
+        if not isinstance(unknown_cases, list):
+            fail(f"Codex {version} contract has no shared unknown-value cases")
+        observed_unknown: set[tuple[str, str]] = set()
+        for case in unknown_cases:
+            active_budget().checkpoint()
+            if not isinstance(case, dict):
+                fail(f"Codex {version} contract contains an invalid unknown-value case")
+            surface = case.get("surface")
+            expected = case.get("expected")
+            if not isinstance(surface, str) or not isinstance(expected, str):
+                fail(f"Codex {version} contract contains an invalid unknown-value case")
+            observed_unknown.add((surface, expected))
+        if (
+            len(unknown_cases) != len(REQUIRED_UNKNOWN_CASES)
+            or observed_unknown != REQUIRED_UNKNOWN_CASES
+        ):
+            fail(f"Codex {version} contract has incomplete shared unknown-value coverage")
+
+        mutation_failures = contract.get("mutationFailureCases")
+        if not isinstance(mutation_failures, list):
+            fail(f"Codex {version} contract has no shared mutation-failure cases")
+        observed_mutation_failures: set[tuple[str, str, str]] = set()
+        for case in mutation_failures:
+            active_budget().checkpoint()
+            if not isinstance(case, dict):
+                fail(f"Codex {version} contract contains an invalid mutation-failure case")
+            method = case.get("method")
+            source = case.get("source")
+            expected = case.get("expected")
+            if (
+                method not in MUTATION_FAILURE_METHODS
+                or source not in MUTATION_FAILURE_EXPECTATIONS
+                or expected != MUTATION_FAILURE_EXPECTATIONS[source]
+            ):
+                fail(f"Codex {version} contract contains an invalid mutation-failure case")
+            observed_mutation_failures.add((method, source, expected))
+        required_mutation_failures = {
+            (method, source, expected)
+            for method in MUTATION_FAILURE_METHODS
+            for source, expected in MUTATION_FAILURE_EXPECTATIONS.items()
+        }
+        if (
+            len(mutation_failures) != len(required_mutation_failures)
+            or observed_mutation_failures != required_mutation_failures
+        ):
+            fail(f"Codex {version} contract has incomplete mutation-failure coverage")
 
 
 @budgeted
@@ -3433,7 +3648,9 @@ def verify_manifest(version: str, selection: Selection, policy: dict[str, Any]) 
     expected_schema = canonical_bytes(bundle)
     if schema_bytes != expected_schema:
         fail(f"Codex {version} normalized schema is not canonical")
-    if list(bundle["roots"].keys()) != sorted(root.name for root in selection.roots):
+    if list(bundle["roots"].keys()) != sorted(
+        root.name for root in selected_roots_for_version(selection, version)
+    ):
         fail(f"Codex {version} selected roots are stale")
     expected_wire = render_wire(
         version, selection.protocol_family, sha256_bytes(expected_schema), bundle
@@ -3448,6 +3665,41 @@ def verify_manifest(version: str, selection: Selection, policy: dict[str, Any]) 
     )
     if manifest_bytes != expected_manifest:
         fail(f"Codex {version} manifest is stale")
+
+
+@budgeted
+def validate_compatibility_review(
+    baseline: str, candidate: str, report: dict[str, Any]
+) -> str:
+    path = COMPATIBILITY_REVIEWS_ROOT / f"{baseline}-to-{candidate}.json"
+    raw_bytes = read_bounded_bytes(path)
+    review = load_json(path)
+    if canonical_bytes(review) != raw_bytes:
+        fail(f"Codex {candidate} compatibility review is not canonical")
+    expected_keys = {
+        "baselineVersion",
+        "breakingChangeCount",
+        "candidateVersion",
+        "decision",
+        "evidence",
+        "formatVersion",
+        "reportSha256",
+    }
+    if not isinstance(review, dict) or set(review) != expected_keys:
+        fail(f"Codex {candidate} compatibility review has an invalid format")
+    report_path = REPORTS_ROOT / f"{baseline}-to-{candidate}.json"
+    report_bytes = read_bounded_bytes(report_path)
+    if (
+        review.get("formatVersion") != 1
+        or review.get("baselineVersion") != baseline
+        or review.get("candidateVersion") != candidate
+        or review.get("decision") != "supported"
+        or review.get("reportSha256") != sha256_bytes(report_bytes)
+        or review.get("breakingChangeCount") != report.get("summary", {}).get("breaking")
+        or review.get("evidence") != REQUIRED_COMPATIBILITY_REVIEW_EVIDENCE
+    ):
+        fail(f"Codex {candidate} compatibility review does not bind the exact report and evidence")
+    return sha256_bytes(raw_bytes)
 
 
 @budgeted
@@ -3499,16 +3751,35 @@ def verify_all() -> None:
             markdown_path = REPORTS_ROOT / f"{supported}-to-{candidate}.md"
             actual_json = read_bounded_bytes(json_path)
             actual_markdown = read_bounded_bytes(markdown_path)
-            if actual_json != canonical_bytes(expected_report) or actual_markdown != report_markdown(expected_report):
+            if (
+                actual_json != canonical_bytes(expected_report)
+                or actual_markdown != report_markdown(expected_report)
+            ):
                 fail(f"Codex {candidate} compatibility report is stale")
 
     for supported in policy["supportedVersions"]:
         active_budget().checkpoint()
         if supported == baseline:
             continue
-        report = compatibility_report(baseline, supported)
-        if not report["compatible"]:
-            fail(f"Codex {supported} cannot be supported because its schema diff is breaking")
+        expected_report = compatibility_report(baseline, supported)
+        json_path = REPORTS_ROOT / f"{baseline}-to-{supported}.json"
+        markdown_path = REPORTS_ROOT / f"{baseline}-to-{supported}.md"
+        actual_json = read_bounded_bytes(json_path)
+        actual_markdown = read_bounded_bytes(markdown_path)
+        if (
+            actual_json != canonical_bytes(expected_report)
+            or actual_markdown != report_markdown(expected_report)
+        ):
+            fail(f"Codex {supported} compatibility report is stale")
+        if not expected_report["compatible"]:
+            review_sha = validate_compatibility_review(
+                baseline, supported, expected_report
+            )
+            release = next(
+                item for item in history["releases"] if item["version"] == supported
+            )
+            if release.get("compatibilityReviewSha256") != review_sha:
+                fail(f"Codex {supported} support history compatibility review hash is stale")
 
 
 def default_report_paths(baseline: str, candidate: str) -> tuple[Path, Path]:

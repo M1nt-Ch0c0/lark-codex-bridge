@@ -69,7 +69,7 @@ pub enum ProcessError {
     },
     #[error("Codex version output must exactly match `codex-cli X.Y.Z`")]
     InvalidVersionOutput,
-    #[error("Codex {found} is unsupported; expected an exact reviewed version (0.146.0)")]
+    #[error("Codex {found} is unsupported; expected an exact reviewed version")]
     UnsupportedVersion { found: Version },
     #[error("Codex app-server stdio was already transferred")]
     StdioAlreadyTaken,
@@ -422,10 +422,11 @@ mod tests {
     #[test]
     fn enforces_the_exact_reviewed_schema_versions() {
         assert!(ensure_supported(Version::new(0, 146, 0)).is_ok());
+        assert!(ensure_supported(Version::new(0, 149, 0)).is_ok());
         for version in [
             Version::new(0, 145, 9),
             Version::new(0, 147, 0),
-            Version::new(0, 149, 0),
+            Version::new(0, 150, 0),
             Version::new(1, 0, 0),
         ] {
             assert!(matches!(
