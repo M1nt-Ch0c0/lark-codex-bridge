@@ -38,8 +38,11 @@ fn project_markdown(input: &str, carrier: MarkdownCarrier) -> String {
     // Markdown delimiters. Re-run the complete block parser over the emitted
     // representation so anything exposed by that removal is validated and,
     // in particular, no newly exposed fence can remain unclosed. The first
-    // pass has already consumed every decodable entity outside code, so this
-    // converges in one additional pass while code spans/blocks remain data.
+    // pass has already consumed every decodable entity outside code into an
+    // inert, visible representation, so this converges in one additional pass
+    // while code spans/blocks remain data. In particular, the second pass can
+    // never reinterpret entity-derived delimiters, ASCII identifiers, or
+    // whitespace as Markdown structure.
     project_markdown_once(&projected, carrier)
 }
 
@@ -1108,20 +1111,34 @@ fn sanitize_entity(rest: &str, carrier: MarkdownCarrier) -> Option<(String, usiz
         }
         return Some(("‹".to_owned(), consumed));
     }
-    if is_unicode_format_control(decoded)
-        || (decoded.is_control() && !matches!(decoded, '\n' | '\t'))
-        || decoded == '\u{7f}'
-    {
+    if is_unicode_format_control(decoded) || (decoded.is_control() && !decoded.is_whitespace()) {
         return Some((String::new(), consumed));
     }
-    let rendered = match decoded {
-        // Never permit a second HTML entity decoding pass to reconstruct an
-        // active `<at>` tag or a numeric format control.
-        '&' => "＆".to_owned(),
+    Some((inert_entity_text(decoded), consumed))
+}
+
+fn inert_entity_text(decoded: char) -> String {
+    // A decoded entity is untrusted syntax, not source Markdown. Preserve a
+    // readable representation without ever emitting an ASCII byte that could
+    // complete a fence, emphasis run, list/task marker, link/image/reference,
+    // HTML control, or escape in the second pass or in either Lark carrier.
+    // Visible control pictures also prevent entity whitespace from exposing a
+    // raw delimiter at the start of a structural line.
+    match decoded {
+        '\n' | '\r' | '\u{0085}' | '\u{2028}' | '\u{2029}' => "␤".to_owned(),
+        '\t' => "␉".to_owned(),
+        character if character.is_whitespace() => "␠".to_owned(),
+        '<' => "‹".to_owned(),
         '>' => "›".to_owned(),
+        character if character.is_ascii_graphic() => char::from_u32(
+            u32::from(character)
+                .saturating_sub(u32::from('!'))
+                .saturating_add(u32::from('！')),
+        )
+        .expect("ASCII graphic characters have full-width forms")
+        .to_string(),
         character => character.to_string(),
-    };
-    Some((rendered, consumed))
+    }
 }
 
 fn encoded_tag(rest: &str, opening_len: usize) -> Option<(String, usize)> {

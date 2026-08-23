@@ -149,7 +149,9 @@ LARK_E2E=1 LARK_E2E_APP_ID=… LARK_E2E_APP_SECRET=… LARK_E2E_TENANT=feishu LA
 只在代码 span 外移除，畸形标签使用惰性的 Unicode 尖括号显示且不会跨行吞掉引用内容。
 可能触发真实提及的 `<at …>` 控制（包括 `&lt;at …&gt;`、十进制/十六进制实体编码）、
 双向/零宽 Unicode format controls（包括数字/命名实体）会在两个载体中净化；代码 span 内的
-对应字面量原样保留。链接目标按载体白名单处理：`post` 只保留 `https`、`http`、`mailto`，
+对应字面量原样保留。代码外由实体解码得到的 ASCII 与空白会显示为惰性的全角字符或可见
+控制符号，不能在二次结构解析或客户端中重建粗体、fence、换行、列表、引用、链接或图片。
+链接目标按载体白名单处理：`post` 只保留 `https`、`http`、`mailto`，
 Card 2.0 只保留 `https`；`javascript`、`data`、`file`、带控制字符/实体的目标稳定降级为文本。
 畸形 link/image 只消费已确认的语法前缀，目标及其后的普通文字不会被吞掉。
 
@@ -183,9 +185,15 @@ LARK_MARKDOWN_E2E_DESKTOP_SCREENSHOT=/tmp/lark-markdown-desktop.png \
 LARK_MARKDOWN_E2E_MOBILE_SCREENSHOT=/tmp/lark-markdown-mobile.png \
 LARK_MARKDOWN_E2E_ATTESTATION=/tmp/lark-markdown-attestation.json \
 LARK_MARKDOWN_E2E_REVIEWER='独立审核人标识' \
-LARK_MARKDOWN_E2E_REVIEW_PUBLIC_KEY_HEX='预先约定的64位Ed25519公钥hex' \
   cargo test --test lark_markdown_smoke --locked -- --ignored --nocapture
 ```
+
+审核信任锚不是运行时输入。`LARK_MARKDOWN_E2E_REVIEWER` 只能选择
+`tests/lark_markdown_smoke.rs` 中编译进测试二进制的审核人标识/Ed25519 公钥，环境变量不能新增
+或替换公钥。当前仓库的可信 allowlist 有意为空，因此真实桌面端/移动端证据仍然**缺失**；即使
+提供全部环境变量，smoke 也会在读取凭证和发送消息前以
+`no trusted review anchor configured` 失败关闭。只有通过独立渠道取得审核公钥，并通过受审查的
+仓库提交固定该身份/公钥后，才可执行并产生可采信的真实验收证据；私钥不得进入仓库。
 
 测试发出覆盖全部子集及表格降级的真实 `post`；正文末尾会显示本次唯一 `nonce` 与基础正文
 SHA-256，测试同时打印回复 `message_id`、marker/body/最终正文 hash，默认等待 5 分钟。在飞书
@@ -225,8 +233,8 @@ PNG/JPEG/WebP；桌面与移动截图按解码后的 canonical RGBA 像素比较
 marker/body/最终正文 hash、两张文件及 pixel hash/尺寸、所有视觉 verdict、审核人和审核公钥。
 
 程序只验证文件、像素和字段绑定，**不会声称能从像素中识别 marker 或判断排版**。这两个视觉
-结论必须由独立审核人检查桌面端和移动端截图后签署。审核公钥应在运行前通过独立渠道预先约定，
-对应私钥不得提供给 smoke 进程或截图操作者；审核人用 Ed25519 签署 UTF-8 字节串
+结论必须由独立审核人检查桌面端和移动端截图后签署。审核公钥必须先经独立渠道核验，再由受审查
+的仓库提交固定；对应私钥不得提供给 smoke 进程或截图操作者。审核人用 Ed25519 签署 UTF-8 字节串
 `lark-markdown-independent-review-signature-v3\n<evidence_sha256>\n`。因此任意两张不同图片加
 自填 verdict/attestation、错误审核密钥、陈旧、同像素或字段错配均不能通过；有效签名表示外部
 审核人对绑定图片作了人工确认，而不是程序完成了 OCR。显式运行 ignored smoke 却没有

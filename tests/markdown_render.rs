@@ -283,18 +283,35 @@ fn encoded_tags_and_format_controls_are_inert_outside_code() {
 }
 
 #[test]
-fn entity_reconstruction_is_fully_reparsed_for_both_carriers() {
+fn entity_derived_characters_cannot_reconstruct_markdown_in_either_carrier() {
     let source = concat!(
-        "&#91;script&#93;&#40;javascript&#58;alert&#40;1&#41;&#41;\n",
-        "&#91;data&#93;&#40;data&#58;text/plain,hello&#41;\n",
+        "&#42;&#42;bold&#42;&#42; &#95;italic&#95; &#126;&#126;strike&#126;&#126; ",
+        "&#96;code&#96;\n",
         "&#96;&#96;&#96;rust&NewLine;let answer = 42;\n",
+        "&#45;&#32;item\n",
+        "&#49;&#46;&#32;ordered\n",
+        "&#62;&#32;quote\n",
+        "&#35;&#32;heading\n",
+        "&#91;script&#93;&#40;javascript&#58;alert&#40;1&#41;&#41;\n",
+        "&#33;&#91;image&#93;&#40;data&#58;text/plain,hello&#41;\n",
+        "plain&NewLine;&#45;&#32;not-a-new-list\n",
+        "&#124; a &#124; b &#124;&NewLine;&#124;&#45;&#45;&#45;&#124;&#45;&#45;&#45;&#124;\n",
+        "- [&#120;] entity task letter\n",
+        "&#91;docs&#93;&#58;&#32;https://example.com\n",
     );
     let expected = concat!(
-        "script (unsafe link target)\n",
-        "data (unsafe link target)\n",
-        "```rust\n",
-        "let answer = 42;\n",
-        "```",
+        "＊＊bold＊＊ ＿italic＿ ～～strike～～ ｀code｀\n",
+        "｀｀｀rust␤let answer = 42;\n",
+        "－␠item\n",
+        "１．␠ordered\n",
+        "›␠quote\n",
+        "＃␠heading\n",
+        "［script］（javascript：alert（1））\n",
+        "！［image］（data：text/plain,hello）\n",
+        "plain␤－␠not-a-new-list\n",
+        "｜ a ｜ b ｜␤｜－－－｜－－－｜\n",
+        "- [ｘ] entity task letter\n",
+        "［docs］：␠https://example.com",
     );
     for rendered in [
         render_lark_markdown(source),
@@ -303,13 +320,17 @@ fn entity_reconstruction_is_fully_reparsed_for_both_carriers() {
         assert_eq!(rendered, expected);
         assert!(!rendered.contains("](javascript:"));
         assert!(!rendered.contains("](data:"));
+        assert!(!rendered.contains("**"));
+        assert!(!rendered.contains("```"));
+        assert!(!rendered.contains("!["));
+        assert!(!rendered.lines().any(|line| line.starts_with("> ")));
         assert!(fences_are_balanced(&rendered));
     }
 
     // Removing an encoded HTML wrapper can expose raw fence bytes. The
     // second structural pass must recognize and close that fence rather than
     // returning a post/Card2 payload with a dangling delimiter.
-    let exposed = "&lt;b&gt;```text&NewLine;payload";
+    let exposed = "&lt;b&gt;```text\npayload";
     for rendered in [
         render_lark_markdown(exposed),
         stabilize_streaming_markdown(exposed),
