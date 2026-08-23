@@ -751,7 +751,11 @@ async fn real_exact_binary_coordinates_two_clients_queue_exact_ids_and_one_appro
             (turn_id, false)
         }
         (
-            Err(error @ (ExternalWriteError::Conflict | ExternalWriteError::Ambiguous)),
+            Err(
+                error @ (ExternalWriteError::Conflict
+                | ExternalWriteError::Uncertain
+                | ExternalWriteError::Ambiguous),
+            ),
             OperatorResponse::Result(result),
         ) => {
             let turn_id = result["turn"]["id"]
@@ -765,7 +769,7 @@ async fn real_exact_binary_coordinates_two_clients_queue_exact_ids_and_one_appro
                 json!({"threadId": thread_id, "turnId": turn_id}),
             )
             .await?;
-            (turn_id, error == ExternalWriteError::Ambiguous)
+            (turn_id, error != ExternalWriteError::Conflict)
         }
         (bridge, operator) => bail!(
             "two-client start race did not have one correlated or safely fenced winner: bridge={bridge:?} operator={operator:?}"

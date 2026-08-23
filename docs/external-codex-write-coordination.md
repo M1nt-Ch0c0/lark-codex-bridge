@@ -78,8 +78,10 @@ The hard-gated smoke starts only the explicitly supplied native Codex 0.149.0
 binary with bearer authentication and an isolated local Responses API. It
 proves start/steer/interrupt/queue behavior, one approval response, orderly
 socket-only shutdown while the server stays healthy, reconnect, and a real
-two-client start race. An uncorrelatable race must become durable uncertainty,
-with one actual turn and no model-work replay:
+two-client start race. An uncorrelatable race may surface as `Uncertain` when
+the competing write disrupts preflight, or `Ambiguous` after the bridge sends
+its mutation; either result must become durable uncertainty, with one actual
+turn and no model-work replay:
 
 ```bash
 CODEX_EXTERNAL_WRITE_E2E=1 \
