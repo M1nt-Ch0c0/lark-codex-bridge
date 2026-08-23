@@ -8,6 +8,95 @@ use crate::lark::api::post_markdown_reply_body_len;
 use crate::limits::{LARK_CARD_MARKDOWN_ELEMENT_MAX_BYTES, REPLY_TRUNCATION_MARKER};
 
 const MAX_SAFE_FENCE_MARKER_CHARS: usize = 64;
+// One allowance is shared by the inline fragment and every recursive label.
+// All suffix scans debit it, so even an unrecognized hostile construct can do
+// only constant work per admitted source byte before linear inert degradation.
+const INLINE_WORK_PER_INPUT_BYTE: usize = 64;
+const INLINE_WORK_BASE: usize = 256;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InlineWorkExhausted;
+
+#[derive(Debug)]
+struct InlineWorkBudget {
+    remaining: usize,
+    spent: usize,
+}
+
+impl InlineWorkBudget {
+    fn new(input_bytes: usize) -> Self {
+        Self {
+            remaining: input_bytes
+                .saturating_mul(INLINE_WORK_PER_INPUT_BYTE)
+                .saturating_add(INLINE_WORK_BASE),
+            spent: 0,
+        }
+    }
+
+    fn charge(&mut self, units: usize) -> Result<(), InlineWorkExhausted> {
+        if units > self.remaining {
+            self.spent = self.spent.saturating_add(self.remaining);
+            self.remaining = 0;
+            return Err(InlineWorkExhausted);
+        }
+        self.remaining -= units;
+        self.spent = self.spent.saturating_add(units);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn spent(&self) -> usize {
+        self.spent
+    }
+}
+
+#[derive(Debug, Default)]
+struct UnescapedBracketSearch {
+    scanned_to: usize,
+    cached: Option<usize>,
+    preceding_backslashes: usize,
+}
+
+impl UnescapedBracketSearch {
+    fn find(
+        &mut self,
+        text: &str,
+        start: usize,
+        budget: &mut InlineWorkBudget,
+    ) -> Result<Option<usize>, InlineWorkExhausted> {
+        if let Some(cached) = self.cached {
+            if cached >= start {
+                return Ok(Some(cached));
+            }
+            self.cached = None;
+        }
+
+        // Callers advance through `text`; this cursor never retreats. An
+        // unmatched `[` therefore cannot rescan an already-inspected suffix.
+        // Keeping the full preceding run also implements Markdown's odd/even
+        // backslash rule instead of treating every immediately preceded `]`
+        // as escaped.
+        let bytes = text.as_bytes();
+        while self.scanned_to < bytes.len() {
+            budget.charge(1)?;
+            let cursor = self.scanned_to;
+            let byte = bytes[cursor];
+            self.scanned_to += 1;
+            if byte == b'\\' {
+                self.preceding_backslashes = self.preceding_backslashes.saturating_add(1);
+                continue;
+            }
+
+            let escaped = self.preceding_backslashes % 2 == 1;
+            self.preceding_backslashes = 0;
+            if cursor >= start && byte == b']' && !escaped {
+                self.cached = Some(cursor);
+                return Ok(Some(cursor));
+            }
+        }
+        Ok(None)
+    }
+}
 
 /// Converts model-produced Markdown into the deterministic subset carried by
 /// a Lark `post` element with `tag=md`.
@@ -796,14 +885,30 @@ fn is_unicode_format_control(character: char) -> bool {
 }
 
 fn sanitize_inline(text: &str, carrier: MarkdownCarrier) -> String {
+    let mut budget = InlineWorkBudget::new(text.len());
+    sanitize_inline_bounded(text, carrier, &mut budget).unwrap_or_else(|InlineWorkExhausted| {
+        // A hostile construct can otherwise make every source delimiter scan
+        // the same suffix. Degrade the whole inline fragment in one pass so a
+        // partially parsed prefix cannot activate syntax around the fallback.
+        inert_inline_text(text)
+    })
+}
+
+fn sanitize_inline_bounded(
+    text: &str,
+    carrier: MarkdownCarrier,
+    budget: &mut InlineWorkBudget,
+) -> Result<String, InlineWorkExhausted> {
     let mut output = String::with_capacity(text.len());
     let mut cursor = 0;
+    let mut brackets = UnescapedBracketSearch::default();
     while cursor < text.len() {
+        budget.charge(1)?;
         let rest = &text[cursor..];
 
         if rest.starts_with('`') {
-            let run = rest.bytes().take_while(|byte| *byte == b'`').count();
-            if let Some(end) = find_code_span_end(text, cursor + run, run) {
+            let run = count_byte_run(text, cursor, b'`', budget)?;
+            if let Some(end) = find_code_span_end(text, cursor + run, run, budget)? {
                 output.push_str(&text[cursor..end]);
                 cursor = end;
                 continue;
@@ -811,7 +916,9 @@ fn sanitize_inline(text: &str, carrier: MarkdownCarrier) -> String {
         }
 
         if rest.starts_with("![") {
-            if let Some((rendered, consumed)) = degrade_image(rest, carrier) {
+            if let Some((rendered, consumed)) =
+                degrade_image(text, cursor, carrier, budget, &mut brackets)?
+            {
                 output.push_str(&rendered);
                 cursor += consumed;
                 continue;
@@ -819,8 +926,9 @@ fn sanitize_inline(text: &str, carrier: MarkdownCarrier) -> String {
         }
 
         if rest.starts_with("[^") {
-            if let Some(end) = find_unescaped(rest, 2, b']') {
-                let identifier = &rest[2..end];
+            if let Some(end) = brackets.find(text, cursor + 2, budget)? {
+                let identifier = &text[cursor + 2..end];
+                budget.charge(identifier.len())?;
                 if !identifier.is_empty() && identifier.chars().all(is_footnote_identifier) {
                     match carrier {
                         MarkdownCarrier::Post => output.push_str("(footnote "),
@@ -831,14 +939,16 @@ fn sanitize_inline(text: &str, carrier: MarkdownCarrier) -> String {
                         MarkdownCarrier::Post => ')',
                         MarkdownCarrier::Card2 => ']',
                     });
-                    cursor += end + 1;
+                    cursor = end + 1;
                     continue;
                 }
             }
         }
 
         if rest.starts_with('[') {
-            if let Some((rendered, consumed)) = preserve_or_degrade_link(rest, carrier) {
+            if let Some((rendered, consumed)) =
+                preserve_or_degrade_link(text, cursor, carrier, budget, &mut brackets)?
+            {
                 output.push_str(&rendered);
                 cursor += consumed;
                 continue;
@@ -846,8 +956,8 @@ fn sanitize_inline(text: &str, carrier: MarkdownCarrier) -> String {
         }
 
         if rest.starts_with("<!--") {
-            if let Some(end) = rest.find("-->") {
-                cursor += end + 3;
+            if let Some(end) = find_bytes(text, cursor + 4, b"-->", budget)? {
+                cursor = end + 3;
             } else {
                 output.push('‹');
                 output.push_str("!--");
@@ -857,7 +967,7 @@ fn sanitize_inline(text: &str, carrier: MarkdownCarrier) -> String {
         }
 
         if rest.starts_with('&') {
-            if let Some((rendered, consumed)) = sanitize_entity(rest, carrier) {
+            if let Some((rendered, consumed)) = sanitize_entity(rest, carrier, budget)? {
                 output.push_str(&rendered);
                 cursor += consumed;
                 continue;
@@ -865,15 +975,15 @@ fn sanitize_inline(text: &str, carrier: MarkdownCarrier) -> String {
         }
 
         if rest.starts_with('<') {
-            if let Some(end) = rest.find('>') {
-                let inner = &rest[1..end];
-                if safe_link_target(inner, carrier) {
+            if let Some(end) = find_byte(text, cursor + 1, b'>', budget)? {
+                let inner = &text[cursor + 1..end];
+                if safe_link_target(inner, carrier, budget)? {
                     output.push('[');
                     output.push_str(inner);
                     output.push_str("](");
                     output.push_str(inner);
                     output.push(')');
-                } else if looks_like_url_target(inner) {
+                } else if looks_like_url_target(inner, budget)? {
                     output.push_str(inner);
                     output.push_str(" (unsafe link target)");
                 } else if !looks_like_html_tag(inner) {
@@ -884,7 +994,7 @@ fn sanitize_inline(text: &str, carrier: MarkdownCarrier) -> String {
                     output.push_str(inner);
                     output.push('›');
                 }
-                cursor += end + 1;
+                cursor = end + 1;
                 continue;
             }
             // A malformed tag must not swallow subsequent quoted lines or be
@@ -898,16 +1008,36 @@ fn sanitize_inline(text: &str, carrier: MarkdownCarrier) -> String {
         output.push(character);
         cursor += character.len_utf8();
     }
-    output
+    Ok(output)
 }
 
-fn find_code_span_end(text: &str, mut cursor: usize, run: usize) -> Option<usize> {
+fn count_byte_run(
+    text: &str,
+    start: usize,
+    needle: u8,
+    budget: &mut InlineWorkBudget,
+) -> Result<usize, InlineWorkExhausted> {
+    let mut cursor = start;
+    while text.as_bytes().get(cursor) == Some(&needle) {
+        budget.charge(1)?;
+        cursor += 1;
+    }
+    Ok(cursor - start)
+}
+
+fn find_code_span_end(
+    text: &str,
+    mut cursor: usize,
+    run: usize,
+    budget: &mut InlineWorkBudget,
+) -> Result<Option<usize>, InlineWorkExhausted> {
     while cursor < text.len() {
+        budget.charge(1)?;
         let rest = &text[cursor..];
         if rest.starts_with('`') {
-            let candidate = rest.bytes().take_while(|byte| *byte == b'`').count();
+            let candidate = count_byte_run(text, cursor, b'`', budget)?;
             if candidate == run {
-                return Some(cursor + run);
+                return Ok(Some(cursor + run));
             }
             cursor += candidate;
         } else {
@@ -918,125 +1048,192 @@ fn find_code_span_end(text: &str, mut cursor: usize, run: usize) -> Option<usize
                 .len_utf8();
         }
     }
-    None
+    Ok(None)
 }
 
-fn degrade_image(rest: &str, carrier: MarkdownCarrier) -> Option<(String, usize)> {
-    let label_end = find_unescaped(rest, 2, b']')?;
-    let alt = sanitize_inline(&rest[2..label_end], carrier);
+fn degrade_image(
+    text: &str,
+    opening: usize,
+    carrier: MarkdownCarrier,
+    budget: &mut InlineWorkBudget,
+    brackets: &mut UnescapedBracketSearch,
+) -> Result<Option<(String, usize)>, InlineWorkExhausted> {
+    let Some(label_end) = brackets.find(text, opening + 2, budget)? else {
+        return Ok(None);
+    };
+    let alt = sanitize_inline_bounded(&text[opening + 2..label_end], carrier, budget)?;
     let after = label_end + 1;
     let mut output = if alt.is_empty() {
         "Image".to_owned()
     } else {
         format!("Image: {alt}")
     };
-    if rest.as_bytes().get(after) == Some(&b'(') {
-        if let Some(end) = find_closing_paren(rest, after) {
-            let target = rest[after + 1..end].trim();
-            if safe_link_target(target, carrier) {
+    if text.as_bytes().get(after) == Some(&b'(') {
+        if let Some(end) = find_closing_paren(text, after, budget)? {
+            let target = text[after + 1..end].trim();
+            if safe_link_target(target, carrier, budget)? {
                 output.push_str(" (");
                 output.push_str(target);
                 output.push(')');
             } else if !target.is_empty() {
                 output.push_str(" (unsafe image target)");
             }
-            return Some((output, end + 1));
+            return Ok(Some((output, end + 1 - opening)));
         }
         output.push_str(" (invalid image target) ");
         // Consume only the syntactic opener. The malformed target and every
         // following byte remain visible instead of being swallowed to EOL.
-        return Some((output, after + 1));
+        return Ok(Some((output, after + 1 - opening)));
     }
-    if rest.as_bytes().get(after) == Some(&b'[') {
-        if let Some(reference_end) = find_unescaped(rest, after + 1, b']') {
-            let identifier = &rest[after + 1..reference_end];
+    if text.as_bytes().get(after) == Some(&b'[') {
+        if let Some(reference_end) = brackets.find(text, after + 1, budget)? {
+            let identifier = &text[after + 1..reference_end];
             output.push_str(" (reference ");
-            output.push_str(&sanitize_inline(
+            output.push_str(&sanitize_inline_bounded(
                 if identifier.is_empty() {
-                    &rest[2..label_end]
+                    &text[opening + 2..label_end]
                 } else {
                     identifier
                 },
                 carrier,
-            ));
+                budget,
+            )?);
             output.push(')');
-            return Some((output, reference_end + 1));
+            return Ok(Some((output, reference_end + 1 - opening)));
         }
     }
-    Some((output, after))
+    Ok(Some((output, after - opening)))
 }
 
-fn preserve_or_degrade_link(rest: &str, carrier: MarkdownCarrier) -> Option<(String, usize)> {
-    let label_end = find_unescaped(rest, 1, b']')?;
-    let label = sanitize_inline(&rest[1..label_end], carrier);
+fn preserve_or_degrade_link(
+    text: &str,
+    opening: usize,
+    carrier: MarkdownCarrier,
+    budget: &mut InlineWorkBudget,
+    brackets: &mut UnescapedBracketSearch,
+) -> Result<Option<(String, usize)>, InlineWorkExhausted> {
+    let Some(label_end) = brackets.find(text, opening + 1, budget)? else {
+        return Ok(None);
+    };
+    let label = sanitize_inline_bounded(&text[opening + 1..label_end], carrier, budget)?;
     let after = label_end + 1;
-    if rest.as_bytes().get(after) == Some(&b'(') {
-        if let Some(end) = find_closing_paren(rest, after) {
-            let target = &rest[after + 1..end];
-            if safe_link_target(target, carrier) {
-                return Some((format!("[{label}]({target})"), end + 1));
+    if text.as_bytes().get(after) == Some(&b'(') {
+        if let Some(end) = find_closing_paren(text, after, budget)? {
+            let target = &text[after + 1..end];
+            if safe_link_target(target, carrier, budget)? {
+                return Ok(Some((format!("[{label}]({target})"), end + 1 - opening)));
             }
-            return Some((format!("{label} (unsafe link target)"), end + 1));
+            return Ok(Some((
+                format!("{label} (unsafe link target)"),
+                end + 1 - opening,
+            )));
         }
         // Preserve all bytes after the malformed opener as inert/readable
         // trailing text. Consuming the whole remainder would silently delete
         // unrelated output after a missing `)`.
-        return Some((format!("[{label}] (invalid link target) "), after + 1));
+        return Ok(Some((
+            format!("[{label}] (invalid link target) "),
+            after + 1 - opening,
+        )));
     }
-    if rest.as_bytes().get(after) == Some(&b'[') {
-        if let Some(reference_end) = find_unescaped(rest, after + 1, b']') {
-            let identifier = &rest[after + 1..reference_end];
+    if text.as_bytes().get(after) == Some(&b'[') {
+        if let Some(reference_end) = brackets.find(text, after + 1, budget)? {
+            let identifier = &text[after + 1..reference_end];
             let identifier = if identifier.is_empty() {
-                &rest[1..label_end]
+                &text[opening + 1..label_end]
             } else {
                 identifier
             };
-            return Some((
+            return Ok(Some((
                 format!(
                     "{label} (reference {})",
-                    sanitize_inline(identifier, carrier)
+                    sanitize_inline_bounded(identifier, carrier, budget)?
                 ),
-                reference_end + 1,
-            ));
+                reference_end + 1 - opening,
+            )));
         }
     }
-    Some((format!("[{label}]"), after))
+    Ok(Some((format!("[{label}]"), after - opening)))
 }
 
-fn find_unescaped(text: &str, start: usize, needle: u8) -> Option<usize> {
+fn find_byte(
+    text: &str,
+    start: usize,
+    needle: u8,
+    budget: &mut InlineWorkBudget,
+) -> Result<Option<usize>, InlineWorkExhausted> {
     let bytes = text.as_bytes();
     let mut cursor = start;
     while cursor < bytes.len() {
-        if bytes[cursor] == needle && (cursor == 0 || bytes[cursor - 1] != b'\\') {
-            return Some(cursor);
+        budget.charge(1)?;
+        if bytes[cursor] == needle {
+            return Ok(Some(cursor));
         }
         cursor += 1;
     }
-    None
+    Ok(None)
 }
 
-fn find_closing_paren(text: &str, opening: usize) -> Option<usize> {
+fn find_bytes(
+    text: &str,
+    start: usize,
+    needle: &[u8],
+    budget: &mut InlineWorkBudget,
+) -> Result<Option<usize>, InlineWorkExhausted> {
+    let bytes = text.as_bytes();
+    let mut cursor = start;
+    while cursor.saturating_add(needle.len()) <= bytes.len() {
+        budget.charge(1)?;
+        if bytes[cursor..].starts_with(needle) {
+            return Ok(Some(cursor));
+        }
+        cursor += 1;
+    }
+    Ok(None)
+}
+
+fn find_closing_paren(
+    text: &str,
+    opening: usize,
+    budget: &mut InlineWorkBudget,
+) -> Result<Option<usize>, InlineWorkExhausted> {
     let bytes = text.as_bytes();
     let mut depth = 0_u32;
     let mut cursor = opening;
+    let mut preceding_backslashes = 0_usize;
     while cursor < bytes.len() {
-        match bytes[cursor] {
-            b'\\' => cursor = cursor.saturating_add(1),
-            b'(' => depth = depth.saturating_add(1),
-            b')' => {
+        budget.charge(1)?;
+        let byte = bytes[cursor];
+        cursor += 1;
+        if byte == b'\\' {
+            preceding_backslashes = preceding_backslashes.saturating_add(1);
+            continue;
+        }
+
+        let escaped = preceding_backslashes % 2 == 1;
+        preceding_backslashes = 0;
+        if !escaped {
+            if byte == b'(' {
+                depth = depth.saturating_add(1);
+            } else if byte == b')' {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
-                    return Some(cursor);
+                    return Ok(Some(cursor - 1));
                 }
             }
-            _ => {}
         }
-        cursor += 1;
     }
-    None
+    Ok(None)
 }
 
-fn safe_link_target(target: &str, carrier: MarkdownCarrier) -> bool {
+fn safe_link_target(
+    target: &str,
+    carrier: MarkdownCarrier,
+    budget: &mut InlineWorkBudget,
+) -> Result<bool, InlineWorkExhausted> {
+    // This pays for trimming, character validation, percent decoding and the
+    // URL parser before any of those complete passes are attempted.
+    budget.charge(target.len().saturating_mul(8).saturating_add(16))?;
     let target = target.trim();
     if target.is_empty()
         || target.chars().any(|character| {
@@ -1048,26 +1245,30 @@ fn safe_link_target(target: &str, carrier: MarkdownCarrier) -> bool {
         || target.contains('&')
         || decoded_url_has_unsafe_controls(target)
     {
-        return false;
+        return Ok(false);
     }
     let Ok(url) = url::Url::parse(target) else {
-        return false;
+        return Ok(false);
     };
-    match carrier {
+    Ok(match carrier {
         MarkdownCarrier::Post => matches!(url.scheme(), "https" | "http" | "mailto"),
         MarkdownCarrier::Card2 => url.scheme() == "https",
-    }
+    })
 }
 
-fn looks_like_url_target(target: &str) -> bool {
+fn looks_like_url_target(
+    target: &str,
+    budget: &mut InlineWorkBudget,
+) -> Result<bool, InlineWorkExhausted> {
+    budget.charge(target.len().saturating_mul(2).saturating_add(4))?;
     let Some((scheme, _)) = target.split_once(':') else {
-        return false;
+        return Ok(false);
     };
-    !scheme.is_empty()
+    Ok(!scheme.is_empty()
         && scheme.chars().enumerate().all(|(index, character)| {
             character.is_ascii_alphabetic()
                 || (index > 0 && matches!(character, '+' | '-' | '.' | '0'..='9'))
-        })
+        }))
 }
 
 fn decoded_url_has_unsafe_controls(target: &str) -> bool {
@@ -1100,21 +1301,30 @@ fn decoded_url_has_unsafe_controls(target: &str) -> bool {
     })
 }
 
-fn sanitize_entity(rest: &str, carrier: MarkdownCarrier) -> Option<(String, usize)> {
-    let (decoded, consumed) = decode_entity(rest)?;
+fn sanitize_entity(
+    rest: &str,
+    carrier: MarkdownCarrier,
+    budget: &mut InlineWorkBudget,
+) -> Result<Option<(String, usize)>, InlineWorkExhausted> {
+    let Some((decoded, consumed)) = decode_entity(rest, budget)? else {
+        return Ok(None);
+    };
     if decoded == '<' {
-        if let Some((inner, end)) = encoded_tag(rest, consumed) {
+        if let Some((inner, end)) = encoded_tag(rest, consumed, budget)? {
             if looks_like_html_tag(&inner) {
-                return Some((String::new(), end));
+                return Ok(Some((String::new(), end)));
             }
-            return Some((format!("‹{}›", sanitize_inline(&inner, carrier)), end));
+            return Ok(Some((
+                format!("‹{}›", sanitize_inline_bounded(&inner, carrier, budget)?),
+                end,
+            )));
         }
-        return Some(("‹".to_owned(), consumed));
+        return Ok(Some(("‹".to_owned(), consumed)));
     }
     if is_unicode_format_control(decoded) || (decoded.is_control() && !decoded.is_whitespace()) {
-        return Some((String::new(), consumed));
+        return Ok(Some((String::new(), consumed)));
     }
-    Some((inert_entity_text(decoded), consumed))
+    Ok(Some((inert_entity_text(decoded), consumed)))
 }
 
 fn inert_entity_text(decoded: char) -> String {
@@ -1124,32 +1334,54 @@ fn inert_entity_text(decoded: char) -> String {
     // HTML control, or escape in the second pass or in either Lark carrier.
     // Visible control pictures also prevent entity whitespace from exposing a
     // raw delimiter at the start of a structural line.
-    match decoded {
-        '\n' | '\r' | '\u{0085}' | '\u{2028}' | '\u{2029}' => "␤".to_owned(),
-        '\t' => "␉".to_owned(),
-        character if character.is_whitespace() => "␠".to_owned(),
-        '<' => "‹".to_owned(),
-        '>' => "›".to_owned(),
+    let mut output = String::new();
+    push_inert_character(&mut output, decoded);
+    output
+}
+
+fn inert_inline_text(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    for character in text.chars() {
+        push_inert_character(&mut output, character);
+    }
+    output
+}
+
+fn push_inert_character(output: &mut String, character: char) {
+    let inert = match character {
+        '\n' | '\r' | '\u{0085}' | '\u{2028}' | '\u{2029}' => '␤',
+        '\t' => '␉',
+        character if character.is_whitespace() => '␠',
+        '<' => '‹',
+        '>' => '›',
         character if character.is_ascii_graphic() => char::from_u32(
             u32::from(character)
                 .saturating_sub(u32::from('!'))
                 .saturating_add(u32::from('！')),
         )
-        .expect("ASCII graphic characters have full-width forms")
-        .to_string(),
-        character => character.to_string(),
-    }
+        .expect("ASCII graphic characters have full-width forms"),
+        character => character,
+    };
+    output.push(inert);
 }
 
-fn encoded_tag(rest: &str, opening_len: usize) -> Option<(String, usize)> {
+fn encoded_tag(
+    rest: &str,
+    opening_len: usize,
+    budget: &mut InlineWorkBudget,
+) -> Result<Option<(String, usize)>, InlineWorkExhausted> {
     let mut cursor = opening_len;
     while cursor < rest.len() {
+        budget.charge(1)?;
         if rest.as_bytes()[cursor] == b'>' {
-            return Some((rest[opening_len..cursor].to_owned(), cursor + 1));
+            return Ok(Some((rest[opening_len..cursor].to_owned(), cursor + 1)));
         }
         if rest.as_bytes()[cursor] == b'&' {
-            if let Some(('>', consumed)) = decode_entity(&rest[cursor..]) {
-                return Some((rest[opening_len..cursor].to_owned(), cursor + consumed));
+            if let Some(('>', consumed)) = decode_entity(&rest[cursor..], budget)? {
+                return Ok(Some((
+                    rest[opening_len..cursor].to_owned(),
+                    cursor + consumed,
+                )));
             }
         }
         cursor += rest[cursor..]
@@ -1158,13 +1390,26 @@ fn encoded_tag(rest: &str, opening_len: usize) -> Option<(String, usize)> {
             .expect("cursor is below entity-tag length")
             .len_utf8();
     }
-    None
+    Ok(None)
 }
 
-fn decode_entity(rest: &str) -> Option<(char, usize)> {
-    let end = rest.get(1..)?.find(';')?.saturating_add(1);
-    if end > 32 {
-        return None;
+fn decode_entity(
+    rest: &str,
+    budget: &mut InlineWorkBudget,
+) -> Result<Option<(char, usize)>, InlineWorkExhausted> {
+    if rest.as_bytes().first() != Some(&b'&') {
+        return Ok(None);
+    }
+    let mut end = 1;
+    while end < rest.len() && end <= 32 {
+        budget.charge(1)?;
+        if rest.as_bytes()[end] == b';' {
+            break;
+        }
+        end += 1;
+    }
+    if end >= rest.len() || end > 32 || rest.as_bytes()[end] != b';' {
+        return Ok(None);
     }
     let body = &rest[1..end];
     let decoded = match body {
@@ -1190,12 +1435,26 @@ fn decode_entity(rest: &str) -> Option<(char, usize)> {
         "Tab" => '\t',
         "NewLine" => '\n',
         numeric if numeric.starts_with("#x") || numeric.starts_with("#X") => {
-            char::from_u32(u32::from_str_radix(&numeric[2..], 16).ok()?)?
+            let Ok(numeric) = u32::from_str_radix(&numeric[2..], 16) else {
+                return Ok(None);
+            };
+            let Some(decoded) = char::from_u32(numeric) else {
+                return Ok(None);
+            };
+            decoded
         }
-        numeric if numeric.starts_with('#') => numeric[1..].parse::<u32>().ok()?.try_into().ok()?,
-        _ => return None,
+        numeric if numeric.starts_with('#') => {
+            let Ok(numeric) = numeric[1..].parse::<u32>() else {
+                return Ok(None);
+            };
+            let Ok(decoded) = numeric.try_into() else {
+                return Ok(None);
+            };
+            decoded
+        }
+        _ => return Ok(None),
     };
-    Some((decoded, end + 1))
+    Ok(Some((decoded, end + 1)))
 }
 
 fn looks_like_html_tag(inner: &str) -> bool {
@@ -1214,4 +1473,59 @@ fn push_line(lines: &mut Vec<String>, line: String) {
         return;
     }
     lines.push(line);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        InlineWorkBudget, InlineWorkExhausted, MarkdownCarrier, render_lark_markdown,
+        sanitize_inline, sanitize_inline_bounded, stabilize_streaming_markdown,
+    };
+    use crate::limits::{LARK_CARD_MARKDOWN_ELEMENT_MAX_BYTES, THREAD_PROJECTION_BYTE_BUDGET};
+
+    #[test]
+    fn multi_mib_unmatched_brackets_have_deterministic_linear_work() {
+        let source = "[".repeat(THREAD_PROJECTION_BYTE_BUDGET);
+        let mut budget = InlineWorkBudget::new(source.len());
+        let rendered = sanitize_inline_bounded(&source, MarkdownCarrier::Post, &mut budget)
+            .expect("the monotonic delimiter scan stays within its linear allowance");
+
+        assert_eq!(rendered, source);
+        assert!(
+            budget.spent() <= source.len().saturating_mul(2),
+            "{} bytes consumed {} deterministic work units",
+            source.len(),
+            budget.spent(),
+        );
+
+        assert_eq!(render_lark_markdown(&source), source);
+        let card = stabilize_streaming_markdown(&source);
+        assert!(
+            super::card_markdown_element_wire_len(&card) <= LARK_CARD_MARKDOWN_ELEMENT_MAX_BYTES
+        );
+        assert!(card.ends_with("…[truncated]"));
+    }
+
+    #[test]
+    fn forward_scan_budget_exhaustion_is_deterministic_and_inert() {
+        let source = "<!--".repeat(32 * 1024);
+        let mut budget = InlineWorkBudget::new(source.len());
+        assert_eq!(
+            sanitize_inline_bounded(&source, MarkdownCarrier::Post, &mut budget),
+            Err(InlineWorkExhausted),
+        );
+        assert_eq!(
+            budget.spent(),
+            source
+                .len()
+                .saturating_mul(super::INLINE_WORK_PER_INPUT_BYTE)
+                .saturating_add(super::INLINE_WORK_BASE),
+        );
+
+        let rendered = sanitize_inline(&source, MarkdownCarrier::Post);
+        assert!(!rendered.contains('<'));
+        assert!(!rendered.contains('>'));
+        assert!(!rendered.contains("<!--"));
+        assert!(rendered.starts_with("‹！－－"));
+    }
 }

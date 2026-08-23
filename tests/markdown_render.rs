@@ -374,6 +374,71 @@ fn carriers_apply_explicit_safe_url_schemes_and_keep_malformed_tails() {
 }
 
 #[test]
+fn escaped_closing_delimiters_use_backslash_parity_in_both_carriers() {
+    let source = concat!(
+        r"[odd\]](javascript:alert(1))",
+        "\n",
+        r"[even\\](javascript:alert(2))",
+        "\n",
+        r"[odd_three\\\]](data:text/plain,owned)",
+        "\n",
+        r"[even_four\\\\](data:text/plain,owned)",
+        "\n",
+        r"![odd\]](data:text/plain,owned)",
+        "\n",
+        r"![even\\](data:text/plain,owned)",
+        "\n",
+        r"![odd_three\\\]](javascript:alert(3))",
+        "\n",
+        r"![even_four\\\\](javascript:alert(4))",
+        "\n",
+        r"[target_odd](javascript:owned\)) trailing",
+        "\n",
+        r"[target_even](javascript:owned\\) trailing",
+        "\n",
+        r"![target_odd](data:text/plain,owned\)) trailing",
+        "\n",
+        r"![target_even](data:text/plain,owned\\) trailing",
+    );
+    let expected = concat!(
+        r"odd\] (unsafe link target)",
+        "\n",
+        r"even\\ (unsafe link target)",
+        "\n",
+        r"odd_three\\\] (unsafe link target)",
+        "\n",
+        r"even_four\\\\ (unsafe link target)",
+        "\n",
+        r"Image: odd\] (unsafe image target)",
+        "\n",
+        r"Image: even\\ (unsafe image target)",
+        "\n",
+        r"Image: odd_three\\\] (unsafe image target)",
+        "\n",
+        r"Image: even_four\\\\ (unsafe image target)",
+        "\n",
+        "target_odd (unsafe link target) trailing",
+        "\n",
+        "target_even (unsafe link target) trailing",
+        "\n",
+        "Image: target_odd (unsafe image target) trailing",
+        "\n",
+        "Image: target_even (unsafe image target) trailing",
+    );
+
+    for rendered in [
+        render_lark_markdown(source),
+        stabilize_streaming_markdown(source),
+    ] {
+        assert_eq!(rendered, expected);
+        assert!(!rendered.contains("](javascript:"));
+        assert!(!rendered.contains("](data:"));
+        assert!(!rendered.contains("javascript:"));
+        assert!(!rendered.contains("data:text/plain"));
+    }
+}
+
+#[test]
 fn pathological_fence_delimiters_are_atomic_and_bounded() {
     let delimiter = "`".repeat(40_000);
     let source = format!("{delimiter}\nbody\n{delimiter}");
