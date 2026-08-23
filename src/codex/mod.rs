@@ -5,6 +5,7 @@ pub mod compat;
 pub mod external;
 pub mod external_recovery;
 pub mod external_transport;
+pub mod external_write;
 pub mod process;
 pub mod protocol;
 pub mod rpc;

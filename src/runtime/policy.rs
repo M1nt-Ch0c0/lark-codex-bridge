@@ -172,6 +172,23 @@ impl PolicyFingerprint {
     }
 }
 
+/// Opaque actor identity minted only after a concrete Lark event passes the access policy.
+#[derive(Clone, Eq, PartialEq)]
+pub struct AuthorizedLarkActor(String);
+
+impl AuthorizedLarkActor {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for AuthorizedLarkActor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthorizedLarkActor([redacted])")
+    }
+}
+
 impl fmt::Debug for PolicyFingerprint {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -319,6 +336,38 @@ impl AccessPolicy {
         Self::mention_gate(event)
     }
 
+    /// Mints a stable opaque source actor only for an authorized ordinary Lark turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exact access decision when the concrete event is not authorized.
+    pub fn authorize_external_source(
+        &self,
+        event: &InboundEvent,
+    ) -> Result<AuthorizedLarkActor, AccessDecision> {
+        let decision = self.decide(event);
+        if decision != AccessDecision::Allow {
+            return Err(decision);
+        }
+        Ok(authorized_lark_actor(&event.sender_id))
+    }
+
+    /// Mints the single-recipient approval actor only for an authorized owner command event.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exact owner-command decision when the concrete event is not authorized.
+    pub fn authorize_external_approval_recipient(
+        &self,
+        event: &InboundEvent,
+    ) -> Result<AuthorizedLarkActor, AccessDecision> {
+        let decision = self.decide_command(event);
+        if decision != AccessDecision::Allow {
+            return Err(decision);
+        }
+        Ok(authorized_lark_actor(&event.sender_id))
+    }
+
     fn is_owner(&self, sender_id: &str) -> bool {
         self.owners.iter().any(|owner| owner.as_str() == sender_id)
     }
@@ -393,6 +442,21 @@ impl AccessPolicy {
             self.network_access,
         ))
     }
+}
+
+fn authorized_lark_actor(sender_id: &str) -> AuthorizedLarkActor {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut hash = Sha256::new();
+    hash.update(b"lark-codex-authorized-actor-v1\0");
+    hash.update(sender_id.as_bytes());
+    let digest = hash.finalize();
+    let mut actor = String::with_capacity(43);
+    actor.push_str("lark-");
+    for byte in digest.iter().take(19) {
+        actor.push(char::from(HEX[usize::from(byte >> 4)]));
+        actor.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    AuthorizedLarkActor(actor)
 }
 
 const POLICY_FINGERPRINT_VERSION: &[u8] = b"lark-codex-policy-v1";

@@ -157,6 +157,8 @@ impl CodexBackendConfig {
 pub enum ExternalCapabilityProfile {
     ObserveShared,
     ResumeShared,
+    MutateShared,
+    QueueShared,
 }
 
 impl ExternalCapabilityProfile {
@@ -164,6 +166,8 @@ impl ExternalCapabilityProfile {
         match self {
             Self::ObserveShared => SharedWireProfile::ObserveShared,
             Self::ResumeShared => SharedWireProfile::ResumeShared,
+            Self::MutateShared => SharedWireProfile::MutateShared,
+            Self::QueueShared => SharedWireProfile::QueueShared,
         }
     }
 }
@@ -395,7 +399,7 @@ impl ExternalEndpointGate {
         client_info.title = Some("Lark Codex Bridge external endpoint gate".to_owned());
         let mut initialize = InitializeParams::new(client_info);
         initialize.capabilities = Some(InitializeCapabilities {
-            experimental_api: (self.capability_profile == ExternalCapabilityProfile::ResumeShared)
+            experimental_api: (self.capability_profile != ExternalCapabilityProfile::ObserveShared)
                 .then_some(true),
             ..InitializeCapabilities::default()
         });
@@ -747,6 +751,8 @@ fn endpoint_label(
     hasher.update(match profile {
         ExternalCapabilityProfile::ObserveShared => b"observe_shared".as_slice(),
         ExternalCapabilityProfile::ResumeShared => b"resume_shared".as_slice(),
+        ExternalCapabilityProfile::MutateShared => b"mutate_shared".as_slice(),
+        ExternalCapabilityProfile::QueueShared => b"queue_shared".as_slice(),
     });
     let digest = hasher.finalize();
     let mut encoded = String::with_capacity(68);

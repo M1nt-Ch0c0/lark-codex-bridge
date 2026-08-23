@@ -1426,6 +1426,34 @@ pub struct ThreadStartedNotification {
     pub thread: Thread,
 }
 
+/// Exact required projection of the 0.149.0 shared-thread settings notification.
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadSettingsUpdatedNotification {
+    pub thread_id: String,
+    pub thread_settings: ThreadSettingsSnapshot,
+}
+
+/// Security-relevant required fields retained from a shared thread settings update.
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadSettingsSnapshot {
+    pub approval_policy: ApprovalPolicy,
+    pub approvals_reviewer: String,
+    pub collaboration_mode: Value,
+    pub cwd: PathBuf,
+    pub model: String,
+    pub model_provider: String,
+    pub sandbox_policy: Value,
+}
+
+/// Bounded endpoint-level rate-limit notification; values are not used for write admission.
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountRateLimitsUpdatedNotification {
+    pub rate_limits: Map<String, Value>,
+}
+
 #[derive(Clone, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnStartedNotification {

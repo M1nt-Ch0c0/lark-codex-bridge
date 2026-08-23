@@ -243,6 +243,42 @@ impl StoreHandle {
                 )
                 .map_err(|error| sqlite_error("fencing external managed threads", &error))?;
             transaction
+                .execute(
+                    "UPDATE external_mutation_intents
+                     SET state = CASE state WHEN 'prepared' THEN 'rejected' ELSE 'uncertain' END,
+                         updated_ms = ?2
+                     WHERE endpoint_label = ?1 AND state IN ('prepared', 'sent')",
+                    params![endpoint_label, now_ms()],
+                )
+                .map_err(|error| sqlite_error("fencing external mutation intents", &error))?;
+            transaction
+                .execute(
+                    "UPDATE external_approval_claims SET state = 'uncertain', updated_ms = ?2
+                     WHERE endpoint_label = ?1
+                       AND state IN ('received', 'claimed', 'responding')",
+                    params![endpoint_label, now_ms()],
+                )
+                .map_err(|error| sqlite_error("fencing external approval claims", &error))?;
+            transaction
+                .execute(
+                    "UPDATE external_write_fences
+                     SET epoch = ?2,
+                         state = CASE WHEN
+                           EXISTS(SELECT 1 FROM external_mutation_intents i
+                                  WHERE i.endpoint_label = external_write_fences.endpoint_label
+                                    AND i.thread_id = external_write_fences.thread_id
+                                    AND i.state = 'uncertain')
+                           OR EXISTS(SELECT 1 FROM external_approval_claims a
+                                     WHERE a.endpoint_label = external_write_fences.endpoint_label
+                                       AND a.thread_id = external_write_fences.thread_id
+                                       AND a.state = 'uncertain')
+                           THEN 'uncertain' ELSE 'open' END,
+                         active_intent_id = NULL, updated_ms = ?3
+                     WHERE endpoint_label = ?1",
+                    params![endpoint_label, next, now_ms()],
+                )
+                .map_err(|error| sqlite_error("advancing external write fences", &error))?;
+            transaction
                 .commit()
                 .map_err(|error| sqlite_error("committing an external epoch", &error))?;
             Ok(ExternalEpochReservation {
@@ -478,6 +514,41 @@ impl StoreHandle {
                     params![endpoint_label, epoch_i64(epoch)?, reason.as_str(), now_ms()],
                 )
                 .map_err(|error| sqlite_error("marking external threads unavailable", &error))?;
+            transaction
+                .execute(
+                    "UPDATE external_mutation_intents
+                     SET state = CASE state WHEN 'prepared' THEN 'rejected' ELSE 'uncertain' END,
+                         updated_ms = ?3
+                     WHERE endpoint_label = ?1 AND epoch = ?2 AND state IN ('prepared', 'sent')",
+                    params![endpoint_label, epoch_i64(epoch)?, now_ms()],
+                )
+                .map_err(|error| sqlite_error("fencing unavailable mutations", &error))?;
+            transaction
+                .execute(
+                    "UPDATE external_approval_claims SET state = 'uncertain', updated_ms = ?3
+                     WHERE endpoint_label = ?1 AND epoch = ?2
+                       AND state IN ('received', 'claimed', 'responding')",
+                    params![endpoint_label, epoch_i64(epoch)?, now_ms()],
+                )
+                .map_err(|error| sqlite_error("fencing unavailable approvals", &error))?;
+            transaction
+                .execute(
+                    "UPDATE external_write_fences
+                     SET state = CASE WHEN
+                           EXISTS(SELECT 1 FROM external_mutation_intents i
+                                  WHERE i.endpoint_label = external_write_fences.endpoint_label
+                                    AND i.thread_id = external_write_fences.thread_id
+                                    AND i.state = 'uncertain')
+                           OR EXISTS(SELECT 1 FROM external_approval_claims a
+                                     WHERE a.endpoint_label = external_write_fences.endpoint_label
+                                       AND a.thread_id = external_write_fences.thread_id
+                                       AND a.state = 'uncertain')
+                           THEN 'uncertain' ELSE 'open' END,
+                         active_intent_id = NULL, updated_ms = ?3
+                     WHERE endpoint_label = ?1 AND epoch = ?2",
+                    params![endpoint_label, epoch_i64(epoch)?, now_ms()],
+                )
+                .map_err(|error| sqlite_error("fencing unavailable external writes", &error))?;
             transaction
                 .commit()
                 .map_err(|error| sqlite_error("committing external unavailability", &error))?;
@@ -922,7 +993,7 @@ fn validate_terminals(
     Ok(())
 }
 
-fn validate_pair(
+pub(super) fn validate_pair(
     endpoint_label: &str,
     thread_id: &str,
     context: &'static str,
@@ -931,7 +1002,11 @@ fn validate_pair(
     validate_id(thread_id, ROUTING_ID_BYTE_LIMIT, context)
 }
 
-fn validate_id(value: &str, limit: usize, context: &'static str) -> Result<(), StoreError> {
+pub(super) fn validate_id(
+    value: &str,
+    limit: usize,
+    context: &'static str,
+) -> Result<(), StoreError> {
     if value.is_empty() || value.len() > limit {
         return Err(StoreError::PayloadTooLarge {
             context,
@@ -957,7 +1032,7 @@ fn terminal_request_bytes(
         )
 }
 
-fn epoch_i64(epoch: u64) -> Result<i64, StoreError> {
+pub(super) fn epoch_i64(epoch: u64) -> Result<i64, StoreError> {
     if epoch == 0 {
         return Err(StoreError::InvalidTransition {
             context: "using a zero external epoch",

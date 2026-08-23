@@ -110,6 +110,17 @@ jobs:
             cargo test --locked --test external_recovery_smoke \
               real_exact_binary_reconciles_across_socket_and_operator_server_restarts_without_write_replay \
               -- --ignored --exact --nocapture
+      - name: Run exact external write coordination smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          codex_binary="$CODEX_0_149_NATIVE"
+          CODEX_EXTERNAL_WRITE_E2E=1 \
+          CODEX_EXTERNAL_WRITE_BINARY="$codex_binary" \
+          CODEX_EXTERNAL_WRITE_EXPECTED_VERSION=0.149.0 \
+            cargo test --locked --test external_write_smoke \
+              real_exact_binary_coordinates_two_clients_queue_exact_ids_and_one_approval_route \
+              -- --ignored --exact --nocapture
 
   fmt:
     name: Format (rustfmt)
@@ -348,6 +359,17 @@ jobs:
           CODEX_EXTERNAL_RECONCILIATION_EXPECTED_VERSION=0.149.0 \
             cargo test --locked --test external_recovery_smoke \
               real_exact_binary_reconciles_across_socket_and_operator_server_restarts_without_write_replay \
+              -- --ignored --exact --nocapture
+      - name: Run exact external write coordination smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          codex_binary="$CODEX_0_149_NATIVE"
+          CODEX_EXTERNAL_WRITE_E2E=1 \
+          CODEX_EXTERNAL_WRITE_BINARY="$codex_binary" \
+          CODEX_EXTERNAL_WRITE_EXPECTED_VERSION=0.149.0 \
+            cargo test --locked --test external_write_smoke \
+              real_exact_binary_coordinates_two_clients_queue_exact_ids_and_one_approval_route \
               -- --ignored --exact --nocapture
       - run: cargo nextest run --all-targets --all-features --profile ci --locked
       - run: cargo build --locked

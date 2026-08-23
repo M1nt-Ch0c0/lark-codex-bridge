@@ -14,7 +14,8 @@
 - Codex app-server 的有界 stdio transport、RPC broker、typed thread/turn client、
   长驻 supervisor、thread 复用、`codex probe` 和门控的真实 Codex smoke；另含显式
   spawned/external backend 配置、外部端点认证/精确版本/只读能力准入门禁，以及不拥有
-  服务端进程的有界只读 WebSocket transport 和持久化跨 epoch 恢复；
+  服务端进程的有界只读 WebSocket transport、持久化跨 epoch 恢复，以及尚未接入普通
+  `run` 链路的共享写入/queue/单审批处理者协调器；
 - Rust 原生飞书/Lark 凭证登记、OpenAPI、WebSocket transport、事件归一化、
   `lark probe` 和门控的真实 Lark smoke；
 - SQLite WAL 单写者 store、持久 inbox/outbox、去重、owner/指定 sender/指定群组 allowlist 授权、安全工作区策略、
@@ -25,11 +26,14 @@
 
 尚未接线的是 slash command handler、Codex 审批卡、服务管理和完整故障注入/恢复。
 外部端点已有 fail-closed 准入、只读长连接 transport、持久 epoch fence 和有界
-resume/read reconciliation，但共享写入策略仍未接入普通 `run` 链路；选择 external mode
-不会回退为新起一个 stdio child。配置与验收说明见
+resume/read reconciliation，并已具备显式 `mutate_shared` / `queue_shared` 的持久写入与
+单审批处理者策略；这些写入能力仍未接入普通 `run` 链路。选择 external mode 不会回退
+为新起一个 stdio child。配置与验收说明见
 [`docs/external-codex-endpoint-gate.md`](docs/external-codex-endpoint-gate.md) 和
 [`docs/external-codex-transport.md`](docs/external-codex-transport.md)，恢复语义与验收见
-[`docs/external-codex-reconciliation.md`](docs/external-codex-reconciliation.md)。
+[`docs/external-codex-reconciliation.md`](docs/external-codex-reconciliation.md)，共享写入、
+审批与不重放语义见
+[`docs/external-codex-write-coordination.md`](docs/external-codex-write-coordination.md)。
 `/stop`、`/status` 按当前最小试用范围明确暂缓；`/new`、`/cd`、`/help` 目前也只有
 解析与 help 元数据，还未进入运行时。启动时会预装有界的 `Received` 行，但尚无周期性
 重扫。首次启动 onboarding 已恢复参考实现的一命令体验：扫码注册后自动携带创建者身份、
@@ -100,6 +104,8 @@ CODEX_E2E=1 cargo test --test codex_smoke --locked -- --ignored --nocapture
 smoke，见 [`docs/external-codex-transport.md`](docs/external-codex-transport.md#verification)。
 跨 socket epoch 与操作者重启服务端的 resume/read reconciliation 真实 smoke 见
 [`docs/external-codex-reconciliation.md`](docs/external-codex-reconciliation.md#verification)。
+两客户端写入竞争、queue、单审批路由和不重放的真实 smoke 见
+[`docs/external-codex-write-coordination.md`](docs/external-codex-write-coordination.md#verification)。
 
 ## 授权角色（owner / sender / group）
 

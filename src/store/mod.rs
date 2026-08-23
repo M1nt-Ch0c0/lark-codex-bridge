@@ -21,6 +21,7 @@
 mod attachments;
 mod dedup;
 mod external;
+mod external_write;
 mod outbox;
 pub mod schema;
 mod sessions;
@@ -47,6 +48,14 @@ pub use external::{
     ExternalApplyOutcome, ExternalEndpointState, ExternalEpochReservation, ExternalFenceOutcome,
     ExternalItemTerminal, ExternalTerminalStatus, ExternalThreadSnapshot, ExternalThreadState,
     ExternalTurnTerminal, ExternalUncertaintyReason,
+};
+pub use external_write::{
+    ExternalApprovalClaim, ExternalApprovalClaimOutcome, ExternalApprovalKind,
+    ExternalApprovalReassignmentOutcome, ExternalApprovalReceiveOutcome,
+    ExternalApprovalResolution, ExternalApprovalState, ExternalMutationIntent,
+    ExternalMutationKind, ExternalMutationOwner, ExternalMutationResolution, ExternalMutationState,
+    ExternalPrepareOutcome, ExternalTransitionOutcome, ExternalWriteFenceState,
+    NewExternalApprovalClaim, NewExternalMutationIntent,
 };
 pub use outbox::{NewOutboxRow, OutboxDepth, OutboxEnqueue, OutboxRow, OutboxState};
 pub use sessions::{NewTurnRow, ScopeRow, ThreadRow, ThreadStatus, TurnRow, TurnState};

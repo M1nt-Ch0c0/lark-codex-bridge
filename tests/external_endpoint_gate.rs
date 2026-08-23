@@ -288,6 +288,38 @@ fn endpoint_policy_is_exact_and_external_mode_has_no_process_fallback() {
 }
 
 #[test]
+fn exact_write_profiles_are_explicit_and_version_gated() {
+    let token_path = std::env::temp_dir().join("external-write-profile-token");
+    let mut labels = Vec::new();
+    for profile in [
+        ExternalCapabilityProfile::MutateShared,
+        ExternalCapabilityProfile::QueueShared,
+    ] {
+        let gate = ExternalEndpointGate::new(ExternalEndpointConfig {
+            endpoint: "ws://127.0.0.1:8123/app-server".to_owned(),
+            expected_codex_version: "0.149.0".to_owned(),
+            capability_profile: profile,
+            authentication: ExternalAuthentication::BearerTokenFile {
+                path: token_path.clone(),
+            },
+        })
+        .expect("exact write profile is promoted");
+        labels.push(gate.endpoint_label().as_str().to_owned());
+    }
+    assert_ne!(labels[0], labels[1]);
+
+    assert!(matches!(
+        ExternalEndpointGate::new(ExternalEndpointConfig {
+            endpoint: "ws://127.0.0.1:8123/app-server".to_owned(),
+            expected_codex_version: "0.146.0".to_owned(),
+            capability_profile: ExternalCapabilityProfile::QueueShared,
+            authentication: ExternalAuthentication::BearerTokenFile { path: token_path },
+        }),
+        Err(ExternalGateError::UnsupportedCapabilityProfile)
+    ));
+}
+
+#[test]
 fn unvalidated_external_configuration_debug_is_already_redacted() {
     let endpoint = "wss://user:ENDPOINT_SECRET@host.invalid/private?bearer=QUERY_SECRET";
     let token_path = Path::new("/private/CREDENTIAL_PATH_SECRET");
