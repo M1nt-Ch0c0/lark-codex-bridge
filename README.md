@@ -71,6 +71,10 @@ Codex app-server 协议采用精确版本的 Schema/契约门控；候选版本�
 [`docs/codex-schema-maintenance.md`](docs/codex-schema-maintenance.md)。普通构建不会安装或运行
 Codex，也不依赖本机存在 Codex binary。
 
+连接显式共享 app-server endpoint 的研究结论、所有权边界和失败关闭规则见
+[`docs/shared-codex-app-server-rfc.md`](docs/shared-codex-app-server-rfc.md)。该路径目前只是 RFC；
+WebSocket 仍是上游实验接口，生产运行时不会自动发现或连接 Desktop/CLI 私有 endpoint。
+
 ```bash
 cargo run --locked -- codex probe
 ```
