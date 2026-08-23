@@ -51,6 +51,10 @@ codegen-units = 1
 lto = "thin"
 strip = true
 
+[package.metadata.cargo-machete]
+# CLI tracing initialization is reviewed and delivered independently in issue #18.
+ignored = ["tracing-subscriber"]
+
 [lints.rust]
 unsafe_code = "forbid"
 
