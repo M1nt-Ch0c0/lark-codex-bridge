@@ -1,6 +1,7 @@
 'use strict';
 
 const fs = require('node:fs');
+const { spawn } = require('node:child_process');
 
 const VERSION = 1;
 const mode = process.argv[2] || 'lifecycle';
@@ -14,6 +15,23 @@ const seen = {
   durableFailure: false,
   unknown: false,
 };
+const ackOrder = [];
+
+const countedModes = new Set([
+  'protocol-descendant',
+  'crash-descendant',
+  'eof-descendant',
+  'duplicate-active',
+  'connect-crash',
+  'configure-failed',
+]);
+let run = 1;
+if (marker && countedModes.has(mode)) {
+  const counter = `${marker}.runs`;
+  const previous = fs.existsSync(counter) ? Number(fs.readFileSync(counter, 'utf8')) : 0;
+  run = previous + 1;
+  fs.writeFileSync(counter, String(run));
+}
 
 function write(value, done) {
   process.stdout.write(`${JSON.stringify(value)}\n`, done);
@@ -23,6 +41,44 @@ function state(value, attempt) {
   const frame = { v: VERSION, type: 'state', id: `state-${value}-${attempt || 1}`, state: value };
   if (attempt) frame.attempt = attempt;
   write(frame);
+}
+
+function spawnHeartbeatDescendant() {
+  const heartbeat = `${marker}.heartbeat-1`;
+  const script = [
+    "'use strict';",
+    "const fs = require('node:fs');",
+    'const path = process.argv[1];',
+    "fs.appendFileSync(path, 'x');",
+    "setInterval(() => fs.appendFileSync(path, 'x'), 20);",
+  ].join('');
+  const descendant = spawn(process.execPath, ['-e', script, heartbeat], {
+    stdio: 'ignore',
+  });
+  fs.writeFileSync(`${marker}.pid-1`, String(descendant.pid));
+  return heartbeat;
+}
+
+const descendantModes = new Set([
+  'startup-descendant',
+  'timeout-descendant',
+  'configure-failed',
+  'protocol-descendant',
+  'crash-descendant',
+  'eof-descendant',
+  'shutdown-descendant',
+  'drop-descendant',
+]);
+const heartbeat = marker && descendantModes.has(mode) && run === 1
+  ? spawnHeartbeatDescendant()
+  : undefined;
+
+function afterHeartbeatReady(callback) {
+  if (!heartbeat || fs.existsSync(heartbeat)) {
+    callback();
+    return;
+  }
+  setTimeout(() => afterHeartbeatReady(callback), 5);
 }
 
 function maybeCrash() {
@@ -40,21 +96,77 @@ function firstRunEvents() {
   }, 25);
 }
 
-function handle(frame) {
-  if (frame.type === 'configure') {
-    if (mode === 'silence') return;
+function connect(frame) {
+  configured = true;
+  write({ v: VERSION, type: 'response', id: frame.id, ok: true });
+  state('connecting', 1);
+  state('connected');
+}
+
+function configure(frame) {
+  if (mode === 'silence' || mode === 'timeout-descendant') return;
+  if (mode === 'configure-failed') {
     configured = true;
-    secondRun = Boolean(marker && fs.existsSync(marker));
     write({ v: VERSION, type: 'response', id: frame.id, ok: true });
     state('connecting', 1);
-    state('connected');
-    if (secondRun) {
-      fs.writeFileSync(`${marker}.second`, 'connected');
-    } else if (mode === 'handler-timeout') {
-      write({ v: VERSION, type: 'event', id: 'event-timeout', payload: { ordinal: 'timeout' } });
-    } else {
-      firstRunEvents();
-    }
+    state('failed', 1);
+    setTimeout(() => process.exit(19), 100);
+    return;
+  }
+
+  secondRun = Boolean(marker && fs.existsSync(marker));
+  connect(frame);
+
+  if (run > 1 && new Set([
+    'protocol-descendant',
+    'crash-descendant',
+    'eof-descendant',
+  ]).has(mode)) {
+    fs.writeFileSync(`${marker}.second`, 'connected');
+    return;
+  }
+  if (run > 1 && mode === 'duplicate-active') {
+    write({
+      v: VERSION,
+      type: 'event',
+      id: 'event-duplicate',
+      payload: { ordinal: 'after-restart' },
+    });
+    return;
+  }
+  if (secondRun && mode === 'lifecycle') {
+    fs.writeFileSync(`${marker}.second`, 'connected');
+    return;
+  }
+  if (mode === 'handler-timeout') {
+    write({ v: VERSION, type: 'event', id: 'event-timeout', payload: { ordinal: 'timeout' } });
+  } else if (mode === 'lifecycle') {
+    firstRunEvents();
+  } else if (mode === 'protocol-descendant') {
+    setTimeout(() => process.stdout.write('{not-json}\n'), 75);
+  } else if (mode === 'crash-descendant' || mode === 'connect-crash') {
+    setTimeout(() => process.exit(42), 50);
+  } else if (mode === 'eof-descendant') {
+    setTimeout(() => fs.closeSync(1), 75);
+  } else if (mode === 'stderr-oversize') {
+    process.stderr.write(Buffer.alloc(512 * 1024, 0x78), () => {
+      process.stderr.write('\nsmall-record\n');
+      write({ v: VERSION, type: 'event', id: 'event-stderr', payload: { ordinal: 'stderr' } });
+    });
+  } else if (mode === 'duplicate-active') {
+    write({ v: VERSION, type: 'event', id: 'event-duplicate', payload: { ordinal: 'first' } });
+    setTimeout(() => {
+      write({ v: VERSION, type: 'event', id: 'event-duplicate', payload: { ordinal: 'second' } });
+    }, 100);
+  } else if (mode === 'reverse-acks') {
+    write({ v: VERSION, type: 'event', id: 'event-slow', payload: { ordinal: 'slow' } });
+    write({ v: VERSION, type: 'event', id: 'event-fast', payload: { ordinal: 'fast' } });
+  }
+}
+
+function handle(frame) {
+  if (frame.type === 'configure') {
+    configure(frame);
     return;
   }
   if (!configured) process.exit(3);
@@ -64,6 +176,20 @@ function handle(frame) {
     return;
   }
   if (frame.type === 'event_ack') {
+    if (mode === 'duplicate-active' && run > 1
+        && frame.id === 'event-duplicate' && frame.ok) {
+      fs.writeFileSync(`${marker}.second`, 'correlation-released');
+      return;
+    }
+    if (mode === 'stderr-oversize' && frame.id === 'event-stderr' && frame.ok) {
+      fs.writeFileSync(marker, 'acked-after-oversized-stderr');
+      return;
+    }
+    if (mode === 'reverse-acks' && frame.ok) {
+      ackOrder.push(frame.id);
+      if (ackOrder.length === 2) fs.writeFileSync(marker, JSON.stringify(ackOrder));
+      return;
+    }
     if (frame.ok) {
       seen.positive = true;
       state('backoff', 7);
@@ -80,6 +206,10 @@ function handle(frame) {
     return;
   }
   if (frame.type === 'shutdown') {
+    if (mode === 'shutdown-descendant') {
+      fs.writeFileSync(`${marker}.shutdown-requested`, 'observed');
+      return;
+    }
     if (marker) fs.writeFileSync(`${marker}.shutdown`, 'clean');
     write({ v: VERSION, type: 'response', id: frame.id, ok: true }, () => process.exit(0));
   }
@@ -96,20 +226,9 @@ process.stdin.on('data', (chunk) => {
   }
 });
 
-if (mode === 'oversize-hello') {
-  process.stdout.write(`${'x'.repeat(1024 * 1024 + 1)}\n`);
-} else if (mode === 'bad-version') {
+function hello(version = VERSION) {
   write({
-    v: 2,
-    type: 'hello',
-    id: 'hello-1',
-    protocol: 'lark-channel',
-    capabilities: ['connection_state', 'durable_event_ack', 'inbound_events', 'graceful_shutdown'],
-    max_frame_bytes: 1024 * 1024,
-  });
-} else {
-  write({
-    v: VERSION,
+    v: version,
     type: 'hello',
     id: 'hello-1',
     protocol: 'lark-channel',
@@ -117,3 +236,13 @@ if (mode === 'oversize-hello') {
     max_frame_bytes: 1024 * 1024,
   });
 }
+
+afterHeartbeatReady(() => {
+  if (mode === 'oversize-hello') {
+    process.stdout.write(`${'x'.repeat(1024 * 1024 + 1)}\n`);
+  } else if (mode === 'bad-version' || mode === 'startup-descendant') {
+    hello(2);
+  } else {
+    hello();
+  }
+});

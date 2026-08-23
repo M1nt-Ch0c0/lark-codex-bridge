@@ -151,6 +151,12 @@ SQLite durable intake 和有界队列预留后才回送正 ack；失败、超时
 失败，让上游保留重投语义。协议、脱敏与容量细节见
 [`docs/channel-wire-v1.md`](docs/channel-wire-v1.md)。
 
+`fallback_to_native` 只用于首次启动：只有在 sidecar 完成协议配置并由 SDK 报告真实
+`connected` 后启动才算成功；在此之前失败会稳定返回给组装层，由该开关决定是否启用原生
+transport。首次连接成功后的崩溃不会在运行中切换来源，而是按有界退避重启；连续健康连接
+30 秒后才重置退避。Rust 在 POSIX 上拥有整个 sidecar 进程组、在 Windows 上拥有 Job
+object，协议错误、stdout EOF、超时、关闭和 handle drop 都会终止其全部后代进程。
+
 真实 sidecar smoke 还要求操作者在连接后发送一条新私聊；未运行或 skip 不算证据：
 
 ```bash

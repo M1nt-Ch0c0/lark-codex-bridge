@@ -26,6 +26,7 @@ let wsClient;
 let sequence = 0;
 let inputBuffer = Buffer.alloc(0);
 let inputChain = Promise.resolve();
+let terminalExitScheduled = false;
 const pending = new Map();
 const outbound = [];
 let writing = false;
@@ -101,6 +102,19 @@ function sendState(state, attempt, delayMs) {
   if (Number.isSafeInteger(attempt) && attempt > 0) frame.attempt = attempt;
   if (Number.isSafeInteger(delayMs) && delayMs >= 0) frame.delay_ms = delayMs;
   if (!writeFrame(frame)) safeStderr('state_frame_dropped');
+}
+
+function exitAfterProtocolFlush(code) {
+  if (terminalExitScheduled) return;
+  terminalExitScheduled = true;
+  const deadline = Date.now() + 1_000;
+  const finish = () => {
+    if ((!writing && outbound.length === 0) || Date.now() >= deadline) {
+      process.exit(code);
+    }
+    setTimeout(finish, 5);
+  };
+  finish();
 }
 
 function failPending(reason) {
@@ -183,7 +197,7 @@ async function configure(frame) {
     onReconnected: () => sendState('connected'),
     onError: () => {
       sendState('failed');
-      setImmediate(() => process.exit(1));
+      exitAfterProtocolFlush(1);
     },
   });
 

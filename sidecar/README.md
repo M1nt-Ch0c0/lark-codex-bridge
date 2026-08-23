@@ -11,4 +11,7 @@ Rust remains authoritative for normalization, policy,
 durable intake, and upstream acknowledgement. Stdout is reserved for the
 versioned NDJSON protocol documented in
 [`docs/channel-wire-v1.md`](../docs/channel-wire-v1.md); all logs go to stderr
-as static classifications.
+as static classifications. The correlated configure response means only that
+the SDK adapter accepted configuration. Rust does not declare startup ready
+until the SDK emits its first authoritative `connected` state, and Rust owns
+the complete POSIX process group / Windows Job for every termination path.

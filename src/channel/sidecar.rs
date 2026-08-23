@@ -5,21 +5,23 @@
 //! never copied into tracing. Every inbound event keeps its correlation id
 //! until the Rust durable handler returns a positive or negative ack.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
+use command_group::{AsyncCommandGroup as _, AsyncGroupChild};
 use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 use secrecy::ExposeSecret as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdout, Command};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{ChildStdout, Command};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout, timeout_at};
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -31,8 +33,9 @@ use crate::lark::bridge::InboundEventHandler;
 use crate::lark::credentials::LarkCredentials;
 use crate::lark::error::LarkError;
 use crate::limits::{
-    CHANNEL_SIDECAR_ACK_GRACE, CHANNEL_SIDECAR_EVENT_CAPACITY, CHANNEL_SIDECAR_FRAME_BYTES,
-    CHANNEL_SIDECAR_HANDLER_TIMEOUT, CHANNEL_SIDECAR_HANDSHAKE_TIMEOUT,
+    CHANNEL_SIDECAR_ACK_GRACE, CHANNEL_SIDECAR_CONNECT_TIMEOUT, CHANNEL_SIDECAR_EVENT_CAPACITY,
+    CHANNEL_SIDECAR_FRAME_BYTES, CHANNEL_SIDECAR_HANDLER_TIMEOUT,
+    CHANNEL_SIDECAR_HANDSHAKE_TIMEOUT, CHANNEL_SIDECAR_HEALTHY_UPTIME,
     CHANNEL_SIDECAR_SHUTDOWN_GRACE, CHANNEL_SIDECAR_WRITE_CAPACITY,
 };
 
@@ -53,6 +56,11 @@ pub struct NodeSidecarConfig {
     pub write_capacity: usize,
     /// Initial hello/configure deadline.
     pub handshake_timeout: Duration,
+    /// Deadline for the SDK to report its first live connection after it
+    /// accepts configuration.
+    pub initial_connect_timeout: Duration,
+    /// Continuous connected time required before restart backoff resets.
+    pub healthy_uptime: Duration,
     /// Deadline for one durable event decision.
     pub handler_timeout: Duration,
     /// Grace for a correlated shutdown response and process exit.
@@ -69,6 +77,8 @@ impl Default for NodeSidecarConfig {
             event_capacity: CHANNEL_SIDECAR_EVENT_CAPACITY,
             write_capacity: CHANNEL_SIDECAR_WRITE_CAPACITY,
             handshake_timeout: CHANNEL_SIDECAR_HANDSHAKE_TIMEOUT,
+            initial_connect_timeout: CHANNEL_SIDECAR_CONNECT_TIMEOUT,
+            healthy_uptime: CHANNEL_SIDECAR_HEALTHY_UPTIME,
             handler_timeout: CHANNEL_SIDECAR_HANDLER_TIMEOUT,
             shutdown_grace: CHANNEL_SIDECAR_SHUTDOWN_GRACE,
         }
@@ -86,6 +96,8 @@ impl fmt::Debug for NodeSidecarConfig {
             .field("event_capacity", &self.event_capacity)
             .field("write_capacity", &self.write_capacity)
             .field("handshake_timeout", &self.handshake_timeout)
+            .field("initial_connect_timeout", &self.initial_connect_timeout)
+            .field("healthy_uptime", &self.healthy_uptime)
             .field("handler_timeout", &self.handler_timeout)
             .field("shutdown_grace", &self.shutdown_grace)
             .finish()
@@ -121,9 +133,13 @@ impl NodeSidecarConfig {
             return Err(LarkError::protocol("node sidecar queue bounds are invalid"));
         }
         if self.handshake_timeout.is_zero()
+            || self.initial_connect_timeout.is_zero()
+            || self.healthy_uptime.is_zero()
             || self.handler_timeout.is_zero()
             || self.shutdown_grace.is_zero()
             || self.handshake_timeout > CHANNEL_SIDECAR_HANDSHAKE_TIMEOUT
+            || self.initial_connect_timeout > CHANNEL_SIDECAR_CONNECT_TIMEOUT
+            || self.healthy_uptime > CHANNEL_SIDECAR_HEALTHY_UPTIME
             || self.handler_timeout > CHANNEL_SIDECAR_HANDLER_TIMEOUT
             || self.shutdown_grace > CHANNEL_SIDECAR_SHUTDOWN_GRACE
         {
@@ -138,7 +154,8 @@ pub struct NodeSidecar;
 
 impl NodeSidecar {
     /// Starts supervision and waits until the first process completes the
-    /// version/capability/configuration handshake.
+    /// version/capability/configuration handshake and the SDK reports an
+    /// established provider connection.
     ///
     /// # Errors
     ///
@@ -150,6 +167,7 @@ impl NodeSidecar {
         handler: InboundEventHandler,
     ) -> Result<NodeSidecarHandle, LarkError> {
         config.validate()?;
+        let shutdown_grace = config.shutdown_grace;
         let shutdown = CancellationToken::new();
         let (state_tx, state) = watch::channel(ConnectionState::Connecting { attempt: 1 });
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -172,6 +190,7 @@ impl NodeSidecar {
                     state,
                     shutdown,
                     task,
+                    shutdown_grace,
                 })
             }
             Ok(Err(error)) => {
@@ -211,6 +230,7 @@ pub struct NodeSidecarHandle {
     state: watch::Receiver<ConnectionState>,
     shutdown: CancellationToken,
     task: Option<JoinHandle<()>>,
+    shutdown_grace: Duration,
 }
 
 impl fmt::Debug for NodeSidecarHandle {
@@ -238,8 +258,12 @@ impl NodeSidecarHandle {
     /// Requests correlated graceful shutdown, then joins the supervisor.
     pub async fn shutdown(mut self) {
         self.shutdown.cancel();
-        if let Some(task) = self.task.take() {
-            let _ = task.await;
+        if let Some(mut task) = self.task.take() {
+            let join_bound = self.shutdown_grace.saturating_mul(3);
+            if timeout(join_bound, &mut task).await.is_err() {
+                task.abort();
+                let _ = task.await;
+            }
         }
     }
 }
@@ -291,8 +315,8 @@ async fn supervise(
                         publish(&state, ConnectionState::Stopped);
                         return;
                     }
-                    SessionEnd::Crashed { was_connected } => {
-                        if was_connected {
+                    SessionEnd::Crashed { was_healthy } => {
+                        if was_healthy {
                             failures = 0;
                         }
                     }
@@ -337,21 +361,87 @@ fn publish(state: &watch::Sender<ConnectionState>, next: ConnectionState) {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SessionEnd {
-    Crashed { was_connected: bool },
+    Crashed { was_healthy: bool },
     Shutdown,
 }
 
+/// The sidecar is always the leader of an owned POSIX process group or, on
+/// Windows, an owned Job object. `start_kill` targets that whole ownership
+/// boundary, including non-exec wrapper descendants.
+struct OwnedChildGroup {
+    child: AsyncGroupChild,
+}
+
+impl OwnedChildGroup {
+    fn new(child: AsyncGroupChild) -> Self {
+        Self { child }
+    }
+
+    fn inner(&mut self) -> &mut tokio::process::Child {
+        self.child.inner()
+    }
+
+    async fn wait_leader(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.child.inner().wait().await
+    }
+
+    async fn terminate_and_reap(&mut self, grace: Duration) {
+        // This is deliberately attempted even after the leader has exited:
+        // descendants may still own the process group/Job and inherited pipes.
+        let _ = self.child.start_kill();
+        if timeout(grace, self.child.wait()).await.is_err() {
+            tracing::warn!("node sidecar process group did not reap within its bound");
+            let _ = self.child.start_kill();
+            let _ = timeout(grace, self.child.inner().wait()).await;
+        }
+    }
+}
+
+impl Drop for OwnedChildGroup {
+    fn drop(&mut self) {
+        // Synchronous group/Job termination is the last-resort guarantee when
+        // an owning async task is aborted or a public handle is dropped.
+        let _ = self.child.start_kill();
+    }
+}
+
+#[derive(Clone, Default)]
+struct ActiveEventIds(Arc<Mutex<HashSet<String>>>);
+
+impl ActiveEventIds {
+    fn insert(&self, id: &str) -> Result<bool, LarkError> {
+        self.0
+            .lock()
+            .map_err(|_| LarkError::protocol("locking node sidecar event correlations"))
+            .map(|mut ids| ids.insert(id.to_owned()))
+    }
+
+    fn remove(&self, id: &str) {
+        if let Ok(mut ids) = self.0.lock() {
+            ids.remove(id);
+        }
+    }
+
+    fn clear(&self) {
+        if let Ok(mut ids) = self.0.lock() {
+            ids.clear();
+        }
+    }
+}
+
 struct ChildSession {
-    child: Child,
+    child: OwnedChildGroup,
     stdout: FramedRead<BufReader<ChildStdout>, LinesCodec>,
     writes: mpsc::Sender<Vec<u8>>,
     events: mpsc::Sender<PendingEvent>,
     writer: JoinHandle<()>,
     worker: JoinHandle<()>,
     stderr: JoinHandle<()>,
+    active_ids: ActiveEventIds,
     state: watch::Sender<ConnectionState>,
     max_frame_bytes: usize,
     shutdown_grace: Duration,
+    healthy_uptime: Duration,
 }
 
 impl ChildSession {
@@ -369,7 +459,6 @@ impl ChildSession {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
             .env_clear()
             .env("NO_COLOR", "1");
         if let Some(search_path) = search_path {
@@ -381,66 +470,31 @@ impl ChildSession {
                 command.env(name, value);
             }
         }
-        let mut child = command
+        let child = command
+            .group()
+            .kill_on_drop(true)
             .spawn()
             .map_err(|_| LarkError::retryable("spawning the node sidecar"))?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| LarkError::protocol("node sidecar stdin is unavailable"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| LarkError::protocol("node sidecar stdout is unavailable"))?;
-        let stderr_pipe = child
-            .stderr
-            .take()
-            .ok_or_else(|| LarkError::protocol("node sidecar stderr is unavailable"))?;
-        let mut stdout = FramedRead::new(
+        let mut child = OwnedChildGroup::new(child);
+        let (stdin, stdout, stderr_pipe) = {
+            let inner = child.inner();
+            (inner.stdin.take(), inner.stdout.take(), inner.stderr.take())
+        };
+        let (Some(stdin), Some(stdout), Some(stderr_pipe)) = (stdin, stdout, stderr_pipe) else {
+            child.terminate_and_reap(config.shutdown_grace).await;
+            return Err(LarkError::protocol(
+                "node sidecar standard streams are unavailable",
+            ));
+        };
+        let stdout = FramedRead::new(
             BufReader::new(stdout),
             LinesCodec::new_with_max_length(config.max_frame_bytes),
         );
-
-        let hello_line = timeout(config.handshake_timeout, stdout.next())
-            .await
-            .map_err(|_| LarkError::retryable("waiting for node sidecar hello"))?
-            .ok_or_else(|| LarkError::retryable("reading node sidecar hello"))?
-            .map_err(|_| LarkError::protocol("node sidecar hello exceeds the frame bound"))?;
-        let hello: HelloFrame = serde_json::from_str(&hello_line)
-            .map_err(|_| LarkError::protocol("decoding node sidecar hello"))?;
-        hello.validate(config.max_frame_bytes)?;
-
         let (write_tx, write_rx) = mpsc::channel(config.write_capacity);
         let writer = tokio::spawn(write_loop(stdin, write_rx, config.max_frame_bytes));
         let stderr = tokio::spawn(drain_stderr(stderr_pipe));
-
-        let configure_id = new_id("configure");
-        let configure = json!({
-            "v": VERSION,
-            "type": "configure",
-            "id": configure_id.clone(),
-            "app_id": &credentials.app_id,
-            "app_secret": credentials.app_secret.expose_secret(),
-            "tenant": credentials.tenant.as_str(),
-            "max_frame_bytes": config.max_frame_bytes,
-            "max_in_flight": config.event_capacity,
-            "ack_timeout_ms": duration_ms(
-                config.handler_timeout.saturating_add(CHANNEL_SIDECAR_ACK_GRACE)
-            ),
-        });
-        enqueue(&write_tx, &configure, config.max_frame_bytes)?;
-        let response_line = timeout(config.handshake_timeout, stdout.next())
-            .await
-            .map_err(|_| LarkError::retryable("waiting for node sidecar configuration"))?
-            .ok_or_else(|| LarkError::retryable("reading node sidecar configuration"))?
-            .map_err(|_| {
-                LarkError::protocol("node sidecar configuration response exceeds the frame bound")
-            })?;
-        let response: ResponseFrame = serde_json::from_str(&response_line)
-            .map_err(|_| LarkError::protocol("decoding node sidecar configuration response"))?;
-        response.validate(&configure_id)?;
-
         let (event_tx, event_rx) = mpsc::channel(config.event_capacity);
+        let active_ids = ActiveEventIds::default();
         let worker = tokio::spawn(event_loop(
             event_rx,
             write_tx.clone(),
@@ -448,8 +502,10 @@ impl ChildSession {
             config.handler_timeout,
             config.max_frame_bytes,
             config.event_capacity,
+            active_ids.clone(),
         ));
-        Ok(Self {
+
+        let mut session = Self {
             child,
             stdout,
             writes: write_tx,
@@ -457,55 +513,188 @@ impl ChildSession {
             writer,
             worker,
             stderr,
+            active_ids,
             state,
             max_frame_bytes: config.max_frame_bytes,
             shutdown_grace: config.shutdown_grace,
+            healthy_uptime: config.healthy_uptime,
+        };
+        if let Err(error) = session.bootstrap(config, credentials).await {
+            session.cleanup_failed_bootstrap().await;
+            return Err(error);
+        }
+        Ok(session)
+    }
+
+    async fn bootstrap(
+        &mut self,
+        config: &NodeSidecarConfig,
+        credentials: &LarkCredentials,
+    ) -> Result<(), LarkError> {
+        self.read_hello(config.handshake_timeout).await?;
+        self.configure(config, credentials).await?;
+        self.wait_until_connected(config.initial_connect_timeout)
+            .await
+    }
+
+    async fn read_hello(&mut self, deadline: Duration) -> Result<(), LarkError> {
+        let line = timeout(deadline, self.stdout.next())
+            .await
+            .map_err(|_| LarkError::retryable("waiting for node sidecar hello"))?
+            .ok_or_else(|| LarkError::retryable("reading node sidecar hello"))?
+            .map_err(|_| LarkError::protocol("node sidecar hello exceeds the frame bound"))?;
+        let hello: HelloFrame = serde_json::from_str(&line)
+            .map_err(|_| LarkError::protocol("decoding node sidecar hello"))?;
+        hello.validate(self.max_frame_bytes)
+    }
+
+    async fn configure(
+        &mut self,
+        config: &NodeSidecarConfig,
+        credentials: &LarkCredentials,
+    ) -> Result<(), LarkError> {
+        let id = new_id("configure");
+        enqueue(
+            &self.writes,
+            &json!({
+                "v": VERSION,
+                "type": "configure",
+                "id": id.clone(),
+                "app_id": &credentials.app_id,
+                "app_secret": credentials.app_secret.expose_secret(),
+                "tenant": credentials.tenant.as_str(),
+                "max_frame_bytes": config.max_frame_bytes,
+                "max_in_flight": config.event_capacity,
+                "ack_timeout_ms": duration_ms(
+                    config.handler_timeout.saturating_add(CHANNEL_SIDECAR_ACK_GRACE)
+                ),
+            }),
+            self.max_frame_bytes,
+        )?;
+        let line = timeout(config.handshake_timeout, self.stdout.next())
+            .await
+            .map_err(|_| LarkError::retryable("waiting for node sidecar configuration"))?
+            .ok_or_else(|| LarkError::retryable("reading node sidecar configuration"))?
+            .map_err(|_| {
+                LarkError::protocol("node sidecar configuration response exceeds the frame bound")
+            })?;
+        let response: ResponseFrame = serde_json::from_str(&line)
+            .map_err(|_| LarkError::protocol("decoding node sidecar configuration response"))?;
+        response.validate(&id)
+    }
+
+    async fn wait_until_connected(&mut self, deadline: Duration) -> Result<(), LarkError> {
+        timeout(deadline, async {
+            loop {
+                tokio::select! {
+                    status = self.child.wait_leader() => {
+                        if status.is_err() {
+                            tracing::warn!("waiting for node sidecar bootstrap failed");
+                        }
+                        return Err(LarkError::retryable(
+                            "establishing the initial node sidecar connection",
+                        ));
+                    }
+                    line = self.stdout.next() => {
+                        let line = line
+                            .ok_or_else(|| LarkError::retryable(
+                                "reading initial node sidecar connection state",
+                            ))?
+                            .map_err(|_| LarkError::protocol(
+                                "node sidecar initial state exceeds the frame bound",
+                            ))?;
+                        match handle_line(
+                            &line,
+                            &self.state,
+                            &self.writes,
+                            &self.events,
+                            &self.active_ids,
+                            self.max_frame_bytes,
+                        )? {
+                            FrameEffect::Connected => return Ok(()),
+                            FrameEffect::Failed | FrameEffect::Stopped => {
+                                return Err(LarkError::retryable(
+                                    "establishing the initial node sidecar connection",
+                                ));
+                            }
+                            FrameEffect::Continue | FrameEffect::Disconnected => {}
+                        }
+                    }
+                }
+            }
         })
+        .await
+        .map_err(|_| LarkError::retryable("waiting for initial node sidecar connection"))?
+    }
+
+    async fn cleanup_failed_bootstrap(&mut self) {
+        self.active_ids.clear();
+        self.writer.abort();
+        self.worker.abort();
+        self.child.terminate_and_reap(self.shutdown_grace).await;
+        self.stderr.abort();
     }
 
     async fn run(mut self, shutdown: &CancellationToken) -> SessionEnd {
-        let mut was_connected = false;
+        let mut connected_since = Some(Instant::now());
+        let mut was_healthy = false;
         loop {
             tokio::select! {
                 biased;
                 () = shutdown.cancelled() => return self.graceful_shutdown().await,
-                status = self.child.wait() => {
+                status = self.child.wait_leader() => {
                     if status.is_err() {
                         tracing::warn!("waiting for node sidecar failed");
                     }
-                    self.abort_tasks();
-                    return SessionEnd::Crashed { was_connected };
+                    was_healthy |= connected_for(connected_since.as_ref(), self.healthy_uptime);
+                    return self.crashed(was_healthy).await;
                 }
                 line = self.stdout.next() => {
                     match line {
                         Some(Ok(line)) => {
-                            if handle_line(
+                            match handle_line(
                                 &line,
                                 &self.state,
                                 &self.writes,
                                 &self.events,
+                                &self.active_ids,
                                 self.max_frame_bytes,
-                            )
-                            .is_err()
-                            {
-                                let _ = self.child.kill().await;
-                                let _ = self.child.wait().await;
-                                self.abort_tasks();
-                                return SessionEnd::Crashed { was_connected };
+                            ) {
+                                Ok(FrameEffect::Connected) => {
+                                    connected_since.get_or_insert_with(Instant::now);
+                                }
+                                Ok(FrameEffect::Disconnected | FrameEffect::Failed | FrameEffect::Stopped) => {
+                                    was_healthy |= connected_for(
+                                        connected_since.as_ref(),
+                                        self.healthy_uptime,
+                                    );
+                                    connected_since = None;
+                                    if matches!(
+                                        *self.state.borrow(),
+                                        ConnectionState::Degraded { .. } | ConnectionState::Stopped
+                                    ) {
+                                        return self.crashed(was_healthy).await;
+                                    }
+                                }
+                                Ok(FrameEffect::Continue) => {}
+                                Err(_) => return self.crashed(was_healthy).await,
                             }
-                            was_connected |= matches!(*self.state.borrow(), ConnectionState::Connected);
                         }
                         Some(Err(_)) => {
                             tracing::warn!("node sidecar emitted an oversized or invalid line");
-                            let _ = self.child.kill().await;
-                            let _ = self.child.wait().await;
-                            self.abort_tasks();
-                            return SessionEnd::Crashed { was_connected };
+                            was_healthy |= connected_for(
+                                connected_since.as_ref(),
+                                self.healthy_uptime,
+                            );
+                            return self.crashed(was_healthy).await;
                         }
                         None => {
-                            let _ = self.child.wait().await;
-                            self.abort_tasks();
-                            return SessionEnd::Crashed { was_connected };
+                            tracing::warn!("node sidecar protocol stdout closed unexpectedly");
+                            was_healthy |= connected_for(
+                                connected_since.as_ref(),
+                                self.healthy_uptime,
+                            );
+                            return self.crashed(was_healthy).await;
                         }
                     }
                 }
@@ -513,7 +702,14 @@ impl ChildSession {
         }
     }
 
+    async fn crashed(&mut self, was_healthy: bool) -> SessionEnd {
+        self.child.terminate_and_reap(self.shutdown_grace).await;
+        self.abort_tasks();
+        SessionEnd::Crashed { was_healthy }
+    }
+
     async fn graceful_shutdown(&mut self) -> SessionEnd {
+        let deadline = Instant::now() + self.shutdown_grace;
         let id = new_id("shutdown");
         let request = json!({"v": VERSION, "type": "shutdown", "id": id.clone()});
         if enqueue(&self.writes, &request, self.max_frame_bytes).is_ok() {
@@ -544,24 +740,27 @@ impl ChildSession {
                     }
                 }
             };
-            let _ = timeout(self.shutdown_grace, wait).await;
+            let _ = timeout_at(deadline, wait).await;
         }
-        if timeout(self.shutdown_grace, self.child.wait())
-            .await
-            .is_err()
-        {
-            let _ = self.child.kill().await;
-            let _ = self.child.wait().await;
+        if Instant::now() < deadline {
+            let _ = timeout_at(deadline, self.child.wait_leader()).await;
         }
+        // Even a cleanly exited wrapper may have left descendants behind.
+        self.child.terminate_and_reap(self.shutdown_grace).await;
         self.abort_tasks();
         SessionEnd::Shutdown
     }
 
     fn abort_tasks(&self) {
+        self.active_ids.clear();
         self.writer.abort();
         self.worker.abort();
         self.stderr.abort();
     }
+}
+
+fn connected_for(since: Option<&Instant>, threshold: Duration) -> bool {
+    since.is_some_and(|started| started.elapsed() >= threshold)
 }
 
 impl Drop for ChildSession {
@@ -570,13 +769,23 @@ impl Drop for ChildSession {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FrameEffect {
+    Continue,
+    Connected,
+    Disconnected,
+    Failed,
+    Stopped,
+}
+
 fn handle_line(
     line: &str,
     state: &watch::Sender<ConnectionState>,
     writes: &mpsc::Sender<Vec<u8>>,
     events: &mpsc::Sender<PendingEvent>,
+    active_ids: &ActiveEventIds,
     max_frame_bytes: usize,
-) -> Result<(), LarkError> {
+) -> Result<FrameEffect, LarkError> {
     let base: BaseFrame = serde_json::from_str(line)
         .map_err(|_| LarkError::protocol("decoding a node sidecar frame"))?;
     base.validate()?;
@@ -584,7 +793,7 @@ fn handle_line(
         "state" => {
             let frame: StateFrame = serde_json::from_str(line)
                 .map_err(|_| LarkError::protocol("decoding node sidecar state"))?;
-            frame.publish(state)?;
+            return frame.publish(state);
         }
         "event" => {
             let frame: EventFrame = serde_json::from_str(line)
@@ -594,7 +803,12 @@ fn handle_line(
                 .map_err(|_| LarkError::protocol("encoding node sidecar event payload"))?;
             if payload.len() > max_frame_bytes {
                 send_negative_ack(writes, &frame.id, "payload_too_large", max_frame_bytes)?;
-                return Ok(());
+                return Ok(FrameEffect::Continue);
+            }
+            if !active_ids.insert(&frame.id)? {
+                return Err(LarkError::protocol(
+                    "node sidecar reused an active event correlation",
+                ));
             }
             match events.try_send(PendingEvent {
                 id: frame.id,
@@ -602,9 +816,11 @@ fn handle_line(
             }) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(event)) => {
+                    active_ids.remove(&event.id);
                     send_negative_ack(writes, &event.id, "backpressure", max_frame_bytes)?;
                 }
                 Err(mpsc::error::TrySendError::Closed(event)) => {
+                    active_ids.remove(&event.id);
                     send_negative_ack(writes, &event.id, "intake_unavailable", max_frame_bytes)?;
                 }
             }
@@ -635,7 +851,7 @@ fn handle_line(
             )?;
         }
     }
-    Ok(())
+    Ok(FrameEffect::Continue)
 }
 
 struct PendingEvent {
@@ -650,6 +866,7 @@ async fn event_loop(
     handler_timeout: Duration,
     max_frame_bytes: usize,
     concurrency: usize,
+    active_ids: ActiveEventIds,
 ) {
     let mut active = FuturesUnordered::new();
     let mut input_closed = false;
@@ -668,11 +885,13 @@ async fn event_loop(
                     None => input_closed = true,
                 }
             }
-            frame = active.next(), if !active.is_empty() => {
-                if let Some(frame) = frame {
-                    if enqueue(&writes, &frame, max_frame_bytes).is_err() {
+            completion = active.next(), if !active.is_empty() => {
+                if let Some(completion) = completion {
+                    if enqueue(&writes, &completion.frame, max_frame_bytes).is_err() {
+                        active_ids.clear();
                         return;
                     }
+                    active_ids.remove(&completion.id);
                 }
             }
         }
@@ -683,30 +902,37 @@ async fn process_event(
     event: PendingEvent,
     handler: InboundEventHandler,
     handler_timeout: Duration,
-) -> Value {
-    match timeout(handler_timeout, handler(event.payload)).await {
+) -> CompletedEvent {
+    let PendingEvent { id, payload } = event;
+    let frame = match timeout(handler_timeout, handler(payload)).await {
         Ok(Ok(data)) => json!({
             "v": VERSION,
             "type": "event_ack",
-            "id": event.id,
+            "id": &id,
             "ok": true,
             "data": data,
         }),
         Ok(Err(_)) => json!({
             "v": VERSION,
             "type": "event_ack",
-            "id": event.id,
+            "id": &id,
             "ok": false,
             "error": "durable_intake_failed",
         }),
         Err(_) => json!({
             "v": VERSION,
             "type": "event_ack",
-            "id": event.id,
+            "id": &id,
             "ok": false,
             "error": "durable_intake_timeout",
         }),
-    }
+    };
+    CompletedEvent { id, frame }
+}
+
+struct CompletedEvent {
+    id: String,
+    frame: Value,
 }
 
 async fn write_loop(
@@ -725,17 +951,40 @@ async fn write_loop(
     }
 }
 
-async fn drain_stderr(stderr: tokio::process::ChildStderr) {
-    let mut lines = FramedRead::new(
-        BufReader::new(stderr),
-        LinesCodec::new_with_max_length(crate::limits::MAX_STDERR_LINE_BYTES),
-    );
-    while let Some(line) = lines.next().await {
-        let Ok(line) = line else {
-            tracing::warn!("node sidecar stderr line exceeded its bound");
-            return;
+async fn drain_stderr(mut stderr: tokio::process::ChildStderr) {
+    const CHUNK_BYTES: usize = 8 * 1024;
+    let mut chunk = [0_u8; CHUNK_BYTES];
+    let mut line_bytes = 0_usize;
+    let mut discarding_oversized = false;
+
+    loop {
+        let read = match stderr.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(_) => {
+                tracing::warn!("reading node sidecar stderr failed");
+                return;
+            }
         };
-        tracing::warn!(line_bytes = line.len(), "node sidecar stderr");
+        for byte in &chunk[..read] {
+            if *byte == b'\n' {
+                if !discarding_oversized && line_bytes > 0 {
+                    tracing::warn!(line_bytes, "node sidecar stderr");
+                }
+                line_bytes = 0;
+                discarding_oversized = false;
+            } else if !discarding_oversized {
+                line_bytes = line_bytes.saturating_add(1);
+                if line_bytes > crate::limits::MAX_STDERR_LINE_BYTES {
+                    tracing::warn!("node sidecar stderr line exceeded its bound");
+                    discarding_oversized = true;
+                }
+            }
+        }
+    }
+
+    if !discarding_oversized && line_bytes > 0 {
+        tracing::warn!(line_bytes, "node sidecar stderr");
     }
 }
 
@@ -928,26 +1177,35 @@ struct StateFrame {
 }
 
 impl StateFrame {
-    fn publish(&self, sink: &watch::Sender<ConnectionState>) -> Result<(), LarkError> {
+    fn publish(&self, sink: &watch::Sender<ConnectionState>) -> Result<FrameEffect, LarkError> {
         if self.v != VERSION || self.kind != "state" || !valid_id(&self.id) {
             return Err(LarkError::protocol("node sidecar state header is invalid"));
         }
-        let state = match self.state.as_str() {
-            "connecting" | "reconnecting" => ConnectionState::Connecting {
-                attempt: self.attempt.unwrap_or(1).max(1),
-            },
-            "connected" => ConnectionState::Connected,
-            "backoff" => ConnectionState::Backoff {
-                attempt: self.attempt.unwrap_or(1).max(1),
-                delay: Duration::from_millis(self.delay_ms.unwrap_or(0)),
-            },
-            "failed" => ConnectionState::Degraded {
-                reason: "node_sidecar_connection_failed".to_owned(),
-            },
-            "stopped" => ConnectionState::Stopped,
+        let (state, effect) = match self.state.as_str() {
+            "connecting" | "reconnecting" => (
+                ConnectionState::Connecting {
+                    attempt: self.attempt.unwrap_or(1).max(1),
+                },
+                FrameEffect::Disconnected,
+            ),
+            "connected" => (ConnectionState::Connected, FrameEffect::Connected),
+            "backoff" => (
+                ConnectionState::Backoff {
+                    attempt: self.attempt.unwrap_or(1).max(1),
+                    delay: Duration::from_millis(self.delay_ms.unwrap_or(0)),
+                },
+                FrameEffect::Disconnected,
+            ),
+            "failed" => (
+                ConnectionState::Degraded {
+                    reason: "node_sidecar_connection_failed".to_owned(),
+                },
+                FrameEffect::Failed,
+            ),
+            "stopped" => (ConnectionState::Stopped, FrameEffect::Stopped),
             _ => return Err(LarkError::protocol("node sidecar state is unknown")),
         };
         sink.send_replace(state);
-        Ok(())
+        Ok(effect)
     }
 }

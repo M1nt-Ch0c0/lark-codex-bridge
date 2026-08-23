@@ -17,12 +17,17 @@ query, media, and outbound implementation.
 
 ## Process and framing
 
-The sidecar is a single local child supervised by Rust. Stdin and stdout carry
+The sidecar is a single local process tree supervised by Rust. The Node leader
+is placed in a dedicated POSIX process group or a Windows Job object; Rust
+terminates that entire boundary on bootstrap failure, protocol failure,
+timeout, crash, stdout EOF, shutdown expiry, cancellation, and handle drop.
+The direct child is reaped within a fixed bound. Stdin and stdout carry
 UTF-8 NDJSON version 1 (`v: 1`, `protocol: "lark-channel"`), with one JSON
 object per line and a 1 MiB hard frame limit. Stderr is log-only. Rust drains
-it by bounded line length and records only the byte count, never its content.
-The child logger similarly discards SDK-provided messages and writes static
-classifications only.
+it in fixed-size chunks, discards the remainder of an oversized or unterminated
+record, and keeps draining later records. It records only byte counts and
+static classifications, never content. The child logger similarly discards
+SDK-provided messages and writes static classifications only.
 
 Startup is:
 
@@ -32,7 +37,12 @@ Startup is:
 2. Rust → Node correlated `configure`, containing credentials over stdin plus
    negotiated frame, in-flight-event, and ack-timeout bounds.
 3. Node → Rust correlated successful `response` after `WSClient.start` accepts
-   the dispatcher. SDK state callbacks are held until that response is queued.
+   the dispatcher. This is protocol configuration acceptance, not connection
+   readiness. SDK state callbacks are held until that response is queued.
+4. Node → Rust `state: "connected"` from `onReady` (or the SDK's authoritative
+   status snapshot). `NodeSidecar::start` succeeds only after this frame. A
+   terminal `failed`, process exit, stdout EOF, or 30-second connection deadline
+   before it is returned makes the one bootstrap attempt fail.
 
 Credentials are never argv or environment values. Rust starts the child with
 a cleared environment. They are redacted from `Debug`, errors, and tracing.
@@ -53,7 +63,11 @@ malformed frames, unknown correlations, overlong frames, and unsolicited
 responses fail the process session. A well-formed unknown message receives
 `unknown_message`. Rust bounds the event queue and stdin-write queue; queue
 saturation returns a negative ack. Node independently bounds pending event
-acks. Every wait has a timeout.
+acks. Rust rejects reuse of an event ID while its durable decision is queued or
+running; IDs are released on completion and every process-epoch termination,
+so concurrent decisions may safely complete in reverse order. Every wait has a
+timeout. Closing protocol stdout while leaving the child alive is a crash, not
+an unbounded wait.
 
 ## Durable upstream receipt
 
@@ -89,6 +103,13 @@ npm run check --prefix sidecar
 
 The Rust runtime never runs npm or downloads dependencies. `native` remains
 the default. `node-sidecar` is opt-in and may be configured to fall back to
-native when the initial executable/handshake/configuration attempt fails.
-After a successful handshake, crashes are supervised with bounded backoff and
-a fresh handshake on every process epoch.
+native when the initial executable, protocol, configuration, or SDK connection
+attempt fails.
+"Initial" includes reaching the first authoritative SDK `connected` state:
+mere configure success never suppresses fallback. Once the first process has
+connected, later crashes stay on the explicitly selected sidecar and are
+supervised with a fresh handshake on every process epoch; the bridge never
+switches live sources mid-run. Restart delay escalates through the existing
+bounded jittered schedule (30-second cap) and resets only after one process
+epoch remains continuously connected for 30 seconds, preventing
+connected-then-crash loops from staying at the minimum delay.

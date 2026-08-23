@@ -483,7 +483,8 @@ pub struct ChannelSection {
     pub node_binary: PathBuf,
     /// Checked-in/deployed sidecar entrypoint used only for `node-sidecar`.
     pub sidecar_entrypoint: PathBuf,
-    /// If the initial sidecar handshake fails, retain the native transport.
+    /// If sidecar bootstrap fails before the first SDK connection is live,
+    /// retain the native transport.
     pub fallback_to_native: bool,
 }
 

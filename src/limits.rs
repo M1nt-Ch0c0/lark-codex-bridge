@@ -141,6 +141,12 @@ pub const CHANNEL_SIDECAR_EVENT_CAPACITY: usize = 64;
 pub const CHANNEL_SIDECAR_WRITE_CAPACITY: usize = 128;
 /// Deadline for protocol/version/capability configuration.
 pub const CHANNEL_SIDECAR_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Deadline for the official SDK to report its first live connection after
+/// protocol configuration succeeds.
+pub const CHANNEL_SIDECAR_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// A process epoch must remain continuously connected for this long before a
+/// later crash starts a fresh restart-backoff sequence.
+pub const CHANNEL_SIDECAR_HEALTHY_UPTIME: Duration = Duration::from_secs(30);
 /// Deadline shared with the Node handler before upstream must receive failure.
 pub const CHANNEL_SIDECAR_HANDLER_TIMEOUT: Duration = LARK_HANDLER_TIMEOUT;
 /// Extra time for a negative handler-timeout ack to reach Node before Node
