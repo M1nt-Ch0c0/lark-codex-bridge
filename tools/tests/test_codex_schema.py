@@ -348,7 +348,13 @@ class CodexSchemaTests(unittest.TestCase):
             ]
         }
         _, changes = self.classified(before, after)
-        self.assertEqual([item["kind"] for item in changes], ["optional_property_added"])
+        self.assertEqual(
+            [item["kind"] for item in changes],
+            [
+                "optional_property_added",
+                "one_of_global_exclusivity_changed_unproven",
+            ],
+        )
         kinds, _ = self.classified(
             {"oneOf": [{"type": "number"}]},
             {"oneOf": [{"type": "number"}, {"type": "integer"}]},
@@ -366,6 +372,236 @@ class CodexSchemaTests(unittest.TestCase):
         }
         kinds, _ = self.classified(before, {"oneOf": [before["oneOf"][0], tagged_b]})
         self.assertIn(("additive", "one_of_variants_added"), kinds)
+
+    def test_one_of_global_exclusivity_changes_fail_closed(self):
+        before = {"oneOf": [{"type": "string"}, {"type": "integer"}]}
+        overlapping_after = {
+            "oneOf": [
+                {"type": ["string", "integer"]},
+                {"type": "integer"},
+            ]
+        }
+        codex_schema.validate_instance(1, before, before)
+        with self.assertRaises(codex_schema.ValidationFailure):
+            codex_schema.validate_instance(1, overlapping_after, overlapping_after)
+        kinds, _ = self.classified(before, overlapping_after)
+        self.assertIn(("additive", "type_widened"), kinds)
+        self.assertIn(
+            ("breaking", "one_of_global_exclusivity_changed_unproven"), kinds
+        )
+
+        constraint_before = {
+            "oneOf": [
+                {"type": "integer", "minimum": 10},
+                {"type": "integer", "maximum": 0},
+            ]
+        }
+        constraint_after = {
+            "oneOf": [
+                {"type": "integer"},
+                {"type": "integer", "maximum": 0},
+            ]
+        }
+        codex_schema.validate_instance(-1, constraint_before, constraint_before)
+        with self.assertRaises(codex_schema.ValidationFailure):
+            codex_schema.validate_instance(-1, constraint_after, constraint_after)
+        kinds, _ = self.classified(constraint_before, constraint_after)
+        self.assertIn(("additive", "minimum_removed"), kinds)
+        self.assertIn(
+            ("breaking", "one_of_global_exclusivity_changed_unproven"), kinds
+        )
+
+        nested_before = {
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {"value": before},
+                    "required": ["value"],
+                },
+                {"type": "null"},
+            ]
+        }
+        nested_after = {
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {"value": overlapping_after},
+                    "required": ["value"],
+                },
+                {"type": "null"},
+            ]
+        }
+        _, nested_changes = self.classified(nested_before, nested_after)
+        self.assertTrue(
+            any(
+                item["classification"] == "breaking"
+                and item["kind"] == "one_of_global_exclusivity_changed_unproven"
+                and item["path"].endswith("/properties/value")
+                for item in nested_changes
+            ),
+            nested_changes,
+        )
+
+        # Reordering an identical multiset is a formal equivalence proof.
+        _, reordered = self.classified(
+            before, {"oneOf": list(reversed(before["oneOf"]))}
+        )
+        self.assertEqual(reordered, [])
+
+        kinds, _ = self.classified(
+            {"oneOf": [{"type": "string"}]},
+            {
+                "oneOf": [
+                    {"type": "string"},
+                    {"type": "integer"},
+                    {"type": "boolean"},
+                ]
+            },
+        )
+        self.assertIn(("additive", "one_of_variants_added"), kinds)
+        kinds, _ = self.classified(
+            {"oneOf": [{"type": "string"}]},
+            {
+                "oneOf": [
+                    {"type": "string"},
+                    {"type": "integer"},
+                    {"type": "number"},
+                ]
+            },
+        )
+        self.assertIn(
+            ("breaking", "one_of_variant_added_unproven_or_closed"), kinds
+        )
+
+        untyped_a = {
+            "properties": {"kind": {"const": "a"}},
+            "required": ["kind"],
+        }
+        untyped_b = {
+            "properties": {"kind": {"const": "b"}},
+            "required": ["kind"],
+        }
+        untyped_before = {"oneOf": [untyped_a]}
+        untyped_after = {"oneOf": [untyped_a, untyped_b]}
+        codex_schema.validate_instance("scalar", untyped_before, untyped_before)
+        with self.assertRaises(codex_schema.ValidationFailure):
+            codex_schema.validate_instance("scalar", untyped_after, untyped_after)
+        kinds, _ = self.classified(untyped_before, untyped_after)
+        self.assertIn(
+            ("breaking", "one_of_variant_added_unproven_or_closed"), kinds
+        )
+
+        def referenced_tag(value):
+            return {
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "$ref": "#/definitions/Anything",
+                        "const": value,
+                    }
+                },
+                "required": ["kind"],
+            }
+
+        referenced_before = {
+            "definitions": {"Anything": True},
+            "oneOf": [referenced_tag("a")],
+        }
+        referenced_after = {
+            "definitions": {"Anything": True},
+            "oneOf": [referenced_tag("a"), referenced_tag("b")],
+        }
+        instance = {"kind": "neither-tag-is-active"}
+        codex_schema.validate_instance(instance, referenced_before, referenced_before)
+        with self.assertRaises(codex_schema.ValidationFailure):
+            codex_schema.validate_instance(instance, referenced_after, referenced_after)
+        kinds, _ = self.classified(referenced_before, referenced_after)
+        self.assertIn(
+            ("breaking", "one_of_variant_added_unproven_or_closed"), kinds
+        )
+
+        top_reference_before = {
+            "definitions": {"Anything": True},
+            "oneOf": [{"type": "string"}],
+        }
+        top_reference_after = {
+            "definitions": {"Anything": True},
+            "oneOf": [
+                {"type": "string"},
+                {
+                    "$ref": "#/definitions/Anything",
+                    "type": "integer",
+                },
+            ],
+        }
+        codex_schema.validate_instance(
+            "scalar", top_reference_before, top_reference_before
+        )
+        with self.assertRaises(codex_schema.ValidationFailure):
+            codex_schema.validate_instance(
+                "scalar", top_reference_after, top_reference_after
+            )
+        kinds, _ = self.classified(top_reference_before, top_reference_after)
+        self.assertIn(
+            ("breaking", "one_of_variant_added_unproven_or_closed"), kinds
+        )
+
+        dependency_before = {
+            "definitions": {"First": {"type": "string"}},
+            "oneOf": [
+                {"$ref": "#/definitions/First"},
+                {"type": "integer"},
+            ],
+        }
+        dependency_after = {
+            "definitions": {
+                "First": {"type": ["string", "integer"]}
+            },
+            "oneOf": [
+                {"$ref": "#/definitions/First"},
+                {"type": "integer"},
+            ],
+        }
+        codex_schema.validate_instance(1, dependency_before, dependency_before)
+        with self.assertRaises(codex_schema.ValidationFailure):
+            codex_schema.validate_instance(1, dependency_after, dependency_after)
+        kinds, _ = self.classified(dependency_before, dependency_after)
+        self.assertIn(
+            ("breaking", "one_of_global_exclusivity_changed_unproven"), kinds
+        )
+
+    def test_one_of_overlap_blocks_an_outgoing_params_candidate(self):
+        before = {"oneOf": [{"type": "string"}, {"type": "integer"}]}
+        after = {
+            "oneOf": [
+                {"type": ["string", "integer"]},
+                {"type": "integer"},
+            ]
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            schemas_root = Path(directory)
+            for version, schema in (("1.0.0", before), ("1.0.1", after)):
+                version_root = schemas_root / version
+                version_root.mkdir()
+                bundle = {
+                    "formatVersion": 1,
+                    "notificationMethods": [],
+                    "roots": {"thread.start.params": schema},
+                }
+                (version_root / "selected.schema.json").write_text(
+                    json.dumps(bundle), encoding="utf-8"
+                )
+            with mock.patch.object(codex_schema, "SCHEMAS_ROOT", schemas_root):
+                report = codex_schema.compatibility_report("1.0.0", "1.0.1")
+        self.assertFalse(report["compatible"])
+        self.assertTrue(
+            any(
+                item["classification"] == "breaking"
+                and item["kind"] == "one_of_global_exclusivity_changed_unproven"
+                for item in report["changes"]
+            ),
+            report,
+        )
 
     def test_unknown_validation_keyword_changes_block(self):
         kinds, _ = self.classified(

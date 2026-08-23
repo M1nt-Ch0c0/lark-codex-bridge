@@ -176,6 +176,16 @@
     },
     {
       "classification": "breaking",
+      "kind": "one_of_global_exclusivity_changed_unproven",
+      "path": "roots/notification.item.completed/definitions/ThreadItem"
+    },
+    {
+      "classification": "breaking",
+      "kind": "one_of_global_exclusivity_changed_unproven",
+      "path": "roots/thread.resume.params/definitions/ResponseItem"
+    },
+    {
+      "classification": "breaking",
       "kind": "property_removed",
       "path": "roots/notification.thread.started/definitions/Thread/properties/isPinned"
     },
@@ -200,7 +210,7 @@
   "protocolFamily": "codex-app-server-jsonrpc/v1+v2-experimental",
   "summary": {
     "additive": 21,
-    "breaking": 12,
-    "total": 33
+    "breaking": 14,
+    "total": 35
   }
 }

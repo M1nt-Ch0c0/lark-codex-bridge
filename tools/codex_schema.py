@@ -2020,7 +2020,11 @@ def branch_key(schema: Any) -> tuple[str, str] | None:
         for name in sorted(properties):
             active_budget().checkpoint()
             child = properties[name]
-            if name not in required or not isinstance(child, dict):
+            if (
+                name not in required
+                or not isinstance(child, dict)
+                or "$ref" in child
+            ):
                 continue
             values = finite_values(child)
             if values is not None and len(values) == 1:
@@ -2035,6 +2039,8 @@ def branch_key(schema: Any) -> tuple[str, str] | None:
 def branches_provably_disjoint(left: Any, right: Any) -> bool:
     if not isinstance(left, dict) or not isinstance(right, dict):
         return False
+    if "$ref" in left or "$ref" in right:
+        return False
     left_types = schema_types(left)
     right_types = schema_types(right)
     if left_types is not None and right_types is not None:
@@ -2045,10 +2051,76 @@ def branches_provably_disjoint(left: Any, right: Any) -> bool:
     return (
         left_key is not None
         and right_key is not None
+        and left_types is not None
+        and right_types is not None
+        and type_atoms(left_types) == {"object"}
+        and type_atoms(right_types) == {"object"}
         and left_key[0].startswith("tag:")
         and left_key[0] == right_key[0]
         and left_key[1] != right_key[1]
     )
+
+
+@budgeted
+def schema_reference_dependencies(schema: Any, root: Any) -> tuple[tuple[str, bytes], ...]:
+    """Fingerprint the local reference closure of one schema fragment."""
+    pending = [schema]
+    visited_objects: set[int] = set()
+    visited_references: set[str] = set()
+    dependencies: dict[str, bytes] = {}
+    while pending:
+        active_budget().checkpoint()
+        current = pending.pop()
+        if isinstance(current, list):
+            pending.extend(current)
+            continue
+        if isinstance(current, bool) or not isinstance(current, dict):
+            continue
+        identity = id(current)
+        if identity in visited_objects:
+            continue
+        visited_objects.add(identity)
+
+        reference = current.get("$ref")
+        if isinstance(reference, str) and reference not in visited_references:
+            visited_references.add(reference)
+            if isinstance(root, dict):
+                try:
+                    target = resolve_pointer(root, reference)
+                except ValidationFailure:
+                    dependencies[reference] = b"<unresolved>"
+                else:
+                    dependencies[reference] = canonical_bytes(target)
+                    pending.append(target)
+            else:
+                dependencies[reference] = b"<unresolved>"
+
+        for keyword in SCHEMA_MAP_KEYWORDS & current.keys():
+            mapping = current[keyword]
+            if isinstance(mapping, dict):
+                pending.extend(mapping.values())
+        raw_dependencies = current.get("dependencies")
+        if isinstance(raw_dependencies, dict):
+            pending.extend(
+                value
+                for value in raw_dependencies.values()
+                if isinstance(value, (dict, bool))
+            )
+        for keyword in SCHEMA_VALUE_KEYWORDS & current.keys():
+            pending.append(current[keyword])
+        items = current.get("items")
+        if isinstance(items, list):
+            pending.extend(items)
+        elif isinstance(items, (dict, bool)):
+            pending.append(items)
+        prefix_items = current.get("prefixItems")
+        if isinstance(prefix_items, list):
+            pending.extend(prefix_items)
+        for keyword in SCHEMA_ARRAY_KEYWORDS & current.keys():
+            variants = current[keyword]
+            if isinstance(variants, list):
+                pending.extend(variants)
+    return tuple(sorted(dependencies.items()))
 
 
 def open_incoming_fallback(path: str, *, tagged: bool = False) -> str | None:
@@ -2068,7 +2140,10 @@ def compare_combinator(
     combinator: str,
     *,
     incoming: bool,
+    before_root: Any,
+    after_root: Any,
 ) -> None:
+    first_change = len(changes)
     old = before.get(combinator)
     new = after.get(combinator)
     if not isinstance(old, list) and not isinstance(new, list):
@@ -2081,16 +2156,35 @@ def compare_combinator(
         changes.append(change("additive", f"{snake}_constraint_removed", path))
         return
 
+    old_canonical = [canonical_bytes(variant) for variant in old]
+    new_canonical = [canonical_bytes(variant) for variant in new]
+    old_counts: dict[bytes, int] = {}
+    new_counts: dict[bytes, int] = {}
+    for fingerprint in old_canonical:
+        old_counts[fingerprint] = old_counts.get(fingerprint, 0) + 1
+    for fingerprint in new_canonical:
+        new_counts[fingerprint] = new_counts.get(fingerprint, 0) + 1
+    pure_addition = len(new) > len(old) and all(
+        new_counts.get(fingerprint, 0) >= count
+        for fingerprint, count in old_counts.items()
+    )
+    reference_dependencies_changed = (
+        combinator == "oneOf"
+        and old_counts == new_counts
+        and schema_reference_dependencies(old, before_root)
+        != schema_reference_dependencies(new, after_root)
+    )
+
     old_unmatched = set(range(len(old)))
     new_unmatched = set(range(len(new)))
     pairs: list[tuple[int, int]] = []
     new_fingerprints: dict[bytes, list[int]] = {}
-    for index, variant in enumerate(new):
+    for index, fingerprint in enumerate(new_canonical):
         active_budget().checkpoint()
-        new_fingerprints.setdefault(canonical_bytes(variant), []).append(index)
-    for old_index, variant in enumerate(old):
+        new_fingerprints.setdefault(fingerprint, []).append(index)
+    for old_index, fingerprint in enumerate(old_canonical):
         active_budget().checkpoint()
-        candidates = new_fingerprints.get(canonical_bytes(variant), [])
+        candidates = new_fingerprints.get(fingerprint, [])
         candidate = next((index for index in candidates if index in new_unmatched), None)
         if candidate is not None:
             old_unmatched.remove(old_index)
@@ -2127,6 +2221,8 @@ def compare_combinator(
                 f"{path}/{combinator}/{new_index}",
                 changes,
                 incoming=incoming,
+                before_root=before_root,
+                after_root=after_root,
             )
         elif old[old_index] != new[new_index]:
             changes.append(
@@ -2152,9 +2248,15 @@ def compare_combinator(
             classification = "breaking" if incoming and fallback is None else "additive"
             kind = "incoming_closed_union_variants_added" if classification == "breaking" else "any_of_variants_added"
         else:
+            addition_indices = sorted(new_unmatched)
             additions_disjoint = all(
                 all(branches_provably_disjoint(new[index], existing) for existing in old)
-                for index in new_unmatched
+                and all(
+                    branches_provably_disjoint(new[index], new[prior])
+                    for prior in addition_indices
+                    if prior < index
+                )
+                for index in addition_indices
             )
             fallback = open_incoming_fallback(path, tagged=True) if incoming else None
             classification = "additive" if additions_disjoint and (not incoming or fallback) else "breaking"
@@ -2168,6 +2270,24 @@ def compare_combinator(
             details["fallbackEvidence"] = fallback
         changes.append(change(classification, kind, path, **details))
 
+    if (
+        combinator == "oneOf"
+        and (
+            (old_counts != new_counts and not pure_addition)
+            or reference_dependencies_changed
+        )
+        and not any(
+            item["classification"] == "breaking" for item in changes[first_change:]
+        )
+    ):
+        changes.append(
+            change(
+                "breaking",
+                "one_of_global_exclusivity_changed_unproven",
+                path,
+            )
+        )
+
 
 @budgeted
 def compare_named_schemas(
@@ -2177,7 +2297,13 @@ def compare_named_schemas(
     changes: list[dict[str, Any]],
     *,
     incoming: bool = False,
+    before_root: Any | None = None,
+    after_root: Any | None = None,
 ) -> None:
+    if before_root is None:
+        before_root = before
+    if after_root is None:
+        after_root = after
     first_change = len(changes)
     active_budget().checkpoint()
     if isinstance(before, bool) or isinstance(after, bool):
@@ -2294,6 +2420,8 @@ def compare_named_schemas(
                 f"{path}/additionalProperties",
                 changes,
                 incoming=incoming,
+                before_root=before_root,
+                after_root=after_root,
             )
 
     for key in ("minimum", "exclusiveMinimum", "minLength", "minItems", "minProperties"):
@@ -2370,6 +2498,8 @@ def compare_named_schemas(
                     f"{path}/properties/{name}",
                     changes,
                     incoming=incoming,
+                    before_root=before_root,
+                    after_root=after_root,
                 )
             elif before_child != after_child:
                 changes.append(
@@ -2401,6 +2531,8 @@ def compare_named_schemas(
                     f"{path}/definitions/{name}",
                     changes,
                     incoming=incoming,
+                    before_root=before_root,
+                    after_root=after_root,
                 )
             elif before_child != after_child:
                 changes.append(
@@ -2410,7 +2542,15 @@ def compare_named_schemas(
     before_items = before.get("items")
     after_items = after.get("items")
     if isinstance(before_items, (dict, bool)) and isinstance(after_items, (dict, bool)):
-        compare_named_schemas(before_items, after_items, f"{path}/items", changes, incoming=incoming)
+        compare_named_schemas(
+            before_items,
+            after_items,
+            f"{path}/items",
+            changes,
+            incoming=incoming,
+            before_root=before_root,
+            after_root=after_root,
+        )
     elif isinstance(before_items, list) and isinstance(after_items, list):
         shared_items = min(len(before_items), len(after_items))
         for index in range(shared_items):
@@ -2426,6 +2566,8 @@ def compare_named_schemas(
                     f"{path}/items/{index}",
                     changes,
                     incoming=incoming,
+                    before_root=before_root,
+                    after_root=after_root,
                 )
             elif before_item != after_item:
                 changes.append(
@@ -2457,7 +2599,16 @@ def compare_named_schemas(
         changes.append(change("breaking", "items_schema_shape_changed", f"{path}/items"))
 
     for combinator in ("anyOf", "oneOf", "allOf"):
-        compare_combinator(before, after, path, changes, combinator, incoming=incoming)
+        compare_combinator(
+            before,
+            after,
+            path,
+            changes,
+            combinator,
+            incoming=incoming,
+            before_root=before_root,
+            after_root=after_root,
+        )
 
     for key in ("not", "if", "then", "else"):
         if before.get(key) != after.get(key):
