@@ -35,7 +35,7 @@
 //! bootstrap or a `handshake-autherrcode` header enters
 //! [`TransportState::Degraded`] without further retries; a `ProtocolViolation`
 //! from bootstrap (a malformed endpoint response) also fails closed into
-//! `Degraded`, since retrying an unparseable response cannot succeed.
+//! `Degraded`, since retrying an unparsable response cannot succeed.
 
 use std::fmt;
 use std::sync::Arc;
@@ -952,7 +952,7 @@ impl Actor {
 
 /// Fail-closed classification for the connect phase: permanent auth and
 /// exhausted bounds cannot succeed on retry, and a protocol violation from
-/// bootstrap means the endpoint response is unparseable — retrying the same
+/// bootstrap means the endpoint response is unparsable — retrying the same
 /// parse cannot help either. All three degrade without further attempts.
 fn is_fatal(error: &LarkError) -> bool {
     matches!(

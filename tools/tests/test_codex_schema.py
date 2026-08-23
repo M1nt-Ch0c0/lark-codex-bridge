@@ -1195,7 +1195,10 @@ class CodexSchemaTests(unittest.TestCase):
         self.assertIn("classified-change", str(raised.exception))
 
         with self.assertRaises(codex_schema.SchemaToolError) as raised:
-            with codex_schema.operation_budget(maximum_work=20):
+            # A one-unit budget deterministically fails on every platform at
+            # the first nested comparison checkpoint; the old value relied on
+            # incidental traversal work and did not fail on Windows.
+            with codex_schema.operation_budget(maximum_work=1):
                 variants = [{"const": value} for value in range(16)]
                 codex_schema.compare_named_schemas(
                     {"oneOf": variants},
