@@ -1,4 +1,5 @@
 import importlib.util
+import itertools
 import json
 import os
 import stat
@@ -117,6 +118,65 @@ class CodexSchemaTests(unittest.TestCase):
         open_after = {"type": "array", "items": [{"type": "string"}]}
         open_kinds, _ = self.classified(before, open_after)
         self.assertIn(("additive", "tuple_item_constraints_removed"), open_kinds)
+
+    def test_finite_and_tuple_matrix_has_no_false_additive_shrinks(self):
+        def accepted_indices(schema, instances):
+            return {
+                index
+                for index, instance in enumerate(instances)
+                if codex_schema.instance_valid(instance, schema, schema, 0)
+            }
+
+        finite_schemas = [
+            {},
+            {"enum": ["a"]},
+            {"enum": ["b"]},
+            {"enum": ["a", "b"]},
+            {"enum": [1]},
+            {"enum": [True]},
+            {"const": "a"},
+            {"const": "b"},
+            {"const": "a", "enum": ["a"]},
+            {"const": "a", "enum": ["b"]},
+            {"const": 1, "enum": [1.0]},
+            {"const": 1, "enum": [True]},
+        ]
+        finite_instances = ["a", "b", 1, True, None]
+
+        item_schemas = [True, False, {"type": "string"}, {"type": "integer"}]
+        additional_items = [None, True, False, {}, {"type": "string"}, {"type": "integer"}]
+        tuple_schemas = []
+        for length in range(3):
+            for items in itertools.product(item_schemas, repeat=length):
+                for additional in additional_items:
+                    schema = {"type": "array", "items": list(items)}
+                    if additional is not None:
+                        schema["additionalItems"] = additional
+                    tuple_schemas.append(schema)
+        tuple_instances = [
+            [],
+            ["x"],
+            [1],
+            [True],
+            ["x", 1],
+            [1, "x"],
+            ["x", 1, True],
+            [1, 1, 1],
+        ]
+
+        for schemas, instances in (
+            (finite_schemas, finite_instances),
+            (tuple_schemas, tuple_instances),
+        ):
+            accepted = [accepted_indices(schema, instances) for schema in schemas]
+            for before_index, after_index in itertools.product(range(len(schemas)), repeat=2):
+                if not accepted[before_index] - accepted[after_index]:
+                    continue
+                _, changes = self.classified(schemas[before_index], schemas[after_index])
+                self.assertTrue(
+                    any(change["classification"] == "breaking" for change in changes),
+                    (schemas[before_index], schemas[after_index], changes),
+                )
 
     def test_references_and_schema_drafts_cannot_change_silently(self):
         cases = (
