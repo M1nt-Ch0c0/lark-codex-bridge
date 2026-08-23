@@ -7,7 +7,7 @@
 //! of that lifecycle are authoritative, discovery, adoption, and release stay
 //! behind this dependency-free gate and cannot reach an RPC client or store.
 
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 
 /// Persisted-thread control operations that require reliable writer release.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -21,8 +21,7 @@ pub enum ThreadAdoptionOperation {
 }
 
 /// Stable availability classification exposed to operators and command handlers.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ThreadAdoptionAvailability {
     /// The app-server offers no verified writer-release operation.
     UnavailableNoReliableWriterRelease,
@@ -37,6 +36,14 @@ impl ThreadAdoptionAvailability {
         }
     }
 
+    /// Whether persisted-thread adoption can pass the capability gate.
+    #[must_use]
+    pub const fn is_available(self) -> bool {
+        match self {
+            Self::UnavailableNoReliableWriterRelease => false,
+        }
+    }
+
     /// Static, path-free guidance safe to show to an authorized operator.
     #[must_use]
     pub const fn guidance(self) -> &'static str {
@@ -45,6 +52,15 @@ impl ThreadAdoptionAvailability {
                 "persisted-thread adoption is disabled because the supported Codex app-server cannot reliably release writer ownership; keep using bridge-created threads and see issue #8 for shared-endpoint research"
             }
         }
+    }
+}
+
+impl Serialize for ThreadAdoptionAvailability {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.code())
     }
 }
 

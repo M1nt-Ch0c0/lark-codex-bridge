@@ -72,6 +72,10 @@ contract and real cross-platform evidence:
    labelled ownership-unverified;
 7. restart, crash, disappearance, and failed-resume recovery rules that never
    leave a half-written mapping or silently create a replacement thread.
+8. Issue #3 context handles remain bound to their original Feishu scope and
+   authoritative Codex thread/turn across adoption and release; adoption must
+   never broaden the messages, media, or context that a handle is allowed to
+   read.
 
 Connecting multiple clients to one shared app-server endpoint is a different
 ownership model and remains the subject of Issue #8.

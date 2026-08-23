@@ -223,7 +223,7 @@ struct ThreadAdoptionReport {
 fn report_thread_adoption_status() -> Result<()> {
     let availability = ThreadAdoptionGate.availability();
     let report = ThreadAdoptionReport {
-        available: false,
+        available: availability.is_available(),
         classification: availability,
         guidance: availability.guidance(),
         requires_explicit_handoff: true,
