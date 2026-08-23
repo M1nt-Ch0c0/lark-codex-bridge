@@ -533,7 +533,7 @@ struct RouterRetry {
 
 struct RouteFailure {
     error: RouteError,
-    event: QueuedInboundEvent,
+    event: Box<QueuedInboundEvent>,
     retryable: bool,
 }
 
@@ -643,7 +643,7 @@ async fn run_router(
                                 match enqueue_retry(
                                     &mut retries,
                                     &retry_budget,
-                                    failure.event,
+                                    *failure.event,
                                 ) {
                                     Ok(()) => Ok(()),
                                     Err(()) => Err(error),
@@ -757,7 +757,7 @@ async fn retry_one(
     .await
     {
         Err(failure) if failure.retryable => {
-            retry.event = failure.event;
+            retry.event = *failure.event;
             retries.push_back(retry);
         }
         Ok(()) | Err(_) => {}
@@ -785,7 +785,7 @@ async fn route_one(
             .await
             .map_err(|error| RouteFailure {
                 error,
-                event: queued,
+                event: Box::new(queued),
                 retryable: true,
             });
     }
@@ -810,7 +810,7 @@ async fn route_one(
                 .await
                 .map_err(|error| RouteFailure {
                     error,
-                    event: queued,
+                    event: Box::new(queued),
                     retryable: true,
                 });
             }
@@ -833,7 +833,7 @@ async fn route_one(
     let Some(actor) = actors.get(&scope_key) else {
         return Err(RouteFailure {
             error: RouteError::ActorUnavailable,
-            event: queued,
+            event: Box::new(queued),
             retryable: false,
         });
     };
@@ -846,25 +846,22 @@ async fn route_one(
             );
             Ok(())
         }
-        Err(ActorRouteError::Capacity(queued)) => {
-            let queued = *queued;
-            reject_with_notice(
-                store,
-                sink.as_ref(),
-                &key,
-                &queued.event,
-                InboundRejectionKind::Overloaded,
-            )
-            .await
-            .map_err(|error| RouteFailure {
-                error,
-                event: queued,
-                retryable: true,
-            })
-        }
+        Err(ActorRouteError::Capacity(queued)) => reject_with_notice(
+            store,
+            sink.as_ref(),
+            &key,
+            &queued.event,
+            InboundRejectionKind::Overloaded,
+        )
+        .await
+        .map_err(|error| RouteFailure {
+            error,
+            event: queued,
+            retryable: true,
+        }),
         Err(ActorRouteError::Closed(queued)) => Err(RouteFailure {
             error: RouteError::ActorUnavailable,
-            event: *queued,
+            event: queued,
             retryable: false,
         }),
     }
