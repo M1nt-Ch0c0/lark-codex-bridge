@@ -12,6 +12,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(unix)]
+use std::{fs::File, io::Read};
+
 use anyhow::{Context, Result, bail, ensure};
 use futures_util::{SinkExt, StreamExt};
 use lark_codex_bridge::{
@@ -88,6 +91,7 @@ async fn real_exact_binary_reconciles_across_socket_and_operator_server_restarts
         binary.is_absolute(),
         "CODEX_EXTERNAL_RECONCILIATION_BINARY must be an absolute path"
     );
+    ensure_native_server_binary(&binary)?;
     let expected_version = required_env("CODEX_EXTERNAL_RECONCILIATION_EXPECTED_VERSION")?;
     let expected_version_parsed =
         Version::parse(&expected_version).context("expected version must be exact semver")?;
@@ -541,6 +545,31 @@ fn required_env(name: &str) -> Result<String> {
         bail!("required gate variable {name} is empty");
     }
     Ok(value)
+}
+
+fn ensure_native_server_binary(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut magic = [0_u8; 2];
+        File::open(path)
+            .context("unable to open the exact reconciliation binary")?
+            .read_exact(&mut magic)
+            .context("unable to inspect the exact reconciliation binary")?;
+        ensure!(
+            magic != *b"#!",
+            "CODEX_EXTERNAL_RECONCILIATION_BINARY must name the native Codex executable, not a launcher script"
+        );
+    }
+    #[cfg(windows)]
+    {
+        ensure!(
+            path.extension()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("exe")),
+            "CODEX_EXTERNAL_RECONCILIATION_BINARY must name the native Codex .exe, not a launcher script"
+        );
+    }
+    Ok(())
 }
 
 fn write_private_token(path: &Path, token: &str) -> Result<()> {

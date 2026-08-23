@@ -71,7 +71,7 @@ stops its child:
 
 ```bash
 CODEX_EXTERNAL_RECONCILIATION_E2E=1 \
-CODEX_EXTERNAL_RECONCILIATION_BINARY=/absolute/path/to/codex \
+CODEX_EXTERNAL_RECONCILIATION_BINARY=/absolute/path/to/native/codex \
 CODEX_EXTERNAL_RECONCILIATION_EXPECTED_VERSION=0.149.0 \
 cargo test --locked --test external_recovery_smoke \
   real_exact_binary_reconciles_across_socket_and_operator_server_restarts_without_write_replay \
@@ -83,4 +83,7 @@ binary and is not acceptance evidence. The exact invocation fails on every
 missing or empty gate variable, skipped selection, version mismatch, recovery
 failure, replayed work, unexpected server exit, or non-200 health result. CI
 installs official exact 0.149.0 and invokes this test by exact name on Linux,
-macOS, and Windows.
+macOS, and Windows. The binary variable must point to the platform's native
+Codex executable inside the npm package, not its `.bin` Node/command launcher:
+killing only that launcher can orphan the real server and invalidate restart
+evidence.
