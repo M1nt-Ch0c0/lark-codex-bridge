@@ -12,10 +12,15 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::limits::STORE_OUTBOX_PAYLOAD_MAX_BYTES;
+use crate::render::render_lark_markdown;
 
-/// Current payload version. A stored payload with any other version is
-/// rejected as undeliverable rather than being guessed at.
-pub const OUTBOX_PAYLOAD_VERSION: u32 = 1;
+/// Current payload version written by this binary.
+///
+/// Version 1 remains readable because an upgrade may find durable rows written
+/// by the previous binary. New Markdown carrier fields are emitted only as
+/// version 2, so an older binary can never silently reinterpret them.
+pub const OUTBOX_PAYLOAD_VERSION: u32 = 2;
+const LEGACY_OUTBOX_PAYLOAD_VERSION: u32 = 1;
 
 /// One durable outbound operation.
 #[derive(Clone, PartialEq, Eq)]
@@ -187,7 +192,7 @@ impl OutboxOperation {
     /// Returns [`OutboxError::Serialize`] if the operation cannot be encoded,
     /// or [`OutboxError::PayloadTooLarge`] when the result exceeds the cap.
     pub fn encode(&self) -> Result<String, OutboxError> {
-        let dto = PayloadDto::from(self);
+        let dto = PayloadV2::from(self);
         let json = serde_json::to_string(&dto).map_err(|_| OutboxError::Serialize)?;
         if json.len() > STORE_OUTBOX_PAYLOAD_MAX_BYTES {
             return Err(OutboxError::PayloadTooLarge {
@@ -211,23 +216,77 @@ impl OutboxOperation {
                 limit: STORE_OUTBOX_PAYLOAD_MAX_BYTES,
             });
         }
-        let dto: PayloadDto = serde_json::from_str(json).map_err(|_| OutboxError::Deserialize)?;
-        if dto.version != OUTBOX_PAYLOAD_VERSION {
-            return Err(OutboxError::UnsupportedVersion {
-                version: dto.version,
-            });
-        }
-        let operation = dto.op.clone();
-        match operation.as_str() {
-            "reply_text" | "reply_markdown_post" | "reply_progress_card" => decode_reply(dto),
-            "update_progress_card" => decode_progress_update(dto),
-            "finalize_progress_card" => decode_progress_finalization(dto),
-            _ => Err(OutboxError::UnknownOperation),
+        let probe: VersionProbe =
+            serde_json::from_str(json).map_err(|_| OutboxError::Deserialize)?;
+        match probe.version {
+            LEGACY_OUTBOX_PAYLOAD_VERSION => {
+                let dto: PayloadV1 =
+                    serde_json::from_str(json).map_err(|_| OutboxError::Deserialize)?;
+                decode_v1(dto)
+            }
+            OUTBOX_PAYLOAD_VERSION => {
+                let dto: PayloadV2 =
+                    serde_json::from_str(json).map_err(|_| OutboxError::Deserialize)?;
+                decode_v2(dto)
+            }
+            version => Err(OutboxError::UnsupportedVersion { version }),
         }
     }
 }
 
-fn decode_reply(dto: PayloadDto) -> Result<OutboxOperation, OutboxError> {
+fn decode_v1(dto: PayloadV1) -> Result<OutboxOperation, OutboxError> {
+    debug_assert_eq!(dto.version, LEGACY_OUTBOX_PAYLOAD_VERSION);
+    let operation = dto.op.clone();
+    match operation.as_str() {
+        // Carrier preservation is intentional: a durable v1 `reply_text` is a
+        // real plain-text operation, even if its content happens to contain
+        // Markdown punctuation.
+        "reply_text" | "reply_progress_card" => decode_reply(PayloadV2 {
+            version: OUTBOX_PAYLOAD_VERSION,
+            op: dto.op,
+            message_id: dto.message_id,
+            thread_id: dto.thread_id,
+            anchor_key: dto.anchor_key,
+            text: dto.text,
+            fallback_markdown: None,
+        }),
+        "update_progress_card" => decode_progress_update(PayloadV2 {
+            version: OUTBOX_PAYLOAD_VERSION,
+            op: dto.op,
+            message_id: dto.message_id,
+            thread_id: dto.thread_id,
+            anchor_key: dto.anchor_key,
+            text: dto.text,
+            fallback_markdown: None,
+        }),
+        "finalize_progress_card" => {
+            let fallback_markdown = legacy_fallback_markdown(&dto.text);
+            decode_progress_finalization(PayloadV2 {
+                version: OUTBOX_PAYLOAD_VERSION,
+                op: dto.op,
+                message_id: dto.message_id,
+                thread_id: dto.thread_id,
+                anchor_key: dto.anchor_key,
+                text: dto.text,
+                fallback_markdown: Some(fallback_markdown),
+            })
+        }
+        _ => Err(OutboxError::UnknownOperation),
+    }
+}
+
+fn decode_v2(dto: PayloadV2) -> Result<OutboxOperation, OutboxError> {
+    debug_assert_eq!(dto.version, OUTBOX_PAYLOAD_VERSION);
+    let operation = dto.op.clone();
+    match operation.as_str() {
+        "reply_text" | "reply_markdown_post" | "reply_progress_card" => decode_reply(dto),
+        "update_progress_card" => decode_progress_update(dto),
+        "finalize_progress_card" => decode_progress_finalization(dto),
+        _ => Err(OutboxError::UnknownOperation),
+    }
+}
+
+fn decode_reply(dto: PayloadV2) -> Result<OutboxOperation, OutboxError> {
     let Some(message_id) = dto.message_id else {
         return Err(OutboxError::Invalid {
             context: "empty reply message_id",
@@ -264,7 +323,7 @@ fn decode_reply(dto: PayloadDto) -> Result<OutboxOperation, OutboxError> {
     }
 }
 
-fn decode_progress_update(dto: PayloadDto) -> Result<OutboxOperation, OutboxError> {
+fn decode_progress_update(dto: PayloadV2) -> Result<OutboxOperation, OutboxError> {
     let Some(anchor_key) = dto.anchor_key else {
         return Err(OutboxError::Invalid {
             context: "empty progress anchor_key",
@@ -286,7 +345,7 @@ fn decode_progress_update(dto: PayloadDto) -> Result<OutboxOperation, OutboxErro
     })
 }
 
-fn decode_progress_finalization(dto: PayloadDto) -> Result<OutboxOperation, OutboxError> {
+fn decode_progress_finalization(dto: PayloadV2) -> Result<OutboxOperation, OutboxError> {
     let (Some(anchor_key), Some(message_id)) = (dto.anchor_key, dto.message_id) else {
         return Err(OutboxError::Invalid {
             context: "missing progress finalization target",
@@ -295,14 +354,16 @@ fn decode_progress_finalization(dto: PayloadDto) -> Result<OutboxOperation, Outb
     if anchor_key.is_empty()
         || message_id.is_empty()
         || dto.text.is_empty()
-        || dto.fallback_markdown.as_deref().is_some_and(str::is_empty)
+        || dto.fallback_markdown.as_deref().is_none_or(str::is_empty)
     {
         return Err(OutboxError::Invalid {
             context: "invalid progress finalization",
         });
     }
     validate_thread_id(dto.thread_id.as_deref())?;
-    let fallback_markdown = dto.fallback_markdown.unwrap_or_else(|| dto.text.clone());
+    let fallback_markdown = dto
+        .fallback_markdown
+        .expect("validated progress finalization fallback");
     Ok(OutboxOperation::FinalizeProgressCard {
         anchor_key,
         message_id,
@@ -310,6 +371,15 @@ fn decode_progress_finalization(dto: PayloadDto) -> Result<OutboxOperation, Outb
         text: dto.text,
         fallback_markdown,
     })
+}
+
+fn legacy_fallback_markdown(text: &str) -> String {
+    let rendered = render_lark_markdown(text);
+    if rendered.is_empty() {
+        "（回复不包含可显示文本）".to_owned()
+    } else {
+        rendered
+    }
 }
 
 fn validate_thread_id(thread_id: Option<&str>) -> Result<(), OutboxError> {
@@ -322,11 +392,31 @@ fn validate_thread_id(thread_id: Option<&str>) -> Result<(), OutboxError> {
     }
 }
 
-/// Strict wire shape. `deny_unknown_fields` makes any forward-incompatible
-/// field a hard decode failure instead of a silent drop.
+#[derive(Deserialize)]
+struct VersionProbe {
+    version: u32,
+}
+
+/// Legacy strict wire shape. It deliberately has no Markdown carrier field.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PayloadV1 {
+    version: u32,
+    op: String,
+    #[serde(default)]
+    message_id: Option<String>,
+    #[serde(default)]
+    thread_id: Option<String>,
+    #[serde(default)]
+    anchor_key: Option<String>,
+    text: String,
+}
+
+/// Version-2 strict wire shape. `deny_unknown_fields` makes any
+/// forward-incompatible field a hard decode failure instead of a silent drop.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PayloadDto {
+struct PayloadV2 {
     version: u32,
     op: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -340,7 +430,7 @@ struct PayloadDto {
     fallback_markdown: Option<String>,
 }
 
-impl From<&OutboxOperation> for PayloadDto {
+impl From<&OutboxOperation> for PayloadV2 {
     fn from(operation: &OutboxOperation) -> Self {
         match operation {
             OutboxOperation::ReplyText {

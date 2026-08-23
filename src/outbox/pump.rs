@@ -24,7 +24,7 @@ use crate::lark::transport::TransportState;
 use crate::limits::{
     OUTBOX_POLL_INTERVAL, OUTBOX_RETRY_BASE, OUTBOX_RETRY_MAX, OUTBOX_SWEEP_BATCH,
     OUTBOX_SWEEP_INTERVAL, OUTBOX_TERMINAL_RETENTION_MS, STORE_OUTBOX_CLAIM_MAX_BATCH,
-    STORE_RECEIPT_WRITE_ATTEMPTS,
+    STORE_OUTBOX_MAX_ATTEMPTS, STORE_RECEIPT_WRITE_ATTEMPTS,
 };
 use crate::render::stabilize_streaming_markdown;
 use crate::store::{OutboxDepth, OutboxRow, OutboxState, StoreError, StoreHandle, now_ms};
@@ -32,8 +32,8 @@ use crate::store::{OutboxDepth, OutboxRow, OutboxState, StoreError, StoreHandle,
 /// How one failed send must be handled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryClass {
-    /// The server explicitly rejected the request (an error code or HTTP
-    /// error status was returned): safe to retry, bounded by the attempt cap.
+    /// The server explicitly returned a documented transient rejection,
+    /// bounded by the attempt cap.
     Retryable,
     /// The send outcome is unknown (no server response was received): never
     /// automatically re-sent.
@@ -43,27 +43,88 @@ pub enum DeliveryClass {
     Permanent,
 }
 
+/// Whether a failed mutating call is known not to have changed Lark state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppliedCertainty {
+    /// Local preflight or an explicit rejection proves no message mutation was
+    /// applied.
+    DefinitelyNotApplied,
+    /// The write may have reached Lark, but no complete success/rejection
+    /// response was available.
+    Uncertain,
+}
+
+/// Whether another attempt is useful independently of applied certainty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retryability {
+    /// The platform explicitly documented the failure as transient.
+    Retryable,
+    /// Repeating the same operation cannot repair the failure.
+    Permanent,
+}
+
+/// Orthogonal delivery semantics used by retry and fallback state machines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeliveryDecision {
+    /// Whether Lark definitely did not apply the attempted write.
+    pub applied: AppliedCertainty,
+    /// Whether the same operation may be retried.
+    pub retryability: Retryability,
+}
+
 /// Classifies a send failure into the three-way delivery semantics.
 ///
 /// The existing [`LarkError`] taxonomy carries a server `code` when the peer
-/// responded (either a Lark envelope code or an HTTP status). A response
-/// proves the send was *not* applied, so it is safe to retry; no response
-/// means the request may have reached Lark before the connection dropped.
+/// responded (either a Lark envelope code or an HTTP status). Such a response
+/// proves non-application, but only documented transient codes are retried;
+/// validation/business rejections are permanent. No response means the write
+/// may have reached Lark before the connection dropped.
 #[must_use]
 pub fn classify_delivery(error: &LarkError) -> DeliveryClass {
-    match error {
-        LarkError::PermanentAuth { .. } | LarkError::Exhausted { .. } => DeliveryClass::Permanent,
-        // A definitive peer rejection: the server responded with a non-success
-        // status, so nothing was sent and a bounded retry is safe.
-        LarkError::Retryable { code: Some(_), .. }
-        | LarkError::ProtocolViolation { code: Some(_), .. } => DeliveryClass::Retryable,
-        // No usable response (transport failure/timeout), or a 200 whose
-        // envelope could not be parsed (or a code-0 response missing its
-        // message_id): the send may have been applied, so it is never
-        // blindly re-sent.
-        LarkError::Retryable { code: None, .. }
-        | LarkError::ProtocolViolation { code: None, .. } => DeliveryClass::Uncertain,
+    let decision = delivery_decision(error);
+    match (decision.applied, decision.retryability) {
+        (AppliedCertainty::Uncertain, _) => DeliveryClass::Uncertain,
+        (AppliedCertainty::DefinitelyNotApplied, Retryability::Retryable) => {
+            DeliveryClass::Retryable
+        }
+        (AppliedCertainty::DefinitelyNotApplied, Retryability::Permanent) => {
+            DeliveryClass::Permanent
+        }
     }
+}
+
+/// Separates proof of non-application from whether a repeated call is useful.
+/// Only HTTP 429/5xx and Lark's documented application-frequency code are
+/// retryable. Validation, card-format, missing-chat, and recalled-message
+/// business codes are explicit permanent rejections. A malformed or missing
+/// response after a write remains uncertain regardless of its likely cause.
+#[must_use]
+pub fn delivery_decision(error: &LarkError) -> DeliveryDecision {
+    match error {
+        LarkError::Retryable {
+            code: Some(code), ..
+        } if is_documented_transient(*code) => DeliveryDecision {
+            applied: AppliedCertainty::DefinitelyNotApplied,
+            retryability: Retryability::Retryable,
+        },
+        LarkError::InvalidRequest { .. }
+        | LarkError::PermanentAuth { .. }
+        | LarkError::Exhausted { .. }
+        | LarkError::Retryable { code: Some(_), .. }
+        | LarkError::ProtocolViolation { code: Some(_), .. } => DeliveryDecision {
+            applied: AppliedCertainty::DefinitelyNotApplied,
+            retryability: Retryability::Permanent,
+        },
+        LarkError::Retryable { code: None, .. }
+        | LarkError::ProtocolViolation { code: None, .. } => DeliveryDecision {
+            applied: AppliedCertainty::Uncertain,
+            retryability: Retryability::Permanent,
+        },
+    }
+}
+
+fn is_documented_transient(code: i64) -> bool {
+    code == 429 || (500..=599).contains(&code) || code == 99_991_400
 }
 
 /// Result of processing one claimed row, telling the batch loop whether it may
@@ -80,6 +141,7 @@ enum ProcessOutcome {
 
 enum SendFailure {
     Delivery(LarkError),
+    FinalCardPatch(LarkError),
     Store(StoreError),
     DependencyPending,
     DependencyPermanent,
@@ -288,6 +350,9 @@ async fn process_row(
             let class = classify_delivery(&error);
             record_failure(store, row, class, config, &error, shutdown).await
         }
+        Err(SendFailure::FinalCardPatch(error)) => {
+            record_final_card_patch_failure(store, row, &operation, config, &error, shutdown).await
+        }
         Err(SendFailure::Store(store_error)) => {
             tracing::warn!(
                 error = %store_error,
@@ -390,7 +455,7 @@ async fn send(
                     .update_card(&receipt, progress_card(text))
                     .await
                     .map(|()| receipt)
-                    .map_err(SendFailure::Delivery),
+                    .map_err(SendFailure::FinalCardPatch),
                 ProgressAnchor::Failed if thread_id.is_some() => api
                     .reply_post_markdown_in_thread(message_id, fallback_markdown)
                     .await
@@ -545,6 +610,103 @@ fn progress_card(text: &str) -> Value {
             }],
         },
     })
+}
+
+async fn record_final_card_patch_failure(
+    store: &StoreHandle,
+    row: &OutboxRow,
+    operation: &OutboxOperation,
+    config: OutboxPumpConfig,
+    error: &LarkError,
+    shutdown: &CancellationToken,
+) -> ProcessOutcome {
+    let decision = delivery_decision(error);
+    if decision.applied == AppliedCertainty::Uncertain {
+        // A fallback could duplicate a final card update that Lark applied but
+        // whose response was lost or malformed.
+        return record_failure(
+            store,
+            row,
+            DeliveryClass::Uncertain,
+            config,
+            error,
+            shutdown,
+        )
+        .await;
+    }
+
+    let attempts = row.attempts.saturating_add(1);
+    if decision.retryability == Retryability::Retryable && attempts < STORE_OUTBOX_MAX_ATTEMPTS {
+        return record_failure(
+            store,
+            row,
+            DeliveryClass::Retryable,
+            config,
+            error,
+            shutdown,
+        )
+        .await;
+    }
+
+    let OutboxOperation::FinalizeProgressCard {
+        message_id,
+        thread_id,
+        fallback_markdown,
+        ..
+    } = operation
+    else {
+        return record_failure(
+            store,
+            row,
+            DeliveryClass::Permanent,
+            config,
+            error,
+            shutdown,
+        )
+        .await;
+    };
+    let fallback = OutboxOperation::ReplyMarkdownPost {
+        message_id: message_id.clone(),
+        thread_id: thread_id.clone(),
+        markdown: fallback_markdown.clone(),
+    };
+    let payload_json = match fallback.encode() {
+        Ok(payload) => payload,
+        Err(encode_error) => {
+            tracing::warn!(
+                error = %encode_error,
+                outbox_id = row.id,
+                "final-card fallback payload is undeliverable"
+            );
+            return record_failure(
+                store,
+                row,
+                DeliveryClass::Permanent,
+                config,
+                error,
+                shutdown,
+            )
+            .await;
+        }
+    };
+    match write_receipt(shutdown, config.poll_interval, || {
+        store.replace_outbox_with_fallback(row.id, payload_json.clone())
+    })
+    .await
+    {
+        Ok(()) => ProcessOutcome::Deferred,
+        Err(store_error) => {
+            // The original row remains `sending`. Recovery therefore marks it
+            // uncertain instead of risking a duplicate standalone final.
+            tracing::warn!(
+                error = %error,
+                store_error = %store_error,
+                outbox_id = row.id,
+                "definite final-card failure could not persist its fallback"
+            );
+            ProcessOutcome::Resolved
+        }
+    }
 }
 
 async fn record_failure(

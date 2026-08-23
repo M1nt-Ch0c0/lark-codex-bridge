@@ -19,30 +19,46 @@ use crate::limits::REPLY_TRUNCATION_MARKER;
 /// is repaired at end of input.
 #[must_use]
 pub fn render_lark_markdown(input: &str) -> String {
+    project_markdown(input, MarkdownCarrier::Post)
+}
+
+#[derive(Clone, Copy)]
+enum MarkdownCarrier {
+    Post,
+    Card2,
+}
+
+fn project_markdown(input: &str, carrier: MarkdownCarrier) -> String {
     let sanitized = sanitize_text(input);
     let lines: Vec<&str> = sanitized.lines().collect();
     let mut rendered = Vec::new();
-    let mut fence: Option<Fence> = None;
-    let mut html = HtmlState::default();
     let mut index = 0;
 
     while index < lines.len() {
         let line = lines[index];
-        if let Some(open) = fence.as_ref() {
-            if is_closing_fence(line, open) {
-                push_line(&mut rendered, open.closing_line());
-                fence = None;
-            } else {
-                push_line(&mut rendered, line.to_owned());
+        if let Some(source_fence) = parse_opening_fence(line) {
+            let mut end = index + 1;
+            while end < lines.len() && !is_closing_fence(lines[end], &source_fence) {
+                end += 1;
             }
-            index += 1;
-            continue;
-        }
-
-        if let Some(open) = parse_opening_fence(line) {
-            push_line(&mut rendered, open.opening_line());
-            fence = Some(open);
-            index += 1;
+            let marker_len = lines[index + 1..end]
+                .iter()
+                .map(|content| longest_run(content, '`'))
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1)
+                .max(3);
+            let canonical = Fence {
+                marker: '`',
+                length: marker_len,
+                language: source_fence.language,
+            };
+            push_line(&mut rendered, canonical.opening_line());
+            for content in &lines[index + 1..end] {
+                push_line(&mut rendered, (*content).to_owned());
+            }
+            push_line(&mut rendered, canonical.closing_line());
+            index = if end < lines.len() { end + 1 } else { end };
             continue;
         }
 
@@ -52,7 +68,7 @@ pub fn render_lark_markdown(input: &str) -> String {
         {
             let mut table = Vec::new();
             while index < lines.len() && contains_table_pipe(lines[index]) {
-                table.push(strip_html(lines[index], &mut html).trim().to_owned());
+                table.push(sanitize_inline(lines[index], carrier).trim().to_owned());
                 index += 1;
             }
             let marker_len = table
@@ -71,13 +87,8 @@ pub fn render_lark_markdown(input: &str) -> String {
             continue;
         }
 
-        let without_html = strip_html(line, &mut html);
-        push_line(&mut rendered, normalize_line(&without_html));
+        push_line(&mut rendered, normalize_line(line, carrier));
         index += 1;
-    }
-
-    if let Some(open) = fence {
-        push_line(&mut rendered, open.closing_line());
     }
 
     while rendered.last().is_some_and(String::is_empty) {
@@ -91,14 +102,7 @@ pub fn render_lark_markdown(input: &str) -> String {
 /// complete the original fence naturally.
 #[must_use]
 pub fn stabilize_streaming_markdown(input: &str) -> String {
-    let mut stable = sanitize_text(input);
-    if let Some(open) = open_fence_at_end(&stable) {
-        if !stable.ends_with('\n') {
-            stable.push('\n');
-        }
-        stable.push_str(&open.closing_line());
-    }
-    stable
+    project_markdown(input, MarkdownCarrier::Card2)
 }
 
 /// Splits already-rendered Lark Markdown into independently valid post parts.
@@ -270,14 +274,21 @@ fn parse_opening_fence(line: &str) -> Option<Fence> {
         return None;
     }
     let rest = &trimmed[marker.len_utf8() * length..];
-    let raw_language = rest.split_whitespace().next().unwrap_or_default();
-    let language: String = raw_language
-        .chars()
-        .filter(|character| {
+    let info = rest.trim();
+    let language = if info.is_empty() {
+        String::new()
+    } else if info.len() <= 32
+        && !info.chars().any(char::is_whitespace)
+        && info.chars().all(|character| {
             character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '+' | '#' | '.')
         })
-        .take(32)
-        .collect();
+    {
+        info.to_owned()
+    } else {
+        // Lark interprets the bytes after a fence as an active language/info
+        // selector. Never concatenate or partially retain malformed input.
+        "text".to_owned()
+    };
     Some(Fence {
         marker,
         length,
@@ -308,7 +319,7 @@ fn open_fence_at_end(text: &str) -> Option<Fence> {
     open
 }
 
-fn normalize_line(line: &str) -> String {
+fn normalize_line(line: &str, carrier: MarkdownCarrier) -> String {
     let mut body = line.trim();
     if body.is_empty() {
         return String::new();
@@ -322,21 +333,23 @@ fn normalize_line(line: &str) -> String {
     }
 
     let normalized = if let Some((identifier, text)) = footnote_definition(body) {
+        format!("Footnote {identifier}: {}", sanitize_inline(text, carrier))
+    } else if let Some((identifier, target)) = reference_definition(body) {
         format!(
-            "Footnote {identifier}: {}",
-            replace_footnote_references(text)
+            "Reference {identifier}: {}",
+            sanitize_inline(target, carrier)
         )
     } else if let Some(heading) = heading_text(body) {
-        format!("**{}**", replace_footnote_references(heading))
+        format!("**{}**", sanitize_inline(heading, carrier))
     } else if let Some((checked, text)) = task_item(body) {
         let marker = if checked { '☑' } else { '☐' };
-        format!("- {marker} {}", replace_footnote_references(text))
+        format!("- {marker} {}", sanitize_inline(text, carrier))
     } else if let Some(text) = unordered_item(body) {
-        format!("- {}", replace_footnote_references(text))
+        format!("- {}", sanitize_inline(text, carrier))
     } else if let Some((number, text)) = ordered_item(body) {
-        format!("{number}. {}", replace_footnote_references(text))
+        format!("{number}. {}", sanitize_inline(text, carrier))
     } else {
-        replace_footnote_references(body)
+        sanitize_inline(body, carrier)
     };
 
     if quoted {
@@ -404,28 +417,17 @@ fn footnote_definition(line: &str) -> Option<(&str, &str)> {
     Some((identifier, rest[end + 2..].trim()))
 }
 
-fn replace_footnote_references(text: &str) -> String {
-    let mut output = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find("[^") {
-        output.push_str(&rest[..start]);
-        let candidate = &rest[start + 2..];
-        let Some(end) = candidate.find(']') else {
-            output.push_str(&rest[start..]);
-            return output;
-        };
-        let identifier = &candidate[..end];
-        if identifier.is_empty() || !identifier.chars().all(is_footnote_identifier) {
-            output.push_str(&rest[start..=start + 2 + end]);
-        } else {
-            output.push_str("(footnote ");
-            output.push_str(identifier);
-            output.push(')');
-        }
-        rest = &candidate[end + 1..];
+fn reference_definition(line: &str) -> Option<(&str, &str)> {
+    let rest = line.strip_prefix('[')?;
+    if rest.starts_with('^') {
+        return None;
     }
-    output.push_str(rest);
-    output
+    let end = rest.find("]:")?;
+    let identifier = &rest[..end];
+    if identifier.is_empty() || !identifier.chars().all(is_footnote_identifier) {
+        return None;
+    }
+    Some((identifier, rest[end + 2..].trim()))
 }
 
 fn is_footnote_identifier(character: char) -> bool {
@@ -466,63 +468,257 @@ fn sanitize_text(input: &str) -> String {
         .replace('\r', "\n")
         .chars()
         .filter(|character| {
-            matches!(character, '\n' | '\t') || (!character.is_control() && *character != '\u{7f}')
+            matches!(character, '\n' | '\t')
+                || (!character.is_control()
+                    && *character != '\u{7f}'
+                    && !is_unicode_format_control(*character))
         })
         .collect()
 }
 
-#[derive(Default)]
-struct HtmlState {
-    comment: bool,
-    tag: bool,
+fn is_unicode_format_control(character: char) -> bool {
+    matches!(
+        character,
+        '\u{00ad}'
+            | '\u{061c}'
+            | '\u{070f}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08e2}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0001}'
+            | '\u{e0020}'..='\u{e007f}'
+    )
 }
 
-fn strip_html(line: &str, state: &mut HtmlState) -> String {
-    let mut output = String::with_capacity(line.len());
+fn sanitize_inline(text: &str, carrier: MarkdownCarrier) -> String {
+    let mut output = String::with_capacity(text.len());
     let mut cursor = 0;
-    while cursor < line.len() {
-        let rest = &line[cursor..];
-        if state.comment {
+    while cursor < text.len() {
+        let rest = &text[cursor..];
+
+        if rest.starts_with('`') {
+            let run = rest.bytes().take_while(|byte| *byte == b'`').count();
+            if let Some(end) = find_code_span_end(text, cursor + run, run) {
+                output.push_str(&text[cursor..end]);
+                cursor = end;
+                continue;
+            }
+        }
+
+        if rest.starts_with("![") {
+            if let Some((rendered, consumed)) = degrade_image(rest, carrier) {
+                output.push_str(&rendered);
+                cursor += consumed;
+                continue;
+            }
+        }
+
+        if rest.starts_with("[^") {
+            if let Some(end) = find_unescaped(rest, 2, b']') {
+                let identifier = &rest[2..end];
+                if !identifier.is_empty() && identifier.chars().all(is_footnote_identifier) {
+                    match carrier {
+                        MarkdownCarrier::Post => output.push_str("(footnote "),
+                        MarkdownCarrier::Card2 => output.push_str("[footnote "),
+                    }
+                    output.push_str(identifier);
+                    output.push(match carrier {
+                        MarkdownCarrier::Post => ')',
+                        MarkdownCarrier::Card2 => ']',
+                    });
+                    cursor += end + 1;
+                    continue;
+                }
+            }
+        }
+
+        if rest.starts_with('[') {
+            if let Some((rendered, consumed)) = preserve_or_degrade_link(rest, carrier) {
+                output.push_str(&rendered);
+                cursor += consumed;
+                continue;
+            }
+        }
+
+        if rest.starts_with("<!--") {
             if let Some(end) = rest.find("-->") {
-                state.comment = false;
                 cursor += end + 3;
             } else {
-                break;
+                output.push('‹');
+                output.push_str("!--");
+                cursor += 4;
             }
             continue;
         }
-        if state.tag {
+
+        if rest.starts_with('<') {
             if let Some(end) = rest.find('>') {
-                state.tag = false;
+                let inner = &rest[1..end];
+                if is_http_autolink(inner) {
+                    output.push('[');
+                    output.push_str(inner);
+                    output.push_str("](");
+                    output.push_str(inner);
+                    output.push(')');
+                } else if !looks_like_html_tag(inner) {
+                    // Not an HTML tag, but raw angle syntax is outside both
+                    // Lark carriers' supported subset. Keep it readable using
+                    // inert Unicode brackets.
+                    output.push('‹');
+                    output.push_str(inner);
+                    output.push('›');
+                }
                 cursor += end + 1;
-                push_space(&mut output);
-            } else {
-                break;
+                continue;
             }
-            continue;
-        }
-        if rest.starts_with("<!--") {
-            state.comment = true;
-            cursor += 4;
-            continue;
-        }
-        if rest.starts_with('<') && looks_like_html_tag(rest) {
-            state.tag = true;
+            // A malformed tag must not swallow subsequent quoted lines or be
+            // allowed to become active when a later stream delta arrives.
+            output.push('‹');
             cursor += 1;
             continue;
         }
+
         let character = rest.chars().next().expect("cursor is below line length");
         output.push(character);
         cursor += character.len_utf8();
     }
-    output.trim().to_owned()
+    output
 }
 
-fn looks_like_html_tag(rest: &str) -> bool {
-    if rest.starts_with("<http://") || rest.starts_with("<https://") {
-        return false;
+fn find_code_span_end(text: &str, mut cursor: usize, run: usize) -> Option<usize> {
+    while cursor < text.len() {
+        let rest = &text[cursor..];
+        if rest.starts_with('`') {
+            let candidate = rest.bytes().take_while(|byte| *byte == b'`').count();
+            if candidate == run {
+                return Some(cursor + run);
+            }
+            cursor += candidate;
+        } else {
+            cursor += rest
+                .chars()
+                .next()
+                .expect("cursor is below line length")
+                .len_utf8();
+        }
     }
-    let mut chars = rest[1..].chars();
+    None
+}
+
+fn degrade_image(rest: &str, carrier: MarkdownCarrier) -> Option<(String, usize)> {
+    let label_end = find_unescaped(rest, 2, b']')?;
+    let alt = sanitize_inline(&rest[2..label_end], carrier);
+    let after = label_end + 1;
+    let mut output = if alt.is_empty() {
+        "Image".to_owned()
+    } else {
+        format!("Image: {alt}")
+    };
+    if rest.as_bytes().get(after) == Some(&b'(') {
+        if let Some(end) = find_closing_paren(rest, after) {
+            let target = rest[after + 1..end].trim();
+            if !target.is_empty() {
+                output.push_str(" (");
+                output.push_str(target);
+                output.push(')');
+            }
+            return Some((output, end + 1));
+        }
+        output.push_str(" (invalid image target)");
+        return Some((output, rest.len()));
+    }
+    if rest.as_bytes().get(after) == Some(&b'[') {
+        if let Some(reference_end) = find_unescaped(rest, after + 1, b']') {
+            let identifier = &rest[after + 1..reference_end];
+            output.push_str(" (reference ");
+            output.push_str(if identifier.is_empty() {
+                &rest[2..label_end]
+            } else {
+                identifier
+            });
+            output.push(')');
+            return Some((output, reference_end + 1));
+        }
+    }
+    Some((output, after))
+}
+
+fn preserve_or_degrade_link(rest: &str, carrier: MarkdownCarrier) -> Option<(String, usize)> {
+    let label_end = find_unescaped(rest, 1, b']')?;
+    let label = sanitize_inline(&rest[1..label_end], carrier);
+    let after = label_end + 1;
+    if rest.as_bytes().get(after) == Some(&b'(') {
+        if let Some(end) = find_closing_paren(rest, after) {
+            let target = &rest[after + 1..end];
+            return Some((format!("[{label}]({target})"), end + 1));
+        }
+        return Some((format!("[{label}] (invalid link target)"), rest.len()));
+    }
+    if rest.as_bytes().get(after) == Some(&b'[') {
+        if let Some(reference_end) = find_unescaped(rest, after + 1, b']') {
+            let identifier = &rest[after + 1..reference_end];
+            let identifier = if identifier.is_empty() {
+                &rest[1..label_end]
+            } else {
+                identifier
+            };
+            return Some((
+                format!("{label} (reference {identifier})"),
+                reference_end + 1,
+            ));
+        }
+    }
+    Some((format!("[{label}]"), after))
+}
+
+fn find_unescaped(text: &str, start: usize, needle: u8) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut cursor = start;
+    while cursor < bytes.len() {
+        if bytes[cursor] == needle && (cursor == 0 || bytes[cursor - 1] != b'\\') {
+            return Some(cursor);
+        }
+        cursor += 1;
+    }
+    None
+}
+
+fn find_closing_paren(text: &str, opening: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0_u32;
+    let mut cursor = opening;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'\\' => cursor = cursor.saturating_add(1),
+            b'(' => depth = depth.saturating_add(1),
+            b')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(cursor);
+                }
+            }
+            _ => {}
+        }
+        cursor += 1;
+    }
+    None
+}
+
+fn is_http_autolink(inner: &str) -> bool {
+    (inner.starts_with("https://") || inner.starts_with("http://"))
+        && !inner.chars().any(char::is_whitespace)
+}
+
+fn looks_like_html_tag(inner: &str) -> bool {
+    let mut chars = inner.chars();
     let Some(mut first) = chars.next() else {
         return false;
     };
@@ -530,12 +726,6 @@ fn looks_like_html_tag(rest: &str) -> bool {
         first = chars.next().unwrap_or('>');
     }
     first.is_ascii_alphabetic()
-}
-
-fn push_space(output: &mut String) {
-    if !output.is_empty() && !output.ends_with(char::is_whitespace) {
-        output.push(' ');
-    }
 }
 
 fn push_line(lines: &mut Vec<String>, line: String) {

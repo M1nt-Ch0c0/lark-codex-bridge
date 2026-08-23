@@ -64,15 +64,87 @@ fn malformed_fences_are_repaired_but_streaming_source_can_continue() {
     let source = "before\n```rust unsafe options\nlet answer = 42;";
     assert_eq!(
         render_lark_markdown(source),
-        "before\n```rust\nlet answer = 42;\n```"
+        "before\n```text\nlet answer = 42;\n```"
     );
     assert_eq!(
         stabilize_streaming_markdown(source),
-        "before\n```rust unsafe options\nlet answer = 42;\n```"
+        "before\n```text\nlet answer = 42;\n```"
     );
     assert_eq!(
         stabilize_streaming_markdown("```rust\nlet answer = 42;\n```"),
         "```rust\nlet answer = 42;\n```"
+    );
+}
+
+#[test]
+fn carrier_sanitizers_neutralize_controls_without_rewriting_code_or_links() {
+    let source = concat!(
+        "> <section>quoted <at id=\"ou_attacker\">name</at></section>\n",
+        "outside <at user_id=\"ou_attacker\">mention</at> ",
+        "`<at id=\"literal\">code</at> [^inside]` ",
+        "[literal](https://example.com/a_(b)) [^outside]",
+        "\u{202e}\u{2066}\u{200b}",
+    );
+    let post = render_lark_markdown(source);
+    assert_eq!(
+        post,
+        concat!(
+            "> quoted name\n",
+            "outside mention `<at id=\"literal\">code</at> [^inside]` ",
+            "[literal](https://example.com/a_(b)) (footnote outside)",
+        )
+    );
+    let card = stabilize_streaming_markdown(source);
+    assert!(card.contains("`<at id=\"literal\">code</at> [^inside]`"));
+    assert!(card.contains("[footnote outside]"));
+    assert!(!card.contains("ou_attacker"));
+    for control in ['\u{202e}', '\u{2066}', '\u{200b}'] {
+        assert!(!post.contains(control));
+        assert!(!card.contains(control));
+    }
+}
+
+#[test]
+fn unsupported_images_references_and_tilde_fences_have_explicit_degradation() {
+    let source = concat!(
+        "![diagram](https://example.com/diagram.png)\n",
+        "![logo][asset]\n",
+        "[guide][docs]\n",
+        "[docs]: https://example.com/docs\n",
+        "~~~rust\n",
+        "let literal = \"```\";\n",
+        "~~~\n",
+    );
+    assert_eq!(
+        render_lark_markdown(source),
+        concat!(
+            "Image: diagram (https://example.com/diagram.png)\n",
+            "Image: logo (reference asset)\n",
+            "guide (reference docs)\n",
+            "Reference docs: https://example.com/docs\n",
+            "````rust\n",
+            "let literal = \"```\";\n",
+            "````",
+        )
+    );
+}
+
+#[test]
+fn malformed_inline_and_html_constructs_degrade_without_cross_line_swallowing() {
+    let source = concat!(
+        "> <div class=\"unfinished\"\n",
+        "> still quoted\n",
+        "[broken](https://example.com\n",
+        "<https://example.com/path>\n",
+    );
+    assert_eq!(
+        render_lark_markdown(source),
+        concat!(
+            "> ‹div class=\"unfinished\"\n",
+            "> still quoted\n",
+            "[broken] (invalid link target)\n",
+            "[https://example.com/path](https://example.com/path)",
+        )
     );
 }
 

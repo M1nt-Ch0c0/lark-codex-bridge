@@ -134,16 +134,33 @@ LARK_E2E=1 LARK_E2E_APP_ID=… LARK_E2E_APP_SECRET=… LARK_E2E_TENANT=feishu LA
   `tag=markdown`。每次发送的快照会临时补齐未闭合代码围栏，后续增量仍基于未修改的原文；
 - 拒绝、过载、失败、中断等短通知继续使用 `msg_type=text`。
 
-独立终答支持并保留段落、无序/有序列表、引用、行内代码、fenced code、粗体、
-斜体、删除线和行内链接。标题稳定降级为粗体段落；表格固定降级为 `text` fenced
-code（不依赖客户端不一致的表格支持）；HTML 标签/注释会移除，任务列表变成
-Unicode 复选框，脚注变成带标签的普通文本，复杂嵌套会展开成单层可读结构，连续空行会压缩。
-畸形或未闭合的 fenced code 会在终态补齐。
+`post/tag=md` 与 Card 2.0 `tag=markdown` 分别经过载体专用的净化入口。两者支持并保留
+段落、无序/有序列表、引用、行内代码、fenced code、粗体、斜体、删除线和行内链接；
+行内代码与链接字面量不会被 HTML/脚注规则误写。标题稳定降级为粗体段落，表格固定降级为
+`text` fenced code（不依赖客户端不一致的表格支持），任务列表变成 Unicode 复选框，脚注
+变成带标签的普通文本且绝不在代码 span 内替换。复杂嵌套会展开成单层可读结构，连续空行会
+压缩。
+
+不支持的图片会降级为 `Image: alt (target)`，reference link/image 会降级为带 reference 标签的
+可读文本，reference definition 会显示为普通文本。`~~~` fence 统一转成长度安全的反引号 fence；
+畸形 info string 整体降级为 `text`，未闭合 fence 在每个发送快照中补齐。原始 HTML 标签/注释
+只在代码 span 外移除，畸形标签使用惰性的 Unicode 尖括号显示且不会跨行吞掉引用内容。
+可能触发真实提及的 `<at …>` 控制、双向/零宽 Unicode format controls 会在两个载体中净化；
+代码 span 内的 `<at …>` 仅作为代码字面量保留，不能触发提及。
 
 转换先于分片。每个 `post` 分片同时检查 4,000 个 Unicode 标量上限和最终 Lark
 reply JSON 的精确序列化字节数（包括内层 JSON 转义与话题回复标记），最多 8 片；在
 代码块内切分时会闭合当前片并在下一片重新打开相同围栏，超出总预算则显式附加
 `…[truncated]`。
+
+持久 outbox 从本功能起只写 payload v2；升级后的 reader 同时严格读取 v1/v2。历史 v1
+`reply_text` 始终保持纯文本载体，不会因内容像 Markdown 而改型；历史终态 Card 的备用正文
+会先经过当前净化器再成为 `post`。数据库 `PRAGMA user_version=6` 是显式降级栅栏：升级前应
+停掉旧进程并备份数据库，升级后不得再用只认识 payload v1/schema v5 的旧二进制打开同一库。
+确定未生效的终态 Card PATCH 在永久拒绝或瞬态重试耗尽后，会把同一个确定性 outbox 行原子
+转换成 standalone Markdown post；响应丢失、畸形或其他 `uncertain_delivery` 绝不会触发备用
+发送。仅 HTTP 429/5xx 和平台明确记录的限频码会重试；校验、卡片格式、机器人不在会话、消息
+已撤回等明确业务拒绝直接视为永久失败。
 
 真实桌面端/移动端 Markdown 验收是单独的显式门控测试。先在目标会话发送一条可供
 机器人回复的消息并取得其 `message_id`，准备三个不纳入 Git 的本地路径，然后运行：
@@ -158,17 +175,27 @@ LARK_MARKDOWN_E2E_ATTESTATION=/tmp/lark-markdown-attestation.json \
   cargo test --test lark_markdown_smoke --locked -- --ignored --nocapture
 ```
 
-测试发出覆盖全部子集及表格降级的真实 `post` 后会打印回复 `message_id`，默认等待
-5 分钟。在飞书桌面端和移动端分别打开该回复、确认排版可读且表格显示为 fenced text，
-再把两张新截图保存到上述路径，并写入同样是新生成的验收文件：
+测试发出覆盖全部子集及表格降级的真实 `post` 后会打印回复 `message_id`、一次性 `nonce`
+和发送正文 SHA-256，默认等待 5 分钟。在飞书桌面端和移动端分别打开该回复、确认排版可读
+且表格显示为 fenced text，再把两张不同的新截图保存到上述路径，计算各自 SHA-256，并写入
+同样是新生成的强类型验收文件：
 
 ```json
-{"message_id":"om_测试打印的回复ID","desktop":"pass","mobile":"pass","table":"fenced"}
+{
+  "version": 1,
+  "nonce": "测试打印的一次性nonce",
+  "message_id": "om_测试打印的回复ID",
+  "markdown_sha256": "测试打印的正文hash",
+  "desktop": {"verdict": "pass", "sha256": "桌面截图hash"},
+  "mobile": {"verdict": "pass", "sha256": "移动截图hash"},
+  "table": "fenced"
+}
 ```
 
-测试会校验两张截图是本次发送后生成的 PNG/JPEG/WebP，并要求验收文件中的消息 ID
-精确匹配；缺任一端证据、复用旧文件或只看到 gate skip 均不算通过。截图可能包含会话
-信息，因此只作为操作者保存的外部验收证据，不应提交仓库。
+测试在发送前记录三个证据文件的旧 hash，只接受发送完成后发生变化且能真实解码、像素数有界、
+内容 hash 不同的 PNG/JPEG/WebP；验收文件还必须绑定本次 nonce、message ID、正文 hash 和两张
+截图 hash。显式运行 ignored smoke 却没有 `LARK_MARKDOWN_E2E=1` 或任一配置会直接失败，不会
+以 skip 冒充证据。截图可能包含会话信息，因此只作为操作者保存的外部验收证据，不应提交仓库。
 
 仓库只跟踪稳定的产品说明；缺陷和遗留项通过 GitHub Issue 与对应 PR 跟踪。实施计划、
 实时进度、Agent 接管记录和临时测试证据属于本地开发材料，不发布到 Git。

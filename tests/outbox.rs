@@ -22,8 +22,8 @@ use lark_codex_bridge::lark::token::TenantTokenProvider;
 use lark_codex_bridge::lark::transport::TransportState;
 use lark_codex_bridge::limits::STORE_OUTBOX_MAX_ATTEMPTS;
 use lark_codex_bridge::outbox::{
-    DeliveryClass, OutboxError, OutboxOperation, OutboxPump, OutboxPumpConfig, OutboxReplySink,
-    classify_delivery,
+    AppliedCertainty, DeliveryClass, OutboxError, OutboxOperation, OutboxPump, OutboxPumpConfig,
+    OutboxReplySink, Retryability, classify_delivery, delivery_decision,
 };
 use lark_codex_bridge::render::ProjectedReply;
 use lark_codex_bridge::runtime::scope::{
@@ -313,7 +313,7 @@ fn payload_roundtrips_and_redacts_text() {
         text: "secret reply body".to_owned(),
     };
     let json = operation.encode().expect("encode");
-    assert!(json.contains("\"version\":1"));
+    assert!(json.contains("\"version\":2"));
     assert_eq!(OutboxOperation::decode(&json).expect("decode"), operation);
 
     let rendered = format!("{operation:?}");
@@ -336,7 +336,7 @@ fn markdown_post_payload_roundtrips_without_losing_its_semantic_type() {
 
 #[test]
 fn payload_rejects_unknown_fields() {
-    let json = r#"{"version":1,"op":"reply_text","message_id":"m","text":"t","bogus":1}"#;
+    let json = r#"{"version":2,"op":"reply_text","message_id":"m","text":"t","bogus":1}"#;
     assert!(matches!(
         OutboxOperation::decode(json),
         Err(OutboxError::Deserialize)
@@ -345,19 +345,68 @@ fn payload_rejects_unknown_fields() {
 
 #[test]
 fn payload_rejects_wrong_version() {
-    let json = r#"{"version":2,"op":"reply_text","message_id":"m","text":"t"}"#;
+    let json = r#"{"version":3,"op":"reply_text","message_id":"m","text":"t"}"#;
     assert!(matches!(
         OutboxOperation::decode(json),
-        Err(OutboxError::UnsupportedVersion { version: 2 })
+        Err(OutboxError::UnsupportedVersion { version: 3 })
     ));
 }
 
 #[test]
 fn payload_rejects_unknown_operation() {
-    let json = r#"{"version":1,"op":"send_text","message_id":"m","text":"t"}"#;
+    let json = r#"{"version":2,"op":"send_text","message_id":"m","text":"t"}"#;
     assert!(matches!(
         OutboxOperation::decode(json),
         Err(OutboxError::UnknownOperation)
+    ));
+}
+
+#[test]
+fn payload_v1_reader_preserves_text_carrier_and_safely_projects_card_fallback() {
+    let text = r#"{"version":1,"op":"reply_text","message_id":"om_old","thread_id":null,"text":"**literal Markdown**"}"#;
+    assert!(matches!(
+        OutboxOperation::decode(text).expect("legacy text"),
+        OutboxOperation::ReplyText { text, .. } if text == "**literal Markdown**"
+    ));
+
+    let final_card = r##"{"version":1,"op":"finalize_progress_card","message_id":"om_old","thread_id":null,"anchor_key":"old:progress","text":"# Done\n<at id=\"ou_bad\">name</at> `[^code]` [^note]"}"##;
+    let decoded = OutboxOperation::decode(final_card).expect("legacy final card");
+    let OutboxOperation::FinalizeProgressCard {
+        text,
+        fallback_markdown,
+        ..
+    } = decoded
+    else {
+        panic!("expected legacy progress finalization")
+    };
+    assert!(
+        text.contains("ou_bad"),
+        "card source remains a private field"
+    );
+    assert_eq!(
+        fallback_markdown,
+        "**Done**\nname `[^code]` (footnote note)"
+    );
+    assert!(!fallback_markdown.contains("<at"));
+}
+
+#[test]
+fn payload_versions_are_strict_at_the_carrier_boundary() {
+    let v1_with_v2_field = r#"{"version":1,"op":"finalize_progress_card","message_id":"m","anchor_key":"a","text":"t","fallback_markdown":"**t**"}"#;
+    assert!(matches!(
+        OutboxOperation::decode(v1_with_v2_field),
+        Err(OutboxError::Deserialize)
+    ));
+    let v1_new_operation =
+        r#"{"version":1,"op":"reply_markdown_post","message_id":"m","text":"**t**"}"#;
+    assert!(matches!(
+        OutboxOperation::decode(v1_new_operation),
+        Err(OutboxError::UnknownOperation)
+    ));
+    let v2_missing_fallback = r#"{"version":2,"op":"finalize_progress_card","message_id":"m","anchor_key":"a","text":"t"}"#;
+    assert!(matches!(
+        OutboxOperation::decode(v2_missing_fallback),
+        Err(OutboxError::Invalid { .. })
     ));
 }
 
@@ -383,7 +432,7 @@ fn delivery_classification_distinguishes_the_three_outcomes() {
     assert_eq!(
         classify_delivery(&LarkError::Retryable {
             context: "send",
-            code: Some(230_001),
+            code: Some(99_991_400),
         }),
         DeliveryClass::Retryable
     );
@@ -394,14 +443,14 @@ fn delivery_classification_distinguishes_the_three_outcomes() {
         }),
         DeliveryClass::Uncertain
     );
-    // An explicit 4xx rejection is a definitive server response (nothing was
-    // sent), so it must be safe-to-retry — never uncertain.
+    // An explicit 4xx rejection is definitely not applied, but validation and
+    // business failures are permanent rather than retryable.
     assert_eq!(
         classify_delivery(&LarkError::ProtocolViolation {
             context: "send",
             code: Some(400),
         }),
-        DeliveryClass::Retryable
+        DeliveryClass::Permanent
     );
     // A protocol violation without a peer status (unparsable body, missing
     // fields) means the send may have been applied: uncertain.
@@ -425,6 +474,30 @@ fn delivery_classification_distinguishes_the_three_outcomes() {
             limit: 256 * 1024,
         }),
         DeliveryClass::Permanent
+    );
+    assert_eq!(
+        delivery_decision(&LarkError::ProtocolViolation {
+            context: "recalled message",
+            code: Some(230_020),
+        }),
+        lark_codex_bridge::outbox::DeliveryDecision {
+            applied: AppliedCertainty::DefinitelyNotApplied,
+            retryability: Retryability::Permanent,
+        }
+    );
+    assert_eq!(
+        delivery_decision(&LarkError::protocol("malformed post-write response")),
+        lark_codex_bridge::outbox::DeliveryDecision {
+            applied: AppliedCertainty::Uncertain,
+            retryability: Retryability::Permanent,
+        }
+    );
+    assert_eq!(
+        delivery_decision(&LarkError::invalid_request("local preflight")),
+        lark_codex_bridge::outbox::DeliveryDecision {
+            applied: AppliedCertainty::DefinitelyNotApplied,
+            retryability: Retryability::Permanent,
+        }
     );
 }
 
@@ -581,7 +654,192 @@ async fn progress_cards_are_created_updated_and_finalized_through_the_outbox() {
         card_markdown(&requests[2]),
         "working\n```rust\nlet x = 1;\nlet y = 2;\n```"
     );
+    let initial_card = serde_json::to_string(&serde_json::json!({
+        "schema": "2.0",
+        "body": {"elements": [{
+            "tag": "markdown",
+            "content": "working\n```rust\nlet x = 1;\n```",
+        }]},
+    }))
+    .expect("initial Card2");
+    let final_card = serde_json::to_string(&serde_json::json!({
+        "schema": "2.0",
+        "body": {"elements": [{
+            "tag": "markdown",
+            "content": "working\n```rust\nlet x = 1;\nlet y = 2;\n```",
+        }]},
+    }))
+    .expect("final Card2");
+    let create_body: serde_json::Value =
+        serde_json::from_slice(&requests[0].body).expect("Card2 create body");
+    let update_body: serde_json::Value =
+        serde_json::from_slice(&requests[1].body).expect("Card2 update body");
+    let final_body: serde_json::Value =
+        serde_json::from_slice(&requests[2].body).expect("Card2 final body");
+    assert_eq!(
+        create_body,
+        serde_json::json!({"msg_type": "interactive", "content": initial_card})
+    );
+    assert_eq!(update_body, serde_json::json!({"content": final_card}));
+    assert_eq!(final_body, serde_json::json!({"content": final_card}));
 
+    pump.shutdown().await;
+}
+
+#[tokio::test]
+async fn permanent_final_patch_failure_persists_one_deterministic_post_fallback() {
+    let server = StubServer::start(token_plus(|request| {
+        if request.method == "PATCH" {
+            StubResponse::json(200, r#"{"code":230002,"msg":"invalid card format"}"#)
+        } else {
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("reply body");
+            if body["msg_type"] == "interactive" {
+                ok_message("om_progress")
+            } else {
+                ok_message("om_fallback")
+            }
+        }
+    }))
+    .await;
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = OutboxReplySink::new(store.clone());
+    sink.progress(TurnProgress {
+        turn_row_id: 91,
+        scope_key: "im:oc_chat".to_owned(),
+        source: source("evt_1", "om_parent"),
+        sequence: 0,
+        text: "working".to_owned(),
+    })
+    .await
+    .expect("progress");
+    let finalization = completed_finalization(91, "ignored");
+    let projected = ProjectedReply::ProgressFinal {
+        text: "# Finished\n<at id=\"ou_bad\">safe</at>".to_owned(),
+    };
+    sink.finalize_projected(finalization.clone(), projected.clone())
+        .await
+        .expect("finalize");
+
+    let (_, rx) = watch::channel(TransportState::Connected);
+    let pump = OutboxPump::spawn(store.clone(), api_for(&server), rx, fast_config());
+    let row = wait_for_state(&store, 2, OutboxState::Sent).await;
+    assert_eq!(row.idempotency_key, "91:progress:final");
+    assert_eq!(row.receipt_message_id.as_deref(), Some("om_fallback"));
+    assert!(matches!(
+        OutboxOperation::decode(&row.payload_json).expect("persisted fallback"),
+        OutboxOperation::ReplyMarkdownPost { markdown, .. }
+            if markdown == "**Finished**\nsafe"
+    ));
+    let requests = reply_requests(&server);
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].method, "POST");
+    assert_eq!(requests[1].method, "PATCH");
+    assert_eq!(requests[2].method, "POST");
+    assert_eq!(reply_markdown(&requests[2]), "**Finished**\nsafe");
+
+    sink.finalize_projected(finalization, projected)
+        .await
+        .expect("idempotent replay");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        reply_requests(&server).len(),
+        3,
+        "fallback is never duplicated"
+    );
+    pump.shutdown().await;
+}
+
+#[tokio::test]
+async fn exhausted_transient_final_patch_falls_back_only_after_attempt_cap() {
+    let server = StubServer::start(token_plus(|request| {
+        if request.method == "PATCH" {
+            StubResponse::json(200, r#"{"code":99991400,"msg":"rate limited"}"#)
+        } else {
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("reply body");
+            if body["msg_type"] == "interactive" {
+                ok_message("om_progress")
+            } else {
+                ok_message("om_after_exhaustion")
+            }
+        }
+    }))
+    .await;
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = OutboxReplySink::new(store.clone());
+    sink.progress(TurnProgress {
+        turn_row_id: 92,
+        scope_key: "im:oc_chat".to_owned(),
+        source: source("evt_1", "om_parent"),
+        sequence: 0,
+        text: "working".to_owned(),
+    })
+    .await
+    .expect("progress");
+    sink.finalize_projected(
+        completed_finalization(92, "ignored"),
+        ProjectedReply::ProgressFinal {
+            text: "complete".to_owned(),
+        },
+    )
+    .await
+    .expect("finalize");
+
+    let (_, rx) = watch::channel(TransportState::Connected);
+    let pump = OutboxPump::spawn(store.clone(), api_for(&server), rx, fast_config());
+    let row = wait_for_state(&store, 2, OutboxState::Sent).await;
+    assert_eq!(
+        row.receipt_message_id.as_deref(),
+        Some("om_after_exhaustion")
+    );
+    let requests = reply_requests(&server);
+    let patches = requests
+        .iter()
+        .filter(|request| request.method == "PATCH")
+        .count();
+    assert_eq!(patches, usize::try_from(STORE_OUTBOX_MAX_ATTEMPTS).unwrap());
+    assert_eq!(requests.last().expect("fallback").method, "POST");
+    pump.shutdown().await;
+}
+
+#[tokio::test]
+async fn malformed_final_patch_response_is_uncertain_and_never_falls_back() {
+    let server = StubServer::start(token_plus(|request| {
+        if request.method == "PATCH" {
+            StubResponse::json(200, "{")
+        } else {
+            ok_message("om_progress")
+        }
+    }))
+    .await;
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = OutboxReplySink::new(store.clone());
+    sink.progress(TurnProgress {
+        turn_row_id: 93,
+        scope_key: "im:oc_chat".to_owned(),
+        source: source("evt_1", "om_parent"),
+        sequence: 0,
+        text: "working".to_owned(),
+    })
+    .await
+    .expect("progress");
+    sink.finalize_projected(
+        completed_finalization(93, "ignored"),
+        ProjectedReply::ProgressFinal {
+            text: "complete".to_owned(),
+        },
+    )
+    .await
+    .expect("finalize");
+
+    let (_, rx) = watch::channel(TransportState::Connected);
+    let pump = OutboxPump::spawn(store.clone(), api_for(&server), rx, fast_config());
+    wait_for_state(&store, 2, OutboxState::UncertainDelivery).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let requests = reply_requests(&server);
+    assert_eq!(requests.len(), 2, "uncertain PATCH must not trigger a post");
+    assert_eq!(requests[1].method, "PATCH");
     pump.shutdown().await;
 }
 
@@ -882,7 +1140,7 @@ async fn retryable_failure_backs_off_and_eventually_succeeds() {
         let replies = Arc::clone(&replies);
         move |_| {
             if replies.fetch_add(1, Ordering::SeqCst) == 0 {
-                StubResponse::json(200, r#"{"code":230001,"msg":"busy"}"#)
+                StubResponse::json(200, r#"{"code":99991400,"msg":"rate limited"}"#)
             } else {
                 ok_message("om_retried")
             }
@@ -907,10 +1165,9 @@ async fn retryable_failure_backs_off_and_eventually_succeeds() {
 }
 
 #[tokio::test]
-async fn explicit_http_4xx_rejection_is_bounded_retry_not_uncertain() {
-    // A definitive 4xx (the server responded and sent nothing) must never be
-    // parked as uncertain_delivery: it is safe to retry, bounded by the
-    // attempt cap, and then terminally failed.
+async fn explicit_http_4xx_validation_rejection_is_permanent_not_uncertain() {
+    // A definitive validation rejection was not applied, but sending the same
+    // invalid body again cannot repair it.
     let server = StubServer::start(token_plus(|_| {
         StubResponse::json(400, r#"{"code":400,"msg":"bad request"}"#)
     }))
@@ -923,11 +1180,11 @@ async fn explicit_http_4xx_rejection_is_bounded_retry_not_uncertain() {
 
     let row = wait_for_state(&store, id, OutboxState::Failed).await;
     assert_eq!(row.state, OutboxState::Failed);
-    assert_eq!(row.attempts, STORE_OUTBOX_MAX_ATTEMPTS);
+    assert_eq!(row.attempts, 0);
     assert_eq!(
         reply_requests(&server).len(),
-        usize::try_from(STORE_OUTBOX_MAX_ATTEMPTS).unwrap(),
-        "the bounded retry must exhaust the attempt cap exactly once per attempt"
+        1,
+        "a permanent validation rejection must not be retried"
     );
 
     // A failed row is terminal: it is never re-claimed.
@@ -952,7 +1209,7 @@ async fn retryable_exhaustion_marks_row_failed_and_stops_claiming() {
     // A persistently retryable send failure must exhaust the bounded attempt
     // budget and terminally fail the row, never re-claiming it afterwards.
     let server = StubServer::start(token_plus(|_| {
-        StubResponse::json(200, r#"{"code":230001,"msg":"busy"}"#)
+        StubResponse::json(200, r#"{"code":99991400,"msg":"rate limited"}"#)
     }))
     .await;
     let api = api_for(&server);
@@ -1155,7 +1412,7 @@ async fn retryable_failure_does_not_reorder_the_batch() {
         let replies = Arc::clone(&replies);
         move |request| {
             if request.path == REPLY_PATH && replies.fetch_add(1, Ordering::SeqCst) == 0 {
-                StubResponse::json(200, r#"{"code":230001,"msg":"busy"}"#)
+                StubResponse::json(200, r#"{"code":99991400,"msg":"rate limited"}"#)
             } else {
                 ok_message("om_delivered")
             }
@@ -1212,7 +1469,7 @@ async fn retryable_failure_defers_pending_successors_across_poll_cycles() {
         let replies = Arc::clone(&replies);
         move |_| {
             if replies.fetch_add(1, Ordering::SeqCst) == 0 {
-                StubResponse::json(200, r#"{"code":230001,"msg":"busy"}"#)
+                StubResponse::json(200, r#"{"code":99991400,"msg":"rate limited"}"#)
             } else {
                 ok_message("om_delivered")
             }
@@ -1265,7 +1522,7 @@ async fn concurrent_enqueue_after_retry_does_not_overtake_the_failed_row() {
         let replies = Arc::clone(&replies);
         move |_| {
             if replies.fetch_add(1, Ordering::SeqCst) == 0 {
-                StubResponse::json(200, r#"{"code":230001,"msg":"busy"}"#)
+                StubResponse::json(200, r#"{"code":99991400,"msg":"rate limited"}"#)
             } else {
                 ok_message("om_delivered")
             }

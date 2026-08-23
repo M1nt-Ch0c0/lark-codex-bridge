@@ -734,7 +734,7 @@ fn is_false(value: &bool) -> bool {
 
 fn text_content(text: &str) -> Result<String, LarkError> {
     serde_json::to_string(&serde_json::json!({ "text": text }))
-        .map_err(|_| LarkError::protocol("serializing a text message"))
+        .map_err(|_| LarkError::invalid_request("serializing a text message"))
 }
 
 fn post_markdown_content(markdown: &str) -> Result<String, LarkError> {
@@ -746,7 +746,7 @@ fn post_markdown_content(markdown: &str) -> Result<String, LarkError> {
             }]],
         },
     }))
-    .map_err(|_| LarkError::protocol("serializing a Markdown post message"))
+    .map_err(|_| LarkError::invalid_request("serializing a Markdown post message"))
 }
 
 /// Returns the exact serialized byte length of a Markdown-post reply body.
@@ -768,12 +768,12 @@ pub fn post_markdown_reply_body_len(markdown: &str, in_thread: bool) -> usize {
 }
 
 fn card_content(card: &Value) -> Result<String, LarkError> {
-    serde_json::to_string(card).map_err(|_| LarkError::protocol("serializing a card"))
+    serde_json::to_string(card).map_err(|_| LarkError::invalid_request("serializing a card"))
 }
 
 fn check_send_body(body: &impl Serialize) -> Result<(), LarkError> {
     let len = serde_json::to_vec(body)
-        .map_err(|_| LarkError::protocol("serializing an outbound body"))?
+        .map_err(|_| LarkError::invalid_request("serializing an outbound body"))?
         .len();
     if len > LARK_MAX_SEND_BODY_BYTES {
         return Err(LarkError::exhausted(
@@ -805,7 +805,7 @@ fn check_path_segment(id: &str) -> Result<(), LarkError> {
     {
         return Ok(());
     }
-    Err(LarkError::protocol(
+    Err(LarkError::invalid_request(
         "server-issued ID contains unsafe characters",
     ))
 }

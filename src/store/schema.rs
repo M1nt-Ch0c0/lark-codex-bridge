@@ -205,4 +205,13 @@ ALTER TABLE threads ADD COLUMN context_tools_version INTEGER NOT NULL DEFAULT 0
     CHECK (context_tools_version >= 0);
 ",
     },
+    Migration {
+        version: 6,
+        name: "fence versioned Markdown outbox payloads",
+        // No table shape changes are needed: outbox payloads are deliberately
+        // opaque JSON. Advancing `user_version` is nevertheless required so a
+        // v1-only binary refuses to open a database after this binary may have
+        // persisted payload v2 rows it cannot understand.
+        sql: "SELECT 1;",
+    },
 ];

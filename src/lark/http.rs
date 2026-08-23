@@ -143,8 +143,9 @@ impl LarkHttp {
             .bearer_auth(bearer.expose_secret());
         let (status, bytes) = self
             .execute(request, "POSTing an OpenAPI JSON request")
-            .await?;
-        ensure_success(status, "POSTing an OpenAPI JSON request")?;
+            .await
+            .map_err(post_write_failure)?;
+        ensure_openapi_success(status, &bytes, "POSTing an OpenAPI JSON request")?;
         parse_json(&bytes, "parsing an OpenAPI JSON response")
     }
 
@@ -173,8 +174,9 @@ impl LarkHttp {
             .bearer_auth(bearer.expose_secret());
         let (status, bytes) = self
             .execute(request, "PATCHing an OpenAPI JSON request")
-            .await?;
-        ensure_success(status, "PATCHing an OpenAPI JSON request")?;
+            .await
+            .map_err(post_write_failure)?;
+        ensure_openapi_success(status, &bytes, "PATCHing an OpenAPI JSON request")?;
         parse_json(&bytes, "parsing an OpenAPI JSON response")
     }
 
@@ -372,6 +374,47 @@ fn ensure_success(status: StatusCode, context: &'static str) -> Result<(), LarkE
     // HTTP status as a `code` so the delivery classifier can tell a rejected
     // (safe-to-retry, bounded) send from an unparseable response.
     Err(LarkError::ProtocolViolation { context, code })
+}
+
+/// Lark sometimes returns a structured `OpenAPI` error envelope with HTTP 400,
+/// including the documented `99991400` application-frequency limit. Preserve
+/// that more specific business code before falling back to HTTP status
+/// classification. A contradictory `code: 0` never turns a non-success HTTP
+/// response into success.
+fn ensure_openapi_success(
+    status: StatusCode,
+    body: &[u8],
+    context: &'static str,
+) -> Result<(), LarkError> {
+    if status.is_success() {
+        return Ok(());
+    }
+    // HTTP transport-level throttling and server failures remain transient
+    // even when a proxy or gateway happens to attach an unrelated JSON code.
+    if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+        return ensure_success(status, context);
+    }
+    if let Some(code) = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("code").and_then(serde_json::Value::as_i64))
+        .filter(|code| *code != 0)
+    {
+        return check_code(code, context);
+    }
+    ensure_success(status, context)
+}
+
+/// Converts a bounded-response failure after a mutating request was started
+/// into an uncertain outcome. The peer may already have applied the write even
+/// though its response body could not be retained. Transport failures already
+/// use a no-code `Retryable` and therefore remain uncertain as well.
+fn post_write_failure(error: LarkError) -> LarkError {
+    match error {
+        LarkError::Exhausted { .. } => {
+            LarkError::protocol("mutating OpenAPI response exceeded the response byte cap")
+        }
+        other => other,
+    }
 }
 
 fn parse_json<R: DeserializeOwned>(body: &[u8], context: &'static str) -> Result<R, LarkError> {
