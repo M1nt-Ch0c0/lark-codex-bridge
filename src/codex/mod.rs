@@ -2,6 +2,7 @@
 
 pub mod client;
 pub mod compat;
+pub mod external;
 pub mod process;
 pub mod protocol;
 pub mod rpc;

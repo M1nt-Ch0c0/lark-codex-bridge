@@ -1,7 +1,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use lark_codex_bridge::codex::types::{ApprovalPolicy, GranularApprovalPolicy, SandboxMode};
+use lark_codex_bridge::codex::{
+    external::CodexBackendConfig,
+    types::{ApprovalPolicy, GranularApprovalPolicy, SandboxMode},
+};
 use lark_codex_bridge::config::{
     BridgeConfig, CodexSection, ConcurrencyConfig, PathsSection, WorkspacePolicy,
 };
@@ -182,7 +185,12 @@ fn full_config_round_trips_and_resolves_only_runtime_relative_paths() {
         config.paths.attachment_cache,
         temp.path().join("cache/attachments")
     );
-    assert_eq!(config.codex.binary, PathBuf::from("/opt/codex/bin/codex"));
+    assert!(matches!(
+        config.codex.backend,
+        CodexBackendConfig::SpawnedStdio { ref binary, ref codex_home }
+            if binary == &PathBuf::from("/opt/codex/bin/codex")
+                && codex_home.as_deref() == Some(Path::new("/opt/codex/home"))
+    ));
 
     let encoded = toml::to_string(&config).expect("full config should serialize");
     let reparsed = toml::from_str::<BridgeConfig>(&encoded).expect("full config should reparse");
@@ -977,8 +985,10 @@ fn debug_and_error_output_never_echo_sensitive_config_or_requested_paths() {
     fs::create_dir_all(&safe).expect("safe root should be created");
     let mut config = policy_config(safe.clone());
     config.owners = vec!["ou_extremely_sensitive_owner_123456".to_owned()];
-    config.codex.binary = PathBuf::from("/outside/secret-codex");
-    config.codex.codex_home = Some(PathBuf::from("/outside/secret-home"));
+    config.codex.backend = CodexBackendConfig::SpawnedStdio {
+        binary: PathBuf::from("/outside/secret-codex"),
+        codex_home: Some(PathBuf::from("/outside/secret-home")),
+    };
     config.paths.database = PathBuf::from("/outside/secret.sqlite");
     config.paths.attachment_cache = PathBuf::from("/outside/secret-cache");
     let debug = format!("{config:?}");
@@ -1008,8 +1018,10 @@ fn unvalidated_config_debug_shows_only_counts_presence_and_static_summaries() {
     let mut config = policy_config(path_sentinel.clone());
     config.owners = vec!["ou_sensitive_OWNER_FRAGMENT".to_owned()];
     config.default_workspace = Some(path_sentinel.clone());
-    config.codex.binary = path_sentinel.join("binary-sentinel");
-    config.codex.codex_home = Some(path_sentinel.join("home-sentinel"));
+    config.codex.backend = CodexBackendConfig::SpawnedStdio {
+        binary: path_sentinel.join("binary-sentinel"),
+        codex_home: Some(path_sentinel.join("home-sentinel")),
+    };
     config.paths.database = path_sentinel.join("database-sentinel");
     config.paths.attachment_cache = path_sentinel.join("cache-sentinel");
 
