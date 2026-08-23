@@ -66,7 +66,7 @@ cargo run --locked -- run -v
 cargo run --locked -- -vv run
 ```
 
-设置 `RUST_LOG` 时会完整覆盖上述默认过滤器，并使用
+设置 `RUST_LOG` 时会覆盖上述 bridge 默认过滤器，并使用
 [`tracing-subscriber` EnvFilter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html)
 语法；无效值会在启动前报错并给出示例，不会被静默忽略：
 
@@ -74,6 +74,10 @@ cargo run --locked -- -vv run
 RUST_LOG='warn,lark_codex_bridge=debug' cargo run --locked -- run
 cargo run --locked -- --log-format json run -v
 ```
+
+为维持日志脱敏边界，终端 subscriber 只接收 `lark_codex_bridge` 自身经过审计的事件；
+即使设置 `RUST_LOG=trace` 或指定第三方 crate，也不会输出 HTTP/WebSocket 依赖库可能包含
+完整 endpoint、header 或 frame payload 的诊断日志。
 
 human 与 JSON 日志都只写入 stderr；`codex probe`、`lark probe` 和认证检查等命令的
 stdout JSON 契约保持独立。因此 launchd/systemd 可分别重定向 stdout 与 stderr，后者
