@@ -159,6 +159,12 @@ struct SweepRound {
     cycle_complete: bool,
 }
 
+#[derive(Clone, Copy)]
+enum SweepRootMode {
+    CreateIfMissing,
+    ExistingOnly,
+}
+
 impl StaleWorkspaceSweeper {
     /// Creates the process-local traversal without touching storage.
     pub(crate) fn for_private_root() -> Self {
@@ -172,25 +178,59 @@ impl StaleWorkspaceSweeper {
         }
     }
 
-    /// Verifies storage and performs one hard-bounded startup or periodic
-    /// cleanup round.
+    /// Creates or verifies storage and performs one hard-bounded cleanup
+    /// round for an enabled ASR configuration.
     pub(crate) fn sweep_once(&mut self) -> Result<(), AsrError> {
-        self.sweep_round(ASR_STALE_AGE, ASR_STALE_SCAN_LIMIT)
-            .map(|_| ())
+        self.sweep_round_with_mode(
+            ASR_STALE_AGE,
+            ASR_STALE_SCAN_LIMIT,
+            SweepRootMode::CreateIfMissing,
+        )
+        .map(|_| ())
     }
 
+    /// Sweeps a pre-existing private root without creating one when ASR is
+    /// disabled.
+    pub(crate) fn sweep_existing_once(&mut self) -> Result<(), AsrError> {
+        self.sweep_round_with_mode(
+            ASR_STALE_AGE,
+            ASR_STALE_SCAN_LIMIT,
+            SweepRootMode::ExistingOnly,
+        )
+        .map(|_| ())
+    }
+
+    #[cfg(test)]
     fn sweep_round(
         &mut self,
         stale_age: Duration,
         scan_limit: usize,
     ) -> Result<SweepRound, AsrError> {
+        self.sweep_round_with_mode(stale_age, scan_limit, SweepRootMode::CreateIfMissing)
+    }
+
+    #[cfg(test)]
+    fn sweep_existing_round(
+        &mut self,
+        stale_age: Duration,
+        scan_limit: usize,
+    ) -> Result<SweepRound, AsrError> {
+        self.sweep_round_with_mode(stale_age, scan_limit, SweepRootMode::ExistingOnly)
+    }
+
+    fn sweep_round_with_mode(
+        &mut self,
+        stale_age: Duration,
+        scan_limit: usize,
+        root_mode: SweepRootMode,
+    ) -> Result<SweepRound, AsrError> {
         let mut round = SweepRound::default();
         if scan_limit == 0 {
             return Ok(round);
         }
-        if ensure_private_directory(&self.root).is_err() {
-            self.entries = None;
-            return Err(AsrError::TemporaryStorage);
+        if !self.prepare_root(root_mode)? {
+            round.cycle_complete = true;
+            return Ok(round);
         }
         if self.entries.is_none() {
             self.entries = Some(fs::read_dir(&self.root).map_err(|_| AsrError::TemporaryStorage)?);
@@ -254,6 +294,34 @@ impl StaleWorkspaceSweeper {
             }
         }
         Ok(round)
+    }
+
+    fn prepare_root(&mut self, mode: SweepRootMode) -> Result<bool, AsrError> {
+        match fs::symlink_metadata(&self.root) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_dir() || secure_private_path(&self.root, true).is_err()
+                {
+                    self.entries = None;
+                    return Err(AsrError::TemporaryStorage);
+                }
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A live iterator can otherwise keep referring to an unlinked
+                // old root. Reset it before either recreating or treating the
+                // disabled/missing-root case as a bounded no-op.
+                self.entries = None;
+                if matches!(mode, SweepRootMode::ExistingOnly) {
+                    return Ok(false);
+                }
+                ensure_private_directory(&self.root)?;
+                Ok(true)
+            }
+            Err(_) => {
+                self.entries = None;
+                Err(AsrError::TemporaryStorage)
+            }
+        }
     }
 }
 
@@ -1376,6 +1444,22 @@ mod tests {
         panic!("stateful stale sweep must eventually finish one directory cycle");
     }
 
+    fn sweep_existing_complete_cycle(root: &Path, stale_age: Duration, scan_limit: usize) {
+        let mut sweeper = StaleWorkspaceSweeper::new(root.to_owned());
+        for _ in 0..16_384 {
+            let round = sweeper
+                .sweep_existing_round(stale_age, scan_limit)
+                .expect("bounded existing-root stale sweep round");
+            assert!(round.read_attempts <= scan_limit);
+            assert!(round.metadata_attempts <= round.read_attempts);
+            assert!(round.cleanup_attempts <= round.metadata_attempts);
+            if round.cycle_complete {
+                return;
+            }
+        }
+        panic!("existing-root stale sweep must eventually finish one directory cycle");
+    }
+
     #[cfg(unix)]
     async fn read_descendant_pid_handshake(process: &mut SupervisedProcess) -> u32 {
         let stdout = process.take_stdout().expect("handshake stdout");
@@ -2230,6 +2314,55 @@ mod tests {
             fs::read(spoofed.join("decoded.wav")).expect("spoofed content survives"),
             b"must survive"
         );
+    }
+
+    #[test]
+    fn disabling_asr_after_a_crash_still_sweeps_existing_decoded_audio() {
+        let parent = tempdir().expect("tempdir");
+        let root = parent.path().join("private-asr-root");
+        assert!(!root.exists());
+
+        let mut enabled = StaleWorkspaceSweeper::new(root.clone());
+        let startup = enabled
+            .sweep_round(Duration::ZERO, 4)
+            .expect("enabled startup creates and sweeps the root");
+        assert!(startup.cycle_complete);
+        assert!(root.is_dir());
+
+        let mut workspace = AsrWorkspace::new_in(&root).expect("crashed enabled workspace");
+        fs::write(workspace.path().join("decoded.wav"), b"private speech")
+            .expect("decoded remnant");
+        let remnant = workspace.directory.take().expect("workspace").keep();
+        drop(enabled);
+
+        sweep_existing_complete_cycle(&root, Duration::ZERO, 3);
+
+        assert!(
+            !remnant.exists(),
+            "disabled startup/periodic cleanup must erase enabled-run remnants"
+        );
+        assert!(
+            root.is_dir(),
+            "existing-only cleanup retains the private root"
+        );
+    }
+
+    #[test]
+    fn disabled_asr_does_not_create_a_missing_root_only_to_sweep() {
+        let parent = tempdir().expect("tempdir");
+        let root = parent.path().join("missing-private-asr-root");
+        let mut disabled = StaleWorkspaceSweeper::new(root.clone());
+
+        for _ in 0..2 {
+            let round = disabled
+                .sweep_existing_round(Duration::ZERO, ASR_STALE_SCAN_LIMIT)
+                .expect("missing root is a bounded disabled-ASR no-op");
+            assert!(round.cycle_complete);
+            assert_eq!(round.read_attempts, 0);
+            assert_eq!(round.metadata_attempts, 0);
+            assert_eq!(round.cleanup_attempts, 0);
+            assert!(!root.exists());
+        }
     }
 
     #[test]

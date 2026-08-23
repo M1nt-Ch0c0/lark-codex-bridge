@@ -589,8 +589,14 @@ async fn run_router(
     let mut retry_tick = interval(Duration::from_millis(250));
     retry_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut stale_sweeper = crate::runtime::asr::StaleWorkspaceSweeper::for_private_root();
-    if settings.asr.is_configured() && stale_sweeper.sweep_once().is_err() {
-        tracing::warn!("private ASR storage initialization failed");
+    let asr_configured = settings.asr.is_configured();
+    let startup_sweep = if asr_configured {
+        stale_sweeper.sweep_once()
+    } else {
+        stale_sweeper.sweep_existing_once()
+    };
+    if startup_sweep.is_err() {
+        tracing::warn!("private ASR startup cleanup failed");
     }
     let mut stale_sweep = interval(crate::runtime::asr::ASR_STALE_SWEEP_INTERVAL);
     stale_sweep.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -659,8 +665,13 @@ async fn run_router(
                     &snapshot, &actors, &receiver, &retries, &active_turns, &settings,
                 );
             }
-            _ = stale_sweep.tick(), if settings.asr.is_configured() => {
-                if stale_sweeper.sweep_once().is_err() {
+            _ = stale_sweep.tick() => {
+                let result = if asr_configured {
+                    stale_sweeper.sweep_once()
+                } else {
+                    stale_sweeper.sweep_existing_once()
+                };
+                if result.is_err() {
                     tracing::warn!("private ASR stale workspace sweep failed");
                 }
             }
