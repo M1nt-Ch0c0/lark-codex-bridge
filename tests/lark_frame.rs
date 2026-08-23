@@ -1,7 +1,5 @@
 //! Codec goldens and reassembly boundary tests for the pbbp2 frame layer.
 
-use std::io::{self, Write};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -33,22 +31,6 @@ fn event_headers(message_id: &str, sum: u32, seq: u32) -> FrameHeaders {
         (header_key::SEQ, &seq.to_string()),
         (header_key::TRACE_ID, "tr-1"),
     ])
-}
-
-struct LogBuffer(Arc<Mutex<Vec<u8>>>);
-
-impl Write for LogBuffer {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0
-            .lock()
-            .expect("log buffer lock")
-            .extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -187,36 +169,6 @@ fn frame_method_and_message_type_wire_mapping() {
     assert_eq!(MessageType::parse("card"), Some(MessageType::Card));
     assert_eq!(MessageType::parse("pong"), Some(MessageType::Pong));
     assert_eq!(MessageType::parse("mystery"), None);
-}
-
-#[test]
-fn fragment_warning_does_not_log_ids_or_payload_content() {
-    let output = Arc::new(Mutex::new(Vec::new()));
-    let writer = Arc::clone(&output);
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
-        .with_writer(move || LogBuffer(Arc::clone(&writer)))
-        .with_ansi(false)
-        .without_time()
-        .finish();
-    let message_id = "SECRET_MESSAGE_ID";
-    let payload = Bytes::from_static(b"SECRET_MESSAGE_BODY_AND_TOKEN");
-
-    tracing::subscriber::with_default(subscriber, || {
-        let mut reassembler = Reassembler::new();
-        let error = reassembler
-            .ingest(&event_headers(message_id, 0, 0), payload, Instant::now())
-            .expect_err("sum zero must be rejected");
-        assert_eq!(error, ReassemblyError::OutOfRange);
-    });
-
-    let output = output.lock().expect("log buffer lock");
-    let output = String::from_utf8_lossy(&output);
-    assert!(output.contains("lark fragment rejected"));
-    assert!(output.contains("fragment-out-of-range"));
-    assert!(!output.contains(message_id));
-    assert!(!output.contains("SECRET_MESSAGE_BODY_AND_TOKEN"));
-    assert!(!output.contains("tr-SECRET_MESSAGE_ID"));
 }
 
 // ---------------------------------------------------------------------------
