@@ -161,7 +161,9 @@ fn text_event(chat_id: &str, message_id: &str, text: &str) -> String {
 
 fn unwrap_event(outcome: NormalizeOutcome) -> (InboundEvent, Option<Degradation>) {
     match outcome {
-        NormalizeOutcome::Event { event, degradation } => (*event, degradation),
+        NormalizeOutcome::Event {
+            event, degradation, ..
+        } => (*event, degradation),
         NormalizeOutcome::Ignored { reason } => {
             panic!("expected an event outcome, got Ignored: {reason}");
         }
@@ -620,7 +622,6 @@ async fn audio_video_card_and_forward_have_typed_availability() {
             ("audio", [MessagePart::Audio(media)]) => {
                 assert_eq!(media.key.as_deref(), Some("aud_key"));
                 assert_eq!(media.metadata.duration_ms, Some(1234));
-                assert_eq!(media.metadata.transcript, None);
                 assert_eq!(media.status, PartStatus::Available);
             }
             ("media", [MessagePart::Video(media)]) => {
@@ -641,7 +642,7 @@ async fn audio_video_card_and_forward_have_typed_availability() {
 }
 
 #[tokio::test]
-async fn audio_client_transcript_stays_lazy_in_metadata_only() {
+async fn audio_client_transcript_is_absent_from_the_durable_event() {
     let server = StubServer::start(im_stub(|_| chat_mode_ok("group"), failing)).await;
     let normalizer = normalizer_for(&server);
     let payload = make_event(
@@ -657,12 +658,20 @@ async fn audio_client_transcript_stays_lazy_in_metadata_only() {
         None,
         &serde_json::json!([]),
     );
-    let (event, _) = unwrap_event(
-        normalizer
-            .normalize(payload.as_bytes())
-            .await
-            .expect("audio with transcript should normalize"),
-    );
+    let outcome = normalizer
+        .normalize(payload.as_bytes())
+        .await
+        .expect("audio with transcript should normalize");
+    let NormalizeOutcome::Event {
+        event,
+        live_transcripts,
+        ..
+    } = outcome
+    else {
+        panic!("expected audio event")
+    };
+    assert!(!format!("{live_transcripts:?}").contains("please review the patch"));
+    let event = *event;
     assert!(
         event.text.is_empty(),
         "inbound recognition must not bypass the configured tool limit"
@@ -671,9 +680,11 @@ async fn audio_client_transcript_stays_lazy_in_metadata_only() {
         [MessagePart::Audio(media)] => {
             assert_eq!(media.key.as_deref(), Some("aud_key"));
             assert_eq!(
-                media.metadata.transcript.as_deref(),
-                Some("please review the patch")
+                media.metadata.transcript_failure,
+                Some(TranscriptFailure::NotRetained)
             );
+            let serialized = serde_json::to_string(&media.metadata).expect("metadata JSON");
+            assert!(!serialized.contains("please review the patch"));
         }
         _ => panic!("expected one audio part"),
     }
@@ -718,7 +729,6 @@ async fn malformed_and_oversize_audio_transcripts_keep_non_content_failure_class
         let [MessagePart::Audio(media)] = event.parts.as_slice() else {
             panic!("expected audio part")
         };
-        assert_eq!(media.metadata.transcript, None);
         assert_eq!(media.metadata.transcript_failure, Some(expected));
         let debug = format!("{:?}", media.metadata);
         assert!(!debug.contains("must-not"));

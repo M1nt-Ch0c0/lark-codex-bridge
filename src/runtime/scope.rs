@@ -1,6 +1,6 @@
 //! One-scope runtime contracts shared by the router and reply projector.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -352,17 +352,21 @@ impl ScopeActorHandle {
         let Some(active) = active else {
             return Ok(InterruptOutcome::NoActiveTurn);
         };
+        if let Some((registry, binding)) = &active.context_binding {
+            // Revoke before asking Codex to acknowledge the interrupt. Any
+            // response that already committed is allowed to finish first;
+            // every other media read is forced to return only cancellation.
+            // This ordering makes it impossible for transcript/media content
+            // to follow a successful interrupt acknowledgement.
+            let _ = registry
+                .revoke_turn_and_wait(binding, RevocationReason::Cancelled)
+                .await;
+        }
         active
             .client
             .interrupt_turn(&active.thread_id, &active.turn_id)
             .await
             .map_err(|_| ())?;
-        if let Some((registry, binding)) = &active.context_binding {
-            // Once Codex accepts the interruption, revoke the capability
-            // immediately. Tool work must not wait for a later terminal event
-            // before observing cancellation.
-            let _ = registry.revoke_turn(binding, RevocationReason::Cancelled);
-        }
         Ok(InterruptOutcome::Requested)
     }
 
@@ -520,7 +524,7 @@ async fn process_batch(
     if eligible.is_empty() {
         return Ok(());
     }
-    let batch = eligible;
+    let mut batch = eligible;
     let (cwd, fingerprint) = match prepare_workspace(scope, store, policy, settings).await {
         Ok(workspace) => workspace,
         Err(ScopeFailureKind::Policy) => {
@@ -557,6 +561,13 @@ async fn process_batch(
         }
     };
     let client_message_id = Uuid::new_v4().to_string();
+    let mut live_transcripts = HashMap::with_capacity(batch.len());
+    for item in &mut batch {
+        let handoff = item.queued.take_live_transcripts();
+        if !handoff.is_empty() {
+            live_transcripts.insert(item.key.clone(), handoff);
+        }
+    }
     let keys = batch
         .iter()
         .map(|item| item.key.clone())
@@ -592,6 +603,7 @@ async fn process_batch(
         .collect::<Vec<_>>();
     let assembly = match assemble_turn_inputs(
         &claimed,
+        &mut live_transcripts,
         attachments,
         contexts,
         &thread_id,
@@ -904,6 +916,7 @@ fn deduplicate_batch(batch: Vec<ActorInbound>) -> Vec<ActorInbound> {
 
 async fn assemble_turn_inputs(
     claimed: &[ClaimedInbound],
+    live_transcripts: &mut HashMap<InboundKey, crate::lark::normalize::LiveTranscriptHandoff>,
     attachments: Option<&AttachmentCache>,
     contexts: Option<&ContextRegistry>,
     codex_thread_id: &str,
@@ -935,7 +948,11 @@ async fn assemble_turn_inputs(
         inputs.push(UserInput::text(event.text.clone()));
         if let (Some(registry), Some(lease)) = (contexts, context_lease.as_mut()) {
             let registered = registry
-                .register_pending(binding.clone(), ContextDraft::from_inbound(event))
+                .register_pending_with_transcripts(
+                    binding.clone(),
+                    ContextDraft::from_inbound(event),
+                    live_transcripts.remove(&claimed.key).unwrap_or_default(),
+                )
                 .map_err(|_| AttachmentAssemblyError::Failed)?;
             let wake = if event.mentions_bot {
                 "mention"

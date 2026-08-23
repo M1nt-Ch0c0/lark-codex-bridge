@@ -7,6 +7,7 @@ use lark_codex_bridge::lark::config::TenantBrand;
 use lark_codex_bridge::lark::credentials::LarkCredentials;
 use lark_codex_bridge::lark::normalize::{
     InboundEvent, MediaMetadata, MediaPart, MentionIdentity, MessagePart, PartStatus, ScopeKey,
+    TranscriptFailure,
 };
 use lark_codex_bridge::limits::{
     OUTBOX_TERMINAL_MAX_ROWS, STORE_ATTACHMENT_LEASE_MAX_ROWS, STORE_OUTBOX_CLAIM_MAX_BYTES,
@@ -372,7 +373,6 @@ async fn extended_inbound_payload_v1_round_trips_mentions_parts_and_metadata() {
             mime_type: Some("audio/opus".to_owned()),
             size_bytes: Some(123),
             duration_ms: Some(456),
-            transcript: None,
             transcript_failure: None,
         },
         status: PartStatus::Available,
@@ -391,6 +391,110 @@ async fn extended_inbound_payload_v1_round_trips_mentions_parts_and_metadata() {
     assert_eq!(retained.event().mentions, rich.mentions);
     assert_eq!(retained.event().parts, rich.parts);
     store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn accepted_live_transcript_never_enters_sqlite_wal_or_reopened_payload() {
+    const SENTINEL: &str = "private-live-transcript-0f2c80d5";
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("transcript-boundary.sqlite");
+    let tenant = tenant_namespace("cli_transcript_boundary");
+    let mut audio = event("event-live-transcript", "message-live-transcript");
+    audio.text.clear();
+    audio.message_type = "audio".to_owned();
+    audio.parts = vec![MessagePart::Audio(MediaPart {
+        key: Some("audio-resource".to_owned()),
+        thumbnail_key: None,
+        metadata: MediaMetadata {
+            duration_ms: Some(800),
+            transcript_failure: Some(TranscriptFailure::NotRetained),
+            ..MediaMetadata::default()
+        },
+        status: PartStatus::Available,
+    })];
+    let permit = std::sync::Arc::new(tokio::sync::Semaphore::new(1))
+        .try_acquire_owned()
+        .expect("permit");
+    let queued = lark_codex_bridge::lark::bridge::QueuedInboundEvent::from_authenticated_event(
+        audio.clone(),
+        permit,
+        vec![(0, SENTINEL.to_owned())],
+    );
+    assert!(!format!("{queued:?}").contains(SENTINEL));
+    assert!(!format!("{:?}", queued.event).contains(SENTINEL));
+
+    let assert_artifacts_absent = || {
+        for entry in std::fs::read_dir(temp.path()).expect("database directory") {
+            let artifact = entry.expect("sidecar entry").path();
+            if artifact.is_file() {
+                let bytes = std::fs::read(&artifact).expect("read database artifact");
+                assert!(
+                    !bytes
+                        .windows(SENTINEL.len())
+                        .any(|window| window == SENTINEL.as_bytes()),
+                    "transcript leaked into {}",
+                    artifact.display()
+                );
+            }
+        }
+    };
+
+    let store = StoreHandle::open(&path).await.expect("open");
+    store
+        .register_inbound(&tenant, &queued.event)
+        .await
+        .expect("received boundary");
+    assert_artifacts_absent();
+    let begun = store
+        .begin_turn_and_claim_inbound(
+            turn("turn-live-transcript", TurnState::Starting),
+            &[InboundKey::new(
+                tenant.clone(),
+                "event-live-transcript".to_owned(),
+            )],
+        )
+        .await
+        .expect("accepted boundary");
+    assert!(matches!(begun, BeginTurnOutcome::Started { .. }));
+    store
+        .enqueue_outbox(outbox("transcript-safe-outbox", "{\"status\":\"safe\"}"))
+        .await
+        .expect("benign outbox");
+    assert_artifacts_absent();
+    store.shutdown().await.expect("checkpoint and close");
+    assert_artifacts_absent();
+
+    let reopened = StoreHandle::open(&path)
+        .await
+        .expect("reopen after crash boundary");
+    assert_eq!(
+        reopened
+            .inbound_state(&tenant, "event-live-transcript")
+            .await
+            .expect("reopened state"),
+        Some(InboundEventState::Accepted)
+    );
+    reopened.shutdown().await.expect("final checkpoint");
+    let connection = rusqlite::Connection::open(&path).expect("inspect persisted payload");
+    let payload: Vec<u8> = connection
+        .query_row(
+            "SELECT payload_blob FROM inbound_events WHERE event_id = 'event-live-transcript'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("payload row");
+    assert!(
+        !payload
+            .windows(SENTINEL.len())
+            .any(|window| window == SENTINEL.as_bytes())
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&payload).expect("payload JSON");
+    assert_eq!(
+        payload["parts"][0]["value"]["metadata"]["transcript_failure"],
+        "not_retained"
+    );
+    drop(connection);
+    assert_artifacts_absent();
 }
 
 #[tokio::test]
@@ -2317,10 +2421,7 @@ async fn debug_redacts_inbound_sender_resource_keys_and_content() {
     let permit = Arc::new(Semaphore::new(1))
         .try_acquire_owned()
         .expect("permit");
-    let queued = QueuedInboundEvent {
-        event: sensitive.clone(),
-        permit,
-    };
+    let queued = QueuedInboundEvent::new(sensitive.clone(), permit);
     let key = InboundKey::new(
         tenant_namespace("cli_debug_key"),
         "event-id-sentinel".to_owned(),

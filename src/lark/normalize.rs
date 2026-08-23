@@ -186,6 +186,11 @@ pub enum TranscriptFailure {
     Invalid,
     /// The value exceeded the bridge's structural inbound transcript bound.
     TooLarge,
+    /// A valid transcript existed on the authenticated live delivery, but its
+    /// content is deliberately not part of the durable event. This state is
+    /// observable after restart (or when the live handoff is otherwise gone)
+    /// and must never fall through to the sidecar.
+    NotRetained,
 }
 
 /// Safe metadata accompanying a media descriptor. String values are bounded
@@ -202,12 +207,8 @@ pub struct MediaMetadata {
     /// Media duration in milliseconds, when supplied as a non-negative
     /// integer.
     pub duration_ms: Option<u64>,
-    /// Client-supplied speech recognition text, when the inbound payload
-    /// already includes a bounded transcript.
-    pub transcript: Option<String>,
-    /// Why a present inbound transcript was rejected, without retaining its
-    /// content. Absent means either no transcript was supplied or `transcript`
-    /// contains the accepted value.
+    /// Why a present inbound transcript cannot be returned, without retaining
+    /// any of its content. Absent means no transcript was supplied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript_failure: Option<TranscriptFailure>,
 }
@@ -226,12 +227,106 @@ impl fmt::Debug for MediaMetadata {
             )
             .field("size_bytes", &self.size_bytes)
             .field("duration_ms", &self.duration_ms)
-            .field(
-                "transcript_len",
-                &self.transcript.as_deref().map_or(0, str::len),
-            )
             .field("transcript_failure", &self.transcript_failure)
             .finish_non_exhaustive()
+    }
+}
+
+/// Authenticated, live-only recognition text bound to one normalized event.
+///
+/// This value is never serializable and its `Debug` representation is fully
+/// redacted. The bridge carries it beside (never inside) the durable event and
+/// verifies the event/message/audio descriptor binding after deduplication.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LiveTranscriptHandoff {
+    event_id: String,
+    message_id: String,
+    entries: Vec<LiveTranscriptEntry>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct LiveTranscriptEntry {
+    part_index: usize,
+    resource_key: String,
+    text: String,
+}
+
+impl LiveTranscriptHandoff {
+    pub(crate) fn bound(event: &InboundEvent, candidates: Vec<(usize, String)>) -> Self {
+        let entries = candidates
+            .into_iter()
+            .filter_map(|(part_index, text)| {
+                let MessagePart::Audio(media) = event.parts.get(part_index)? else {
+                    return None;
+                };
+                let resource_key = media.key.clone()?;
+                Some(LiveTranscriptEntry {
+                    part_index,
+                    resource_key,
+                    text,
+                })
+            })
+            .collect();
+        Self {
+            event_id: event.event_id.clone(),
+            message_id: event.message_id.clone(),
+            entries,
+        }
+    }
+
+    /// Returns an empty handoff for recovery and synthetic events.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            event_id: String::new(),
+            message_id: String::new(),
+            entries: Vec::new(),
+        }
+    }
+
+    /// Discards the handoff unless it still names the exact canonical event
+    /// and audio descriptors returned by the durable dedup boundary.
+    #[must_use]
+    pub(crate) fn retain_if_bound(mut self, event: &InboundEvent) -> Self {
+        let bound = self.event_id == event.event_id
+            && self.message_id == event.message_id
+            && self.entries.iter().all(|entry| {
+                matches!(
+                    event.parts.get(entry.part_index),
+                    Some(MessagePart::Audio(media))
+                        if media.key.as_deref() == Some(entry.resource_key.as_str())
+                            && media.metadata.transcript_failure
+                                == Some(TranscriptFailure::NotRetained)
+                )
+            });
+        if !bound {
+            self.entries.clear();
+        }
+        self
+    }
+
+    pub(crate) fn take_for_part(&mut self, part_index: usize) -> Option<String> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.part_index == part_index)?;
+        Some(self.entries.swap_remove(index).text)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+impl Default for LiveTranscriptHandoff {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl fmt::Debug for LiveTranscriptHandoff {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LiveTranscriptHandoff([REDACTED])")
     }
 }
 
@@ -428,6 +523,9 @@ pub enum NormalizeOutcome {
     Event {
         /// The normalized event.
         event: Box<InboundEvent>,
+        /// Recognition text from this authenticated live delivery. It is
+        /// intentionally outside the serializable event.
+        live_transcripts: LiveTranscriptHandoff,
         /// Conservative degradation applied along the way, if any.
         degradation: Option<Degradation>,
     },
@@ -501,27 +599,30 @@ impl Normalizer {
             ScopeKey::Chat(_) => None,
             ScopeKey::Thread(_, thread_id) => Some(thread_id.clone()),
         };
+        let event = Box::new(InboundEvent {
+            event_id: parsed.event_id,
+            message_id: parsed.message_id,
+            chat_id: parsed.chat_id,
+            sender_id: parsed.sender_open_id,
+            chat_type: chat_mode,
+            thread_id,
+            root_id: parsed.root_id,
+            reply_to_message_id: parsed.parent_id,
+            text: parsed.text,
+            mentions_bot: parsed.mentions_bot,
+            mention_all: parsed.mention_all,
+            sender_is_human: parsed.sender_is_human,
+            mentions: parsed.mentions,
+            parts: parsed.parts,
+            resources: parsed.resources,
+            message_type: parsed.message_type,
+            create_time_ms: parsed.create_time_ms,
+            scope,
+        });
+        let live_transcripts = LiveTranscriptHandoff::bound(&event, parsed.live_transcripts);
         Ok(NormalizeOutcome::Event {
-            event: Box::new(InboundEvent {
-                event_id: parsed.event_id,
-                message_id: parsed.message_id,
-                chat_id: parsed.chat_id,
-                sender_id: parsed.sender_open_id,
-                chat_type: chat_mode,
-                thread_id,
-                root_id: parsed.root_id,
-                reply_to_message_id: parsed.parent_id,
-                text: parsed.text,
-                mentions_bot: parsed.mentions_bot,
-                mention_all: parsed.mention_all,
-                sender_is_human: parsed.sender_is_human,
-                mentions: parsed.mentions,
-                parts: parsed.parts,
-                resources: parsed.resources,
-                message_type: parsed.message_type,
-                create_time_ms: parsed.create_time_ms,
-                scope,
-            }),
+            event,
+            live_transcripts,
             degradation,
         })
     }
@@ -610,6 +711,7 @@ impl Normalizer {
             mentions,
             parts: extracted.parts,
             resources: extracted.resources,
+            live_transcripts: extracted.live_transcripts,
         }))
     }
 
@@ -761,6 +863,7 @@ struct ParsedEvent {
     mentions: Vec<MentionIdentity>,
     parts: Vec<MessagePart>,
     resources: Vec<ResourceDesc>,
+    live_transcripts: Vec<(usize, String)>,
 }
 
 fn required(value: Option<String>, context: &'static str) -> Result<String, LarkError> {
@@ -778,6 +881,7 @@ struct ExtractedContent {
     mentions_all: bool,
     resources: Vec<ResourceDesc>,
     parts: Vec<MessagePart>,
+    live_transcripts: Vec<(usize, String)>,
 }
 
 /// Extracts legacy text/resource fields and the richer typed representation
@@ -802,15 +906,7 @@ fn extract_message_content(
             | "forward"
     );
     if !known {
-        return Ok(ExtractedContent {
-            text: String::new(),
-            mentions_all: false,
-            resources: Vec::new(),
-            parts: vec![MessagePart::Unsupported {
-                message_type: message_type.to_owned(),
-                status: PartStatus::Unsupported,
-            }],
-        });
+        return Ok(unsupported_content(message_type));
     }
     let value: Value = serde_json::from_str(content)
         .map_err(|_| LarkError::protocol("message content is not valid JSON"))?;
@@ -827,6 +923,7 @@ fn extract_message_content(
                 text,
                 mentions_all,
                 resources: Vec::new(),
+                live_transcripts: Vec::new(),
             })
         }
         "image" => {
@@ -837,6 +934,7 @@ fn extract_message_content(
                 mentions_all: false,
                 resources: resource_desc(key, ResourceKind::Image),
                 parts: vec![MessagePart::Image(media)],
+                live_transcripts: Vec::new(),
             })
         }
         "file" => {
@@ -847,6 +945,7 @@ fn extract_message_content(
                 mentions_all: false,
                 resources: resource_desc(key, ResourceKind::File),
                 parts: vec![MessagePart::File(media)],
+                live_transcripts: Vec::new(),
             })
         }
         "sticker" => Ok(rich_media_content(&value, MessagePart::Sticker)),
@@ -859,6 +958,7 @@ fn extract_message_content(
                 mentions_all: false,
                 resources: Vec::new(),
                 parts: vec![MessagePart::Video(media_part(key, thumbnail_key, &value))],
+                live_transcripts: Vec::new(),
             })
         }
         "interactive" | "card" => Ok(ExtractedContent {
@@ -868,6 +968,7 @@ fn extract_message_content(
             parts: vec![MessagePart::Card {
                 status: PartStatus::Unsupported,
             }],
+            live_transcripts: Vec::new(),
         }),
         "merge_forward" | "forward" => {
             let message_id = content_string(&value, "message_id");
@@ -881,9 +982,23 @@ fn extract_message_content(
                 mentions_all: false,
                 resources: Vec::new(),
                 parts: vec![MessagePart::Forward { message_id, status }],
+                live_transcripts: Vec::new(),
             })
         }
         _ => unreachable!("known message type handled above"),
+    }
+}
+
+fn unsupported_content(message_type: &str) -> ExtractedContent {
+    ExtractedContent {
+        text: String::new(),
+        mentions_all: false,
+        resources: Vec::new(),
+        parts: vec![MessagePart::Unsupported {
+            message_type: message_type.to_owned(),
+            status: PartStatus::Unsupported,
+        }],
+        live_transcripts: Vec::new(),
     }
 }
 
@@ -894,12 +1009,22 @@ fn rich_media_content(value: &Value, wrap: fn(MediaPart) -> MessagePart) -> Extr
         mentions_all: false,
         resources: Vec::new(),
         parts: vec![wrap(media_part(key, None, value))],
+        live_transcripts: Vec::new(),
     }
 }
 
 fn audio_content(value: &Value) -> ExtractedContent {
     let key = content_string(value, "file_key");
     let transcript = content_transcript(value);
+    let persistent_failure = if transcript.text.is_some() {
+        Some(TranscriptFailure::NotRetained)
+    } else {
+        transcript.failure
+    };
+    let live_transcripts = transcript
+        .text
+        .map(|text| vec![(0, text)])
+        .unwrap_or_default();
     ExtractedContent {
         // Recognition text remains inside the turn-scoped media capability.
         // Copying it into the ordinary event text would bypass the operator's
@@ -907,33 +1032,31 @@ fn audio_content(value: &Value) -> ExtractedContent {
         text: String::new(),
         mentions_all: false,
         resources: Vec::new(),
-        parts: vec![MessagePart::Audio(media_part_with_transcript(
+        parts: vec![MessagePart::Audio(media_part_with_transcript_state(
             key,
             value,
-            transcript.text,
-            transcript.failure,
+            persistent_failure,
         ))],
+        live_transcripts,
     }
 }
 
 fn media_part(key: Option<String>, thumbnail_key: Option<String>, value: &Value) -> MediaPart {
-    media_part_inner(key, thumbnail_key, value, None, None)
+    media_part_inner(key, thumbnail_key, value, None)
 }
 
-fn media_part_with_transcript(
+fn media_part_with_transcript_state(
     key: Option<String>,
     value: &Value,
-    transcript: Option<String>,
     transcript_failure: Option<TranscriptFailure>,
 ) -> MediaPart {
-    media_part_inner(key, None, value, transcript, transcript_failure)
+    media_part_inner(key, None, value, transcript_failure)
 }
 
 fn media_part_inner(
     key: Option<String>,
     thumbnail_key: Option<String>,
     value: &Value,
-    transcript: Option<String>,
     transcript_failure: Option<TranscriptFailure>,
 ) -> MediaPart {
     let status = if key.is_some() {
@@ -953,7 +1076,6 @@ fn media_part_inner(
                 .filter(|mime| safe_mime(mime)),
             size_bytes: content_u64(value, &["file_size", "size"]),
             duration_ms: content_u64(value, &["duration_ms", "duration"]),
-            transcript,
             transcript_failure,
         },
         status,

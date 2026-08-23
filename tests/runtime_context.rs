@@ -5,7 +5,7 @@ use lark_codex_bridge::{
         api::{ChatMode, ResourceKind},
         normalize::{
             InboundEvent, MediaMetadata as InboundMediaMetadata, MediaPart, MentionIdentity,
-            MessagePart, PartStatus, ResourceDesc, ScopeKey,
+            MessagePart, PartStatus, ResourceDesc, ScopeKey, TranscriptFailure,
         },
     },
     runtime::context::{
@@ -72,7 +72,6 @@ fn draft(message_id: &str) -> ContextDraft {
                     mime_type: Some("image/png".to_owned()),
                     ..MediaMetadata::default()
                 },
-                transcript: None,
                 transcript_failure: None,
             },
         ],
@@ -177,7 +176,7 @@ fn media_key_is_hidden_and_handle_is_bound_to_exact_context_and_turn() {
 }
 
 #[test]
-fn transcript_content_exists_only_behind_the_media_grant() {
+fn durable_context_types_have_no_transcript_content_field() {
     const SENTINEL: &str = "private-transcript-sentinel-7f54";
     let registry = ContextRegistry::new(config(4, Duration::from_secs(60))).expect("registry");
     let mut context = draft("om_audio_private");
@@ -193,8 +192,7 @@ fn transcript_content_exists_only_behind_the_media_grant() {
             duration_ms: Some(800),
             ..MediaMetadata::default()
         },
-        transcript: Some(SENTINEL.to_owned()),
-        transcript_failure: None,
+        transcript_failure: Some(TranscriptFailure::NotRetained),
     }];
     assert!(!format!("{context:?}").contains(SENTINEL));
 
@@ -222,7 +220,11 @@ fn transcript_content_exists_only_behind_the_media_grant() {
     let authorized = registry
         .authorize_media_for_tool(&registered.context_id, handle, "thread-a", "turn-private")
         .expect("authorize exact grant");
-    assert_eq!(authorized.transcript.as_deref(), Some(SENTINEL));
+    assert_eq!(authorized.transcript, None);
+    assert_eq!(
+        authorized.transcript_failure,
+        Some(TranscriptFailure::NotRetained)
+    );
     assert!(!format!("{authorized:?}").contains(SENTINEL));
 }
 
@@ -279,7 +281,6 @@ fn inbound_rich_parts_become_opaque_typed_context_parts() {
                     mime_type: Some("video/mp4".to_owned()),
                     size_bytes: Some(10),
                     duration_ms: Some(20),
-                    transcript: None,
                     transcript_failure: None,
                 },
                 status: PartStatus::Available,

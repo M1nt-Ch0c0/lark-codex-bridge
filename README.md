@@ -84,12 +84,12 @@ CODEX_E2E=1 cargo test --test codex_smoke --locked -- --ignored --nocapture
 
 飞书语音气泡默认**不会**把 `localAudio` 交给 Codex。`bridge_media.read` 对音频按需转写后只回传文本：
 
-1. 入站 payload 已带客户端识别文本时，原文只进入 turn-scoped media grant；`ContextSnapshot` / `TypedPart`、prompt 和 `Debug` 都不含原文。只有 `bridge_media.read` 会按 `max_transcript_bytes` 校验并返回它。客户端明确给出畸形或超限文本时分别返回 `invalid_transcript` / `transcript_too_large`，不会误降级到 sidecar；
-2. 否则用 `ffmpeg` 在 Bridge 专属私有根目录中解码为 16 kHz WAV，再跑配置的本地 sidecar。Unix 目录/文件会显式设置并复核为 `0700` / `0600`（不依赖 umask）；Windows 会在写入内容前设置并复核仅当前用户与 `SYSTEM` 的 protected DACL。Bridge 对 stdout 做有界读取，并接受纯文本或带 `text` 字段的 sherpa JSON；
-3. `ffmpeg` 和 sidecar 都在完整的进程组（Windows 为 Job Object）中运行。turn 中断、Bridge shutdown、超时或 future drop 会终止整棵进程树并等待回收；每次媒体读取持有独立 lease token，同一 turn/hash 的重叠读取不会相互释放 GC 保护；
-4. `max_duration_ms` 可下调但绝不能超过 10 分钟；Bridge 还会在 `ffmpeg` 运行期间限制固定 PCM 投影的 WAV 字节数，并在交给 sidecar 前再次验证时长和大小，防止小型压缩输入膨胀；
-5. 异常退出残留目录会在启动时和运行期间定时做有界、只匹配 Bridge workspace 的 no-follow 清理；无关目录项不会耗尽匹配扫描额度；
-6. 缺 sidecar、解码失败、空/畸形/超限转写、过长音频、取消或私有目录失败都会返回稳定错误码（`sidecar_missing` / `unsupported_codec` / `empty_transcript` / `invalid_transcript` / `transcript_too_large` / `too_long` / `oversize` / `sidecar_failed` / `cancelled` / `temporary_storage_failed`），不会静默丢 part。
+1. 入站 payload 已带客户端识别文本时，原文只通过一次性的、与 event/message/part/resource 精确绑定的内存 handoff 进入 turn-scoped media grant；durable DTO、SQLite/WAL、outbox、checkpoint、`ContextSnapshot` / `TypedPart`、prompt 和 `Debug` 都不含原文。只有 `bridge_media.read` 会按 `max_transcript_bytes` 校验并返回它。进程在读取前重启时返回无内容的 `transcript_unavailable`，不会把已接受文本写盘或误降级到 sidecar；畸形或超限文本同样只保留 `invalid_transcript` / `transcript_too_large` 分类；
+2. 否则 `ffmpeg` 只向受监督的 pipe 输出 16 kHz mono PCM；Bridge 自己在专属私有根目录中、每次写入前检查硬字节上限并构造完整 canonical WAV，再跑本地 sidecar。子进程从不获得输出文件路径，不能用单次大写入或 sparse 文件绕过上限。Unix 目录/文件会在创建时显式设为并复核 `0700` / `0600`（不依赖 umask）；Windows 会在写入内容前设置并复核仅当前用户与 `SYSTEM` 的 protected DACL；
+3. `ffmpeg` 和 sidecar 都在完整的进程组（Windows 为 Job Object）中运行。正常完成、turn 中断、Bridge shutdown、超时或 future drop 都会终止残留子孙并等待回收；中断响应屏障保证 transcript/media 内容不会出现在成功的中断确认之后。每次媒体读取持有独立 lease token，同一 turn/hash 的重叠读取不会相互释放 GC 保护；
+4. `max_duration_ms` 可下调但绝不能超过 10 分钟；Bridge 在解码期间实施固定 PCM 投影的绝对硬上限，并在交给 sidecar 前验证 RIFF 声明长度、所有 chunk/padding、PCM 格式、唯一 data chunk、精确时长和完整文件边界，防止小型压缩输入膨胀或畸形 WAV；
+5. 异常退出残留目录会在启动时和运行期间定时做有界清理：轮转 cursor 保证在大量 hostile/fresh/symlink 前缀项后仍能前进，Bridge workspace 先原子隔离并用目录身份 claim 证明所有权，已知 `decoded.wav` 以 no-follow 方式擦除；未知文件绝不删除，失败状态保留供后续重试；
+6. 缺 sidecar、解码失败、空/畸形/超限/恢复后不可用的转写、过长音频、取消或私有目录失败都会返回稳定错误码（`sidecar_missing` / `unsupported_codec` / `empty_transcript` / `invalid_transcript` / `transcript_too_large` / `transcript_unavailable` / `too_long` / `oversize` / `sidecar_failed` / `cancelled` / `temporary_storage_failed`），不会静默丢 part。
 
 推荐 sidecar 是 [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) 上的 SenseVoice Small。仓库不内置模型权重；未配置 sidecar 时图片/文件读取不受影响。
 
@@ -119,6 +119,8 @@ export LARK_ASR_FFMPEG=$(command -v ffmpeg)
 export LARK_ASR_SAMPLE_OGG=$HOME/lark-codex-bridge-asr/samples/zh.ogg
 cargo test --locked --lib runtime::asr::tests::sensevoice_transcribes_real_feishu_like_ogg -- --ignored --nocapture
 ```
+
+该测试只有在上述环境变量齐全、命令实际成功且得到非空结果时才构成真实模型证据；`#[ignore]`、跳过或缺少任一变量都明确表示 **NO EVIDENCE**。测试和错误输出不会打印转写正文。
 
 ## 授权角色（owner / sender / group）
 

@@ -501,10 +501,35 @@ async fn queued_registered(
         .acquire_many_owned(u32::try_from(bytes).expect("retained bytes fit"))
         .await
         .expect("byte permit");
-    QueuedInboundEvent {
-        event: *retained.into_event(),
+    QueuedInboundEvent::new(*retained.into_event(), permit)
+}
+
+async fn queued_registered_with_live_transcript(
+    store: &StoreHandle,
+    namespace: &TenantNamespace,
+    event: InboundEvent,
+    transcript: &str,
+) -> QueuedInboundEvent {
+    let retained = match store
+        .register_inbound(namespace, &event)
+        .await
+        .expect("register")
+    {
+        DedupOutcome::New(retained) | DedupOutcome::ReplayReceived(retained) => retained,
+        duplicate @ DedupOutcome::Duplicate { .. } => {
+            panic!("expected retained event, got {duplicate:?}")
+        }
+    };
+    let bytes = retained.retained_bytes();
+    let permit = Arc::new(Semaphore::new(bytes))
+        .acquire_many_owned(u32::try_from(bytes).expect("retained bytes fit"))
+        .await
+        .expect("byte permit");
+    QueuedInboundEvent::from_authenticated_event(
+        *retained.into_event(),
         permit,
-    }
+        vec![(0, transcript.to_owned())],
+    )
 }
 
 async fn queued_synthetic(event: InboundEvent, retained_bytes: usize) -> QueuedInboundEvent {
@@ -512,7 +537,7 @@ async fn queued_synthetic(event: InboundEvent, retained_bytes: usize) -> QueuedI
         .acquire_many_owned(u32::try_from(retained_bytes).expect("retained bytes fit"))
         .await
         .expect("synthetic retained permit");
-    QueuedInboundEvent { event, permit }
+    QueuedInboundEvent::new(event, permit)
 }
 
 async fn wait_for_inbound_states(
@@ -3380,35 +3405,16 @@ fn stub_program(
 }
 
 fn ffmpeg_stub(dir: &std::path::Path) -> std::path::PathBuf {
-    let fixture = dir.join("decoded-audio.wav");
+    let fixture = dir.join("decoded-audio.pcm");
     let samples = 160_u32;
     let data_bytes = samples * 2;
-    let mut wav = Vec::with_capacity(44 + data_bytes as usize);
-    wav.extend_from_slice(b"RIFF");
-    wav.extend_from_slice(&(36_u32 + data_bytes).to_le_bytes());
-    wav.extend_from_slice(b"WAVEfmt ");
-    wav.extend_from_slice(&16_u32.to_le_bytes());
-    wav.extend_from_slice(&1_u16.to_le_bytes());
-    wav.extend_from_slice(&1_u16.to_le_bytes());
-    wav.extend_from_slice(&16_000_u32.to_le_bytes());
-    wav.extend_from_slice(&32_000_u32.to_le_bytes());
-    wav.extend_from_slice(&2_u16.to_le_bytes());
-    wav.extend_from_slice(&16_u16.to_le_bytes());
-    wav.extend_from_slice(b"data");
-    wav.extend_from_slice(&data_bytes.to_le_bytes());
-    wav.resize(44 + data_bytes as usize, 0);
-    std::fs::write(&fixture, wav).expect("write decoded WAV fixture");
+    std::fs::write(&fixture, vec![0_u8; data_bytes as usize]).expect("write decoded PCM fixture");
     let source = fixture.to_string_lossy();
     stub_program(
         dir,
         "ffmpeg",
-        &format!(
-            r#"out=""; for arg in "$@"; do out=$arg; done; cp "{}" "$out""#,
-            source.replace('"', r#"\""#)
-        ),
-        &format!(
-            "@echo off\r\n:loop\r\nif \"%~2\"==\"\" (\r\ncopy /y \"{source}\" \"%~1\" >nul\r\nexit /b %errorlevel%\r\n)\r\nshift\r\ngoto loop\r\n"
-        ),
+        &format!(r#"cat "{}""#, source.replace('"', r#"\""#)),
+        &format!("@echo off\r\ntype \"{source}\"\r\n"),
     )
 }
 
@@ -3431,7 +3437,7 @@ fn audio_part(transcript: Option<&str>) -> MessagePart {
         thumbnail_key: None,
         metadata: MediaMetadata {
             duration_ms: Some(800),
-            transcript: transcript.map(ToOwned::to_owned),
+            transcript_failure: transcript.map(|_| TranscriptFailure::NotRetained),
             ..MediaMetadata::default()
         },
         status: PartStatus::Available,
@@ -3498,8 +3504,59 @@ async fn route_audio_event(
     thread_id: &str,
     turn_id: &str,
 ) -> (String, String, Value) {
+    route_audio_event_inner(
+        router, store, namespace, control, workspace, event_id, inbound, None, thread_id, turn_id,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn route_audio_event_with_live_transcript(
+    router: &lark_codex_bridge::runtime::router::RouterHandle,
+    store: &StoreHandle,
+    namespace: &TenantNamespace,
+    control: &fakecodex::FakeControl,
+    workspace: &std::path::Path,
+    event_id: &str,
+    inbound: InboundEvent,
+    transcript: &str,
+    thread_id: &str,
+    turn_id: &str,
+) -> (String, String, Value) {
+    route_audio_event_inner(
+        router,
+        store,
+        namespace,
+        control,
+        workspace,
+        event_id,
+        inbound,
+        Some(transcript),
+        thread_id,
+        turn_id,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn route_audio_event_inner(
+    router: &lark_codex_bridge::runtime::router::RouterHandle,
+    store: &StoreHandle,
+    namespace: &TenantNamespace,
+    control: &fakecodex::FakeControl,
+    workspace: &std::path::Path,
+    event_id: &str,
+    inbound: InboundEvent,
+    live_transcript: Option<&str>,
+    thread_id: &str,
+    turn_id: &str,
+) -> (String, String, Value) {
     router
-        .route(queued_registered(store, namespace, inbound).await)
+        .route(if let Some(transcript) = live_transcript {
+            queued_registered_with_live_transcript(store, namespace, inbound, transcript).await
+        } else {
+            queued_registered(store, namespace, inbound).await
+        })
         .await
         .expect("route audio event");
     let start_thread = control.next_request().await;
@@ -3550,6 +3607,12 @@ async fn route_audio_event(
     let context_text = context_response["result"]["contentItems"][0]["text"]
         .as_str()
         .expect("context result text");
+    if let Some(transcript) = live_transcript {
+        assert!(
+            !context_text.contains(transcript),
+            "ContextSnapshot must not contain live recognition text"
+        );
+    }
     let context_value: Value = serde_json::from_str(context_text).expect("context result JSON");
     let handle = context_value["parts"]
         .as_array()
@@ -3781,7 +3844,7 @@ async fn inbound_audio_transcript_skips_sidecar() {
     inbound.message_type = "audio".to_owned();
     inbound.text.clear();
     inbound.parts = vec![audio_part(Some("please review the patch"))];
-    let (context_id, handle, _) = route_audio_event(
+    let (context_id, handle, start_turn) = route_audio_event_with_live_transcript(
         &router,
         &store,
         &namespace,
@@ -3789,10 +3852,15 @@ async fn inbound_audio_transcript_skips_sidecar() {
         &workspace,
         "inbound",
         inbound,
+        "please review the patch",
         "thread-audio-inbound",
         "turn-audio-inbound",
     )
     .await;
+    assert!(
+        !start_turn.to_string().contains("please review the patch"),
+        "turn prompt must contain only the opaque context reference"
+    );
     let response = read_media(
         &control,
         "thread-audio-inbound",
@@ -3860,7 +3928,7 @@ async fn configured_inbound_transcript_limit_is_enforced_only_at_media_read() {
     inbound.message_type = "audio".to_owned();
     inbound.text.clear();
     inbound.parts = vec![audio_part(Some("private transcript"))];
-    let (context_id, handle, start_turn) = route_audio_event(
+    let (context_id, handle, start_turn) = route_audio_event_with_live_transcript(
         &router,
         &store,
         &namespace,
@@ -3868,6 +3936,7 @@ async fn configured_inbound_transcript_limit_is_enforced_only_at_media_read() {
         &workspace,
         "over-limit",
         inbound,
+        "private transcript",
         "thread-audio-over-limit",
         "turn-audio-over-limit",
     )
@@ -3914,6 +3983,11 @@ async fn rejected_inbound_transcripts_never_download_or_fall_back_to_sidecar() {
             "oversize",
             TranscriptFailure::TooLarge,
             "transcript_too_large",
+        ),
+        (
+            "recovered",
+            TranscriptFailure::NotRetained,
+            "transcript_unavailable",
         ),
     ] {
         let mut config = validated_config();
@@ -4054,6 +4128,16 @@ async fn interrupt_cancels_an_active_audio_download_and_returns_a_tool_result() 
     .expect("audio download starts");
 
     let (interrupt, ()) = tokio::join!(router.interrupt(&scope), async {
+        let response = control.next_request().await;
+        assert_eq!(response["id"], "server-audio-cancel-download");
+        assert_eq!(response["result"]["success"], false);
+        let body: Value = serde_json::from_str(
+            response["result"]["contentItems"][0]["text"]
+                .as_str()
+                .expect("tool response text"),
+        )
+        .expect("tool response JSON");
+        assert_eq!(body["error"]["code"], "cancelled");
         let request = control.next_request().await;
         assert_eq!(request["method"], "turn/interrupt");
         control.respond(&request, json!({})).await;
@@ -4062,18 +4146,6 @@ async fn interrupt_cancels_an_active_audio_download_and_returns_a_tool_result() 
         interrupt.expect("interrupt request"),
         InterruptOutcome::Requested
     );
-    let response = timeout(Duration::from_secs(2), control.next_request())
-        .await
-        .expect("cancelled media tool responds");
-    assert_eq!(response["id"], "server-audio-cancel-download");
-    assert_eq!(response["result"]["success"], false);
-    let body: Value = serde_json::from_str(
-        response["result"]["contentItems"][0]["text"]
-            .as_str()
-            .expect("tool response text"),
-    )
-    .expect("tool response JSON");
-    assert_eq!(body["error"]["code"], "cancelled");
     assert!(
         store
             .list_attachments()
@@ -4169,16 +4241,40 @@ async fn interrupt_cancels_an_active_sidecar_and_releases_its_exact_lease() {
     .expect("sidecar starts");
     let rows = store.list_attachments().await.expect("attachments");
     assert_eq!(rows.len(), 1);
+    let active = store
+        .attachment_leases(&rows[0].sha256)
+        .await
+        .expect("active ASR lease");
+    assert_eq!(active.len(), 1);
+    let sibling_token = store
+        .put_attachment_and_lease(
+            &rows[0].sha256,
+            rows[0].bytes,
+            &rows[0].kind,
+            active[0].turn_row_id,
+        )
+        .await
+        .expect("independent sibling acquisition");
     assert_eq!(
         store
             .attachment_leases(&rows[0].sha256)
             .await
-            .expect("active ASR lease")
+            .expect("two independent leases")
             .len(),
-        1
+        2
     );
 
     let (interrupt, ()) = tokio::join!(router.interrupt(&scope), async {
+        let response = control.next_request().await;
+        assert_eq!(response["id"], "server-audio-cancel-sidecar");
+        assert_eq!(response["result"]["success"], false);
+        let body: Value = serde_json::from_str(
+            response["result"]["contentItems"][0]["text"]
+                .as_str()
+                .expect("tool response text"),
+        )
+        .expect("tool response JSON");
+        assert_eq!(body["error"]["code"], "cancelled");
         let request = control.next_request().await;
         assert_eq!(request["method"], "turn/interrupt");
         control.respond(&request, json!({})).await;
@@ -4187,30 +4283,26 @@ async fn interrupt_cancels_an_active_sidecar_and_releases_its_exact_lease() {
         interrupt.expect("interrupt request"),
         InterruptOutcome::Requested
     );
-    let response = timeout(Duration::from_secs(2), control.next_request())
-        .await
-        .expect("cancelled ASR tool responds");
-    assert_eq!(response["id"], "server-audio-cancel-sidecar");
-    assert_eq!(response["result"]["success"], false);
-    let body: Value = serde_json::from_str(
-        response["result"]["contentItems"][0]["text"]
-            .as_str()
-            .expect("tool response text"),
-    )
-    .expect("tool response JSON");
-    assert_eq!(body["error"]["code"], "cancelled");
     timeout(Duration::from_secs(2), async {
-        while !store
-            .attachment_leases(&rows[0].sha256)
-            .await
-            .expect("cancelled ASR leases")
-            .is_empty()
-        {
+        loop {
+            let leases = store
+                .attachment_leases(&rows[0].sha256)
+                .await
+                .expect("cancelled ASR leases");
+            if leases.len() == 1 && leases[0].lease_token == sibling_token {
+                break;
+            }
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("cancelled ASR releases its exact lease");
+    .expect("cancelled ASR releases only its exact lease");
+    assert!(
+        store
+            .release_attachment_lease(&sibling_token)
+            .await
+            .expect("release test sibling")
+    );
     #[cfg(unix)]
     {
         let pid = std::fs::read_to_string(&marker)
