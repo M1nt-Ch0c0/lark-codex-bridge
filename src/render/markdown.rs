@@ -886,7 +886,14 @@ fn is_unicode_format_control(character: char) -> bool {
 
 fn sanitize_inline(text: &str, carrier: MarkdownCarrier) -> String {
     let mut budget = InlineWorkBudget::new(text.len());
-    sanitize_inline_bounded(text, carrier, &mut budget).unwrap_or_else(|InlineWorkExhausted| {
+    let rendered = sanitize_inline_bounded(text, carrier, &mut budget);
+    #[cfg(test)]
+    super::record_markdown_inline_work(
+        budget
+            .spent()
+            .saturating_add(usize::from(rendered.is_err()).saturating_mul(text.len())),
+    );
+    rendered.unwrap_or_else(|InlineWorkExhausted| {
         // A hostile construct can otherwise make every source delimiter scan
         // the same suffix. Degrade the whole inline fragment in one pass so a
         // partially parsed prefix cannot activate syntax around the fallback.

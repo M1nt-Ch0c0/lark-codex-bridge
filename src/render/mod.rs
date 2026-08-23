@@ -40,6 +40,42 @@ use crate::limits::{
 
 mod markdown;
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MeasuredProjectionWork {
+    email_mask: usize,
+    markdown_inline: usize,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static MEASURED_PROJECTION_WORK: std::cell::Cell<MeasuredProjectionWork> =
+        const { std::cell::Cell::new(MeasuredProjectionWork { email_mask: 0, markdown_inline: 0 }) };
+}
+
+#[cfg(test)]
+fn record_email_mask_work(units: usize) {
+    MEASURED_PROJECTION_WORK.with(|work| {
+        let mut measured = work.get();
+        measured.email_mask = measured.email_mask.saturating_add(units);
+        work.set(measured);
+    });
+}
+
+#[cfg(test)]
+fn record_markdown_inline_work(units: usize) {
+    MEASURED_PROJECTION_WORK.with(|work| {
+        let mut measured = work.get();
+        measured.markdown_inline = measured.markdown_inline.saturating_add(units);
+        work.set(measured);
+    });
+}
+
+#[cfg(test)]
+fn take_measured_projection_work() -> MeasuredProjectionWork {
+    MEASURED_PROJECTION_WORK.with(|work| work.replace(MeasuredProjectionWork::default()))
+}
+
 pub use markdown::{
     card_markdown_element_wire_len, render_lark_markdown, split_lark_markdown,
     stabilize_streaming_markdown,
@@ -522,51 +558,117 @@ fn tail_beyond(text: &str, prefix_bytes: usize) -> &str {
 /// Replaces the `@` in plausible email addresses with `[at]`, leaving package
 /// versions (`pkg@1.2.3`), scoped package names (`@scope/pkg`), and `@mention`
 /// markers untouched. A masking decision is deterministic and depends only on
-/// the characters immediately around each `@`.
+/// the characters in the same whitespace-delimited token.
 #[must_use]
 pub fn email_mask(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut cursor = 0;
-    for (index, _) in text.match_indices('@') {
-        out.push_str(&text[cursor..index]);
-        if is_email_at(text, index) {
-            out.push_str("[at]");
-        } else {
-            out.push('@');
+    let mut output = String::with_capacity(text.len());
+    let mut token = EmailToken::default();
+    #[cfg(test)]
+    let mut measured_work = 0_usize;
+
+    for (index, character) in text.char_indices() {
+        #[cfg(test)]
+        {
+            measured_work = measured_work.saturating_add(character.len_utf8());
         }
-        cursor = index + 1;
+        if character.is_whitespace() {
+            let emitted_work = token.emit(text, index, &mut output);
+            #[cfg(test)]
+            {
+                measured_work = measured_work.saturating_add(emitted_work);
+            }
+            #[cfg(not(test))]
+            let _ = emitted_work;
+            output.push(character);
+            #[cfg(test)]
+            {
+                measured_work = measured_work.saturating_add(character.len_utf8());
+            }
+            token.reset(index + character.len_utf8());
+        } else {
+            token.observe(index, character);
+        }
     }
-    out.push_str(&text[cursor..]);
-    out
+    let emitted_work = token.emit(text, text.len(), &mut output);
+    #[cfg(test)]
+    {
+        measured_work = measured_work.saturating_add(emitted_work);
+        record_email_mask_work(measured_work);
+    }
+    #[cfg(not(test))]
+    let _ = emitted_work;
+    output
 }
 
-/// Whether the `@` at byte `index` is the separator of an email address: a
-/// non-empty, valid local character on the left and a right-hand token whose
-/// first character is not a digit (so `pkg@1.2.3` version ranges are never
-/// masked) and whose last-dot segment is a pure alphabetic domain label of
-/// 2..=24 letters (so `pkg@v1.2.3`-style tokens and other dot-separated
-/// identifiers stay untouched).
-fn is_email_at(text: &str, index: usize) -> bool {
-    let Some(left) = text[..index].chars().next_back() else {
-        return false;
-    };
-    if !(left.is_ascii_alphanumeric() || matches!(left, '.' | '_' | '%' | '+' | '-')) {
-        return false;
+#[derive(Debug, Default)]
+struct EmailToken {
+    start: usize,
+    last_dot: Option<usize>,
+    terminal_label_chars: usize,
+    terminal_label_is_ascii_alpha: bool,
+    previous_is_local: bool,
+    candidates: Vec<usize>,
+}
+
+impl EmailToken {
+    fn observe(&mut self, index: usize, character: char) {
+        if character == '@' && self.previous_is_local {
+            self.candidates.push(index);
+        }
+
+        if character == '.' {
+            self.last_dot = Some(index);
+            self.terminal_label_chars = 0;
+            self.terminal_label_is_ascii_alpha = true;
+        } else if self.last_dot.is_some() {
+            self.terminal_label_chars = self.terminal_label_chars.saturating_add(1);
+            self.terminal_label_is_ascii_alpha &= character.is_ascii_alphabetic();
+        }
+
+        self.previous_is_local =
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '%' | '+' | '-');
     }
-    let right = &text[index + 1..];
-    let token: String = right.chars().take_while(|c| !c.is_whitespace()).collect();
-    let Some(first) = token.chars().next() else {
-        return false;
-    };
-    if first.is_ascii_digit() {
-        return false;
+
+    /// Emits one already-classified token without rescanning any candidate's
+    /// suffix. The terminal label is shared by every `@` before the last dot,
+    /// exactly matching the former per-candidate predicate.
+    fn emit(&self, text: &str, end: usize, output: &mut String) -> usize {
+        let output_start = output.len();
+        let terminal_label_is_domain =
+            self.terminal_label_is_ascii_alpha && (2..=24).contains(&self.terminal_label_chars);
+        let mut cursor = self.start;
+        for &candidate in &self.candidates {
+            output.push_str(&text[cursor..candidate]);
+            let right_starts_with_digit = text[candidate + 1..end]
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_ascii_digit());
+            if terminal_label_is_domain
+                && self.last_dot.is_some_and(|last_dot| candidate < last_dot)
+                && !right_starts_with_digit
+            {
+                output.push_str("[at]");
+            } else {
+                output.push('@');
+            }
+            cursor = candidate + 1;
+        }
+        output.push_str(&text[cursor..end]);
+
+        output
+            .len()
+            .saturating_sub(output_start)
+            .saturating_add(self.candidates.len())
     }
-    let Some(last_dot) = token.rfind('.') else {
-        return false;
-    };
-    let label = &token[last_dot + 1..];
-    let len = label.chars().count();
-    (2..=24).contains(&len) && label.chars().all(|c| c.is_ascii_alphabetic())
+
+    fn reset(&mut self, start: usize) {
+        self.start = start;
+        self.last_dot = None;
+        self.terminal_label_chars = 0;
+        self.terminal_label_is_ascii_alpha = false;
+        self.previous_is_local = false;
+        self.candidates.clear();
+    }
 }
 
 /// Deterministically splits `text` into at most `max_splits` parts of at most
@@ -631,4 +733,89 @@ fn truncate_to_chars(buffer: &mut String, max_chars: usize) {
         .nth(keep)
         .map_or(buffer.len(), |(index, _)| index);
     buffer.truncate(byte);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProjectedReply, ReplyProjector, take_measured_projection_work};
+    use crate::codex::client::{ThreadId, TurnId, TurnOutcome};
+    use crate::codex::types::{MessagePhase, ThreadItem, TurnStatus};
+    use crate::lark::api::post_markdown_reply_body_len;
+    use crate::limits::{
+        LARK_MAX_SEND_BODY_BYTES, REPLY_MAX_SPLITS, REPLY_MESSAGE_MAX_CHARS,
+        REPLY_TRUNCATION_MARKER, THREAD_PROJECTION_BYTE_BUDGET,
+    };
+    use serde_json::Map;
+
+    #[test]
+    fn actual_final_projection_has_tight_linear_mask_and_markdown_work() {
+        let target_bytes = THREAD_PROJECTION_BYTE_BUDGET - 4 * 1024;
+        let pair_count = (target_bytes / 2 - "x.com ".len()) / 2;
+        let mut text = String::with_capacity(target_bytes);
+        text.push_str(&"a@".repeat(pair_count));
+        text.push_str("x.com ");
+        text.push_str(&"[".repeat(target_bytes - text.len()));
+        assert_eq!(text.len(), target_bytes);
+
+        let outcome = TurnOutcome {
+            thread_id: ThreadId::from("thread_linear_projection"),
+            turn_id: TurnId::from("turn_linear_projection"),
+            status: TurnStatus::Completed,
+            error: None,
+            completed_items: vec![ThreadItem::AgentMessage {
+                id: "item_linear_projection".to_owned(),
+                text,
+                phase: Some(MessagePhase::FinalAnswer),
+                memory_citation: None,
+                extra: Map::new(),
+            }],
+            token_usage: None,
+        };
+
+        let _ = take_measured_projection_work();
+        let projected = ReplyProjector::with_defaults().project_final(&outcome);
+        let measured = take_measured_projection_work();
+
+        // One classification visit per source byte, one output-byte write,
+        // and exactly one constant-time decision per `@` candidate. Every
+        // qualifying one-byte `@` expands to the four-byte `[at]` marker.
+        assert_eq!(
+            measured.email_mask,
+            target_bytes
+                .saturating_mul(2)
+                .saturating_add(pair_count.saturating_mul(4)),
+        );
+        assert!(
+            measured.markdown_inline <= target_bytes.saturating_mul(7),
+            "{} source bytes consumed {} Markdown work units",
+            target_bytes,
+            measured.markdown_inline,
+        );
+        assert!(
+            measured.email_mask.saturating_add(measured.markdown_inline)
+                <= target_bytes.saturating_mul(10),
+            "{target_bytes} source bytes consumed {measured:?}",
+        );
+
+        let ProjectedReply::Final { parts } = projected else {
+            panic!("the completed answer must project to bounded final parts");
+        };
+        assert_eq!(parts.len(), REPLY_MAX_SPLITS);
+        assert!(
+            parts
+                .iter()
+                .all(|part| part.chars().count() == REPLY_MESSAGE_MAX_CHARS)
+        );
+        assert!(
+            parts.iter().all(|part| {
+                post_markdown_reply_body_len(part, true) <= LARK_MAX_SEND_BODY_BYTES
+            })
+        );
+        assert!(
+            parts
+                .last()
+                .is_some_and(|part| part.ends_with(REPLY_TRUNCATION_MARKER))
+        );
+        assert!(parts.iter().all(|part| !part.contains('@')));
+    }
 }
