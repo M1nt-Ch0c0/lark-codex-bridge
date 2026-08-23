@@ -1149,6 +1149,11 @@ async fn release_thread_route(
     }
 }
 
+#[allow(
+    clippy::if_not_else,
+    clippy::too_many_arguments,
+    reason = "the mismatch-first branch archives stale state before the explicit dependencies start a replacement"
+)]
 async fn ensure_thread(
     scope: &ScopeKey,
     store: &StoreHandle,

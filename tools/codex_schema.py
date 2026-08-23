@@ -9,19 +9,25 @@ on committed artifacts and are safe in an offline build/test environment.
 from __future__ import annotations
 
 import argparse
+import contextvars
+import functools
 import hashlib
 import json
+import math
 import os
 import re
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
-from typing import Any, Iterable, NoReturn
+from typing import Any, Iterable, Iterator, NoReturn
 
 
 GENERATOR_NAME = "lark-codex-bridge/codex-schema"
@@ -34,8 +40,21 @@ HISTORY_FORMAT_VERSION = 1
 ESTABLISHED_BASELINE_VERSION = "0.146.0"
 ESTABLISHED_BASELINE_SCHEMA_SHA256 = "8f949f41d0de731f26d264db686a90469a817837f83050c47487045745a3b3a6"
 MAX_CAPTURE_BYTES = 64 * 1024
-MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
-SCHEMA_VALIDATION_RECURSION_LIMIT = 512
+MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
+MAX_AGGREGATE_ARTIFACT_BYTES = 64 * 1024 * 1024
+MAX_JSON_NODES_PER_ARTIFACT = 500_000
+MAX_AGGREGATE_JSON_NODES = 2_000_000
+MAX_JSON_DEPTH = 128
+MAX_JSON_NUMBER_CHARACTERS = 4_096
+MAX_WORK_UNITS = 5_000_000
+MAX_CLASSIFIED_CHANGES = 10_000
+MAX_DIRECTORY_ENTRIES = 1_024
+MAX_GENERATOR_ARGUMENTS = 64
+MAX_SELECTED_ROOTS = 128
+MAX_TRACKED_VERSIONS = 256
+MAX_OPERATION_SECONDS = 180
+READ_CHUNK_BYTES = 64 * 1024
+SCHEMA_VALIDATION_RECURSION_LIMIT = MAX_JSON_DEPTH
 VERSION_TIMEOUT_SECONDS = 10
 GENERATION_TIMEOUT_SECONDS = 120
 VERSION_RE = re.compile(rb"codex-cli (0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:\r?\n)?\Z")
@@ -54,6 +73,117 @@ HISTORY_PATH = PROTOCOL_ROOT / "support-history.json"
 
 class SchemaToolError(Exception):
     """A sanitized maintenance failure; it never contains wire payloads."""
+
+
+@dataclass
+class OperationBudget:
+    """One bounded maintenance operation shared by all nested helpers."""
+
+    deadline: float
+    maximum_aggregate_bytes: int = MAX_AGGREGATE_ARTIFACT_BYTES
+    maximum_file_json_nodes: int = MAX_JSON_NODES_PER_ARTIFACT
+    maximum_json_nodes: int = MAX_AGGREGATE_JSON_NODES
+    maximum_json_depth: int = MAX_JSON_DEPTH
+    maximum_work: int = MAX_WORK_UNITS
+    maximum_changes: int = MAX_CLASSIFIED_CHANGES
+    artifact_bytes: int = 0
+    json_nodes: int = 0
+    work: int = 0
+    changes: int = 0
+
+    def checkpoint(self, units: int = 1) -> None:
+        if units < 0:
+            fail("maintenance work accounting is invalid")
+        self.work += units
+        if self.work > self.maximum_work:
+            fail("maintenance operation exceeded the bounded work limit")
+        if time.monotonic() > self.deadline:
+            fail("maintenance operation exceeded its bounded deadline")
+
+    def consume_bytes(self, count: int) -> None:
+        self.checkpoint()
+        self.artifact_bytes += count
+        if self.artifact_bytes > self.maximum_aggregate_bytes:
+            fail("maintenance operation exceeded the aggregate artifact-byte limit")
+
+    def consume_json_nodes(self, count: int) -> None:
+        self.checkpoint()
+        self.json_nodes += count
+        if self.json_nodes > self.maximum_json_nodes:
+            fail("maintenance operation exceeded the aggregate JSON-node limit")
+
+    def consume_change(self) -> None:
+        self.checkpoint()
+        self.changes += 1
+        if self.changes > self.maximum_changes:
+            fail("schema comparison exceeded the classified-change limit")
+
+
+_ACTIVE_BUDGET: contextvars.ContextVar[OperationBudget | None] = contextvars.ContextVar(
+    "codex_schema_operation_budget", default=None
+)
+
+
+@contextmanager
+def operation_budget(
+    *,
+    timeout: float = MAX_OPERATION_SECONDS,
+    maximum_aggregate_bytes: int = MAX_AGGREGATE_ARTIFACT_BYTES,
+    maximum_file_json_nodes: int = MAX_JSON_NODES_PER_ARTIFACT,
+    maximum_json_nodes: int = MAX_AGGREGATE_JSON_NODES,
+    maximum_json_depth: int = MAX_JSON_DEPTH,
+    maximum_work: int = MAX_WORK_UNITS,
+    maximum_changes: int = MAX_CLASSIFIED_CHANGES,
+) -> Iterator[OperationBudget]:
+    """Install one aggregate resource budget unless a caller already owns it."""
+    existing = _ACTIVE_BUDGET.get()
+    if existing is not None:
+        existing.checkpoint()
+        yield existing
+        return
+    if (
+        timeout <= 0
+        or maximum_aggregate_bytes <= 0
+        or maximum_file_json_nodes <= 0
+        or maximum_json_nodes <= 0
+        or maximum_json_depth <= 0
+        or maximum_work <= 0
+        or maximum_changes <= 0
+    ):
+        fail("maintenance operation has an invalid resource budget")
+    budget = OperationBudget(
+        deadline=time.monotonic() + timeout,
+        maximum_aggregate_bytes=maximum_aggregate_bytes,
+        maximum_file_json_nodes=maximum_file_json_nodes,
+        maximum_json_nodes=maximum_json_nodes,
+        maximum_json_depth=maximum_json_depth,
+        maximum_work=maximum_work,
+        maximum_changes=maximum_changes,
+    )
+    token = _ACTIVE_BUDGET.set(budget)
+    try:
+        yield budget
+    finally:
+        _ACTIVE_BUDGET.reset(token)
+
+
+def budgeted(function: Any) -> Any:
+    """Give directly-invoked helpers the same limits as CLI operations."""
+
+    @functools.wraps(function)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        with operation_budget():
+            return function(*args, **kwargs)
+
+    return wrapper
+
+
+def active_budget() -> OperationBudget:
+    budget = _ACTIVE_BUDGET.get()
+    if budget is None:
+        fail("maintenance resource budget is unavailable")
+    budget.checkpoint()
+    return budget
 
 
 @dataclass(frozen=True)
@@ -79,12 +209,172 @@ class BoundedProcessResult:
     timed_out: bool
 
 
-def _signal_process_group(process: subprocess.Popen[bytes], signal_number: int) -> None:
+@dataclass(frozen=True)
+class CodexExecutionContext:
+    cwd: Path
+    codex_home: Path
+    environment: dict[str, str]
+
+
+class WindowsJob:
+    """Kill-on-close Windows Job Object assigned before the child can execute."""
+
+    def __init__(self) -> None:
+        if os.name != "nt":
+            fail("Windows process-tree ownership is unavailable on this platform")
+        import ctypes
+        from ctypes import wintypes
+
+        class BasicLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class IoCounters(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_ulonglong),
+                ("WriteOperationCount", ctypes.c_ulonglong),
+                ("OtherOperationCount", ctypes.c_ulonglong),
+                ("ReadTransferCount", ctypes.c_ulonglong),
+                ("WriteTransferCount", ctypes.c_ulonglong),
+                ("OtherTransferCount", ctypes.c_ulonglong),
+            ]
+
+        class ExtendedLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", BasicLimitInformation),
+                ("IoInfo", IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel32.TerminateJobObject.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.CreateJobObjectW(None, None)
+        if not handle:
+            fail("Windows process-tree owner could not be created")
+        information = ExtendedLimitInformation()
+        # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE in the extended-limit class (9).
+        information.BasicLimitInformation.LimitFlags = 0x00002000
+        if not kernel32.SetInformationJobObject(
+            handle, 9, ctypes.byref(information), ctypes.sizeof(information)
+        ):
+            kernel32.CloseHandle(handle)
+            fail("Windows process-tree owner could not be configured")
+        self._ctypes = ctypes
+        self._wintypes = wintypes
+        self._kernel32 = kernel32
+        self._handle = handle
+
+    def assign_and_resume(self, process: subprocess.Popen[bytes]) -> None:
+        ctypes = self._ctypes
+        wintypes = self._wintypes
+        kernel32 = self._kernel32
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        # PROCESS_SET_QUOTA | PROCESS_TERMINATE, required by assignment.
+        process_handle = kernel32.OpenProcess(0x00000101, False, process.pid)
+        if not process_handle:
+            fail("Windows child process handle is unavailable")
+        try:
+            if not kernel32.AssignProcessToJobObject(self._handle, process_handle):
+                fail("Windows child could not enter the owned process tree")
+        finally:
+            kernel32.CloseHandle(process_handle)
+
+        class ThreadEntry32(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ThreadID", wintypes.DWORD),
+                ("th32OwnerProcessID", wintypes.DWORD),
+                ("tpBasePri", wintypes.LONG),
+                ("tpDeltaPri", wintypes.LONG),
+                ("dwFlags", wintypes.DWORD),
+            ]
+
+        kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        kernel32.Thread32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(ThreadEntry32)]
+        kernel32.Thread32First.restype = wintypes.BOOL
+        kernel32.Thread32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(ThreadEntry32)]
+        kernel32.Thread32Next.restype = wintypes.BOOL
+        kernel32.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenThread.restype = wintypes.HANDLE
+        kernel32.ResumeThread.argtypes = [wintypes.HANDLE]
+        kernel32.ResumeThread.restype = wintypes.DWORD
+        snapshot = kernel32.CreateToolhelp32Snapshot(0x00000004, 0)  # TH32CS_SNAPTHREAD
+        invalid_handle = ctypes.c_void_p(-1).value
+        snapshot_value = ctypes.cast(snapshot, ctypes.c_void_p).value
+        if not snapshot or snapshot_value == invalid_handle:
+            fail("Windows child main thread could not be enumerated")
+        thread_handle = None
+        try:
+            entry = ThreadEntry32()
+            entry.dwSize = ctypes.sizeof(entry)
+            present = kernel32.Thread32First(snapshot, ctypes.byref(entry))
+            while present:
+                if entry.th32OwnerProcessID == process.pid:
+                    # THREAD_SUSPEND_RESUME is the only requested thread right.
+                    thread_handle = kernel32.OpenThread(0x0002, False, entry.th32ThreadID)
+                    break
+                present = kernel32.Thread32Next(snapshot, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(snapshot)
+        if not thread_handle:
+            fail("Windows child main thread could not be opened")
+        try:
+            if kernel32.ResumeThread(thread_handle) == 0xFFFFFFFF:
+                fail("Windows child main thread could not be resumed")
+        finally:
+            kernel32.CloseHandle(thread_handle)
+
+    def terminate(self) -> None:
+        if self._handle:
+            self._kernel32.TerminateJobObject(self._handle, 1)
+
+    def close(self) -> None:
+        if self._handle:
+            self._kernel32.CloseHandle(self._handle)
+            self._handle = None
+
+
+def _signal_process_group(
+    process: subprocess.Popen[bytes],
+    signal_number: int,
+    windows_job: WindowsJob | None = None,
+) -> None:
     try:
         if os.name == "posix":
             os.killpg(process.pid, signal_number)
         else:
-            if signal_number == signal.SIGTERM:
+            if windows_job is not None:
+                windows_job.terminate()
+            elif signal_number == signal.SIGTERM:
                 process.terminate()
             else:
                 process.kill()
@@ -92,13 +382,17 @@ def _signal_process_group(process: subprocess.Popen[bytes], signal_number: int) 
         pass
 
 
-def _stop_process(process: subprocess.Popen[bytes]) -> None:
-    _signal_process_group(process, signal.SIGTERM)
+def _stop_process(
+    process: subprocess.Popen[bytes], windows_job: WindowsJob | None = None
+) -> None:
+    _signal_process_group(process, signal.SIGTERM, windows_job)
     if process.poll() is None:
         try:
             process.wait(timeout=0.5)
         except subprocess.TimeoutExpired:
-            _signal_process_group(process, signal.SIGKILL)
+            _signal_process_group(process, signal.SIGKILL, windows_job)
+    elif windows_job is not None:
+        windows_job.terminate()
     if process.poll() is None:
         try:
             process.wait(timeout=1)
@@ -106,8 +400,15 @@ def _stop_process(process: subprocess.Popen[bytes]) -> None:
             pass
 
 
-def run_bounded(command: list[str], *, timeout: float) -> BoundedProcessResult:
+def run_bounded(
+    command: list[str],
+    *,
+    timeout: float,
+    cwd: Path | None = None,
+    environment: dict[str, str] | None = None,
+) -> BoundedProcessResult:
     """Run a command while concurrently draining and bounding both output pipes."""
+    windows_job = WindowsJob() if os.name == "nt" else None
     try:
         process = subprocess.Popen(
             command,
@@ -115,9 +416,28 @@ def run_bounded(command: list[str], *, timeout: float) -> BoundedProcessResult:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=os.name == "posix",
+            cwd=cwd,
+            env=environment,
+            # CREATE_SUSPENDED closes the child-spawn race before Job assignment.
+            creationflags=0x00000004 if os.name == "nt" else 0,
         )
-    except OSError as error:
+    except (OSError, ValueError) as error:
+        if windows_job is not None:
+            windows_job.close()
         raise SchemaToolError("external command could not start") from error
+    if windows_job is not None:
+        try:
+            windows_job.assign_and_resume(process)
+        except Exception as error:
+            try:
+                process.kill()
+                process.wait(timeout=1)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            windows_job.close()
+            if isinstance(error, SchemaToolError):
+                raise
+            raise SchemaToolError("Windows process-tree ownership failed") from error
     assert process.stdout is not None and process.stderr is not None
     overflow = threading.Event()
     reader_failed = threading.Event()
@@ -131,7 +451,7 @@ def run_bounded(command: list[str], *, timeout: float) -> BoundedProcessResult:
                     capture.extend(chunk[:remaining])
                 if len(chunk) > remaining:
                     overflow.set()
-        except OSError:
+        except (OSError, ValueError):
             reader_failed.set()
         finally:
             pipe.close()
@@ -140,41 +460,63 @@ def run_bounded(command: list[str], *, timeout: float) -> BoundedProcessResult:
         threading.Thread(target=drain, args=(process.stdout, captures[0]), daemon=True),
         threading.Thread(target=drain, args=(process.stderr, captures[1]), daemon=True),
     ]
-    for reader in readers:
-        reader.start()
+    started_readers: list[threading.Thread] = []
+    try:
+        for reader in readers:
+            reader.start()
+            started_readers.append(reader)
+    except RuntimeError as error:
+        _stop_process(process, windows_job)
+        if windows_job is not None:
+            windows_job.close()
+        for reader in started_readers:
+            reader.join(timeout=1)
+        process.stdout.close()
+        process.stderr.close()
+        raise SchemaToolError("external command pipe readers could not start") from error
     deadline = time.monotonic() + timeout
     timed_out = False
     inherited_pipe = False
     try:
         while process.poll() is None:
+            if _ACTIVE_BUDGET.get() is not None:
+                active_budget().checkpoint()
             if overflow.is_set():
-                _stop_process(process)
+                _stop_process(process, windows_job)
                 break
             if reader_failed.is_set():
-                _stop_process(process)
+                _stop_process(process, windows_job)
                 break
             if time.monotonic() >= deadline:
                 timed_out = True
-                _stop_process(process)
+                _stop_process(process, windows_job)
                 break
             time.sleep(0.01)
     finally:
+        if process.poll() is None:
+            _stop_process(process, windows_job)
+        if windows_job is not None:
+            # KILL_ON_JOB_CLOSE settles descendants even after the direct child
+            # exits normally and before inherited output pipes are joined.
+            windows_job.close()
         for reader in readers:
             reader.join(timeout=0.25)
         if any(reader.is_alive() for reader in readers):
             # A descendant inherited stdout/stderr after the direct child
             # exited. Kill the isolated group so EOF and cleanup are bounded.
             inherited_pipe = True
-            _signal_process_group(process, signal.SIGKILL)
+            _signal_process_group(process, signal.SIGKILL, windows_job)
             for reader in readers:
                 reader.join(timeout=1)
+        if os.name == "posix":
+            # Also settle descendants that deliberately closed inherited pipes
+            # before the direct child exited.
+            _signal_process_group(process, signal.SIGKILL, windows_job)
         if any(reader.is_alive() for reader in readers):
             raise SchemaToolError("external command pipe cleanup did not complete")
-        if process.poll() is None:
-            _stop_process(process)
     if reader_failed.is_set():
         raise SchemaToolError("external command pipe read failed")
-    if inherited_pipe and not (timed_out or overflow.is_set()):
+    if inherited_pipe and os.name != "nt" and not (timed_out or overflow.is_set()):
         raise SchemaToolError("external command descendants retained output pipes")
     return BoundedProcessResult(
         process.returncode if process.returncode is not None else -1,
@@ -189,22 +531,141 @@ def fail(message: str) -> NoReturn:
     raise SchemaToolError(message)
 
 
+def inspect_json_shape(value: Any, *, count_toward_aggregate: bool) -> None:
+    """Bound JSON depth/nodes iteratively before recursive consumers see it."""
+    budget = active_budget()
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    nodes = 0
+    while stack:
+        current, depth = stack.pop()
+        nodes += 1
+        budget.checkpoint()
+        if nodes > budget.maximum_file_json_nodes:
+            fail("JSON artifact exceeds the per-file node limit")
+        if depth > budget.maximum_json_depth:
+            fail("JSON artifact exceeds the nesting-depth limit")
+        if isinstance(current, dict):
+            for key, child in current.items():
+                if not isinstance(key, str):
+                    fail("JSON object contains a non-string key")
+                stack.append((child, depth + 1))
+        elif isinstance(current, list):
+            for child in current:
+                stack.append((child, depth + 1))
+        elif not (
+            current is None
+            or isinstance(current, (str, bool, int))
+            or (isinstance(current, float) and math.isfinite(current))
+        ):
+            fail("JSON artifact contains an unsupported value")
+    if count_toward_aggregate:
+        budget.consume_json_nodes(nodes)
+
+
+def inspect_json_text_depth(text: str) -> None:
+    """Reject excessive container nesting before the JSON decoder recurses."""
+    budget = active_budget()
+    depth = 0
+    in_string = False
+    escaped = False
+    for index, character in enumerate(text):
+        if index % 4_096 == 0:
+            budget.checkpoint()
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            if depth > budget.maximum_json_depth:
+                fail("JSON artifact exceeds the nesting-depth limit")
+        elif character in "]}":
+            depth -= 1
+
+
+@budgeted
+def read_bounded_bytes(path: Path, *, maximum: int = MAX_ARTIFACT_BYTES) -> bytes:
+    """Read one file without a stat/read race and charge the aggregate budget."""
+    if maximum <= 0 or maximum > MAX_ARTIFACT_BYTES:
+        fail("artifact read has an invalid byte limit")
+    content = bytearray()
+    try:
+        if path.is_symlink():
+            fail(f"artifact symbolic links are not permitted: {safe_relative(path)}")
+        flags = os.O_RDONLY
+        for flag_name in ("O_BINARY", "O_CLOEXEC", "O_NOINHERIT", "O_NONBLOCK", "O_NOFOLLOW"):
+            flags |= getattr(os, flag_name, 0)
+        descriptor = os.open(path, flags)
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                fail(f"artifact is not a regular file: {safe_relative(path)}")
+            with os.fdopen(descriptor, "rb") as handle:
+                descriptor = -1
+                while True:
+                    active_budget().checkpoint()
+                    remaining = maximum + 1 - len(content)
+                    if remaining <= 0:
+                        fail(
+                            f"artifact exceeds the {maximum}-byte limit: {safe_relative(path)}"
+                        )
+                    chunk = handle.read(min(READ_CHUNK_BYTES, remaining))
+                    if not chunk:
+                        break
+                    content.extend(chunk)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+    except SchemaToolError:
+        raise
+    except OSError as error:
+        raise SchemaToolError(
+            f"required artifact is unavailable: {safe_relative(path)}"
+        ) from error
+    if len(content) > maximum:
+        fail(f"artifact exceeds the {maximum}-byte limit: {safe_relative(path)}")
+    active_budget().consume_bytes(len(content))
+    return bytes(content)
+
+
+@budgeted
 def load_json(path: Path, *, maximum: int = MAX_ARTIFACT_BYTES) -> Any:
     try:
-        size = path.stat().st_size
-    except OSError as error:
-        raise SchemaToolError(f"required artifact is unavailable: {safe_relative(path)}") from error
-    if size > maximum:
-        fail(f"JSON artifact exceeds the {maximum}-byte limit: {safe_relative(path)}")
-    try:
-        with path.open("r", encoding="utf-8") as handle:
-            return json.load(
-                handle,
-                parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
-                object_pairs_hook=unique_json_object,
-            )
-    except (OSError, UnicodeError, ValueError, json.JSONDecodeError, RecursionError) as error:
+        text = read_bounded_bytes(path, maximum=maximum).decode("utf-8")
+        inspect_json_text_depth(text)
+        value = json.loads(
+            text,
+            parse_int=parse_bounded_integer,
+            parse_float=parse_bounded_float,
+            parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
+            object_pairs_hook=unique_json_object,
+        )
+        inspect_json_shape(value, count_toward_aggregate=True)
+        return value
+    except SchemaToolError:
+        raise
+    except (UnicodeError, ValueError, json.JSONDecodeError, RecursionError) as error:
         raise SchemaToolError(f"invalid JSON artifact: {safe_relative(path)}") from error
+
+
+def parse_bounded_integer(value: str) -> int:
+    active_budget().checkpoint(max(1, len(value) // 64))
+    digits = len(value) - int(value.startswith("-"))
+    if digits > MAX_JSON_NUMBER_CHARACTERS:
+        fail("JSON integer exceeds the per-number character limit")
+    return int(value)
+
+
+def parse_bounded_float(value: str) -> float:
+    active_budget().checkpoint(max(1, len(value) // 64))
+    if len(value) > MAX_JSON_NUMBER_CHARACTERS:
+        fail("JSON number exceeds the per-number character limit")
+    return float(value)
 
 
 def unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -223,19 +684,28 @@ def safe_relative(path: Path) -> str:
         return path.name
 
 
+@budgeted
 def canonical_bytes(value: Any) -> bytes:
+    inspect_json_shape(value, count_toward_aggregate=False)
     try:
         encoded = json.dumps(value, allow_nan=False, ensure_ascii=False, indent=2, sort_keys=True)
-    except (TypeError, ValueError, RecursionError) as error:
+        content = (encoded + "\n").encode("utf-8")
+    except (TypeError, ValueError, UnicodeError, RecursionError) as error:
         raise SchemaToolError("value cannot be encoded as canonical JSON") from error
-    return (encoded + "\n").encode("utf-8")
+    if len(content) > MAX_ARTIFACT_BYTES:
+        fail("generated artifact exceeds the per-file byte limit")
+    return content
 
 
 def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+@budgeted
 def atomic_write(path: Path, content: bytes) -> None:
+    active_budget().checkpoint()
+    if len(content) > MAX_ARTIFACT_BYTES:
+        fail("generated artifact exceeds the per-file byte limit")
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary = Path(temporary_name)
@@ -252,6 +722,7 @@ def atomic_write(path: Path, content: bytes) -> None:
             pass
 
 
+@budgeted
 def read_selection() -> Selection:
     raw = load_json(SELECTION_PATH)
     if not isinstance(raw, dict) or raw.get("formatVersion") != 1:
@@ -260,37 +731,59 @@ def read_selection() -> Selection:
     arguments = raw.get("generatorArguments")
     roots = raw.get("roots")
     catalog = raw.get("notificationCatalog")
-    if not isinstance(protocol, str) or not protocol:
+    if (
+        not isinstance(protocol, str)
+        or re.fullmatch(r"[A-Za-z0-9+./_-]{1,128}", protocol) is None
+    ):
         fail("schema selection has no protocol family")
-    if not isinstance(arguments, list) or not all(isinstance(value, str) for value in arguments):
+    if (
+        not isinstance(arguments, list)
+        or len(arguments) > MAX_GENERATOR_ARGUMENTS
+        or not all(
+            isinstance(value, str)
+            and re.fullmatch(r"[A-Za-z0-9_./<>-]{1,256}", value) is not None
+            for value in arguments
+        )
+    ):
         fail("schema selection has invalid generator arguments")
     if arguments.count("<temporary-directory>") != 1:
         fail("schema selection must contain one temporary output placeholder")
-    if not isinstance(roots, list) or not roots:
+    if not isinstance(roots, list) or not roots or len(roots) > MAX_SELECTED_ROOTS:
         fail("schema selection has no roots")
     selected: list[SelectionRoot] = []
     names: set[str] = set()
     paths: set[str] = set()
     for raw_root in roots:
+        active_budget().checkpoint()
         if not isinstance(raw_root, dict):
             fail("schema selection contains an invalid root")
         name = raw_root.get("name")
         relative = raw_root.get("path")
-        if not isinstance(name, str) or not isinstance(relative, str):
+        if (
+            not isinstance(name, str)
+            or re.fullmatch(r"[a-z][a-z0-9_.]{0,127}", name) is None
+            or not isinstance(relative, str)
+            or re.fullmatch(r"[A-Za-z0-9_./-]{1,512}", relative) is None
+        ):
             fail("schema selection contains an invalid root")
         candidate = Path(relative)
         if candidate.is_absolute() or ".." in candidate.parts or candidate.suffix != ".json":
-            fail(f"schema selection contains an unsafe path for root {name}")
+            fail("schema selection contains an unsafe root path")
         if name in names or relative in paths:
-            fail(f"schema selection contains a duplicate root: {name}")
+            fail("schema selection contains a duplicate root")
         names.add(name)
         paths.add(relative)
         selected.append(SelectionRoot(name, relative))
-    if not isinstance(catalog, str) or Path(catalog).name != catalog:
+    if (
+        not isinstance(catalog, str)
+        or re.fullmatch(r"[A-Za-z0-9_.-]{1,255}", catalog) is None
+        or Path(catalog).name != catalog
+    ):
         fail("schema selection has an invalid notification catalog")
     return Selection(protocol, tuple(arguments), tuple(selected), catalog)
 
 
+@budgeted
 def read_policy() -> dict[str, Any]:
     raw = load_json(POLICY_PATH)
     if not isinstance(raw, dict) or raw.get("formatVersion") != 1:
@@ -305,10 +798,16 @@ def read_policy() -> dict[str, Any]:
         fail("Codex support policy is incomplete")
     for key in ("supportedVersions", "candidateVersions"):
         versions = raw[key]
-        if not isinstance(versions, list) or not all(is_version(value) for value in versions):
+        if (
+            not isinstance(versions, list)
+            or len(versions) > MAX_TRACKED_VERSIONS
+            or not all(is_version(value) for value in versions)
+        ):
             fail(f"Codex support policy has invalid {key}")
         if versions != sorted(set(versions), key=version_key):
             fail(f"Codex support policy {key} must be sorted and unique")
+    if len(raw["supportedVersions"]) + len(raw["candidateVersions"]) > MAX_TRACKED_VERSIONS:
+        fail("Codex support policy tracks too many versions")
     if raw["selectedWireVersion"] not in raw["supportedVersions"]:
         fail("selected wire version is not supported")
     if set(raw["supportedVersions"]) & set(raw["candidateVersions"]):
@@ -316,6 +815,7 @@ def read_policy() -> dict[str, Any]:
     return raw
 
 
+@budgeted
 def read_history(path: Path = HISTORY_PATH) -> dict[str, Any]:
     raw = load_json(path)
     if not isinstance(raw, dict) or raw.get("formatVersion") != HISTORY_FORMAT_VERSION:
@@ -323,10 +823,11 @@ def read_history(path: Path = HISTORY_PATH) -> dict[str, Any]:
     if raw.get("establishedBaselineVersion") != ESTABLISHED_BASELINE_VERSION:
         fail("Codex support history changed the established baseline")
     releases = raw.get("releases")
-    if not isinstance(releases, list) or not releases:
+    if not isinstance(releases, list) or not releases or len(releases) > MAX_TRACKED_VERSIONS:
         fail("Codex support history has no releases")
     seen: set[str] = set()
     for release in releases:
+        active_budget().checkpoint()
         if not isinstance(release, dict) or release.get("decision") != "supported":
             fail("Codex support history contains an invalid decision")
         version = release.get("version")
@@ -345,6 +846,7 @@ def read_history(path: Path = HISTORY_PATH) -> dict[str, Any]:
     return raw
 
 
+@budgeted
 def verify_history_append_only(previous_path: Path) -> None:
     previous = read_history(previous_path)
     current = read_history()
@@ -356,7 +858,13 @@ def verify_history_append_only(previous_path: Path) -> None:
 
 
 def is_version(value: Any) -> bool:
-    return isinstance(value, str) and re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", value) is not None
+    if not isinstance(value, str) or len(value) > 64:
+        return False
+    match = re.fullmatch(
+        r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)",
+        value,
+    )
+    return match is not None and all(int(part) <= 2**64 - 1 for part in match.groups())
 
 
 def version_key(value: str) -> tuple[int, int, int]:
@@ -369,9 +877,96 @@ def rust_version_module(version: str) -> str:
     return "v" + version.replace(".", "_")
 
 
-def probe_version(binary: Path) -> str:
+def private_directory(path: Path) -> None:
     try:
-        result = run_bounded([os.fspath(binary), "--version"], timeout=VERSION_TIMEOUT_SECONDS)
+        path.mkdir(mode=0o700, parents=True, exist_ok=False)
+        if os.name == "posix":
+            path.chmod(0o700)
+            if path.stat().st_mode & 0o077:
+                fail("isolated Codex directory permissions are not private")
+    except SchemaToolError:
+        raise
+    except OSError as error:
+        raise SchemaToolError("isolated Codex directory could not be created") from error
+
+
+@budgeted
+def isolated_codex_context(root: Path) -> CodexExecutionContext:
+    """Create the only profile, temp roots, and cwd visible to Codex export."""
+    active_budget().checkpoint()
+    try:
+        if os.name == "posix":
+            root.chmod(0o700)
+            if root.stat().st_mode & 0o077:
+                fail("isolated Codex root permissions are not private")
+    except SchemaToolError:
+        raise
+    except OSError as error:
+        raise SchemaToolError("isolated Codex root could not be secured") from error
+    cwd = root / "work"
+    codex_home = root / "codex-home"
+    home = root / "home"
+    temporary = root / "tmp"
+    config = root / "config"
+    data = root / "data"
+    cache = root / "cache"
+    runtime = root / "runtime"
+    app_data = root / "app-data"
+    local_app_data = root / "local-app-data"
+    for path in (
+        cwd,
+        codex_home,
+        home,
+        temporary,
+        config,
+        data,
+        cache,
+        runtime,
+        app_data,
+        local_app_data,
+    ):
+        private_directory(path)
+
+    environment: dict[str, str] = {}
+    # PATH is required by the npm launcher (`#!/usr/bin/env node`). The Windows
+    # loader also relies on these static platform variables. Everything else,
+    # including proxies, auth, Python/Node options, and the real profile, is
+    # deliberately absent.
+    for key in ("PATH", "SystemRoot", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT"):
+        value = os.environ.get(key)
+        if value:
+            environment[key] = value
+    environment.update(
+        {
+            "CODEX_HOME": os.fspath(codex_home),
+            "HOME": os.fspath(home),
+            "USERPROFILE": os.fspath(home),
+            "XDG_CONFIG_HOME": os.fspath(config),
+            "XDG_DATA_HOME": os.fspath(data),
+            "XDG_CACHE_HOME": os.fspath(cache),
+            "XDG_RUNTIME_DIR": os.fspath(runtime),
+            "APPDATA": os.fspath(app_data),
+            "LOCALAPPDATA": os.fspath(local_app_data),
+            "TMPDIR": os.fspath(temporary),
+            "TMP": os.fspath(temporary),
+            "TEMP": os.fspath(temporary),
+            "NO_COLOR": "1",
+        }
+    )
+    if os.name == "posix":
+        environment.update({"LANG": "C", "LC_ALL": "C"})
+    return CodexExecutionContext(cwd=cwd, codex_home=codex_home, environment=environment)
+
+
+@budgeted
+def probe_version_in_context(binary: Path, context: CodexExecutionContext) -> str:
+    try:
+        result = run_bounded(
+            [os.fspath(binary), "--version"],
+            timeout=VERSION_TIMEOUT_SECONDS,
+            cwd=context.cwd,
+            environment=context.environment,
+        )
     except SchemaToolError as error:
         raise SchemaToolError("Codex version probe could not complete") from error
     if result.timed_out:
@@ -385,21 +980,45 @@ def probe_version(binary: Path) -> str:
     match = VERSION_RE.fullmatch(result.stdout)
     if match is None:
         fail("Codex version output must exactly match `codex-cli X.Y.Z`")
-    return ".".join(part.decode("ascii") for part in match.groups())
+    version = ".".join(part.decode("ascii") for part in match.groups())
+    if not is_version(version):
+        fail("Codex version output must exactly match a bounded `codex-cli X.Y.Z`")
+    return version
 
 
-def generate_schema_directory(binary: Path, selection: Selection) -> tuple[str, Path, tempfile.TemporaryDirectory[str]]:
-    version = probe_version(binary)
-    temporary = tempfile.TemporaryDirectory(prefix="lark-codex-schema-")
-    output = Path(temporary.name) / "export"
-    arguments = [str(output) if value == "<temporary-directory>" else value for value in selection.generator_arguments]
+@budgeted
+def probe_version(binary: Path) -> str:
     try:
+        with tempfile.TemporaryDirectory(prefix="lark-codex-version-") as directory:
+            context = isolated_codex_context(Path(directory))
+            return probe_version_in_context(binary.resolve(), context)
+    except OSError as error:
+        raise SchemaToolError("Codex version probe could not prepare isolation") from error
+
+
+@budgeted
+def generate_schema_directory(
+    binary: Path, selection: Selection
+) -> tuple[str, Path, tempfile.TemporaryDirectory[str]]:
+    temporary = tempfile.TemporaryDirectory(prefix="lark-codex-schema-")
+    try:
+        context = isolated_codex_context(Path(temporary.name))
+        resolved_binary = binary.resolve(strict=True)
+        version = probe_version_in_context(resolved_binary, context)
+        output = Path(temporary.name) / "export"
+        arguments = [
+            str(output) if value == "<temporary-directory>" else value
+            for value in selection.generator_arguments
+        ]
         result = run_bounded(
-            [os.fspath(binary), *arguments], timeout=GENERATION_TIMEOUT_SECONDS
+            [os.fspath(resolved_binary), *arguments],
+            timeout=GENERATION_TIMEOUT_SECONDS,
+            cwd=context.cwd,
+            environment=context.environment,
         )
-    except SchemaToolError as error:
+    except (OSError, SchemaToolError) as error:
         temporary.cleanup()
-        raise SchemaToolError(f"Codex {version} schema export could not complete") from error
+        raise SchemaToolError("Codex schema export could not complete") from error
     if result.timed_out:
         temporary.cleanup()
         fail(f"Codex {version} schema export timed out")
@@ -409,12 +1028,18 @@ def generate_schema_directory(binary: Path, selection: Selection) -> tuple[str, 
     if result.returncode != 0:
         temporary.cleanup()
         fail(f"Codex {version} schema export failed (code {result.returncode})")
-    if not output.is_dir():
+    try:
+        expected_output = Path(temporary.name).resolve(strict=True) / "export"
+        output_is_isolated = output.is_dir() and output.resolve(strict=True) == expected_output
+    except OSError:
+        output_is_isolated = False
+    if not output_is_isolated:
         temporary.cleanup()
-        fail(f"Codex {version} schema export produced no output directory")
+        fail(f"Codex {version} schema export produced no isolated output directory")
     return version, output, temporary
 
 
+@budgeted
 def normalize_schema(value: Any, parent_key: str | None = None) -> Any:
     if isinstance(value, dict):
         return {key: normalize_schema(value[key], key) for key in sorted(value)}
@@ -426,6 +1051,7 @@ def normalize_schema(value: Any, parent_key: str | None = None) -> Any:
     return value
 
 
+@budgeted
 def notification_methods(schema: Any) -> list[str]:
     if not isinstance(schema, dict):
         fail("notification catalog is not a JSON Schema object")
@@ -434,6 +1060,7 @@ def notification_methods(schema: Any) -> list[str]:
     if not isinstance(variants, list):
         fail("notification catalog has no oneOf variants")
     for variant in variants:
+        active_budget().checkpoint()
         try:
             values = variant["properties"]["method"]["enum"]
         except (KeyError, TypeError):
@@ -445,16 +1072,14 @@ def notification_methods(schema: Any) -> list[str]:
     return sorted(methods)
 
 
+@budgeted
 def make_bundle(export: Path, selection: Selection) -> dict[str, Any]:
     roots: dict[str, Any] = {}
     for root in selection.roots:
-        source = export / root.path
-        if not source.is_file():
-            fail(f"Codex schema export omitted selected root {root.name}")
+        active_budget().checkpoint()
+        source = isolated_export_file(export, root.path)
         roots[root.name] = normalize_schema(load_json(source))
-    catalog_path = export / selection.notification_catalog
-    if not catalog_path.is_file():
-        fail("Codex schema export omitted the notification catalog")
+    catalog_path = isolated_export_file(export, selection.notification_catalog)
     catalog = normalize_schema(load_json(catalog_path))
     return {
         "formatVersion": SCHEMA_BUNDLE_FORMAT_VERSION,
@@ -463,14 +1088,31 @@ def make_bundle(export: Path, selection: Selection) -> dict[str, Any]:
     }
 
 
+@budgeted
+def isolated_export_file(export: Path, relative: str) -> Path:
+    """Resolve one regular export file without allowing link-based escape."""
+    candidate = export / relative
+    try:
+        export_root = export.resolve(strict=True)
+        resolved = candidate.resolve(strict=True)
+    except OSError as error:
+        raise SchemaToolError("Codex schema export omitted a selected artifact") from error
+    expected = export_root.joinpath(*Path(relative).parts)
+    if resolved != expected or not candidate.is_file() or candidate.is_symlink():
+        fail("Codex schema export contains an unsafe selected artifact")
+    return candidate
+
+
 def camel_to_snake(value: str) -> str:
     first = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", value)
     return re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", first).replace("-", "_").lower()
 
 
+@budgeted
 def generated_value_fields(properties: dict[str, Any], required: set[str], excluded: set[str]) -> str:
     lines: list[str] = []
     for wire_name in sorted(set(properties) - excluded):
+        active_budget().checkpoint()
         rust_name = camel_to_snake(wire_name)
         if not re.fullmatch(r"[a-z_][a-z0-9_]*", rust_name):
             fail("selected schema contains a field the Rust generator cannot name safely")
@@ -491,10 +1133,11 @@ def generated_value_fields(properties: dict[str, Any], required: set[str], exclu
     return "\n".join(lines)
 
 
+@budgeted
 def render_wire(version: str, protocol_family: str, schema_sha: str, bundle: dict[str, Any]) -> bytes:
     try:
-        template = WIRE_TEMPLATE_PATH.read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as error:
+        template = read_bounded_bytes(WIRE_TEMPLATE_PATH).decode("utf-8")
+    except UnicodeError as error:
         raise SchemaToolError("wire template is unavailable") from error
     roots = bundle["roots"]
     thread_response = roots["thread.start.response"]
@@ -554,16 +1197,18 @@ def render_wire(version: str, protocol_family: str, schema_sha: str, bundle: dic
         rendered = rendered.replace(marker, value)
     if re.search(r"@[A-Z][A-Z0-9_]+@", rendered):
         fail("wire template contains an unresolved generator marker")
-    return rendered.encode("utf-8")
+    content = rendered.encode("utf-8")
+    if len(content) > MAX_ARTIFACT_BYTES:
+        fail("generated Rust wire artifact exceeds the per-file byte limit")
+    return content
 
 
+@budgeted
 def template_sha256() -> str:
-    try:
-        return sha256_bytes(WIRE_TEMPLATE_PATH.read_bytes())
-    except OSError as error:
-        raise SchemaToolError("wire template is unavailable") from error
+    return sha256_bytes(read_bounded_bytes(WIRE_TEMPLATE_PATH))
 
 
+@budgeted
 def manifest_for(
     version: str,
     selection: Selection,
@@ -613,10 +1258,12 @@ def is_incoming_root(name: str) -> bool:
     )
 
 
+@budgeted
 def incoming_audit(version: str, bundle: dict[str, Any]) -> dict[str, Any]:
     entries: dict[tuple[str, str], dict[str, Any]] = {}
 
     def walk(value: Any, path: str) -> None:
+        active_budget().checkpoint()
         if isinstance(value, dict):
             logical_path = path.split("/definitions/", 1)[-1]
             if logical_path != path:
@@ -670,14 +1317,24 @@ def incoming_audit(version: str, bundle: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+@budgeted
 def render_wire_mod(policy: dict[str, Any], versions: Iterable[str]) -> bytes:
-    modules = sorted(set(versions), key=version_key)
+    module_set: set[str] = set()
+    for index, version in enumerate(versions, start=1):
+        active_budget().checkpoint()
+        if index > MAX_TRACKED_VERSIONS or not is_version(version):
+            fail("generated wire registry has an invalid version set")
+        module_set.add(version)
+    modules = sorted(module_set, key=version_key)
+    if len(modules) > MAX_TRACKED_VERSIONS:
+        fail("generated wire registry tracks too many versions")
     lines = [
         "// @generated by tools/codex_schema.py; DO NOT EDIT.",
         "//! Versioned Codex app-server wire DTOs. Stable domain types live in `types`.",
         "",
     ]
     for version in modules:
+        active_budget().checkpoint()
         lines.extend(["#[rustfmt::skip]", f"pub mod {rust_version_module(version)};"])
     lines.extend(
         [
@@ -704,20 +1361,30 @@ def render_wire_mod(policy: dict[str, Any], versions: Iterable[str]) -> bytes:
             "",
         ]
     )
-    return "\n".join(lines).encode("utf-8")
+    content = "\n".join(lines).encode("utf-8")
+    if len(content) > MAX_ARTIFACT_BYTES:
+        fail("generated Rust module registry exceeds the per-file byte limit")
+    return content
 
 
+@budgeted
 def existing_wire_versions(extra: str | None = None) -> list[str]:
     versions: set[str] = set()
     if SCHEMAS_ROOT.is_dir():
-        for child in SCHEMAS_ROOT.iterdir():
+        for index, child in enumerate(SCHEMAS_ROOT.iterdir(), start=1):
+            active_budget().checkpoint()
+            if index > MAX_DIRECTORY_ENTRIES:
+                fail("schema artifact directory contains too many entries")
             if child.is_dir() and is_version(child.name) and (child / "manifest.json").is_file():
                 versions.add(child.name)
     if extra is not None:
         versions.add(extra)
+    if len(versions) > MAX_TRACKED_VERSIONS:
+        fail("schema artifact directory tracks too many versions")
     return sorted(versions, key=version_key)
 
 
+@budgeted
 def sync(binary: Path, *, check: bool) -> str:
     selection = read_selection()
     policy = read_policy()
@@ -741,10 +1408,8 @@ def sync(binary: Path, *, check: bool) -> str:
         if check:
             mismatches = []
             for path, expected in targets.items():
-                try:
-                    actual = path.read_bytes()
-                except OSError:
-                    actual = b""
+                active_budget().checkpoint()
+                actual = read_bounded_bytes(path) if path.is_file() else b""
                 if actual != expected:
                     mismatches.append(safe_relative(path))
             if mismatches:
@@ -757,6 +1422,7 @@ def sync(binary: Path, *, check: bool) -> str:
         temporary.cleanup()
 
 
+@budgeted
 def load_bundle(version: str) -> dict[str, Any]:
     if not is_version(version):
         fail("Codex version is not a stable X.Y.Z value")
@@ -765,10 +1431,32 @@ def load_bundle(version: str) -> dict[str, Any]:
         fail(f"Codex {version} has an unsupported normalized schema format")
     if not isinstance(bundle.get("roots"), dict) or not isinstance(bundle.get("notificationMethods"), list):
         fail(f"Codex {version} has an incomplete normalized schema")
+    if len(bundle["roots"]) > MAX_SELECTED_ROOTS:
+        fail(f"Codex {version} normalized schema selects too many roots")
+    if len(bundle["notificationMethods"]) > MAX_CLASSIFIED_CHANGES:
+        fail(f"Codex {version} normalized schema contains too many notifications")
+    if any(
+        re.fullmatch(r"[a-z][a-z0-9_.]{0,127}", name) is None
+        or not isinstance(schema, (dict, bool))
+        for name, schema in bundle["roots"].items()
+    ):
+        fail(f"Codex {version} normalized schema contains an invalid root")
+    notifications = bundle["notificationMethods"]
+    if (
+        not all(
+            isinstance(method, str)
+            and re.fullmatch(r"[A-Za-z0-9_./-]{1,256}", method) is not None
+            for method in notifications
+        )
+        or notifications != sorted(set(notifications))
+    ):
+        fail(f"Codex {version} normalized schema contains an invalid notification catalog")
     return bundle
 
 
+@budgeted
 def change(classification: str, kind: str, path: str, **details: Any) -> dict[str, Any]:
+    active_budget().consume_change()
     result = {"classification": classification, "kind": kind, "path": path}
     result.update(details)
     return result
@@ -793,11 +1481,18 @@ def type_atoms(types: set[str]) -> set[str]:
     return atoms
 
 
+@budgeted
 def semantic_json_key(value: Any) -> str:
+    active_budget().checkpoint()
     if isinstance(value, bool) or value is None or isinstance(value, str):
         return f"{type(value).__name__}:{json.dumps(value, sort_keys=True)}"
-    if isinstance(value, (int, float)):
-        return f"number:{float(value):.17g}"
+    if isinstance(value, int):
+        return f"number:{signed_hex(value)}/1"
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            fail("JSON number is not finite")
+        numerator, denominator = value.as_integer_ratio()
+        return f"number:{signed_hex(numerator)}/{denominator:x}"
     if isinstance(value, list):
         return "list:[" + ",".join(semantic_json_key(item) for item in value) + "]"
     if isinstance(value, dict):
@@ -805,6 +1500,22 @@ def semantic_json_key(value: Any) -> str:
             f"{json.dumps(key)}:{semantic_json_key(value[key])}" for key in sorted(value)
         ) + "}"
     return canonical_bytes(value).decode("utf-8")
+
+
+def signed_hex(value: int) -> str:
+    """Encode an arbitrary-size integer without decimal or float conversion."""
+    sign = "-" if value < 0 else ""
+    return f"{sign}{abs(value):x}"
+
+
+def exact_number_fraction(value: int | float) -> Fraction:
+    """Represent an accepted JSON number without coercing integers to floats."""
+    if isinstance(value, int):
+        return Fraction(value, 1)
+    if not math.isfinite(value):
+        fail("JSON number is not finite")
+    numerator, denominator = value.as_integer_ratio()
+    return Fraction(numerator, denominator)
 
 
 def finite_values(schema: dict[str, Any]) -> list[Any] | None:
@@ -846,6 +1557,7 @@ def classify_bound(
         )
 
 
+@budgeted
 def branch_key(schema: Any) -> tuple[str, str] | None:
     if not isinstance(schema, dict):
         return None
@@ -855,6 +1567,7 @@ def branch_key(schema: Any) -> tuple[str, str] | None:
     required = schema.get("required", [])
     if isinstance(properties, dict) and isinstance(required, list):
         for name in sorted(properties):
+            active_budget().checkpoint()
             child = properties[name]
             if name not in required or not isinstance(child, dict):
                 continue
@@ -867,6 +1580,7 @@ def branch_key(schema: Any) -> tuple[str, str] | None:
     return None
 
 
+@budgeted
 def branches_provably_disjoint(left: Any, right: Any) -> bool:
     if not isinstance(left, dict) or not isinstance(right, dict):
         return False
@@ -894,6 +1608,7 @@ def open_incoming_fallback(path: str, *, tagged: bool = False) -> str | None:
     return None
 
 
+@budgeted
 def compare_combinator(
     before: dict[str, Any],
     after: dict[str, Any],
@@ -920,8 +1635,10 @@ def compare_combinator(
     pairs: list[tuple[int, int]] = []
     new_fingerprints: dict[bytes, list[int]] = {}
     for index, variant in enumerate(new):
+        active_budget().checkpoint()
         new_fingerprints.setdefault(canonical_bytes(variant), []).append(index)
     for old_index, variant in enumerate(old):
+        active_budget().checkpoint()
         candidates = new_fingerprints.get(canonical_bytes(variant), [])
         candidate = next((index for index in candidates if index in new_unmatched), None)
         if candidate is not None:
@@ -929,8 +1646,13 @@ def compare_combinator(
             new_unmatched.remove(candidate)
 
     for old_index in list(old_unmatched):
+        active_budget().checkpoint()
         key = branch_key(old[old_index])
-        candidates = [index for index in new_unmatched if branch_key(new[index]) == key]
+        candidates = []
+        for index in new_unmatched:
+            active_budget().checkpoint()
+            if branch_key(new[index]) == key:
+                candidates.append(index)
         if key is not None and len(candidates) == 1:
             new_index = candidates[0]
             old_unmatched.remove(old_index)
@@ -939,11 +1661,15 @@ def compare_combinator(
     # Preserve a modified branch at the same position. This is what prevents an
     # optional field edit inside oneOf from being double-counted as remove+add.
     for index in sorted(old_unmatched & new_unmatched):
+        active_budget().checkpoint()
         old_unmatched.remove(index)
         new_unmatched.remove(index)
         pairs.append((index, index))
     for old_index, new_index in pairs:
-        if isinstance(old[old_index], dict) and isinstance(new[new_index], dict):
+        active_budget().checkpoint()
+        if isinstance(old[old_index], (dict, bool)) and isinstance(
+            new[new_index], (dict, bool)
+        ):
             compare_named_schemas(
                 old[old_index],
                 new[new_index],
@@ -953,7 +1679,11 @@ def compare_combinator(
             )
         elif old[old_index] != new[new_index]:
             changes.append(
-                change("breaking", f"{snake}_boolean_variant_changed", f"{path}/{combinator}/{new_index}")
+                change(
+                    "breaking",
+                    f"{snake}_invalid_variant_changed",
+                    f"{path}/{combinator}/{new_index}",
+                )
             )
 
     if old_unmatched:
@@ -988,15 +1718,38 @@ def compare_combinator(
         changes.append(change(classification, kind, path, **details))
 
 
+@budgeted
 def compare_named_schemas(
-    before: dict[str, Any],
-    after: dict[str, Any],
+    before: Any,
+    after: Any,
     path: str,
     changes: list[dict[str, Any]],
     *,
     incoming: bool = False,
 ) -> None:
     first_change = len(changes)
+    active_budget().checkpoint()
+    if isinstance(before, bool) or isinstance(after, bool):
+        if before == after:
+            return
+        if before is True or after is False:
+            classification = "breaking"
+            kind = "boolean_schema_narrowed"
+        elif before is False or after is True:
+            classification = "additive"
+            kind = "boolean_schema_widened"
+        else:
+            classification = "breaking"
+            kind = "boolean_schema_changed"
+        changes.append(change(classification, kind, path))
+        if incoming and classification == "additive":
+            changes[-1]["classification"] = "breaking"
+            changes[-1]["incomingDirection"] = "conservative_consumer_boundary"
+        return
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        if before != after:
+            changes.append(change("breaking", "schema_shape_changed", path))
+        return
     before_types = schema_types(before)
     after_types = schema_types(after)
     if before_types is not None and after_types is not None:
@@ -1005,7 +1758,15 @@ def compare_named_schemas(
         removed_types = sorted(before_atoms - after_atoms)
         added_types = sorted(after_atoms - before_atoms)
         if removed_types:
-            changes.append(change("breaking", "type_narrowed_or_changed", path, removedTypes=removed_types, addedTypes=added_types))
+            changes.append(
+                change(
+                    "breaking",
+                    "type_narrowed_or_changed",
+                    path,
+                    removedTypes=removed_types,
+                    addedTypes=added_types,
+                )
+            )
         elif added_types:
             changes.append(change("additive", "type_widened", path, addedTypes=added_types))
     elif before_types is None and after_types is not None:
@@ -1028,7 +1789,12 @@ def compare_named_schemas(
             details = {"values": added}
             if fallback is not None:
                 details["fallbackEvidence"] = fallback
-            changes.append(change(classification, "incoming_closed_values_added" if classification == "breaking" else "finite_values_added", path, **details))
+            kind = (
+                "incoming_closed_values_added"
+                if classification == "breaking"
+                else "finite_values_added"
+            )
+            changes.append(change(classification, kind, path, **details))
     elif before_values_raw is None and after_values_raw is not None:
         changes.append(change("breaking", "finite_constraint_added", path))
     elif before_values_raw is not None and after_values_raw is None:
@@ -1036,8 +1802,26 @@ def compare_named_schemas(
 
     before_ref = before.get("$ref")
     after_ref = after.get("$ref")
-    if isinstance(before_ref, str) and isinstance(after_ref, str) and before_ref != after_ref:
-        changes.append(change("breaking", "reference_changed", path))
+    if before_ref != after_ref or (("$ref" in before) != ("$ref" in after)):
+        if isinstance(before_ref, str) and isinstance(after_ref, str):
+            changes.append(change("breaking", "reference_changed", path))
+        elif "$ref" not in before and isinstance(after_ref, str):
+            changes.append(change("breaking", "reference_added", path))
+        elif isinstance(before_ref, str) and "$ref" not in after:
+            changes.append(change("additive", "reference_removed", path))
+        else:
+            changes.append(change("breaking", "reference_invalid_or_changed", path))
+
+    before_draft = before.get("$schema")
+    after_draft = after.get("$schema")
+    if before_draft != after_draft or (("$schema" in before) != ("$schema" in after)):
+        if "$schema" not in before:
+            kind = "schema_draft_added"
+        elif "$schema" not in after:
+            kind = "schema_draft_removed"
+        else:
+            kind = "schema_draft_changed"
+        changes.append(change("breaking", kind, path))
 
     old_additional = before.get("additionalProperties", True)
     new_additional = after.get("additionalProperties", True)
@@ -1051,7 +1835,13 @@ def compare_named_schemas(
         elif new_additional is False:
             changes.append(change("breaking", "additional_properties_narrowed", path))
         elif isinstance(old_additional, dict) and isinstance(new_additional, dict):
-            compare_named_schemas(old_additional, new_additional, f"{path}/additionalProperties", changes, incoming=incoming)
+            compare_named_schemas(
+                old_additional,
+                new_additional,
+                f"{path}/additionalProperties",
+                changes,
+                incoming=incoming,
+            )
 
     for key in ("minimum", "exclusiveMinimum", "minLength", "minItems", "minProperties"):
         classify_bound(before, after, path, changes, key, minimum=True)
@@ -1074,18 +1864,35 @@ def compare_named_schemas(
             changes.append(change("breaking", "multiple_of_added", path))
         elif new_multiple is None:
             changes.append(change("additive", "multiple_of_removed", path))
-        elif isinstance(old_multiple, (int, float)) and isinstance(new_multiple, (int, float)):
-            ratio = new_multiple / old_multiple if old_multiple else None
-            inverse = old_multiple / new_multiple if new_multiple else None
-            widened = inverse is not None and float(inverse).is_integer()
-            narrowed = ratio is not None and float(ratio).is_integer()
-            changes.append(change("additive" if widened and not narrowed else "breaking", "multiple_of_changed", path))
+        elif (
+            isinstance(old_multiple, (int, float))
+            and not isinstance(old_multiple, bool)
+            and isinstance(new_multiple, (int, float))
+            and not isinstance(new_multiple, bool)
+        ):
+            old_fraction = exact_number_fraction(old_multiple)
+            new_fraction = exact_number_fraction(new_multiple)
+            classification = "breaking"
+            if old_fraction > 0 and new_fraction > 0:
+                ratio = new_fraction / old_fraction
+                inverse = old_fraction / new_fraction
+                widened = inverse.denominator == 1
+                narrowed = ratio.denominator == 1
+                if widened and not narrowed:
+                    classification = "additive"
+            changes.append(change(classification, "multiple_of_changed", path))
         else:
             changes.append(change("breaking", "multiple_of_changed", path))
     old_unique = before.get("uniqueItems", False) is True
     new_unique = after.get("uniqueItems", False) is True
     if old_unique != new_unique:
-        changes.append(change("breaking" if new_unique else "additive", "unique_items_enabled" if new_unique else "unique_items_disabled", path))
+        changes.append(
+            change(
+                "breaking" if new_unique else "additive",
+                "unique_items_enabled" if new_unique else "unique_items_disabled",
+                path,
+            )
+        )
 
     before_props = before.get("properties", {})
     after_props = after.get("properties", {})
@@ -1101,8 +1908,20 @@ def compare_named_schemas(
         for name in sorted(before_props.keys() & after_props.keys()):
             before_child = before_props[name]
             after_child = after_props[name]
-            if isinstance(before_child, dict) and isinstance(after_child, dict):
-                compare_named_schemas(before_child, after_child, f"{path}/properties/{name}", changes, incoming=incoming)
+            if isinstance(before_child, (dict, bool)) and isinstance(
+                after_child, (dict, bool)
+            ):
+                compare_named_schemas(
+                    before_child,
+                    after_child,
+                    f"{path}/properties/{name}",
+                    changes,
+                    incoming=incoming,
+                )
+            elif before_child != after_child:
+                changes.append(
+                    change("breaking", "property_schema_shape_changed", f"{path}/properties/{name}")
+                )
         newly_declared = after_props.keys() - before_props.keys()
         for name in sorted(after_required - before_required):
             if name not in newly_declared:
@@ -1120,17 +1939,69 @@ def compare_named_schemas(
         for name in sorted(before_defs.keys() & after_defs.keys()):
             before_child = before_defs[name]
             after_child = after_defs[name]
-            if isinstance(before_child, dict) and isinstance(after_child, dict):
-                compare_named_schemas(before_child, after_child, f"{path}/definitions/{name}", changes, incoming=incoming)
+            if isinstance(before_child, (dict, bool)) and isinstance(
+                after_child, (dict, bool)
+            ):
+                compare_named_schemas(
+                    before_child,
+                    after_child,
+                    f"{path}/definitions/{name}",
+                    changes,
+                    incoming=incoming,
+                )
+            elif before_child != after_child:
+                changes.append(
+                    change("breaking", "definition_schema_shape_changed", f"{path}/definitions/{name}")
+                )
 
     before_items = before.get("items")
     after_items = after.get("items")
-    if isinstance(before_items, dict) and isinstance(after_items, dict):
+    if isinstance(before_items, (dict, bool)) and isinstance(after_items, (dict, bool)):
         compare_named_schemas(before_items, after_items, f"{path}/items", changes, incoming=incoming)
-    elif before_items is None and isinstance(after_items, (dict, bool)):
+    elif isinstance(before_items, list) and isinstance(after_items, list):
+        shared_items = min(len(before_items), len(after_items))
+        for index in range(shared_items):
+            active_budget().checkpoint()
+            before_item = before_items[index]
+            after_item = after_items[index]
+            if isinstance(before_item, (dict, bool)) and isinstance(
+                after_item, (dict, bool)
+            ):
+                compare_named_schemas(
+                    before_item,
+                    after_item,
+                    f"{path}/items/{index}",
+                    changes,
+                    incoming=incoming,
+                )
+            elif before_item != after_item:
+                changes.append(
+                    change("breaking", "tuple_item_schema_shape_changed", f"{path}/items/{index}")
+                )
+        if len(before_items) > shared_items:
+            changes.append(
+                change(
+                    "additive",
+                    "tuple_item_constraints_removed",
+                    f"{path}/items",
+                    count=len(before_items) - shared_items,
+                )
+            )
+        if len(after_items) > shared_items:
+            changes.append(
+                change(
+                    "breaking",
+                    "tuple_item_constraints_added",
+                    f"{path}/items",
+                    count=len(after_items) - shared_items,
+                )
+            )
+    elif before_items is None and after_items is not None:
         changes.append(change("breaking", "items_constraint_added", f"{path}/items"))
-    elif isinstance(before_items, (dict, bool)) and after_items is None:
+    elif before_items is not None and after_items is None:
         changes.append(change("additive", "items_constraint_removed", f"{path}/items"))
+    elif before_items != after_items:
+        changes.append(change("breaking", "items_schema_shape_changed", f"{path}/items"))
 
     for combinator in ("anyOf", "oneOf", "allOf"):
         compare_combinator(before, after, path, changes, combinator, incoming=incoming)
@@ -1140,9 +2011,9 @@ def compare_named_schemas(
             classification = "additive" if key == "not" and key in before and key not in after else "breaking"
             changes.append(change(classification, f"{key}_constraint_changed", path))
 
-    annotations = {"$schema", "$id", "title", "description", "default", "examples", "deprecated", "readOnly", "writeOnly"}
+    annotations = {"$id", "title", "description", "default", "examples", "deprecated", "readOnly", "writeOnly"}
     handled = annotations | {
-        "$ref", "type", "enum", "const", "properties", "required", "definitions",
+        "$ref", "$schema", "type", "enum", "const", "properties", "required", "definitions",
         "additionalProperties", "items", "anyOf", "oneOf", "allOf", "not", "if", "then", "else",
         "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf",
         "minLength", "maxLength", "pattern", "format", "minItems", "maxItems", "uniqueItems",
@@ -1163,6 +2034,7 @@ def compare_named_schemas(
             item["incomingDirection"] = "conservative_consumer_boundary"
 
 
+@budgeted
 def compatibility_report(baseline: str, candidate: str) -> dict[str, Any]:
     before = load_bundle(baseline)
     after = load_bundle(candidate)
@@ -1170,10 +2042,13 @@ def compatibility_report(baseline: str, candidate: str) -> dict[str, Any]:
     before_roots = before["roots"]
     after_roots = after["roots"]
     for name in sorted(before_roots.keys() - after_roots.keys()):
+        active_budget().checkpoint()
         changes.append(change("breaking", "selected_root_removed", f"roots/{name}"))
     for name in sorted(after_roots.keys() - before_roots.keys()):
+        active_budget().checkpoint()
         changes.append(change("additive", "selected_root_added", f"roots/{name}"))
     for name in sorted(before_roots.keys() & after_roots.keys()):
+        active_budget().checkpoint()
         compare_named_schemas(
             before_roots[name],
             after_roots[name],
@@ -1185,8 +2060,10 @@ def compatibility_report(baseline: str, candidate: str) -> dict[str, Any]:
     before_notifications = set(before["notificationMethods"])
     after_notifications = set(after["notificationMethods"])
     for method in sorted(before_notifications - after_notifications):
+        active_budget().checkpoint()
         changes.append(change("breaking", "notification_removed", f"notifications/{method}"))
     for method in sorted(after_notifications - before_notifications):
+        active_budget().checkpoint()
         changes.append(change("additive", "notification_added", f"notifications/{method}"))
 
     before_audit = incoming_audit(baseline, before)
@@ -1195,6 +2072,7 @@ def compatibility_report(baseline: str, candidate: str) -> dict[str, Any]:
         (entry["schemaPath"], entry["construct"]) for entry in before_audit["constructs"]
     }
     for entry in after_audit["constructs"]:
+        active_budget().checkpoint()
         key = (entry["schemaPath"], entry["construct"])
         if key in before_constructs:
             continue
@@ -1212,11 +2090,20 @@ def compatibility_report(baseline: str, candidate: str) -> dict[str, Any]:
 
     unique: dict[bytes, dict[str, Any]] = {}
     for item in changes:
+        active_budget().checkpoint()
         dedupe = dict(item)
         if "/definitions/" in dedupe["path"]:
             dedupe["path"] = "definitions/" + dedupe["path"].split("/definitions/", 1)[1]
         unique.setdefault(canonical_bytes(dedupe), item)
-    ordered = sorted(unique.values(), key=lambda item: (item["classification"], item["kind"], item["path"], canonical_bytes(item)))
+    ordered = sorted(
+        unique.values(),
+        key=lambda item: (
+            item["classification"],
+            item["kind"],
+            item["path"],
+            canonical_bytes(item),
+        ),
+    )
     breaking = sum(item["classification"] == "breaking" for item in ordered)
     additive = len(ordered) - breaking
     return {
@@ -1230,6 +2117,7 @@ def compatibility_report(baseline: str, candidate: str) -> dict[str, Any]:
     }
 
 
+@budgeted
 def report_markdown(report: dict[str, Any]) -> bytes:
     state = "PASS (additive only)" if report["compatible"] else "BLOCKED (breaking changes found)"
     lines = [
@@ -1246,6 +2134,7 @@ def report_markdown(report: dict[str, Any]) -> bytes:
     ]
     limit = 250
     for item in report["changes"][:limit]:
+        active_budget().checkpoint()
         path = str(item["path"]).replace("|", "\\|")
         lines.append(f"| {item['classification']} | `{item['kind']}` | `{path}` |")
     omitted = len(report["changes"]) - limit
@@ -1254,14 +2143,19 @@ def report_markdown(report: dict[str, Any]) -> bytes:
     lines.extend(
         [
             "",
-            "Incoming enum/union additions are additive only when the machine-readable audit names tested fallback evidence; closed constructs block promotion.",
+            "Incoming enum/union additions are additive only when the machine-readable "
+            "audit names tested fallback evidence; closed constructs block promotion.",
             "Promotion still requires contract fixtures, append-only support history, and explicit adapter review.",
             "",
         ]
     )
-    return "\n".join(lines).encode("utf-8")
+    content = "\n".join(lines).encode("utf-8")
+    if len(content) > MAX_ARTIFACT_BYTES:
+        fail("generated compatibility report exceeds the per-file byte limit")
+    return content
 
 
+@budgeted
 def write_report(baseline: str, candidate: str, json_path: Path | None, markdown_path: Path | None) -> dict[str, Any]:
     report = compatibility_report(baseline, candidate)
     if json_path is not None:
@@ -1293,11 +2187,13 @@ def instance_type_matches(instance: Any, expected: str) -> bool:
     return False
 
 
+@budgeted
 def resolve_pointer(root: dict[str, Any], reference: str) -> Any:
     if not reference.startswith("#/"):
         raise ValidationFailure("external references are not permitted")
     current: Any = root
     for encoded in reference[2:].split("/"):
+        active_budget().checkpoint()
         key = encoded.replace("~1", "/").replace("~0", "~")
         if not isinstance(current, dict) or key not in current:
             raise ValidationFailure("schema reference is unresolved")
@@ -1307,7 +2203,9 @@ def resolve_pointer(root: dict[str, Any], reference: str) -> Any:
     return current
 
 
+@budgeted
 def validate_instance(instance: Any, schema: Any, root: dict[str, Any], *, depth: int = 0) -> None:
+    active_budget().checkpoint()
     if depth > SCHEMA_VALIDATION_RECURSION_LIMIT:
         raise ValidationFailure("schema validation nesting limit exceeded")
     if schema is True:
@@ -1334,6 +2232,7 @@ def validate_instance(instance: Any, schema: Any, root: dict[str, Any], *, depth
         variants = schema.get(combinator)
         if isinstance(variants, list):
             for variant in variants:
+                active_budget().checkpoint()
                 if isinstance(variant, (dict, bool)):
                     validate_instance(instance, variant, root, depth=depth + 1)
     for combinator, exact in (("anyOf", False), ("oneOf", True)):
@@ -1341,6 +2240,7 @@ def validate_instance(instance: Any, schema: Any, root: dict[str, Any], *, depth
         if isinstance(variants, list):
             matches = 0
             for variant in variants:
+                active_budget().checkpoint()
                 if not isinstance(variant, (dict, bool)):
                     continue
                 try:
@@ -1376,11 +2276,13 @@ def validate_instance(instance: Any, schema: Any, root: dict[str, Any], *, depth
         required = schema.get("required", [])
         if isinstance(required, list):
             for key in required:
+                active_budget().checkpoint()
                 if isinstance(key, str) and key not in instance:
                     raise ValidationFailure("required property is absent")
         properties = schema.get("properties", {})
         if isinstance(properties, dict):
             for key, value in instance.items():
+                active_budget().checkpoint()
                 child = properties.get(key)
                 if isinstance(child, (dict, bool)):
                     validate_instance(value, child, root, depth=depth + 1)
@@ -1389,7 +2291,12 @@ def validate_instance(instance: Any, schema: Any, root: dict[str, Any], *, depth
                 patterns = schema.get("patternProperties", {})
                 if isinstance(patterns, dict):
                     for pattern, pattern_schema in patterns.items():
-                        if re.search(pattern, key) and isinstance(pattern_schema, (dict, bool)):
+                        active_budget().checkpoint()
+                        try:
+                            matches_pattern = re.search(pattern, key) is not None
+                        except (TypeError, re.error) as error:
+                            raise ValidationFailure("schema pattern is invalid") from error
+                        if matches_pattern and isinstance(pattern_schema, (dict, bool)):
                             matched_pattern = True
                             validate_instance(value, pattern_schema, root, depth=depth + 1)
                 if matched_pattern:
@@ -1402,6 +2309,7 @@ def validate_instance(instance: Any, schema: Any, root: dict[str, Any], *, depth
         dependencies = schema.get("dependencies", {})
         if isinstance(dependencies, dict):
             for key, dependency in dependencies.items():
+                active_budget().checkpoint()
                 if key not in instance:
                     continue
                 if isinstance(dependency, list) and any(item not in instance for item in dependency):
@@ -1420,9 +2328,11 @@ def validate_instance(instance: Any, schema: Any, root: dict[str, Any], *, depth
         items = schema.get("items")
         if isinstance(items, (dict, bool)):
             for item in instance:
+                active_budget().checkpoint()
                 validate_instance(item, items, root, depth=depth + 1)
         elif isinstance(items, list):
             for index, item in enumerate(instance[: len(items)]):
+                active_budget().checkpoint()
                 validate_instance(item, items[index], root, depth=depth + 1)
             if len(instance) > len(items):
                 additional_items = schema.get("additionalItems", True)
@@ -1430,6 +2340,7 @@ def validate_instance(instance: Any, schema: Any, root: dict[str, Any], *, depth
                     raise ValidationFailure("additional array item is forbidden")
                 if isinstance(additional_items, dict):
                     for item in instance[len(items) :]:
+                        active_budget().checkpoint()
                         validate_instance(item, additional_items, root, depth=depth + 1)
         contains = schema.get("contains")
         if isinstance(contains, (dict, bool)):
@@ -1458,9 +2369,17 @@ def validate_instance(instance: Any, schema: Any, root: dict[str, Any], *, depth
         if isinstance(schema.get("exclusiveMaximum"), (int, float)) and instance >= schema["exclusiveMaximum"]:
             raise ValidationFailure("exclusive maximum numeric constraint failed")
         multiple = schema.get("multipleOf")
-        if isinstance(multiple, (int, float)) and multiple > 0:
-            quotient = instance / multiple
-            if abs(quotient - round(quotient)) > 1e-12:
+        if (
+            isinstance(multiple, (int, float))
+            and not isinstance(multiple, bool)
+            and multiple > 0
+        ):
+            if isinstance(instance, int) and isinstance(multiple, int):
+                is_multiple = instance % multiple == 0
+            else:
+                quotient = instance / multiple
+                is_multiple = abs(quotient - round(quotient)) <= 1e-12
+            if not is_multiple:
                 raise ValidationFailure("multiple-of numeric constraint failed")
         numeric_ranges = {
             "int32": (-(2**31), 2**31 - 1),
@@ -1509,6 +2428,7 @@ REVERSE_REQUEST_ROOTS = {
     "item/tool/call": ("server_request.dynamic_tool_call.params", "server_request.dynamic_tool_call.response")
 }
 
+@budgeted
 def validate_contract(version: str) -> None:
     bundle = load_bundle(version)
     roots = bundle["roots"]
@@ -1526,6 +2446,7 @@ def validate_contract(version: str) -> None:
         fail(f"Codex {version} contract has no method exchanges")
     seen_methods: set[str] = set()
     for exchange in exchanges:
+        active_budget().checkpoint()
         if not isinstance(exchange, dict) or not isinstance(exchange.get("method"), str):
             fail(f"Codex {version} contract contains an invalid exchange")
         method = exchange["method"]
@@ -1546,6 +2467,7 @@ def validate_contract(version: str) -> None:
         fail(f"Codex {version} contract has no notifications")
     seen_notifications: set[str] = set()
     for notification in notifications:
+        active_budget().checkpoint()
         if not isinstance(notification, dict) or not isinstance(notification.get("method"), str):
             fail(f"Codex {version} contract contains an invalid notification")
         method = notification["method"]
@@ -1569,6 +2491,7 @@ def validate_contract(version: str) -> None:
         fail(f"Codex {version} contract has invalid reverse-request coverage")
     seen_reverse: set[str] = set()
     for request in reverse_requests:
+        active_budget().checkpoint()
         if not isinstance(request, dict) or request.get("method") not in REVERSE_REQUEST_ROOTS:
             fail(f"Codex {version} contract has an unexpected reverse request")
         method = request["method"]
@@ -1587,6 +2510,7 @@ def validate_contract(version: str) -> None:
         fail(f"Codex {version} contract has no failure classification cases")
     observed_failure_sources: set[str] = set()
     for case in failures:
+        active_budget().checkpoint()
         if not isinstance(case, dict):
             fail(f"Codex {version} contract contains an invalid failure case")
         source = case.get("source")
@@ -1596,18 +2520,16 @@ def validate_contract(version: str) -> None:
         observed_failure_sources.add(source)
 
 
+@budgeted
 def verify_manifest(version: str, selection: Selection, policy: dict[str, Any]) -> None:
     manifest_path = SCHEMAS_ROOT / version / "manifest.json"
     schema_path = SCHEMAS_ROOT / version / "selected.schema.json"
     wire_path = WIRE_ROOT / f"{rust_version_module(version)}.rs"
     audit_path = SCHEMAS_ROOT / version / "incoming-audit.json"
-    try:
-        manifest_bytes = manifest_path.read_bytes()
-        schema_bytes = schema_path.read_bytes()
-        wire_bytes = wire_path.read_bytes()
-        audit_bytes = audit_path.read_bytes()
-    except OSError as error:
-        raise SchemaToolError(f"Codex {version} is missing a generated artifact") from error
+    manifest_bytes = read_bounded_bytes(manifest_path)
+    schema_bytes = read_bounded_bytes(schema_path)
+    wire_bytes = read_bounded_bytes(wire_path)
+    audit_bytes = read_bounded_bytes(audit_path)
     bundle = load_bundle(version)
     expected_schema = canonical_bytes(bundle)
     if schema_bytes != expected_schema:
@@ -1629,6 +2551,7 @@ def verify_manifest(version: str, selection: Selection, policy: dict[str, Any]) 
         fail(f"Codex {version} manifest is stale")
 
 
+@budgeted
 def verify_all() -> None:
     selection = read_selection()
     policy = read_policy()
@@ -1645,25 +2568,21 @@ def verify_all() -> None:
         key=version_key,
     )
     for version in versions:
+        active_budget().checkpoint()
         verify_manifest(version, selection, policy)
         validate_contract(version)
 
     expected_mod = render_wire_mod(policy, versions)
-    try:
-        actual_mod = (WIRE_ROOT / "mod.rs").read_bytes()
-    except OSError as error:
-        raise SchemaToolError("generated wire module registry is unavailable") from error
+    actual_mod = read_bounded_bytes(WIRE_ROOT / "mod.rs")
     if actual_mod != expected_mod:
         fail("generated wire module registry is stale")
 
     for release in history["releases"]:
+        active_budget().checkpoint()
         version = release["version"]
-        try:
-            schema = (SCHEMAS_ROOT / version / "selected.schema.json").read_bytes()
-            contract_bytes = (CONTRACTS_ROOT / f"{version}.json").read_bytes()
-            wire = (WIRE_ROOT / f"{rust_version_module(version)}.rs").read_bytes()
-        except OSError as error:
-            raise SchemaToolError(f"Codex {version} support history artifact is unavailable") from error
+        schema = read_bounded_bytes(SCHEMAS_ROOT / version / "selected.schema.json")
+        contract_bytes = read_bounded_bytes(CONTRACTS_ROOT / f"{version}.json")
+        wire = read_bounded_bytes(WIRE_ROOT / f"{rust_version_module(version)}.rs")
         if release["schemaSha256"] != sha256_bytes(schema):
             fail(f"Codex {version} support history schema hash is stale")
         if release["contractSha256"] != sha256_bytes(contract_bytes):
@@ -1673,19 +2592,19 @@ def verify_all() -> None:
 
     baseline = ESTABLISHED_BASELINE_VERSION
     for candidate in policy["candidateVersions"]:
+        active_budget().checkpoint()
         for supported in historical_versions:
+            active_budget().checkpoint()
             expected_report = compatibility_report(supported, candidate)
             json_path = REPORTS_ROOT / f"{supported}-to-{candidate}.json"
             markdown_path = REPORTS_ROOT / f"{supported}-to-{candidate}.md"
-            try:
-                actual_json = json_path.read_bytes()
-                actual_markdown = markdown_path.read_bytes()
-            except OSError as error:
-                raise SchemaToolError(f"Codex {candidate} compatibility report is unavailable") from error
+            actual_json = read_bounded_bytes(json_path)
+            actual_markdown = read_bounded_bytes(markdown_path)
             if actual_json != canonical_bytes(expected_report) or actual_markdown != report_markdown(expected_report):
                 fail(f"Codex {candidate} compatibility report is stale")
 
     for supported in policy["supportedVersions"]:
+        active_budget().checkpoint()
         if supported == baseline:
             continue
         report = compatibility_report(baseline, supported)
@@ -1726,6 +2645,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+@budgeted
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     if args.command == "sync":
@@ -1743,7 +2663,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "contract":
         policy = read_policy()
         versions = args.versions or policy["supportedVersions"] + policy["candidateVersions"]
+        if len(versions) > MAX_TRACKED_VERSIONS:
+            fail("contract validation requested too many versions")
         for version in versions:
+            active_budget().checkpoint()
             validate_contract(version)
         print(json.dumps({"contracts": sorted(set(versions), key=version_key), "status": "valid"}, sort_keys=True))
         return 0
@@ -1774,4 +2697,7 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except SchemaToolError as error:
         print(f"codex-schema: {error}", file=sys.stderr)
+        raise SystemExit(1) from None
+    except Exception:
+        print("codex-schema: maintenance operation failed safely", file=sys.stderr)
         raise SystemExit(1) from None

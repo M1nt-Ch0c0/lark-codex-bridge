@@ -118,8 +118,8 @@ pub async fn handle_server_request(
     };
 
     let response = match result {
-        Ok(value) => tool_response(value, true),
-        Err(value) => tool_response(value, false),
+        Ok(value) => tool_response(&value, true),
+        Err(value) => tool_response(&value, false),
     };
     let _ = client
         .respond_dynamic_tool_call(&mut request, &response)
@@ -148,7 +148,7 @@ fn resolve_context(
                 retryable: false,
             })
         })
-        .map_err(context_error)
+        .map_err(|error| context_error(&error))
 }
 
 async fn read_media(
@@ -168,7 +168,7 @@ async fn read_media(
     let handle = MediaHandle::from_external(arguments.handle);
     let authorized = contexts
         .authorize_media_for_tool(&context_id, &handle, &params.thread_id, &params.turn_id)
-        .map_err(context_error)?;
+        .map_err(|error| context_error(&error))?;
     let cached = attachments
         .fetch(
             &authorized.message_id,
@@ -176,7 +176,7 @@ async fn read_media(
             authorized.local_turn_row_id,
         )
         .await
-        .map_err(attachment_error)?;
+        .map_err(|error| attachment_error(&error))?;
     let path = cached.path.to_str().ok_or_else(|| {
         tool_error(
             "media_unavailable",
@@ -202,11 +202,11 @@ fn resource_kind(kind: ResourceKind) -> &'static str {
     }
 }
 
-fn context_error(error: ContextError) -> Value {
+fn context_error(error: &ContextError) -> Value {
     json!({"error": error})
 }
 
-fn attachment_error(error: AttachError) -> Value {
+fn attachment_error(error: &AttachError) -> Value {
     let retryable = matches!(
         error,
         AttachError::Cancelled { .. }
@@ -231,7 +231,7 @@ fn tool_error(code: &'static str, message: &'static str, retryable: bool) -> Val
     })
 }
 
-fn tool_response(value: Value, success: bool) -> DynamicToolCallResponse {
+fn tool_response(value: &Value, success: bool) -> DynamicToolCallResponse {
     DynamicToolCallResponse {
         content_items: vec![DynamicToolCallOutputContentItem::InputText {
             text: serde_json::to_string(&value).unwrap_or_else(|_| {
@@ -243,6 +243,6 @@ fn tool_response(value: Value, success: bool) -> DynamicToolCallResponse {
 }
 
 async fn respond_tool_error(client: &AppServerClient, request: &mut ServerRequest, error: &Value) {
-    let response = tool_response(error.clone(), false);
+    let response = tool_response(error, false);
     let _ = client.respond_dynamic_tool_call(request, &response).await;
 }
