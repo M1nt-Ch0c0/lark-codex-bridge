@@ -186,9 +186,9 @@ fn full_config_round_trips_and_resolves_only_runtime_relative_paths() {
     assert_eq!(config.codex.binary, PathBuf::from("/opt/codex/bin/codex"));
     assert_eq!(
         config.asr.command.as_deref(),
-        Some(std::path::Path::new("/opt/asr/sherpa-onnx-offline"))
+        Some(std::path::Path::new("sherpa-onnx-offline"))
     );
-    assert_eq!(config.asr.ffmpeg, PathBuf::from("/usr/bin/ffmpeg"));
+    assert_eq!(config.asr.ffmpeg, PathBuf::from("ffmpeg"));
     assert_eq!(config.asr.max_duration_ms, 120_000);
 
     let encoded = toml::to_string(&config).expect("full config should serialize");

@@ -883,7 +883,10 @@ fn audio_content(value: &Value) -> ExtractedContent {
     let key = content_string(value, "file_key");
     let transcript = content_transcript(value);
     ExtractedContent {
-        text: transcript.clone().unwrap_or_default(),
+        // Recognition text remains inside the turn-scoped media capability.
+        // Copying it into the ordinary event text would bypass the operator's
+        // configured ASR transcript limit before `bridge_media.read` runs.
+        text: String::new(),
         mentions_all: false,
         resources: Vec::new(),
         parts: vec![MessagePart::Audio(media_part_with_transcript(

@@ -357,6 +357,12 @@ impl ScopeActorHandle {
             .interrupt_turn(&active.thread_id, &active.turn_id)
             .await
             .map_err(|_| ())?;
+        if let Some((registry, binding)) = &active.context_binding {
+            // Once Codex accepts the interruption, revoke the capability
+            // immediately. Tool work must not wait for a later terminal event
+            // before observing cancellation.
+            let _ = registry.revoke_turn(binding, RevocationReason::Cancelled);
+        }
         Ok(InterruptOutcome::Requested)
     }
 
@@ -379,6 +385,7 @@ struct ActiveTurn {
     client: Arc<AppServerClient>,
     thread_id: ThreadId,
     turn_id: TurnId,
+    context_binding: Option<(ContextRegistry, PendingBinding)>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -713,6 +720,9 @@ async fn process_batch(
             client: Arc::clone(&client),
             thread_id: ThreadId::from(thread_id.as_str()),
             turn_id: TurnId::from(started.id.as_str()),
+            context_binding: context_lease
+                .as_ref()
+                .map(TurnContextLease::cancellation_binding),
         }),
     )?;
     let mut projector = ReplyProjector::with_defaults();
@@ -777,6 +787,10 @@ async fn process_batch(
     set_active_turn(active_turn, None)?;
     set_state(state, ScopeState::Finalizing { turn_row_id });
     let Some(outcome) = outcome else {
+        if let Some(lease) = context_lease.as_mut() {
+            lease.reason = RevocationReason::Failed;
+        }
+        drop(context_lease.take());
         finalize_uncertain_and_settle_attachments(
             store,
             sink.as_ref(),
@@ -819,6 +833,10 @@ async fn process_batch(
             TurnResolution::Failed | TurnResolution::Uncertain => RevocationReason::Failed,
         };
     }
+    // Revoke/cancel tool capabilities before the attachment release pass.
+    // A cancelled fetch that commits at the boundary then compensates its
+    // exact lease instead of recreating one after finalization.
+    drop(context_lease.take());
     if resolution != TurnResolution::Uncertain {
         release_attachments(attachments, turn_row_id).await?;
     }
@@ -1007,6 +1025,10 @@ impl TurnContextLease {
                 .map_err(|_| ScopeFailureKind::Context)?;
         }
         Ok(())
+    }
+
+    fn cancellation_binding(&self) -> (ContextRegistry, PendingBinding) {
+        (self.registry.clone(), self.binding.clone())
     }
 }
 

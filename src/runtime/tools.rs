@@ -179,13 +179,22 @@ async fn read_media(
         return read_audio(attachments, asr, &authorized).await;
     }
     let cached = attachments
-        .fetch(
+        .fetch_cancellable(
             &authorized.message_id,
             &authorized.resource,
             authorized.local_turn_row_id,
+            &authorized.cancellation,
         )
         .await
         .map_err(attachment_error)?;
+    if authorized.is_cancelled() {
+        if cached.lease_was_inserted {
+            let _ = attachments
+                .release_lease(&cached.sha256, authorized.local_turn_row_id)
+                .await;
+        }
+        return Err(asr_error(AsrError::Cancelled));
+    }
     let path = cached.path.to_str().ok_or_else(|| {
         tool_error(
             "media_unavailable",
@@ -209,9 +218,13 @@ async fn read_audio(
     asr: &AsrSection,
     authorized: &crate::runtime::context::AuthorizedResource,
 ) -> Result<Value, Value> {
-    if let Some(transcript) = authorized.transcript.as_deref().and_then(|text| {
-        crate::lark::normalize::normalize_transcript(text, asr.max_transcript_bytes)
-    }) {
+    if authorized.is_cancelled() {
+        return Err(asr_error(AsrError::Cancelled));
+    }
+    if let Some(inbound) = authorized.transcript.as_deref() {
+        let transcript =
+            crate::lark::normalize::normalize_transcript(inbound, asr.max_transcript_bytes)
+                .ok_or_else(|| asr_error(AsrError::TranscriptTooLarge))?;
         return Ok(audio_transcript_value(
             &transcript,
             TranscriptSource::Inbound,
@@ -228,19 +241,32 @@ async fn read_audio(
         return Err(asr_error(AsrError::SidecarMissing));
     }
     let cached = attachments
-        .fetch(
+        .fetch_cancellable(
             &authorized.message_id,
             &authorized.resource,
             authorized.local_turn_row_id,
+            &authorized.cancellation,
         )
         .await
         .map_err(|error| match error {
             AttachError::TooLarge { .. } => asr_error(AsrError::Oversize),
+            AttachError::Cancelled { .. } => asr_error(AsrError::Cancelled),
             other => attachment_error(other),
         })?;
-    let transcript = asr::transcribe_file(asr, &cached.path, authorized.duration_ms)
-        .await
-        .map_err(asr_error)?;
+    let transcription = asr::transcribe_file(asr, &cached.path, authorized.duration_ms);
+    tokio::pin!(transcription);
+    let transcript = tokio::select! {
+        biased;
+        () = authorized.cancellation.cancelled() => {
+            if cached.lease_was_inserted {
+                let _ = attachments
+                    .release_lease(&cached.sha256, authorized.local_turn_row_id)
+                    .await;
+            }
+            return Err(asr_error(AsrError::Cancelled));
+        }
+        result = &mut transcription => result.map_err(asr_error)?,
+    };
     Ok(audio_transcript_value(
         &transcript,
         TranscriptSource::Sidecar,

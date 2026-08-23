@@ -7,6 +7,7 @@ use std::sync::{
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use fs2::FileExt;
 use futures_util::{FutureExt, future::BoxFuture};
 use lark_codex_bridge::codex::process::{CodexProcessConfig, ProcessError};
 use lark_codex_bridge::codex::supervisor::AppServerSupervisor;
@@ -44,6 +45,24 @@ use tokio::sync::{Notify, Semaphore};
 use tokio::time::{sleep, timeout};
 
 use fakecodex::{FakeFactory, FakeOutcome, test_settings};
+
+// Process-heavy ASR cases share the host process table and system temp root.
+// Serializing only those cases keeps their short fake-RPC deadlines
+// deterministic while the rest of this large integration suite stays parallel.
+static ASR_SUBPROCESS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn lock_asr_process_tests() -> std::fs::File {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(std::env::temp_dir().join("lark-codex-bridge-asr-process-tests.lock"))
+        .expect("open shared ASR process-test lock");
+    file.lock_exclusive()
+        .expect("lock shared ASR process-test file");
+    file
+}
 
 #[derive(Default)]
 struct RecordingSink {
@@ -3464,7 +3483,7 @@ async fn route_audio_event(
     inbound: InboundEvent,
     thread_id: &str,
     turn_id: &str,
-) -> (String, String) {
+) -> (String, String, Value) {
     router
         .route(queued_registered(store, namespace, inbound).await)
         .await
@@ -3526,7 +3545,7 @@ async fn route_audio_event(
         .and_then(|part| part["handle"].as_str())
         .expect("audio handle")
         .to_owned();
-    (context_id, handle)
+    (context_id, handle, start_turn)
 }
 
 async fn read_media(
@@ -3551,12 +3570,16 @@ async fn read_media(
             }
         }))
         .await;
-    control.next_request().await
+    // Local process startup is intentionally tested through the real Tokio
+    // process boundary and can be slower under a fully parallel CI suite.
+    control.next_request_within(Duration::from_secs(10)).await
 }
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn audio_media_read_uses_stub_sidecar_and_leaves_image_path_reads_unchanged() {
+    let _asr_subprocess_guard = ASR_SUBPROCESS_TEST_LOCK.lock().await;
+    let _asr_process_lock = lock_asr_process_tests();
     let mut config = validated_config();
     let temp = tempdir().expect("tempdir");
     let marker = temp.path().join("asr-invoked.txt");
@@ -3742,9 +3765,9 @@ async fn inbound_audio_transcript_skips_sidecar() {
         start_audio_router(config, store.clone(), cache).await;
     let mut inbound = event("event-audio-inbound", "owner-runtime-scope");
     inbound.message_type = "audio".to_owned();
-    inbound.text = "please review the patch".to_owned();
+    inbound.text.clear();
     inbound.parts = vec![audio_part(Some("please review the patch"))];
-    let (context_id, handle) = route_audio_event(
+    let (context_id, handle, _) = route_audio_event(
         &router,
         &store,
         &namespace,
@@ -3787,6 +3810,357 @@ async fn inbound_audio_transcript_skips_sidecar() {
 }
 
 #[tokio::test]
+async fn configured_inbound_transcript_limit_is_enforced_only_at_media_read() {
+    let mut config = validated_config();
+    let temp = tempdir().expect("tempdir");
+    let marker = temp.path().join("must-not-run-over-limit.txt");
+    let exploding = stub_program(
+        temp.path(),
+        "asr-over-limit",
+        r#"printf 'invoked\n' >> "$1"; exit 99"#,
+        "@echo off\r\necho invoked>>\"%~1\"\r\nexit /b 99\r\n",
+    );
+    config.asr = asr_config(
+        exploding,
+        ffmpeg_stub(temp.path()),
+        vec![marker.to_string_lossy().into_owned()],
+    );
+    config.asr.max_transcript_bytes = 4;
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let download_count = Arc::new(AtomicUsize::new(0));
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &temp.path().join("attachments-over-limit"),
+            store.clone(),
+            Arc::new(PendingAttachmentDownloader {
+                started: Arc::clone(&download_count),
+                started_notify: Arc::new(Notify::new()),
+            }),
+            AttachmentLimits::default(),
+        )
+        .expect("attachment cache"),
+    );
+    let (router, control, namespace, workspace) =
+        start_audio_router(config, store.clone(), cache).await;
+    let mut inbound = event("event-audio-over-limit", "owner-runtime-scope");
+    inbound.message_type = "audio".to_owned();
+    inbound.text.clear();
+    inbound.parts = vec![audio_part(Some("private transcript"))];
+    let (context_id, handle, start_turn) = route_audio_event(
+        &router,
+        &store,
+        &namespace,
+        &control,
+        &workspace,
+        "over-limit",
+        inbound,
+        "thread-audio-over-limit",
+        "turn-audio-over-limit",
+    )
+    .await;
+    assert!(
+        !start_turn.to_string().contains("private transcript"),
+        "recognition text must remain behind the turn-scoped media capability"
+    );
+    let response = read_media(
+        &control,
+        "thread-audio-over-limit",
+        "turn-audio-over-limit",
+        "server-audio-over-limit",
+        &context_id,
+        &handle,
+    )
+    .await;
+    assert_eq!(response["result"]["success"], false);
+    let body: Value = serde_json::from_str(
+        response["result"]["contentItems"][0]["text"]
+            .as_str()
+            .expect("tool response text"),
+    )
+    .expect("tool response JSON");
+    assert_eq!(body["error"]["code"], "transcript_too_large");
+    assert_eq!(download_count.load(Ordering::SeqCst), 0);
+    assert!(!marker.exists(), "over-limit inbound text must not run ASR");
+    send_turn_completed(
+        &control,
+        "thread-audio-over-limit",
+        "turn-audio-over-limit",
+        "completed",
+    )
+    .await;
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn interrupt_cancels_an_active_audio_download_and_returns_a_tool_result() {
+    let mut config = validated_config();
+    let temp = tempdir().expect("tempdir");
+    config.asr = asr_config(
+        stub_program(
+            temp.path(),
+            "asr-unused-on-cancel",
+            "printf unexpected",
+            "@echo off\r\necho unexpected\r\n",
+        ),
+        ffmpeg_stub(temp.path()),
+        Vec::new(),
+    );
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let started = Arc::new(AtomicUsize::new(0));
+    let started_notify = Arc::new(Notify::new());
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &temp.path().join("attachments-cancelled-download"),
+            store.clone(),
+            Arc::new(PendingAttachmentDownloader {
+                started: Arc::clone(&started),
+                started_notify: Arc::clone(&started_notify),
+            }),
+            AttachmentLimits::default(),
+        )
+        .expect("attachment cache"),
+    );
+    let (router, control, namespace, workspace) =
+        start_audio_router(config, store.clone(), cache).await;
+    let mut inbound = event("event-audio-cancel-download", "owner-runtime-scope");
+    inbound.message_type = "audio".to_owned();
+    inbound.text.clear();
+    inbound.parts = vec![audio_part(None)];
+    let scope = inbound.scope.clone();
+    let (context_id, handle, _) = route_audio_event(
+        &router,
+        &store,
+        &namespace,
+        &control,
+        &workspace,
+        "cancel-download",
+        inbound,
+        "thread-audio-cancel-download",
+        "turn-audio-cancel-download",
+    )
+    .await;
+    control
+        .send_json(json!({
+            "id": "server-audio-cancel-download",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-audio-cancel-download",
+                "turnId": "turn-audio-cancel-download",
+                "callId": "server-audio-cancel-download",
+                "namespace": "bridge_media",
+                "tool": "read",
+                "arguments": {"context_id": context_id, "handle": handle}
+            }
+        }))
+        .await;
+    timeout(Duration::from_secs(2), async {
+        while started.load(Ordering::SeqCst) == 0 {
+            started_notify.notified().await;
+        }
+    })
+    .await
+    .expect("audio download starts");
+
+    let (interrupt, ()) = tokio::join!(router.interrupt(&scope), async {
+        let request = control.next_request().await;
+        assert_eq!(request["method"], "turn/interrupt");
+        control.respond(&request, json!({})).await;
+    });
+    assert_eq!(
+        interrupt.expect("interrupt request"),
+        InterruptOutcome::Requested
+    );
+    let response = timeout(Duration::from_secs(2), control.next_request())
+        .await
+        .expect("cancelled media tool responds");
+    assert_eq!(response["id"], "server-audio-cancel-download");
+    assert_eq!(response["result"]["success"], false);
+    let body: Value = serde_json::from_str(
+        response["result"]["contentItems"][0]["text"]
+            .as_str()
+            .expect("tool response text"),
+    )
+    .expect("tool response JSON");
+    assert_eq!(body["error"]["code"], "cancelled");
+    assert!(
+        store
+            .list_attachments()
+            .await
+            .expect("attachments")
+            .is_empty()
+    );
+    send_turn_completed(
+        &control,
+        "thread-audio-cancel-download",
+        "turn-audio-cancel-download",
+        "interrupted",
+    )
+    .await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-audio-cancel-download"],
+        InboundEventState::Rejected,
+    )
+    .await;
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn interrupt_cancels_an_active_sidecar_and_releases_its_exact_lease() {
+    let _asr_subprocess_guard = ASR_SUBPROCESS_TEST_LOCK.lock().await;
+    let _asr_process_lock = lock_asr_process_tests();
+    let mut config = validated_config();
+    let temp = tempdir().expect("tempdir");
+    let marker = temp.path().join("active-sidecar.txt");
+    config.asr = asr_config(
+        stub_program(
+            temp.path(),
+            "asr-block-until-cancelled",
+            r#"printf '%s' "$$" > "$1"; exec sleep 60"#,
+            "@echo off\r\necho invoked>\"%~1\"\r\n:loop\r\ngoto loop\r\n",
+        ),
+        ffmpeg_stub(temp.path()),
+        vec![marker.to_string_lossy().into_owned()],
+    );
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &temp.path().join("attachments-cancelled-sidecar"),
+            store.clone(),
+            Arc::new(StaticAttachmentDownloader),
+            AttachmentLimits::default(),
+        )
+        .expect("attachment cache"),
+    );
+    let (router, control, namespace, workspace) =
+        start_audio_router(config, store.clone(), Arc::clone(&cache)).await;
+    let mut inbound = event("event-audio-cancel-sidecar", "owner-runtime-scope");
+    inbound.message_type = "audio".to_owned();
+    inbound.text.clear();
+    inbound.parts = vec![audio_part(None)];
+    let scope = inbound.scope.clone();
+    let (context_id, handle, _) = route_audio_event(
+        &router,
+        &store,
+        &namespace,
+        &control,
+        &workspace,
+        "cancel-sidecar",
+        inbound,
+        "thread-audio-cancel-sidecar",
+        "turn-audio-cancel-sidecar",
+    )
+    .await;
+    control
+        .send_json(json!({
+            "id": "server-audio-cancel-sidecar",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-audio-cancel-sidecar",
+                "turnId": "turn-audio-cancel-sidecar",
+                "callId": "server-audio-cancel-sidecar",
+                "namespace": "bridge_media",
+                "tool": "read",
+                "arguments": {"context_id": context_id, "handle": handle}
+            }
+        }))
+        .await;
+    timeout(Duration::from_secs(3), async {
+        while !marker.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("sidecar starts");
+    let rows = store.list_attachments().await.expect("attachments");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        store
+            .attachment_leases(&rows[0].sha256)
+            .await
+            .expect("active ASR lease")
+            .len(),
+        1
+    );
+
+    let (interrupt, ()) = tokio::join!(router.interrupt(&scope), async {
+        let request = control.next_request().await;
+        assert_eq!(request["method"], "turn/interrupt");
+        control.respond(&request, json!({})).await;
+    });
+    assert_eq!(
+        interrupt.expect("interrupt request"),
+        InterruptOutcome::Requested
+    );
+    let response = timeout(Duration::from_secs(2), control.next_request())
+        .await
+        .expect("cancelled ASR tool responds");
+    assert_eq!(response["id"], "server-audio-cancel-sidecar");
+    assert_eq!(response["result"]["success"], false);
+    let body: Value = serde_json::from_str(
+        response["result"]["contentItems"][0]["text"]
+            .as_str()
+            .expect("tool response text"),
+    )
+    .expect("tool response JSON");
+    assert_eq!(body["error"]["code"], "cancelled");
+    timeout(Duration::from_secs(2), async {
+        while !store
+            .attachment_leases(&rows[0].sha256)
+            .await
+            .expect("cancelled ASR leases")
+            .is_empty()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled ASR releases its exact lease");
+    #[cfg(unix)]
+    {
+        let pid = std::fs::read_to_string(&marker)
+            .expect("sidecar pid marker")
+            .parse::<u32>()
+            .expect("sidecar pid");
+        timeout(Duration::from_secs(2), async {
+            while std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("exec-ed sidecar process exits on cancellation");
+    }
+    send_turn_completed(
+        &control,
+        "thread-audio-cancel-sidecar",
+        "turn-audio-cancel-sidecar",
+        "interrupted",
+    )
+    .await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-audio-cancel-sidecar"],
+        InboundEventState::Rejected,
+    )
+    .await;
+    router.shutdown().await.expect("shutdown");
+    drop(cache);
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
 async fn missing_sidecar_returns_structured_audio_error() {
     let config = validated_config();
     let temp = tempdir().expect("tempdir");
@@ -3810,7 +4184,7 @@ async fn missing_sidecar_returns_structured_audio_error() {
     inbound.message_type = "audio".to_owned();
     inbound.text.clear();
     inbound.parts = vec![audio_part(None)];
-    let (context_id, handle) = route_audio_event(
+    let (context_id, handle, _) = route_audio_event(
         &router,
         &store,
         &namespace,
@@ -3857,6 +4231,8 @@ async fn missing_sidecar_returns_structured_audio_error() {
 
 #[tokio::test]
 async fn empty_and_failing_sidecar_return_structured_audio_errors() {
+    let _asr_subprocess_guard = ASR_SUBPROCESS_TEST_LOCK.lock().await;
+    let _asr_process_lock = lock_asr_process_tests();
     for (name, unix, windows, code) in [
         (
             "empty",
@@ -3897,7 +4273,7 @@ async fn empty_and_failing_sidecar_return_structured_audio_errors() {
         inbound.message_type = "audio".to_owned();
         inbound.text.clear();
         inbound.parts = vec![audio_part(None)];
-        let (context_id, handle) = route_audio_event(
+        let (context_id, handle, _) = route_audio_event(
             &router, &store, &namespace, &control, &workspace, name, inbound, &thread_id, &turn_id,
         )
         .await;

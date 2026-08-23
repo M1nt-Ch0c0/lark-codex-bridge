@@ -1000,6 +1000,59 @@ async fn attachment_leases_require_both_parents_and_protect_gc_deletion() {
 }
 
 #[tokio::test]
+async fn exact_attachment_lease_release_preserves_sibling_turn_resources() {
+    let store = StoreHandle::open_in_memory().await.expect("open");
+    let turn_id = store
+        .record_turn(turn("exact-release", TurnState::Starting))
+        .await
+        .expect("turn");
+    for sha in ["first", "second"] {
+        assert!(
+            store
+                .put_attachment_and_lease(sha, 1, "file", turn_id)
+                .await
+                .expect("attachment and lease")
+        );
+    }
+    assert!(
+        !store
+            .put_attachment_and_lease("first", 1, "file", turn_id)
+            .await
+            .expect("idempotent existing lease")
+    );
+
+    assert!(
+        store
+            .release_attachment_lease("first", turn_id)
+            .await
+            .expect("exact release")
+    );
+    assert!(
+        !store
+            .release_attachment_lease("first", turn_id)
+            .await
+            .expect("idempotent exact release")
+    );
+    assert!(
+        store
+            .attachment_leases("first")
+            .await
+            .expect("first leases")
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .attachment_leases("second")
+            .await
+            .expect("sibling leases")
+            .len(),
+        1,
+        "cancellation compensation must not release sibling media"
+    );
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
 async fn debug_never_contains_outbox_payload() {
     let row = outbox("key", "prompt-sentinel-must-not-leak");
     let debug = format!("{row:?}");

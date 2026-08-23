@@ -14,6 +14,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::lark::{
@@ -644,7 +645,7 @@ pub struct RegisteredContext {
 }
 
 /// A descriptor returned only after context, thread, turn, and handle checks.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct AuthorizedResource {
     /// Lark message that owns the resource.
     pub message_id: String,
@@ -658,6 +659,17 @@ pub struct AuthorizedResource {
     pub transcript: Option<String>,
     /// Declared duration, used to refuse over-long audio before download.
     pub duration_ms: Option<u64>,
+    /// Cancellation tied to the exact context/turn capability. This is kept
+    /// crate-private so callers cannot mint or replace lifecycle authority.
+    pub(crate) cancellation: CancellationToken,
+}
+
+impl AuthorizedResource {
+    /// Whether the owning turn has already revoked this resource grant.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
 }
 
 impl fmt::Debug for AuthorizedResource {
@@ -673,7 +685,7 @@ impl fmt::Debug for AuthorizedResource {
                 &self.transcript.as_deref().map_or(0, str::len),
             )
             .field("duration_ms", &self.duration_ms)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -712,6 +724,7 @@ struct ContextEntry {
     expires_at: Instant,
     snapshot: ContextSnapshot,
     grants: HashMap<MediaHandle, ResourceGrant>,
+    cancellation: CancellationToken,
 }
 
 #[derive(Default)]
@@ -812,6 +825,7 @@ impl ContextRegistry {
                 expires_at,
                 snapshot,
                 grants,
+                cancellation: CancellationToken::new(),
             },
         );
         Ok(RegisteredContext {
@@ -1185,6 +1199,7 @@ fn authorized_resource(
         resource: grant.resource.clone(),
         transcript: grant.transcript.clone(),
         duration_ms: grant.duration_ms,
+        cancellation: entry.cancellation.clone(),
     })
 }
 
@@ -1209,6 +1224,7 @@ fn revoke_entry(entry: &mut ContextEntry, reason: RevocationReason) {
     if matches!(entry.state, EntryState::Revoked { .. }) {
         return;
     }
+    entry.cancellation.cancel();
     entry.state = EntryState::Revoked { reason };
     entry.grants.clear();
 }

@@ -104,7 +104,9 @@ impl StoreHandle {
     /// The capacity check, the upsert, and the lease insert all share one
     /// transaction. The lease insert is `INSERT OR IGNORE` so re-leasing an
     /// already-leased pair stays idempotent; foreign-key violations are not
-    /// suppressed by `OR IGNORE` and abort the transaction as errors.
+    /// suppressed by `OR IGNORE` and abort the transaction as errors. The
+    /// return value reports whether this call inserted the lease, allowing a
+    /// cancelled caller to compensate without deleting an older lease.
     ///
     /// # Errors
     ///
@@ -116,7 +118,7 @@ impl StoreHandle {
         bytes: u64,
         kind: &str,
         turn_row_id: i64,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         let sha256 = sha256.to_owned();
         let kind = kind.to_owned();
         let bytes = i64::try_from(bytes).unwrap_or(i64::MAX);
@@ -159,7 +161,7 @@ impl StoreHandle {
                     params![sha256, bytes, kind, now_ms()],
                 )
                 .map_err(|error| sqlite_error("recording an attachment", &error))?;
-            transaction
+            let inserted = transaction
                 .execute(
                     "INSERT OR IGNORE INTO attachment_leases (sha256, turn_row_id, created_ms)
                      VALUES (?1, ?2, ?3)",
@@ -168,7 +170,8 @@ impl StoreHandle {
                 .map_err(|error| sqlite_error("adding an attachment lease", &error))?;
             transaction
                 .commit()
-                .map_err(|error| sqlite_error("committing an attachment transaction", &error))
+                .map_err(|error| sqlite_error("committing an attachment transaction", &error))?;
+            Ok(inserted > 0)
         })
         .await
     }
@@ -223,6 +226,35 @@ impl StoreHandle {
                 )
                 .map_err(|error| sqlite_error("adding an attachment lease", &error))?;
             Ok(())
+        })
+        .await
+    }
+
+    /// Releases one exact attachment/turn lease pair.
+    ///
+    /// This is the cancellation compensation boundary for a dynamic media
+    /// fetch that may be dropped after its writer request was admitted. The
+    /// operation is idempotent and never affects other attachments held by the
+    /// same turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the writer task or SQLite fails.
+    pub async fn release_attachment_lease(
+        &self,
+        sha256: &str,
+        turn_row_id: i64,
+    ) -> Result<bool, StoreError> {
+        let sha256 = sha256.to_owned();
+        let request_size = request_bytes(&[&sha256]);
+        self.run_sized(request_size, move |connection| {
+            connection
+                .execute(
+                    "DELETE FROM attachment_leases WHERE sha256 = ?1 AND turn_row_id = ?2",
+                    params![sha256, turn_row_id],
+                )
+                .map(|deleted| deleted > 0)
+                .map_err(|error| sqlite_error("releasing an attachment lease", &error))
         })
         .await
     }

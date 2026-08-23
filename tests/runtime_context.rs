@@ -162,6 +162,16 @@ fn media_key_is_hidden_and_handle_is_bound_to_exact_context_and_turn() {
         .authorize_media(&first.context_id, handle, &wrong_turn)
         .expect_err("handle is scoped to its turn");
     assert_eq!(error.code, ContextErrorCode::Forbidden);
+
+    assert!(!resource.is_cancelled());
+    assert_eq!(
+        registry.revoke_turn(&pending(1), RevocationReason::Cancelled),
+        1
+    );
+    assert!(
+        resource.is_cancelled(),
+        "revocation must cancel already-authorized media work"
+    );
 }
 
 #[test]

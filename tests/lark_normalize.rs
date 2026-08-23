@@ -639,7 +639,7 @@ async fn audio_video_card_and_forward_have_typed_availability() {
 }
 
 #[tokio::test]
-async fn audio_client_transcript_is_retained_as_text_and_metadata() {
+async fn audio_client_transcript_stays_lazy_in_metadata_only() {
     let server = StubServer::start(im_stub(|_| chat_mode_ok("group"), failing)).await;
     let normalizer = normalizer_for(&server);
     let payload = make_event(
@@ -661,7 +661,10 @@ async fn audio_client_transcript_is_retained_as_text_and_metadata() {
             .await
             .expect("audio with transcript should normalize"),
     );
-    assert_eq!(event.text, "please review the patch");
+    assert!(
+        event.text.is_empty(),
+        "inbound recognition must not bypass the configured tool limit"
+    );
     match event.parts.as_slice() {
         [MessagePart::Audio(media)] => {
             assert_eq!(media.key.as_deref(), Some("aud_key"));

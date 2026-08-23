@@ -22,8 +22,8 @@ database = "state/bridge.sqlite3"
 attachment_cache = "cache/attachments"
 
 [asr]
-command = "/opt/asr/sherpa-onnx-offline"
+command = "sherpa-onnx-offline"
 args = ["--tokens", "/opt/asr/tokens.txt"]
-ffmpeg = "/usr/bin/ffmpeg"
+ffmpeg = "ffmpeg"
 max_duration_ms = 120000
 max_transcript_bytes = 4096

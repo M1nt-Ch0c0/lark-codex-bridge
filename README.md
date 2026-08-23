@@ -84,9 +84,10 @@ CODEX_E2E=1 cargo test --test codex_smoke --locked -- --ignored --nocapture
 
 飞书语音气泡默认**不会**把 `localAudio` 交给 Codex。`bridge_media.read` 对音频按需转写后只回传文本：
 
-1. 入站 payload 已带客户端识别文本时直接使用，不调用 sidecar；
-2. 否则用 `ffmpeg` 解码为 16 kHz WAV，再跑配置的本地 sidecar（stdout 即转写结果）；
-3. 缺 sidecar、解码失败、空/超限转写或过长音频会返回稳定错误码（`sidecar_missing` / `unsupported_codec` / `empty_transcript` / `transcript_too_large` / `too_long` / `oversize` / `sidecar_failed`），不会静默丢 part。
+1. 入站 payload 已带客户端识别文本时仍只保存在 turn-scoped media capability 中，`bridge_media.read` 按 `max_transcript_bytes` 校验后使用，不会提前混入 prompt，也不会调用 sidecar；
+2. 否则用 `ffmpeg` 在 owner-only 临时目录中解码为 16 kHz WAV，再跑配置的本地 sidecar；Bridge 对 stdout 做有界读取，并接受纯文本或带 `text` 字段的 sherpa JSON；
+3. turn 中断会取消下载/解码/sidecar 并回收本次精确租约和临时目录；异常退出残留的私有 ASR 目录会在后续启动时做有界老化清理；
+4. 缺 sidecar、解码失败、空/超限转写、过长音频、取消或临时目录失败会返回稳定错误码（`sidecar_missing` / `unsupported_codec` / `empty_transcript` / `transcript_too_large` / `too_long` / `oversize` / `sidecar_failed` / `cancelled` / `temporary_storage_failed`），不会静默丢 part。
 
 推荐 sidecar 是 [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) 上的 SenseVoice Small。仓库不内置模型权重；未配置 sidecar 时图片/文件读取不受影响。
 
@@ -99,12 +100,12 @@ max_duration_ms = 600000
 max_transcript_bytes = 32768
 ```
 
-`command` 可省略。`args` 按声明顺序传给 sidecar，解码后的 WAV 路径始终作为最后一个参数。
+`command` 可省略。`args` 按声明顺序传给 sidecar，解码后的 WAV 路径始终作为最后一个参数。`max_transcript_bytes` 必须在 `1..=32768` 内。
 相对路径相对配置文件目录解析；单个程序名（如 `ffmpeg`）走 `PATH`。
 
-sherpa-onnx-offline 的 stdout 含配置转储，不能直接当 sidecar。仓库提供
-[`scripts/sensevoice-sidecar.sh`](scripts/sensevoice-sidecar.sh)，只把 JSON 里的
-`text` 打到 stdout。本机冒烟：
+sherpa-onnx-offline 的 stdout 可含配置转储；Bridge 会在有界输出中提取首个 JSON
+`text`。仓库提供的 [`scripts/sensevoice-sidecar.sh`](scripts/sensevoice-sidecar.sh)
+用 `exec` 直接启动识别器，使 Bridge 的进程监督和取消边界覆盖实际识别进程。本机冒烟：
 
 ```bash
 export SENSEVOICE_BIN=$HOME/lark-codex-bridge-asr/sherpa-onnx-v1.13.6-osx-arm64-static-no-tts/bin/sherpa-onnx-offline

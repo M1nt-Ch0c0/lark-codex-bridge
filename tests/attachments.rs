@@ -860,6 +860,7 @@ fn debug_output_never_leaks_content_or_paths() {
         path: Path::new("/home/secret/cache").join(sha_hex(b"secret-bytes")),
         kind: ResourceKind::File,
         bytes: 12,
+        lease_was_inserted: true,
     };
     let debug = format!("{cached:?}");
     assert!(!debug.contains("secret-bytes"));

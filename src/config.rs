@@ -516,7 +516,10 @@ impl AsrSection {
         if self.args.iter().any(|arg| arg.len() > ASR_MAX_ARG_BYTES) {
             return Err(ConfigError::AsrArgsTooLarge);
         }
-        if self.max_duration_ms == 0 || self.max_transcript_bytes == 0 {
+        if self.max_duration_ms == 0
+            || self.max_transcript_bytes == 0
+            || self.max_transcript_bytes > ASR_TRANSCRIPT_MAX_BYTES
+        {
             return Err(ConfigError::InvalidAsrLimit);
         }
         Ok(())

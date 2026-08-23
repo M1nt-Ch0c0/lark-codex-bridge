@@ -4,19 +4,30 @@
 //! receives a 16 kHz WAV path as its last argument and must print a transcript
 //! on stdout. ffmpeg is used only to decode Feishu Opus/Ogg into that WAV.
 
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::OnceLock;
+use std::time::{Duration, SystemTime};
 
+use tempfile::{Builder as TempDirBuilder, TempDir};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time::timeout;
-use uuid::Uuid;
 
 use crate::config::AsrSection;
 use crate::lark::normalize::normalize_transcript;
 use crate::limits::{ASR_FFMPEG_TIMEOUT, ASR_SIDECAR_TIMEOUT};
+
+const ASR_TEMP_PREFIX: &str = "lark-codex-bridge-asr-";
+const ASR_TEMP_MARKER: &str = ".lark-codex-bridge-asr-v1";
+const ASR_TEMP_MARKER_CONTENTS: &[u8] = b"lark-codex-bridge private ASR workspace v1\n";
+const ASR_STALE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const ASR_STALE_SCAN_LIMIT: usize = 256;
+const ASR_CLEANUP_ATTEMPTS: usize = 20;
+const ASR_CLEANUP_RETRY: Duration = Duration::from_millis(50);
+static ASR_STALE_SWEEP: OnceLock<()> = OnceLock::new();
 
 /// Why local transcription could not produce text.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,6 +46,10 @@ pub enum AsrError {
     TranscriptTooLarge,
     /// Downloaded audio exceeded the attachment byte cap.
     Oversize,
+    /// The owning turn was cancelled while ASR work was active.
+    Cancelled,
+    /// A private temporary workspace could not be created.
+    TemporaryStorage,
 }
 
 impl AsrError {
@@ -49,6 +64,8 @@ impl AsrError {
             Self::EmptyTranscript => "empty_transcript",
             Self::TranscriptTooLarge => "transcript_too_large",
             Self::Oversize => "oversize",
+            Self::Cancelled => "cancelled",
+            Self::TemporaryStorage => "temporary_storage_failed",
         }
     }
 
@@ -63,6 +80,8 @@ impl AsrError {
             Self::EmptyTranscript => "local ASR sidecar produced an empty transcript",
             Self::TranscriptTooLarge => "local ASR transcript exceeds the configured limit",
             Self::Oversize => "audio is too large to transcribe",
+            Self::Cancelled => "audio transcription was cancelled",
+            Self::TemporaryStorage => "private audio workspace is unavailable",
         }
     }
 }
@@ -103,50 +122,186 @@ pub async fn transcribe_file(
         return Err(AsrError::SidecarMissing);
     }
 
-    transcribe_file_at(config, input, unique_wav_path()).await
+    let temp_root = std::env::temp_dir();
+    ASR_STALE_SWEEP.get_or_init(|| {
+        sweep_stale_workspaces(&temp_root, ASR_STALE_AGE, ASR_STALE_SCAN_LIMIT);
+    });
+    transcribe_file_in(config, input, &temp_root).await
 }
 
-async fn transcribe_file_at(
+async fn transcribe_file_in(
     config: &AsrSection,
     input: &Path,
-    wav_path: PathBuf,
+    temp_root: &Path,
 ) -> Result<String, AsrError> {
-    let wav = TemporaryWav::new(wav_path);
-    let decode = decode_to_wav(&config.ffmpeg, input, wav.path(), config.max_duration_ms).await;
-    match decode {
+    let workspace = AsrWorkspace::new_in(temp_root)?;
+    let wav_path = workspace.path().join("decoded.wav");
+    let decode = decode_to_wav(&config.ffmpeg, input, &wav_path, config.max_duration_ms).await;
+    let result = match decode {
         Ok(()) => {
             let command = config.command.as_ref().ok_or(AsrError::SidecarMissing)?;
-            run_sidecar(config, command, wav.path()).await
+            run_sidecar(config, command, &wav_path).await
         }
         Err(error) => Err(error),
-    }
+    };
+    workspace.cleanup().await;
+    result
 }
 
-fn unique_wav_path() -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "lark-codex-bridge-asr-{}.wav",
-        Uuid::new_v4().simple()
-    ))
+struct AsrWorkspace {
+    directory: Option<TempDir>,
 }
 
-struct TemporaryWav {
-    path: PathBuf,
-}
-
-impl TemporaryWav {
-    fn new(path: PathBuf) -> Self {
-        Self { path }
+impl AsrWorkspace {
+    fn new_in(root: &Path) -> Result<Self, AsrError> {
+        let directory = TempDirBuilder::new()
+            .prefix(ASR_TEMP_PREFIX)
+            .tempdir_in(root)
+            .map_err(|_| AsrError::TemporaryStorage)?;
+        fs::write(
+            directory.path().join(ASR_TEMP_MARKER),
+            ASR_TEMP_MARKER_CONTENTS,
+        )
+        .map_err(|_| AsrError::TemporaryStorage)?;
+        Ok(Self {
+            directory: Some(directory),
+        })
     }
 
     fn path(&self) -> &Path {
-        &self.path
+        self.directory
+            .as_ref()
+            .expect("workspace exists until cleanup")
+            .path()
+    }
+
+    async fn cleanup(mut self) {
+        let Some(directory) = self.directory.take() else {
+            return;
+        };
+        cleanup_workspace(directory.keep()).await;
     }
 }
 
-impl Drop for TemporaryWav {
+impl Drop for AsrWorkspace {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        let Some(directory) = self.directory.take() else {
+            return;
+        };
+        let path = directory.keep();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(cleanup_workspace(path));
+        } else if fs::remove_dir_all(path).is_err() {
+            tracing::warn!("private ASR workspace cleanup could not be scheduled");
+        }
     }
+}
+
+async fn cleanup_workspace(path: PathBuf) {
+    for attempt in 0..ASR_CLEANUP_ATTEMPTS {
+        match fs::remove_dir_all(&path) {
+            Ok(()) => return,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(_) if attempt + 1 < ASR_CLEANUP_ATTEMPTS => {
+                tokio::time::sleep(ASR_CLEANUP_RETRY).await;
+            }
+            Err(_) => {
+                tracing::warn!("private ASR workspace cleanup failed");
+                return;
+            }
+        }
+    }
+}
+
+fn sweep_stale_workspaces(root: &Path, stale_age: Duration, scan_limit: usize) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.take(scan_limit).flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(ASR_TEMP_PREFIX) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.file_type().is_dir()
+            || metadata
+                .modified()
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_none_or(|age| age < stale_age)
+        {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                continue;
+            }
+        }
+        if !is_owned_stale_workspace(&path) {
+            continue;
+        }
+        let decoded = path.join("decoded.wav");
+        if decoded.exists() && fs::remove_file(&decoded).is_err() {
+            tracing::warn!("stale private ASR workspace cleanup failed");
+            continue;
+        }
+        if fs::remove_file(path.join(ASR_TEMP_MARKER)).is_err() || fs::remove_dir(path).is_err() {
+            tracing::warn!("stale private ASR workspace cleanup failed");
+        }
+    }
+}
+
+fn is_owned_stale_workspace(path: &Path) -> bool {
+    let marker_path = path.join(ASR_TEMP_MARKER);
+    let Ok(marker_metadata) = fs::symlink_metadata(&marker_path) else {
+        return false;
+    };
+    if !marker_metadata.file_type().is_file() {
+        return false;
+    }
+    let Ok(mut marker) = File::open(&marker_path) else {
+        return false;
+    };
+    let mut contents = Vec::with_capacity(ASR_TEMP_MARKER_CONTENTS.len());
+    if marker
+        .by_ref()
+        .take(u64::try_from(ASR_TEMP_MARKER_CONTENTS.len() + 1).unwrap_or(u64::MAX))
+        .read_to_end(&mut contents)
+        .is_err()
+        || contents != ASR_TEMP_MARKER_CONTENTS
+    {
+        return false;
+    }
+    let Ok(entries) = fs::read_dir(path) else {
+        return false;
+    };
+    let mut count = 0_usize;
+    for entry in entries.take(3) {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        count += 1;
+        let name = entry.file_name();
+        if name != ASR_TEMP_MARKER && name != "decoded.wav" {
+            return false;
+        }
+        let Ok(metadata) = fs::symlink_metadata(entry.path()) else {
+            return false;
+        };
+        if !metadata.file_type().is_file() {
+            return false;
+        }
+    }
+    (1..=2).contains(&count)
 }
 
 async fn decode_to_wav(
@@ -291,7 +446,11 @@ async fn run_sidecar(
     let mut child = process.spawn().map_err(|_| AsrError::SidecarFailed)?;
     let mut stdout = child.stdout.take().ok_or(AsrError::SidecarFailed)?;
     let execution = async {
-        let bytes = read_bounded_stdout(&mut stdout, config.max_transcript_bytes).await?;
+        let stdout_limit = config
+            .max_transcript_bytes
+            .saturating_mul(4)
+            .saturating_add(4 * 1024);
+        let bytes = read_bounded_stdout(&mut stdout, stdout_limit).await?;
         let status = child.wait().await.map_err(|_| AsrError::SidecarFailed)?;
         Ok::<_, AsrError>((bytes, status))
     };
@@ -312,7 +471,30 @@ async fn run_sidecar(
         return Err(AsrError::SidecarFailed);
     }
     let stdout = String::from_utf8_lossy(&bytes);
-    normalize_transcript(&stdout, config.max_transcript_bytes).ok_or(AsrError::EmptyTranscript)
+    parse_sidecar_transcript(&stdout, config.max_transcript_bytes)
+}
+
+fn parse_sidecar_transcript(stdout: &str, max_bytes: usize) -> Result<String, AsrError> {
+    // sherpa-onnx SenseVoice commonly emits one JSON object with a `text`
+    // field. Parsing that envelope in Rust lets the documented wrapper `exec`
+    // the recognizer directly, so process cancellation cannot orphan a
+    // descendant shell pipeline. Plain-text sidecars remain supported.
+    for line in stdout.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        if let Some(text) = value.get("text").and_then(serde_json::Value::as_str) {
+            return bounded_transcript(text, max_bytes);
+        }
+    }
+    bounded_transcript(stdout, max_bytes)
+}
+
+fn bounded_transcript(text: &str, max_bytes: usize) -> Result<String, AsrError> {
+    if text.trim().len() > max_bytes {
+        return Err(AsrError::TranscriptTooLarge);
+    }
+    normalize_transcript(text, max_bytes).ok_or(AsrError::EmptyTranscript)
 }
 
 async fn read_bounded_stdout(
@@ -339,8 +521,23 @@ async fn read_bounded_stdout(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use fs2::FileExt;
+    use std::fs::{self, File, OpenOptions};
     use tempfile::tempdir;
+    use uuid::Uuid;
+
+    fn lock_asr_process_tests() -> File {
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(std::env::temp_dir().join("lark-codex-bridge-asr-process-tests.lock"))
+            .expect("open shared ASR process-test lock");
+        file.lock_exclusive()
+            .expect("lock shared ASR process-test file");
+        file
+    }
 
     fn stub(
         dir: &Path,
@@ -454,6 +651,7 @@ mod tests {
 
     #[tokio::test]
     async fn stub_sidecar_prints_transcript_after_ffmpeg_decode() {
+        let _process_lock = lock_asr_process_tests();
         let dir = tempdir().expect("tempdir");
         let marker = dir.path().join("marker.txt");
         let ffmpeg = ffmpeg_stub(dir.path());
@@ -476,6 +674,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_sidecar_stdout_is_empty_transcript() {
+        let _process_lock = lock_asr_process_tests();
         let dir = tempdir().expect("tempdir");
         let ffmpeg = ffmpeg_stub(dir.path());
         let asr = stub(dir.path(), "asr", "exit 0", "@echo off\r\nexit /b 0\r\n");
@@ -490,6 +689,7 @@ mod tests {
 
     #[tokio::test]
     async fn failing_sidecar_is_sidecar_failed() {
+        let _process_lock = lock_asr_process_tests();
         let dir = tempdir().expect("tempdir");
         let ffmpeg = ffmpeg_stub(dir.path());
         let asr = stub(dir.path(), "asr", "exit 2", "@echo off\r\nexit /b 2\r\n");
@@ -504,6 +704,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_ffmpeg_is_unsupported_codec() {
+        let _process_lock = lock_asr_process_tests();
         let dir = tempdir().expect("tempdir");
         let asr = stub(
             dir.path(),
@@ -523,6 +724,7 @@ mod tests {
 
     #[tokio::test]
     async fn decoded_duration_limit_applies_without_inbound_metadata() {
+        let _process_lock = lock_asr_process_tests();
         let dir = tempdir().expect("tempdir");
         let marker = dir.path().join("sidecar-must-not-run");
         let asr = stub(
@@ -555,6 +757,7 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_sidecar_stdout_is_bounded_and_classified() {
+        let _process_lock = lock_asr_process_tests();
         let dir = tempdir().expect("tempdir");
         let transcript = "x".repeat(64);
         let asr = stub(
@@ -579,30 +782,135 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelling_sidecar_phase_removes_temporary_wav() {
+    async fn cancelling_real_transcribe_future_removes_private_workspace() {
+        let _process_lock = lock_asr_process_tests();
         let dir = tempdir().expect("tempdir");
-        let wav = dir.path().join("cancelled.wav");
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let task_wav = wav.clone();
-        let task = tokio::spawn(async move {
-            let temporary_wav = TemporaryWav::new(task_wav);
-            fs::write(temporary_wav.path(), b"decoded private speech").expect("decoded WAV");
-            let _ = started_tx.send(());
-            std::future::pending::<()>().await;
-            drop(temporary_wav);
-        });
-        started_rx.await.expect("sidecar phase starts");
-        assert!(wav.exists(), "decoded WAV exists while sidecar is active");
+        let workspace_root = dir.path().join("workspaces");
+        fs::create_dir(&workspace_root).expect("workspace root");
+        let source = dir.path().join("decoded.wav");
+        write_pcm_wav(&source, 160);
+        let marker = dir.path().join("ffmpeg-started");
+        let source_text = source.to_string_lossy();
+        let marker_text = marker.to_string_lossy();
+        let ffmpeg = stub(
+            dir.path(),
+            "ffmpeg-cancellable",
+            &format!(
+                r#"out=""; for arg in "$@"; do out=$arg; done; cp "{}" "$out"; printf ready > "{}"; exec sleep 60"#,
+                source_text.replace('"', r#"\""#),
+                marker_text.replace('"', r#"\""#),
+            ),
+            &format!(
+                "@echo off\r\n:loop\r\nif \"%~2\"==\"\" (\r\ncopy /y \"{source_text}\" \"%~1\" >nul\r\necho ready>\"{marker_text}\"\r\nping -n 60 127.0.0.1 >nul\r\nexit /b 0\r\n)\r\nshift\r\ngoto loop\r\n"
+            ),
+        );
+        let sidecar = stub(
+            dir.path(),
+            "sidecar-unused",
+            "printf unexpected",
+            "@echo off\r\necho unexpected\r\n",
+        );
+        let input = dir.path().join("voice.ogg");
+        fs::write(&input, b"private compressed speech").expect("input");
+        let config = config_with(sidecar, ffmpeg, Vec::new());
+        let task_root = workspace_root.clone();
+        let task =
+            tokio::spawn(async move { transcribe_file_in(&config, &input, &task_root).await });
+
+        timeout(Duration::from_secs(5), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("ffmpeg starts");
+        let workspace = fs::read_dir(&workspace_root)
+            .expect("read workspaces")
+            .next()
+            .expect("active private workspace")
+            .expect("workspace entry")
+            .path();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&workspace)
+                    .expect("workspace metadata")
+                    .permissions()
+                    .mode()
+                    & 0o077,
+                0,
+                "decoded speech directory must be owner-only"
+            );
+        }
 
         task.abort();
         let _ = task.await;
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if fs::read_dir(&workspace_root)
+                    .expect("read workspaces")
+                    .next()
+                    .is_none()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("cancelled workspace is removed after child termination");
+    }
 
-        assert!(!wav.exists(), "RAII removes decoded speech on cancellation");
+    #[test]
+    fn stale_private_workspaces_are_swept_without_touching_other_entries() {
+        let root = tempdir().expect("tempdir");
+        let mut stale_workspace = AsrWorkspace::new_in(root.path()).expect("stale workspace");
+        fs::write(
+            stale_workspace.path().join("decoded.wav"),
+            b"private speech",
+        )
+        .expect("decoded speech");
+        let stale = stale_workspace
+            .directory
+            .take()
+            .expect("workspace directory")
+            .keep();
+        let unrelated = root.path().join("keep-me");
+        fs::create_dir(&unrelated).expect("unrelated directory");
+
+        let spoofed = TempDirBuilder::new()
+            .prefix(ASR_TEMP_PREFIX)
+            .tempdir_in(root.path())
+            .expect("spoofed workspace")
+            .keep();
+        fs::write(spoofed.join("decoded.wav"), b"must survive without marker")
+            .expect("spoofed content");
+
+        sweep_stale_workspaces(root.path(), Duration::ZERO, 16);
+
+        assert!(!stale.exists());
+        assert!(unrelated.exists());
+        assert!(spoofed.exists(), "a prefix alone is not deletion authority");
+    }
+
+    #[test]
+    fn sherpa_json_envelope_is_parsed_and_bounded() {
+        assert_eq!(
+            parse_sidecar_transcript("diagnostic\n{\"text\":\" known transcript \"}\n", 32,)
+                .expect("JSON transcript"),
+            "known transcript"
+        );
+        assert_eq!(
+            parse_sidecar_transcript("{\"text\":\"too long\"}", 4),
+            Err(AsrError::TranscriptTooLarge)
+        );
     }
 
     #[tokio::test]
     #[ignore = "requires ffmpeg + sherpa-onnx SenseVoice; run with LARK_ASR_SMOKE=1 -- --ignored"]
     async fn sensevoice_transcribes_real_feishu_like_ogg() {
+        let _process_lock = lock_asr_process_tests();
         assert_eq!(
             std::env::var("LARK_ASR_SMOKE").ok().as_deref(),
             Some("1"),
