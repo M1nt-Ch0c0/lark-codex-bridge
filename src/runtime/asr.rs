@@ -4,7 +4,6 @@
 //! receives a 16 kHz WAV path as its last argument and must print a transcript
 //! on stdout. ffmpeg is used only to decode Feishu Opus/Ogg into that WAV.
 
-use std::collections::BinaryHeap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -32,8 +31,6 @@ const ASR_TEMP_MARKER: &str = ".lark-codex-bridge-asr-v1";
 const ASR_TEMP_MARKER_CONTENTS: &[u8] = b"lark-codex-bridge private ASR workspace v1\n";
 const ASR_QUARANTINE_PREFIX: &str = ".quarantine-";
 const ASR_CLAIM_PREFIX: &str = ".cleanup-claim-";
-const ASR_SWEEP_CURSOR: &str = ".sweep-cursor";
-const ASR_SWEEP_CURSOR_MAX_BYTES: usize = 255;
 const ASR_STALE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const ASR_STALE_SCAN_LIMIT: usize = 256;
 /// Runtime cadence for retrying cleanup of stale, bridge-owned workspaces.
@@ -144,21 +141,119 @@ pub async fn transcribe_file(
     transcribe_file_cancellable(config, input, duration_ms, &turn_cancellation, &shutdown).await
 }
 
-/// Initializes and sweeps the bridge-owned private ASR root. The router calls
-/// this before accepting reverse tool work so a storage-permission failure is
-/// observed before any decoded speech can be written.
-pub(crate) fn initialize_storage() -> Result<(), AsrError> {
-    let root = private_root();
-    ensure_private_directory(&root)?;
-    sweep_stale_workspaces(&root, ASR_STALE_AGE, ASR_STALE_SCAN_LIMIT);
-    Ok(())
+/// Process-local stale-workspace traversal retained across periodic ticks.
+///
+/// Each round advances one live directory iterator by at most the configured
+/// entry budget. A restart discards only traversal progress; ownership is
+/// revalidated independently before every cleanup attempt.
+pub(crate) struct StaleWorkspaceSweeper {
+    root: PathBuf,
+    entries: Option<fs::ReadDir>,
 }
 
-/// Retries the bounded, bridge-owned stale workspace sweep.
-pub(crate) fn sweep_stale_storage() {
-    let root = private_root();
-    if ensure_private_directory(&root).is_ok() {
-        sweep_stale_workspaces(&root, ASR_STALE_AGE, ASR_STALE_SCAN_LIMIT);
+#[derive(Debug, Default, Eq, PartialEq)]
+struct SweepRound {
+    read_attempts: usize,
+    metadata_attempts: usize,
+    cleanup_attempts: usize,
+    cycle_complete: bool,
+}
+
+impl StaleWorkspaceSweeper {
+    /// Creates the process-local traversal without touching storage.
+    pub(crate) fn for_private_root() -> Self {
+        Self::new(private_root())
+    }
+
+    fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            entries: None,
+        }
+    }
+
+    /// Verifies storage and performs one hard-bounded startup or periodic
+    /// cleanup round.
+    pub(crate) fn sweep_once(&mut self) -> Result<(), AsrError> {
+        self.sweep_round(ASR_STALE_AGE, ASR_STALE_SCAN_LIMIT)
+            .map(|_| ())
+    }
+
+    fn sweep_round(
+        &mut self,
+        stale_age: Duration,
+        scan_limit: usize,
+    ) -> Result<SweepRound, AsrError> {
+        let mut round = SweepRound::default();
+        if scan_limit == 0 {
+            return Ok(round);
+        }
+        if ensure_private_directory(&self.root).is_err() {
+            self.entries = None;
+            return Err(AsrError::TemporaryStorage);
+        }
+        if self.entries.is_none() {
+            self.entries = Some(fs::read_dir(&self.root).map_err(|_| AsrError::TemporaryStorage)?);
+        }
+
+        let now = SystemTime::now();
+        for _ in 0..scan_limit {
+            round.read_attempts += 1;
+            let entry = match self
+                .entries
+                .as_mut()
+                .expect("directory iterator exists during a sweep cycle")
+                .next()
+            {
+                Some(Ok(entry)) => entry,
+                Some(Err(_)) => continue,
+                None => {
+                    round.cycle_complete = true;
+                    self.entries = None;
+                    break;
+                }
+            };
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let is_workspace = name.starts_with(ASR_TEMP_PREFIX);
+            let is_quarantine = name.starts_with(ASR_QUARANTINE_PREFIX);
+            if !is_workspace && !is_quarantine {
+                continue;
+            }
+
+            round.metadata_attempts += 1;
+            let path = entry.path();
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !metadata.file_type().is_dir() {
+                continue;
+            }
+            if is_workspace
+                && metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| now.duration_since(modified).ok())
+                    .is_none_or(|age| age < stale_age)
+            {
+                continue;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if metadata.permissions().mode() & 0o077 != 0 {
+                    continue;
+                }
+            }
+
+            round.cleanup_attempts += 1;
+            if cleanup_owned_workspace_once(&path).is_err() {
+                tracing::warn!("stale private ASR workspace cleanup failed");
+            }
+        }
+        Ok(round)
     }
 }
 
@@ -304,78 +399,6 @@ async fn cleanup_workspace(path: PathBuf) {
             }
         }
     }
-}
-
-fn sweep_stale_workspaces(root: &Path, stale_age: Duration, scan_limit: usize) {
-    if scan_limit == 0 {
-        return;
-    }
-    let Ok(entries) = fs::read_dir(root) else {
-        return;
-    };
-    let now = SystemTime::now();
-    let cursor = read_sweep_cursor(root);
-    // Keep only the lexicographically smallest bounded window beyond the
-    // durable cursor. Unlike a numeric read_dir offset, this makes progress
-    // independent of platform/filesystem enumeration order. Directory-name
-    // inspection is cheap and unrelated names never consume the cleanup
-    // budget; metadata and deletion work stay bounded by scan_limit.
-    let mut candidates = BinaryHeap::with_capacity(scan_limit.saturating_add(1));
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        let is_workspace = name.starts_with(ASR_TEMP_PREFIX);
-        let is_quarantine = name.starts_with(ASR_QUARANTINE_PREFIX);
-        if !is_workspace && !is_quarantine {
-            continue;
-        }
-        if cursor.as_deref().is_some_and(|cursor| name <= cursor) {
-            continue;
-        }
-        candidates.push((name.to_owned(), entry.path(), is_workspace));
-        if candidates.len() > scan_limit {
-            let _ = candidates.pop();
-        }
-    }
-    let candidates = candidates.into_sorted_vec();
-    if candidates.is_empty() {
-        write_sweep_cursor(root, None);
-        return;
-    }
-    let next_cursor = candidates
-        .last()
-        .map(|(name, _, _)| name.clone())
-        .expect("non-empty candidate window");
-    for (_, path, is_workspace) in candidates {
-        let Ok(metadata) = fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if !metadata.file_type().is_dir() {
-            continue;
-        }
-        if is_workspace
-            && metadata
-                .modified()
-                .ok()
-                .and_then(|modified| now.duration_since(modified).ok())
-                .is_none_or(|age| age < stale_age)
-        {
-            continue;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if metadata.permissions().mode() & 0o077 != 0 {
-                continue;
-            }
-        }
-        if cleanup_owned_workspace_once(&path).is_err() {
-            tracing::warn!("stale private ASR workspace cleanup failed");
-        }
-    }
-    write_sweep_cursor(root, Some(&next_cursor));
 }
 
 fn is_owned_stale_workspace(path: &Path) -> bool {
@@ -584,55 +607,6 @@ fn ensure_cleanup_claim(path: &Path) -> std::io::Result<PathBuf> {
         ));
     }
     Ok(claim)
-}
-
-fn read_sweep_cursor(root: &Path) -> Option<String> {
-    let path = root.join(ASR_SWEEP_CURSOR);
-    let Ok(file) = open_no_follow_read(&path) else {
-        return None;
-    };
-    let mut bytes = Vec::with_capacity(ASR_SWEEP_CURSOR_MAX_BYTES);
-    if file
-        .take(u64::try_from(ASR_SWEEP_CURSOR_MAX_BYTES + 1).unwrap_or(u64::MAX))
-        .read_to_end(&mut bytes)
-        .is_err()
-        || bytes.is_empty()
-        || bytes.len() > ASR_SWEEP_CURSOR_MAX_BYTES
-    {
-        return None;
-    }
-    let Ok(cursor) = String::from_utf8(bytes) else {
-        return None;
-    };
-    (cursor.starts_with(ASR_TEMP_PREFIX) || cursor.starts_with(ASR_QUARANTINE_PREFIX))
-        .then_some(cursor)
-}
-
-fn write_sweep_cursor(root: &Path, cursor: Option<&str>) {
-    let path = root.join(ASR_SWEEP_CURSOR);
-    let temporary = root.join(format!(".sweep-cursor-{}", Uuid::new_v4().simple()));
-    let contents = cursor.unwrap_or_default().as_bytes();
-    if contents.len() <= ASR_SWEEP_CURSOR_MAX_BYTES
-        && create_private_file(&temporary, contents).is_ok()
-        && fs::rename(&temporary, &path).is_err()
-        && !replace_private_cursor(&temporary, &path)
-    {
-        let _ = fs::remove_file(temporary);
-    }
-}
-
-fn replace_private_cursor(temporary: &Path, destination: &Path) -> bool {
-    let Ok(metadata) = fs::symlink_metadata(destination) else {
-        return false;
-    };
-    if !metadata.file_type().is_file() || secure_private_path(destination, false).is_err() {
-        return false;
-    }
-    // Windows rename does not replace an existing destination. The cursor is
-    // non-authoritative progress metadata in a bridge-owned 0700/protected
-    // root, so removing a verified private regular cursor and retrying is safe;
-    // a crash merely restarts the bounded scan at zero.
-    fs::remove_file(destination).is_ok() && fs::rename(temporary, destination).is_ok()
 }
 
 fn as_io_error(_error: AsrError) -> std::io::Error {
@@ -1368,6 +1342,8 @@ mod tests {
     use fs2::FileExt;
     use std::fs::{self, File, OpenOptions};
     use tempfile::tempdir;
+    #[cfg(unix)]
+    use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::time::timeout;
     use uuid::Uuid;
 
@@ -1382,6 +1358,54 @@ mod tests {
         file.lock_exclusive()
             .expect("lock shared ASR process-test file");
         file
+    }
+
+    fn sweep_complete_cycle(root: &Path, stale_age: Duration, scan_limit: usize) {
+        let mut sweeper = StaleWorkspaceSweeper::new(root.to_owned());
+        for _ in 0..16_384 {
+            let round = sweeper
+                .sweep_round(stale_age, scan_limit)
+                .expect("bounded stale sweep round");
+            assert!(round.read_attempts <= scan_limit);
+            assert!(round.metadata_attempts <= round.read_attempts);
+            assert!(round.cleanup_attempts <= round.metadata_attempts);
+            if round.cycle_complete {
+                return;
+            }
+        }
+        panic!("stateful stale sweep must eventually finish one directory cycle");
+    }
+
+    #[cfg(unix)]
+    async fn read_descendant_pid_handshake(process: &mut SupervisedProcess) -> u32 {
+        let stdout = process.take_stdout().expect("handshake stdout");
+        let mut stdout = BufReader::new(stdout);
+        let mut line = String::new();
+        let read = timeout(Duration::from_secs(30), stdout.read_line(&mut line))
+            .await
+            .expect("descendant startup handshake deadline")
+            .expect("read descendant startup handshake");
+        assert_ne!(read, 0, "descendant startup handshake must not reach EOF");
+        line.trim()
+            .parse::<u32>()
+            .expect("descendant pid handshake")
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_process_exit(pid: u32, context: &'static str) {
+        timeout(Duration::from_secs(30), async {
+            while std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+            {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect(context);
     }
 
     fn stub(
@@ -1777,19 +1801,7 @@ mod tests {
             .expect("grandchild pid")
             .parse::<u32>()
             .expect("pid");
-        timeout(Duration::from_secs(2), async {
-            while std::process::Command::new("kill")
-                .args(["-0", &pid.to_string()])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success())
-            {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("expanded ffmpeg process tree exits");
+        wait_for_process_exit(pid, "expanded ffmpeg process tree exits").await;
     }
 
     #[tokio::test]
@@ -1928,19 +1940,11 @@ mod tests {
         .await
         .expect("cancelled workspace is removed after child termination");
         #[cfg(unix)]
-        timeout(Duration::from_secs(2), async {
-            while std::process::Command::new("kill")
-                .args(["-0", &grandchild_pid.to_string()])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success())
-            {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("non-exec ffmpeg grandchild exits before cleanup completes");
+        wait_for_process_exit(
+            grandchild_pid,
+            "non-exec ffmpeg grandchild exits before cleanup completes",
+        )
+        .await;
     }
 
     #[cfg(unix)]
@@ -1992,19 +1996,7 @@ mod tests {
 
         shutdown.cancel();
         assert_eq!(task.await.expect("task joins"), Err(AsrError::Cancelled));
-        timeout(Duration::from_secs(2), async {
-            while std::process::Command::new("kill")
-                .args(["-0", &pid.to_string()])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success())
-            {
-                sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("shutdown waits for whole sidecar tree");
+        wait_for_process_exit(pid, "shutdown waits for whole sidecar tree").await;
     }
 
     #[cfg(unix)]
@@ -2012,49 +2004,23 @@ mod tests {
     async fn dropping_supervisor_kills_and_reaps_non_exec_grandchild() {
         let _process_lock = lock_asr_process_tests();
         let dir = tempdir().expect("tempdir");
-        let pid_marker = dir.path().join("drop-grandchild.pid");
         let program = stub(
             dir.path(),
             "drop-process-tree",
-            &format!(
-                r#"sleep 60 & child=$!; printf '%s' "$child" > '{}'; wait "$child""#,
-                pid_marker.display()
-            ),
+            r#"sleep 60 & child=$!; printf '%s\n' "$child"; wait "$child""#,
             "",
         );
         let mut command = Command::new(program);
         command
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        let process = SupervisedProcess::spawn(&mut command, AsrError::SidecarFailed)
+        let mut process = SupervisedProcess::spawn(&mut command, AsrError::SidecarFailed)
             .expect("spawn process group");
-        timeout(Duration::from_secs(5), async {
-            while !pid_marker.exists() {
-                sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("grandchild starts");
-        let pid = fs::read_to_string(&pid_marker)
-            .expect("pid marker")
-            .parse::<u32>()
-            .expect("pid");
+        let pid = read_descendant_pid_handshake(&mut process).await;
         drop(process);
-        timeout(Duration::from_secs(2), async {
-            while std::process::Command::new("kill")
-                .args(["-0", &pid.to_string()])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success())
-            {
-                sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("drop kills whole process group");
+        wait_for_process_exit(pid, "drop kills whole process group").await;
     }
 
     #[cfg(unix)]
@@ -2100,31 +2066,21 @@ mod tests {
     async fn actual_supervisor_timeout_kills_non_exec_descendants() {
         let _process_lock = lock_asr_process_tests();
         let dir = tempdir().expect("tempdir");
-        let pid_marker = dir.path().join("timeout-grandchild.pid");
         let program = stub(
             dir.path(),
             "timeout-tree",
-            &format!(
-                r#"sleep 60 & child=$!; printf '%s' "$child" > '{}'; wait "$child""#,
-                pid_marker.display()
-            ),
+            r#"sleep 60 & child=$!; printf '%s\n' "$child"; wait "$child""#,
             "",
         );
         let mut command = Command::new(program);
         command
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
         let mut process = SupervisedProcess::spawn(&mut command, AsrError::SidecarFailed)
             .expect("spawn timeout tree");
-        timeout(Duration::from_secs(2), async {
-            while !pid_marker.exists() {
-                sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("grandchild starts");
+        let pid = read_descendant_pid_handshake(&mut process).await;
         let turn = CancellationToken::new();
         let shutdown = CancellationToken::new();
         assert_eq!(
@@ -2139,10 +2095,6 @@ mod tests {
                 .await,
             Err(AsrError::SidecarFailed)
         );
-        let pid = fs::read_to_string(&pid_marker)
-            .expect("pid marker")
-            .parse::<u32>()
-            .expect("pid");
         assert!(
             !std::process::Command::new("kill")
                 .args(["-0", &pid.to_string()])
@@ -2183,7 +2135,7 @@ mod tests {
         fs::write(spoofed.join("decoded.wav"), b"must survive without marker")
             .expect("spoofed content");
 
-        sweep_stale_workspaces(root.path(), Duration::ZERO, 16);
+        sweep_complete_cycle(root.path(), Duration::ZERO, 16);
 
         assert!(!stale.exists());
         assert!(unrelated.exists());
@@ -2191,7 +2143,97 @@ mod tests {
     }
 
     #[test]
-    fn rotating_sweep_reaches_stale_entries_beyond_hostile_prefixes() {
+    fn large_root_rounds_hard_bound_reads_and_eventually_finish_the_cycle() {
+        const ROUND_LIMIT: usize = 7;
+
+        let root = tempdir().expect("tempdir");
+        for index in 0..(ASR_STALE_SCAN_LIMIT + 73) {
+            fs::write(root.path().join(format!("unrelated-{index:04}")), b"keep")
+                .expect("unrelated entry");
+        }
+        let mut hostile = Vec::new();
+        for index in 0..(ROUND_LIMIT * 5) {
+            let path = root
+                .path()
+                .join(format!("{ASR_TEMP_PREFIX}hostile-{index:04}"));
+            fs::create_dir(&path).expect("hostile workspace-shaped entry");
+            hostile.push(path);
+        }
+        let mut workspace = AsrWorkspace::new_in(root.path()).expect("owned stale workspace");
+        fs::write(workspace.path().join("decoded.wav"), b"private speech").expect("decoded speech");
+        let stale = workspace.directory.take().expect("workspace").keep();
+
+        let initial_entries = fs::read_dir(root.path())
+            .expect("count root entries")
+            .count();
+        assert!(initial_entries > ASR_STALE_SCAN_LIMIT);
+        let mut sweeper = StaleWorkspaceSweeper::new(root.path().to_owned());
+        let mut completed = false;
+        let mut rounds = 0_usize;
+        while rounds <= initial_entries.saturating_add(32) {
+            let round = sweeper
+                .sweep_round(Duration::ZERO, ROUND_LIMIT)
+                .expect("bounded stale sweep round");
+            rounds += 1;
+            assert!(round.read_attempts <= ROUND_LIMIT);
+            assert!(round.metadata_attempts <= round.read_attempts);
+            assert!(round.cleanup_attempts <= round.metadata_attempts);
+            if !round.cycle_complete {
+                assert_eq!(round.read_attempts, ROUND_LIMIT);
+            }
+            if round.cycle_complete {
+                completed = true;
+                break;
+            }
+        }
+
+        assert!(completed, "retained iterator must reach directory EOF");
+        assert!(rounds > 1, "a large root must span multiple bounded rounds");
+        assert!(
+            !stale.exists(),
+            "one complete cycle must reach owned stale work"
+        );
+        assert!(hostile.iter().all(|path| path.exists()));
+    }
+
+    #[test]
+    fn restart_resets_progress_without_granting_prefix_cleanup_authority() {
+        let root = tempdir().expect("tempdir");
+        for index in 0..32 {
+            fs::write(root.path().join(format!("unrelated-{index:04}")), b"keep")
+                .expect("unrelated entry");
+        }
+        let spoofed = root
+            .path()
+            .join(format!("{ASR_TEMP_PREFIX}spoofed-after-restart"));
+        ensure_private_directory(&spoofed).expect("private spoofed workspace");
+        fs::write(spoofed.join("decoded.wav"), b"must survive").expect("spoofed decoded file");
+        let mut workspace = AsrWorkspace::new_in(root.path()).expect("owned stale workspace");
+        fs::write(workspace.path().join("decoded.wav"), b"private speech").expect("decoded speech");
+        let stale = workspace.directory.take().expect("workspace").keep();
+
+        let mut before_restart = StaleWorkspaceSweeper::new(root.path().to_owned());
+        let first = before_restart
+            .sweep_round(Duration::ZERO, 3)
+            .expect("bounded pre-restart round");
+        assert_eq!(first.read_attempts, 3);
+        assert!(!first.cycle_complete);
+        drop(before_restart);
+
+        sweep_complete_cycle(root.path(), Duration::ZERO, 5);
+
+        assert!(
+            !stale.exists(),
+            "restart may reset progress but must remain live"
+        );
+        assert_eq!(
+            fs::read(spoofed.join("decoded.wav")).expect("spoofed content survives"),
+            b"must survive"
+        );
+    }
+
+    #[test]
+    fn stateful_sweep_reaches_stale_entries_beyond_hostile_prefixes() {
         let root = tempdir().expect("tempdir");
         let mut hostile = Vec::new();
         for index in 0..(ASR_STALE_SCAN_LIMIT + 80) {
@@ -2211,8 +2253,14 @@ mod tests {
         let stale = root.path().join(format!("{ASR_TEMP_PREFIX}zzzz-owned"));
         fs::rename(original, &stale).expect("place stale entry beyond hostile names");
 
+        let mut sweeper = StaleWorkspaceSweeper::new(root.path().to_owned());
         for _ in 0..4 {
-            sweep_stale_workspaces(root.path(), Duration::ZERO, 128);
+            let round = sweeper
+                .sweep_round(Duration::ZERO, 128)
+                .expect("bounded stale sweep round");
+            assert!(round.read_attempts <= 128);
+            assert!(round.metadata_attempts <= round.read_attempts);
+            assert!(round.cleanup_attempts <= round.metadata_attempts);
             if !stale.exists() {
                 break;
             }
@@ -2226,7 +2274,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn lexical_sweep_advances_past_hostile_fresh_and_symlink_windows() {
+    fn stateful_sweep_advances_past_hostile_fresh_and_symlink_windows() {
         use std::os::unix::fs::symlink;
 
         let root = tempdir().expect("tempdir");
@@ -2268,14 +2316,20 @@ mod tests {
             .expect("set stale mtime");
         assert!(touched.success());
 
+        let mut sweeper = StaleWorkspaceSweeper::new(root.path().to_owned());
         for _ in 0..6 {
-            sweep_stale_workspaces(root.path(), ASR_STALE_AGE, 64);
+            let round = sweeper
+                .sweep_round(ASR_STALE_AGE, 64)
+                .expect("bounded stale sweep round");
+            assert!(round.read_attempts <= 64);
+            assert!(round.metadata_attempts <= round.read_attempts);
+            assert!(round.cleanup_attempts <= round.metadata_attempts);
             if !stale.exists() {
                 break;
             }
         }
 
-        assert!(!stale.exists(), "lexical windows must reach the stale tail");
+        assert!(!stale.exists(), "stateful rounds must reach the stale tail");
         assert!(hostile.iter().all(|path| path.exists()));
         assert!(fresh.iter().all(|path| path.exists()));
         assert!(links.iter().all(|path| path.is_symlink()));
@@ -2289,7 +2343,7 @@ mod tests {
         ensure_private_directory(&spoofed).expect("private spoofed quarantine");
         fs::write(spoofed.join("decoded.wav"), b"must survive").expect("spoofed decoded name");
 
-        sweep_stale_workspaces(root.path(), Duration::ZERO, 16);
+        sweep_complete_cycle(root.path(), Duration::ZERO, 16);
 
         assert_eq!(
             fs::read(spoofed.join("decoded.wav")).expect("unproven content survives"),
@@ -2359,8 +2413,11 @@ mod tests {
         fs::write(workspace.path().join("decoded.wav"), b"private speech").expect("decoded speech");
         let root_path = root.path().to_owned();
         let dropper = std::thread::spawn(move || drop(workspace));
+        let mut sweeper = StaleWorkspaceSweeper::new(root_path.clone());
         for _ in 0..4 {
-            sweep_stale_workspaces(&root_path, Duration::ZERO, ASR_STALE_SCAN_LIMIT);
+            let _ = sweeper
+                .sweep_round(Duration::ZERO, ASR_STALE_SCAN_LIMIT)
+                .expect("bounded racing stale sweep");
         }
         dropper.join().expect("drop thread");
         for entry in fs::read_dir(&root_path).expect("root entries").flatten() {
@@ -2473,7 +2530,7 @@ mod tests {
         symlink(&outside, workspace.path().join("decoded.wav")).expect("decoded symlink");
         let workspace = workspace.directory.take().expect("directory").keep();
 
-        sweep_stale_workspaces(root.path(), Duration::ZERO, 16);
+        sweep_complete_cycle(root.path(), Duration::ZERO, 16);
 
         assert!(
             !workspace.exists(),

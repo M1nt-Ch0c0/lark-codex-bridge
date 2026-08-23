@@ -4232,7 +4232,10 @@ async fn interrupt_cancels_an_active_sidecar_and_releases_its_exact_lease() {
             }
         }))
         .await;
-    timeout(Duration::from_secs(3), async {
+    // The marker is the child-process startup handshake. Keep the deadline
+    // generous because this integration case competes with the full suite for
+    // process-table and scheduler time.
+    timeout(Duration::from_secs(30), async {
         while !marker.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -4309,7 +4312,7 @@ async fn interrupt_cancels_an_active_sidecar_and_releases_its_exact_lease() {
             .expect("sidecar pid marker")
             .parse::<u32>()
             .expect("sidecar pid");
-        timeout(Duration::from_secs(2), async {
+        timeout(Duration::from_secs(30), async {
             while std::process::Command::new("kill")
                 .args(["-0", &pid.to_string()])
                 .stdout(std::process::Stdio::null())

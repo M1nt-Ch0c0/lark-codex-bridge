@@ -588,6 +588,14 @@ async fn run_router(
     let mut retries = VecDeque::<RouterRetry>::new();
     let mut retry_tick = interval(Duration::from_millis(250));
     retry_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut stale_sweeper = crate::runtime::asr::StaleWorkspaceSweeper::for_private_root();
+    if settings.asr.is_configured() && stale_sweeper.sweep_once().is_err() {
+        tracing::warn!("private ASR storage initialization failed");
+    }
+    let mut stale_sweep = interval(crate::runtime::asr::ASR_STALE_SWEEP_INTERVAL);
+    stale_sweep.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // The startup round above replaces the interval's immediate first tick.
+    stale_sweep.tick().await;
     let mut supervisor_open = true;
     let mut tool_task =
         start_context_tool_task(&supervisor, &attachments, &contexts, settings.asr.clone());
@@ -650,6 +658,11 @@ async fn run_router(
                 update_runtime_snapshot(
                     &snapshot, &actors, &receiver, &retries, &active_turns, &settings,
                 );
+            }
+            _ = stale_sweep.tick(), if settings.asr.is_configured() => {
+                if stale_sweeper.sweep_once().is_err() {
+                    tracing::warn!("private ASR stale workspace sweep failed");
+                }
             }
             command = receiver.recv() => {
                 let Some(command) = command else { break };
@@ -725,13 +738,6 @@ fn start_context_tool_task(
     let shutdown = CancellationToken::new();
     let task_shutdown = shutdown.clone();
     let task = tokio::spawn(async move {
-        if asr.is_configured() && crate::runtime::asr::initialize_storage().is_err() {
-            tracing::warn!("private ASR storage initialization failed");
-        }
-        let mut stale_sweep = interval(crate::runtime::asr::ASR_STALE_SWEEP_INTERVAL);
-        stale_sweep.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        // Initialization already performed the startup sweep.
-        stale_sweep.tick().await;
         loop {
             tokio::select! {
                 biased;
@@ -755,9 +761,6 @@ fn start_context_tool_task(
                         | ControlEvent::UnknownNotification { .. }
                         | ControlEvent::InvalidNotification { .. } => {}
                     }
-                }
-                _ = stale_sweep.tick(), if asr.is_configured() => {
-                    crate::runtime::asr::sweep_stale_storage();
                 }
             }
         }
