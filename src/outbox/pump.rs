@@ -169,8 +169,14 @@ async fn run(
 ) {
     // Rows stranded in `sending` by a prior process are explicitly uncertain:
     // delivery may have reached Lark before that process died.
-    if let Err(error) = store.recover_sending_outbox().await {
-        tracing::warn!(error = %error, "outbox startup recovery failed");
+    match store.recover_sending_outbox().await {
+        Ok(recovered) => {
+            tracing::info!(
+                recovered_uncertain = recovered,
+                "outbox recovery scan complete"
+            );
+        }
+        Err(error) => tracing::warn!(error = %error, "outbox startup recovery failed"),
     }
     let sweep_interval_ms = i64::try_from(OUTBOX_SWEEP_INTERVAL.as_millis()).unwrap_or(i64::MAX);
     let mut next_sweep_ms = 0_i64;
@@ -201,6 +207,7 @@ async fn run(
             }
             continue;
         }
+        tracing::debug!(claimed_rows = batch.len(), "outbox batch claimed");
         let mut cursor = 0;
         while cursor < batch.len() {
             if shutdown.is_cancelled() {
@@ -228,8 +235,10 @@ async fn run(
             break;
         }
     }
+    tracing::info!("outbox pump stopped");
 }
 
+#[allow(clippy::too_many_lines)]
 async fn process_row(
     store: &StoreHandle,
     api: &LarkApi,
@@ -240,7 +249,7 @@ async fn process_row(
     let operation = match OutboxOperation::decode(&row.payload_json) {
         Ok(operation) => operation,
         Err(error) => {
-            tracing::warn!(error = %error, outbox_id = row.id, "outbox payload is undeliverable");
+            tracing::warn!(error = %error, "outbox payload is undeliverable");
             if let Err(store_error) = write_receipt(shutdown, config.poll_interval, || {
                 store.fail_outbox_terminal(row.id)
             })
@@ -252,13 +261,18 @@ async fn process_row(
                 tracing::warn!(
                     error = %error,
                     store_error = %store_error,
-                    outbox_id = row.id,
                     "outbox payload is undeliverable and the terminal receipt could not be recorded"
                 );
             }
             return ProcessOutcome::Resolved;
         }
     };
+    let operation_kind = operation_kind(&operation);
+    tracing::debug!(
+        operation = operation_kind,
+        attempt = row.attempts.saturating_add(1),
+        "outbox row sending"
+    );
     match send(store, api, row, &operation).await {
         Ok(message_id) => {
             if message_id.is_empty() {
@@ -270,8 +284,14 @@ async fn process_row(
                 })
                 .await
                 {
-                    tracing::warn!(error = %error, outbox_id = row.id, "outbox receipt failure");
+                    tracing::warn!(error = %error, "outbox receipt failure");
                 }
+                tracing::warn!(
+                    operation = operation_kind,
+                    attempt = row.attempts.saturating_add(1),
+                    state = "uncertain",
+                    "outbox delivery receipt was empty"
+                );
                 return ProcessOutcome::Resolved;
             }
             if let Err(error) = write_receipt(shutdown, config.poll_interval, || {
@@ -279,7 +299,14 @@ async fn process_row(
             })
             .await
             {
-                tracing::warn!(error = %error, outbox_id = row.id, "outbox receipt failed");
+                tracing::warn!(error = %error, "outbox receipt failed");
+            } else {
+                tracing::info!(
+                    operation = operation_kind,
+                    attempt = row.attempts.saturating_add(1),
+                    state = "sent",
+                    "outbox row delivered"
+                );
             }
             ProcessOutcome::Resolved
         }
@@ -290,7 +317,6 @@ async fn process_row(
         Err(SendFailure::Store(store_error)) => {
             tracing::warn!(
                 error = %store_error,
-                outbox_id = row.id,
                 "progress dependency lookup failed"
             );
             record_failure(
@@ -336,6 +362,15 @@ async fn process_row(
             )
             .await
         }
+    }
+}
+
+const fn operation_kind(operation: &OutboxOperation) -> &'static str {
+    match operation {
+        OutboxOperation::ReplyText { .. } => "reply_text",
+        OutboxOperation::ReplyProgressCard { .. } => "reply_progress_card",
+        OutboxOperation::UpdateProgressCard { .. } => "update_progress_card",
+        OutboxOperation::FinalizeProgressCard { .. } => "finalize_progress_card",
     }
 }
 
@@ -550,15 +585,33 @@ async fn record_failure(
             // mark it explicitly uncertain, so a transient store failure can
             // never silently drop an attempted send.
             tracing::warn!(
-                error = %error,
+                error_kind = ?error.kind(),
                 store_error = %store_error,
-                outbox_id = row.id,
                 class = ?class,
                 "outbox send failed and the receipt could not be recorded"
             );
             return ProcessOutcome::Resolved;
         }
     };
+    let retry_delay = if matches!(class, DeliveryClass::Retryable) {
+        u64::try_from(retry_delay_ms(attempts, config)).unwrap_or(u64::MAX)
+    } else {
+        0
+    };
+    tracing::warn!(
+        error_kind = ?error.kind(),
+        class = ?class,
+        attempts,
+        retry_delay_ms = retry_delay,
+        state = if matches!(class, DeliveryClass::Retryable) {
+            "pending"
+        } else if matches!(class, DeliveryClass::Uncertain) {
+            "uncertain"
+        } else {
+            "failed"
+        },
+        "outbox delivery failed"
+    );
     if deferred {
         ProcessOutcome::Deferred
     } else {
@@ -567,11 +620,18 @@ async fn record_failure(
 }
 
 async fn release_tail(store: &StoreHandle, tail: &[OutboxRow]) {
+    let mut failures = 0_usize;
     for row in tail {
         if let Err(error) = store.release_outbox_claim(row.id).await {
-            tracing::warn!(error = %error, outbox_id = row.id, "outbox claim release failed");
+            failures = failures.saturating_add(1);
+            tracing::warn!(error = %error, "outbox claim release failed");
         }
     }
+    tracing::debug!(
+        released_rows = tail.len().saturating_sub(failures),
+        failures,
+        "outbox claimed rows returned to pending"
+    );
 }
 
 /// One bounded, cancellation-aware terminal sweep. Failures are logged and

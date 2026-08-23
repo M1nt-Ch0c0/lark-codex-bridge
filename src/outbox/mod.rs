@@ -1,9 +1,9 @@
 //! Durable outbound queue: versioned payloads, the bounded send pump, and the
-//! [`DurableReplySink`] adapter.
+//! [`DurableReplySink`](crate::runtime::scope::DurableReplySink) adapter.
 //!
-//! The store (see [`crate::store::outbox`]) owns the rows and the atomic
-//! state machine; this module owns the codec ([`payload`]), the send loop
-//! ([`pump`]), and the runtime boundary ([`sink`]).
+//! [`StoreHandle`](crate::store::StoreHandle) owns the rows and the atomic
+//! state machine; this module owns the private `payload` codec, `pump` send
+//! loop, and `sink` runtime boundary.
 
 #![allow(clippy::doc_markdown)]
 

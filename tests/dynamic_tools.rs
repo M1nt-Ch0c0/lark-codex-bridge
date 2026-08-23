@@ -173,7 +173,7 @@ fn dynamic_tool_response_supports_all_0_147_content_items() {
 fn default_thread_start_does_not_emit_experimental_dynamic_tools_field() {
     let wire = serde_json::to_value(ThreadStartParams::default())
         .expect("default thread params should serialize");
-    assert_eq!(wire, Value::Object(Default::default()));
+    assert_eq!(wire, Value::Object(serde_json::Map::default()));
 }
 
 #[test]

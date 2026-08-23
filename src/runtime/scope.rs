@@ -488,6 +488,7 @@ async fn process_batch(
     shutdown: &CancellationToken,
 ) -> Result<(), ScopeFailureKind> {
     let batch = deduplicate_batch(batch);
+    tracing::debug!(batch_messages = batch.len(), "scope batch ready");
     let _active_permit = tokio::select! {
         biased;
         () = shutdown.cancelled() => return Err(ScopeFailureKind::Supervisor),
@@ -624,12 +625,21 @@ async fn process_batch(
         return Ok(());
     };
     let mut context_lease = assembly.contexts;
+    let input_count = assembly.inputs.len();
+    let source_count = sources.len();
     let mut params = TurnStartParams::new(&thread_id, assembly.inputs);
     params.client_user_message_id = Some(client_message_id);
     params.cwd = Some(rpc_cwd.clone());
     params.approval_policy = Some(settings.approval_policy.clone());
     params.model.clone_from(&settings.model);
     params.sandbox_policy = Some(turn_sandbox(settings, rpc_cwd));
+    let turn_started_at = StdInstant::now();
+    tracing::info!(
+        epoch = turn_epoch,
+        source_count,
+        input_count,
+        "Codex turn starting"
+    );
     let start_result = tokio::select! {
         biased;
         () = shutdown.cancelled() => None,
@@ -638,6 +648,13 @@ async fn process_batch(
     let started = match start_result {
         Some(Ok(started)) => started,
         Some(Err(error)) if error.turn_start_definitely_not_applied() => {
+            tracing::warn!(
+                epoch = turn_epoch,
+                elapsed_ms =
+                    u64::try_from(turn_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                outcome = "rejected",
+                "Codex turn start failed"
+            );
             finalize_failed(
                 store,
                 sink.as_ref(),
@@ -652,6 +669,13 @@ async fn process_batch(
             return Ok(());
         }
         None | Some(Err(_)) => {
+            tracing::warn!(
+                epoch = turn_epoch,
+                elapsed_ms =
+                    u64::try_from(turn_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                outcome = "uncertain",
+                "Codex turn start outcome is uncertain"
+            );
             finalize_uncertain_and_settle_attachments(
                 store,
                 sink.as_ref(),
@@ -707,6 +731,11 @@ async fn process_batch(
         return Ok(());
     }
     set_state(state, ScopeState::Running { turn_row_id });
+    tracing::info!(
+        epoch = turn_epoch,
+        start_elapsed_ms = u64::try_from(turn_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "Codex turn running"
+    );
     set_active_turn(
         active_turn,
         Some(ActiveTurn {
@@ -764,7 +793,6 @@ async fn process_batch(
                             projector.restore_progress(&text);
                             tracing::warn!(
                                 error = %error,
-                                turn_row_id,
                                 "durable progress projection was rejected"
                             );
                         }
@@ -777,6 +805,12 @@ async fn process_batch(
     set_active_turn(active_turn, None)?;
     set_state(state, ScopeState::Finalizing { turn_row_id });
     let Some(outcome) = outcome else {
+        tracing::warn!(
+            epoch = turn_epoch,
+            elapsed_ms = u64::try_from(turn_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+            outcome = "uncertain",
+            "Codex turn ended without an authoritative completion"
+        );
         finalize_uncertain_and_settle_attachments(
             store,
             sink.as_ref(),
@@ -812,6 +846,13 @@ async fn process_batch(
         .resolve_turn_and_finish_inbound_batch(turn_row_id, resolution, inbound)
         .await
         .map_err(|_| ScopeFailureKind::Store)?;
+    tracing::info!(
+        epoch = turn_epoch,
+        resolution = ?resolution,
+        elapsed_ms = u64::try_from(turn_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+        source_count,
+        "Codex turn completed"
+    );
     if let Some(lease) = context_lease.as_mut() {
         lease.reason = match resolution {
             TurnResolution::Completed => RevocationReason::Completed,
@@ -1062,6 +1103,7 @@ async fn reject_item(
         .reject_received_and_enqueue_notice(&item.key, reason, notice)
         .await
         .map_err(|_| ScopeFailureKind::Store)?;
+    tracing::info!(reason = reason.as_str(), "inbound event rejected");
     Ok(())
 }
 
@@ -1149,6 +1191,7 @@ async fn release_thread_route(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn ensure_thread(
     scope: &ScopeKey,
     store: &StoreHandle,
@@ -1169,15 +1212,7 @@ async fn ensure_thread(
         } else {
             0
         };
-        if active.context_tools_version != required_version {
-            store
-                .archive_active_thread(scope)
-                .await
-                .map_err(|_| ScopeFailureKind::Store)?;
-            let _ = client
-                .release_thread(&ThreadId::from(active.codex_thread_id.as_str()))
-                .await;
-        } else {
+        if active.context_tools_version == required_version {
             let rpc_cwd = revalidate_workspace(policy, cwd, fingerprint)?;
             let mut params = ThreadResumeParams::new(&active.codex_thread_id);
             params.overrides.cwd = Some(rpc_cwd);
@@ -1190,6 +1225,13 @@ async fn ensure_thread(
                 .map_err(|_| ScopeFailureKind::Client)?;
             return Ok(thread.id);
         }
+        store
+            .archive_active_thread(scope)
+            .await
+            .map_err(|_| ScopeFailureKind::Store)?;
+        let _ = client
+            .release_thread(&ThreadId::from(active.codex_thread_id.as_str()))
+            .await;
     }
     let rpc_cwd = revalidate_workspace(policy, cwd, fingerprint)?;
     let params = ThreadStartParams {

@@ -265,6 +265,7 @@ impl Router {
     /// # Errors
     ///
     /// Returns the same static classifications as [`Self::start`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_with_contexts(
         store: StoreHandle,
         tenant: TenantNamespace,
@@ -288,6 +289,7 @@ impl Router {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn start_inner(
         store: StoreHandle,
         tenant: TenantNamespace,
@@ -557,7 +559,8 @@ async fn run_router(
     let mut retry_tick = interval(Duration::from_millis(250));
     retry_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut supervisor_open = true;
-    let mut tool_task = start_context_tool_task(&supervisor, &attachments, &contexts);
+    let mut tool_task =
+        start_context_tool_task(&supervisor, attachments.as_ref(), contexts.as_ref());
     loop {
         tokio::select! {
             biased;
@@ -585,7 +588,11 @@ async fn run_router(
                         if let Some((_, task)) = tool_task.take() {
                             task.abort();
                         }
-                        tool_task = start_context_tool_task(&supervisor, &attachments, &contexts);
+                        tool_task = start_context_tool_task(
+                            &supervisor,
+                            attachments.as_ref(),
+                            contexts.as_ref(),
+                        );
                     }
                 } else {
                     if let Some((_, task)) = tool_task.take() {
@@ -674,11 +681,11 @@ async fn run_router(
 
 fn start_context_tool_task(
     supervisor: &SupervisorHandle,
-    attachments: &Option<Arc<AttachmentCache>>,
-    contexts: &Option<Arc<ContextRegistry>>,
+    attachments: Option<&Arc<AttachmentCache>>,
+    contexts: Option<&Arc<ContextRegistry>>,
 ) -> Option<(crate::codex::rpc::ConnectionEpoch, JoinHandle<()>)> {
-    let attachments = attachments.as_ref().map(Arc::clone)?;
-    let contexts = contexts.as_ref().map(Arc::clone)?;
+    let attachments = attachments.map(Arc::clone)?;
+    let contexts = contexts.map(Arc::clone)?;
     let client = supervisor.client().ok()?;
     let epoch = client.epoch();
     let mut events = client.take_control_events().ok()?;
@@ -832,7 +839,13 @@ async fn route_one(
     };
     let route = actor.try_route(key.clone(), queued);
     match route {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            tracing::debug!(
+                queued_messages = actor.snapshot().queued_messages,
+                "inbound event queued for scope"
+            );
+            Ok(())
+        }
         Err(ActorRouteError::Capacity(queued)) => {
             let queued = *queued;
             reject_with_notice(
@@ -888,6 +901,7 @@ async fn reject_with_notice(
     store
         .reject_received_and_enqueue_notice(key, reason, notice)
         .await?;
+    tracing::info!(reason = reason.as_str(), "inbound event rejected by policy");
     Ok(())
 }
 
