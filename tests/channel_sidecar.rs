@@ -50,8 +50,11 @@ fn config(mode: &str, marker: &Path) -> NodeSidecarConfig {
 
 fn fast_config(mode: &str, marker: &Path) -> NodeSidecarConfig {
     NodeSidecarConfig {
-        handshake_timeout: Duration::from_secs(5),
-        initial_connect_timeout: Duration::from_secs(5),
+        // Keep lifecycle mechanics fast, but retain the production handshake
+        // allowance. On a loaded Windows runner, starting Node can consume
+        // most of a five-second test-only deadline before it emits `hello`.
+        handshake_timeout: Duration::from_secs(10),
+        initial_connect_timeout: Duration::from_secs(10),
         healthy_uptime: Duration::from_secs(2),
         handler_timeout: Duration::from_secs(1),
         shutdown_grace: Duration::from_millis(250),
@@ -60,7 +63,10 @@ fn fast_config(mode: &str, marker: &Path) -> NodeSidecarConfig {
 }
 
 async fn wait_for_file(path: &Path) {
-    tokio::time::timeout(Duration::from_secs(8), async {
+    // A supervised restart includes bounded process-tree cleanup, jittered
+    // backoff, and a fresh Node handshake. Allow that whole sequence rather
+    // than imposing a deadline shorter than its configured components.
+    tokio::time::timeout(Duration::from_secs(20), async {
         while !path.exists() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -97,7 +103,7 @@ async fn assert_heartbeat_stops(marker: &Path) {
 }
 
 async fn wait_connected(state: &mut tokio::sync::watch::Receiver<ConnectionState>) {
-    tokio::time::timeout(Duration::from_secs(8), async {
+    tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             if matches!(*state.borrow(), ConnectionState::Connected) {
                 return;
@@ -411,7 +417,7 @@ async fn connected_immediate_crashes_escalate_restart_backoff() {
     let mut state = handle.subscribe_state();
     let mut observed = Vec::new();
 
-    tokio::time::timeout(Duration::from_secs(8), async {
+    tokio::time::timeout(Duration::from_secs(20), async {
         while observed.len() < 3 {
             if let ConnectionState::Backoff { attempt, delay } = *state.borrow() {
                 if observed.last().is_none_or(|(seen, _)| *seen != attempt) {
