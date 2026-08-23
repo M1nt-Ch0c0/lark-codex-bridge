@@ -209,7 +209,7 @@ impl ChildGuard {
                 .id()
                 .context("smoke-owned app-server had no process id")?
                 .to_string();
-            let result = timeout(
+            let _result = timeout(
                 CHILD_SHUTDOWN_TIMEOUT,
                 Command::new("taskkill")
                     .args(["/PID", pid.as_str(), "/T", "/F"])
@@ -219,10 +219,16 @@ impl ChildGuard {
             .await
             .context("timed out stopping the smoke-owned Windows process tree")?
             .context("unable to invoke the Windows process-tree terminator")?;
-            ensure!(
-                result.status.success(),
-                "unable to stop the smoke-owned Windows process tree"
-            );
+            if self
+                .child
+                .try_wait()
+                .context("unable to inspect the smoke-owned app-server after taskkill")?
+                .is_none()
+            {
+                self.child
+                    .start_kill()
+                    .context("unable to stop the smoke-owned app-server after taskkill")?;
+            }
         }
         #[cfg(not(windows))]
         self.child
@@ -387,6 +393,7 @@ async fn real_exact_binary_reconciles_across_socket_and_operator_server_restarts
     exact_health(port).await?;
     store.shutdown().await.context("store shutdown failed")?;
     child.stop().await?;
+    wait_until_not_listening(port).await?;
 
     eprintln!(
         "external_reconciliation_epochs initial={first_epoch} socket={socket_epoch} server_restart={server_restart_epoch}"

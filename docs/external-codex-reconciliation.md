@@ -68,11 +68,14 @@ thread, and blocks that turn against an isolated local Responses endpoint. The
 harness does not restart the server until `turn/interrupt` has produced both its
 correlated response and matching `turn/completed`, the interrupted status is
 readable through `thread/turns/list`, and the model HTTP connection is released.
-It then forces a bridge socket reconnect, terminates the complete smoke-owned
-process tree on Windows, proves the old TCP listener is gone, starts and
-health-checks the replacement operator-owned server, and proves that resume/read
-reconciliation retained exactly one thread and turn. Coordinator shutdown must
-leave the server healthy; only the harness stops its child:
+It then forces a bridge socket reconnect, asks Windows to terminate the complete
+smoke-owned process tree with a direct-child kill fallback, reaps the process,
+and treats disappearance of the old TCP listener—not the racy utility exit
+status—as the authoritative cleanup proof. It starts and health-checks the
+replacement operator-owned server, then proves that resume/read reconciliation
+retained exactly one thread and turn. Coordinator shutdown must leave the server
+healthy; only the harness stops its child, and final cleanup proves the listener
+is gone again:
 
 ```bash
 CODEX_EXTERNAL_RECONCILIATION_E2E=1 \
