@@ -59,7 +59,8 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-      - run: cargo nextest run --all-targets --profile ci --locked
+      - run: cargo nextest run --all-targets --profile ci --locked -E 'not binary(channel_sidecar)'
+      - run: cargo test --test channel_sidecar --locked -- --test-threads=1
       - run: cargo test --doc --locked
 
   sidecar:
@@ -203,5 +204,6 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-      - run: cargo nextest run --all-targets --profile ci --locked
+      - run: cargo nextest run --all-targets --profile ci --locked -E 'not binary(channel_sidecar)'
+      - run: cargo test --test channel_sidecar --locked -- --test-threads=1
       - run: cargo build --locked

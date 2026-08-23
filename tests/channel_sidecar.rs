@@ -315,10 +315,10 @@ async fn startup_protocol_and_timeout_paths_kill_non_exec_descendants() {
 }
 
 #[tokio::test]
-async fn protocol_crash_and_stdout_eof_restart_after_killing_non_exec_descendants() {
+async fn protocol_and_crash_restart_after_killing_non_exec_descendants() {
     let handler: InboundEventHandler = Arc::new(|_payload| async { Ok(None) }.boxed());
 
-    for mode in ["protocol-descendant", "crash-descendant", "eof-descendant"] {
+    for mode in ["protocol-descendant", "crash-descendant"] {
         let temp = tempfile::tempdir().expect("tempdir");
         let marker = temp.path().join(mode);
         let handle = NodeSidecar::start(
@@ -333,6 +333,34 @@ async fn protocol_crash_and_stdout_eof_restart_after_killing_non_exec_descendant
         assert_heartbeat_stops(&marker).await;
         handle.shutdown().await;
     }
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn stdout_eof_restarts_the_still_running_wrapper() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let marker = temp.path().join("eof");
+    let handler: InboundEventHandler = Arc::new(|_payload| async { Ok(None) }.boxed());
+    let handle = NodeSidecar::start(fast_config("eof", &marker), credentials(), handler)
+        .await
+        .expect("first sidecar connection");
+
+    wait_for_file(&PathBuf::from(format!("{}.second", marker.display()))).await;
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+#[cfg(windows)]
+async fn unexpected_clean_wrapper_exit_restarts_on_windows() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let marker = temp.path().join("clean-exit");
+    let handler: InboundEventHandler = Arc::new(|_payload| async { Ok(None) }.boxed());
+    let handle = NodeSidecar::start(fast_config("clean-exit", &marker), credentials(), handler)
+        .await
+        .expect("first sidecar connection");
+
+    wait_for_file(&PathBuf::from(format!("{}.second", marker.display()))).await;
+    handle.shutdown().await;
 }
 
 #[tokio::test]

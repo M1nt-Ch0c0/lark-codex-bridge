@@ -20,7 +20,8 @@ const ackOrder = [];
 const countedModes = new Set([
   'protocol-descendant',
   'crash-descendant',
-  'eof-descendant',
+  'eof',
+  'clean-exit',
   'duplicate-active',
   'connect-crash',
   'configure-failed',
@@ -65,7 +66,6 @@ const descendantModes = new Set([
   'configure-failed',
   'protocol-descendant',
   'crash-descendant',
-  'eof-descendant',
   'shutdown-descendant',
   'drop-descendant',
 ]);
@@ -123,7 +123,8 @@ function configure(frame) {
   if (run > 1 && new Set([
     'protocol-descendant',
     'crash-descendant',
-    'eof-descendant',
+    'eof',
+    'clean-exit',
   ]).has(mode)) {
     fs.writeFileSync(`${marker}.second`, 'connected');
     return;
@@ -149,8 +150,13 @@ function configure(frame) {
     setTimeout(() => process.stdout.write('{not-json}\n'), 75);
   } else if (mode === 'crash-descendant' || mode === 'connect-crash') {
     setTimeout(() => process.exit(42), 50);
-  } else if (mode === 'eof-descendant') {
+  } else if (mode === 'eof') {
+    // POSIX can close the protocol fd while the wrapper remains alive. The
+    // Windows test uses `clean-exit` because closing CRT fd 1 there does not
+    // close Node's libuv pipe.
     setTimeout(() => fs.closeSync(1), 75);
+  } else if (mode === 'clean-exit') {
+    setTimeout(() => process.exit(0), 75);
   } else if (mode === 'stderr-oversize') {
     process.stderr.write(Buffer.alloc(512 * 1024, 0x78), () => {
       process.stderr.write('\nsmall-record\n');
