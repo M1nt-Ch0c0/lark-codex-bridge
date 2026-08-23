@@ -210,12 +210,22 @@ async function reportedProfileMatches(reported, expected) {
   if (
     typeof reported !== "string" ||
     !path.isAbsolute(reported) ||
-    utf8Length(reported) > MAX_PROFILE_BYTES
+    utf8Length(reported) > MAX_PROFILE_BYTES ||
+    reported !== path.normalize(reported)
   ) {
     return false;
   }
   try {
-    return (await realpath(reported)) === expected;
+    const [entry, canonical] = await Promise.all([
+      lstat(reported),
+      realpath(reported),
+    ]);
+    return (
+      entry.isDirectory() &&
+      !entry.isSymbolicLink() &&
+      canonical === reported &&
+      canonical === expected
+    );
   } catch {
     return false;
   }

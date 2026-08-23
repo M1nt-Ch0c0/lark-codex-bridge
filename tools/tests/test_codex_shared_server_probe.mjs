@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmod, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdtemp,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -130,15 +137,18 @@ class FakeCodexServer {
 
   initializeResult() {
     if (this.scenario === "empty-initialize") return {};
+    let codexHome = this.expectedProfile;
+    if (this.scenario === "wrong-home") {
+      codexHome = `${this.expectedProfile}-different`;
+    } else if (this.scenario === "noncanonical-home") {
+      codexHome = `${this.expectedProfile}${path.sep}.`;
+    }
     return {
       userAgent:
         this.scenario === "wrong-version"
           ? "codex_cli_rs/0.148.0 (fake)"
           : `codex_cli_rs/${EXPECTED_VERSION} (fake)`,
-      codexHome:
-        this.scenario === "wrong-home"
-          ? `${this.expectedProfile}-different`
-          : this.expectedProfile,
+      codexHome,
       platformFamily: "unix",
       platformOs: "fake",
     };
@@ -364,6 +374,7 @@ for (const name of [
   "empty-initialize",
   "wrong-version",
   "wrong-home",
+  "noncanonical-home",
   "binary",
   "oversized",
   "aggregate-overflow",
@@ -403,3 +414,122 @@ test("the old isolation acknowledgement cannot replace profile proof", async () 
     await rm(profile.created, { recursive: true, force: true });
   }
 });
+
+const configurationFailure = {
+  code: 1,
+  output: { ok: false, stage: "configuration" },
+};
+
+test("rejects unsafe endpoint and version configuration before connecting", async () => {
+  const profile = await isolatedProfile();
+  const invalidConfigurations = [
+    { endpoint: "ws://localhost:45152/" },
+    { endpoint: "ws://127.0.0.1:45152/not-root" },
+    { endpoint: "ws://user@127.0.0.1:45152/" },
+    { endpoint: "ws://127.0.0.1:45152/?secret=value" },
+    { endpoint: "ws://127.0.0.1:45152/#fragment" },
+    { endpoint: "ws://127.0.0.1/" },
+    { endpoint: "wss://127.0.0.1:45152/" },
+    {
+      endpoint: "ws://127.0.0.1:45152/",
+      overrides: { CODEX_SHARED_PROBE_EXPECTED_VERSION: "latest" },
+    },
+  ];
+  try {
+    for (const { endpoint, overrides } of invalidConfigurations) {
+      assert.deepEqual(
+        await runProbe(endpoint, profile.canonical, overrides),
+        configurationFailure,
+      );
+    }
+  } finally {
+    await rm(profile.created, { recursive: true, force: true });
+  }
+});
+
+test("rejects a noncanonical expected profile path", async () => {
+  const profile = await isolatedProfile();
+  try {
+    assert.deepEqual(
+      await runProbe(
+        "ws://127.0.0.1:45152/",
+        `${profile.canonical}${path.sep}.`,
+      ),
+      configurationFailure,
+    );
+  } finally {
+    await rm(profile.created, { recursive: true, force: true });
+  }
+});
+
+test("rejects a profile directory symlink", async () => {
+  const profile = await isolatedProfile();
+  const aliases = await mkdtemp(path.join(tmpdir(), "issue8-probe-alias-"));
+  const alias = path.join(aliases, "profile-link");
+  try {
+    await symlink(
+      profile.canonical,
+      alias,
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    assert.deepEqual(
+      await runProbe("ws://127.0.0.1:45152/", alias),
+      configurationFailure,
+    );
+  } finally {
+    await rm(aliases, { recursive: true, force: true });
+    await rm(profile.created, { recursive: true, force: true });
+  }
+});
+
+test("rejects a marker file symlink", async (context) => {
+  const profile = await isolatedProfile(false);
+  const markerTarget = path.join(profile.canonical, "marker-target");
+  const marker = path.join(profile.canonical, MARKER);
+  try {
+    await writeFile(markerTarget, MARKER_CONTENT, { mode: 0o600 });
+    await chmod(markerTarget, 0o600);
+    try {
+      await symlink(markerTarget, marker, "file");
+    } catch (error) {
+      if (
+        process.platform === "win32" &&
+        (error?.code === "EPERM" || error?.code === "EACCES")
+      ) {
+        context.skip("file symlinks require Windows developer privileges");
+        return;
+      }
+      throw error;
+    }
+    assert.deepEqual(
+      await runProbe("ws://127.0.0.1:45152/", profile.canonical),
+      configurationFailure,
+    );
+  } finally {
+    await rm(profile.created, { recursive: true, force: true });
+  }
+});
+
+test(
+  "rejects group-accessible profile and marker permissions on Unix",
+  { skip: process.platform === "win32" },
+  async () => {
+    const profile = await isolatedProfile();
+    try {
+      await chmod(profile.canonical, 0o750);
+      assert.deepEqual(
+        await runProbe("ws://127.0.0.1:45152/", profile.canonical),
+        configurationFailure,
+      );
+
+      await chmod(profile.canonical, 0o700);
+      await chmod(path.join(profile.canonical, MARKER), 0o640);
+      assert.deepEqual(
+        await runProbe("ws://127.0.0.1:45152/", profile.canonical),
+        configurationFailure,
+      );
+    } finally {
+      await rm(profile.created, { recursive: true, force: true });
+    }
+  },
+);

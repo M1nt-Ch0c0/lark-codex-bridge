@@ -8,20 +8,23 @@
 
 ## Decision summary
 
-A bridge and another client can connect to one explicitly started Codex
-app-server WebSocket listener. In the local 0.149.0 experiments, two raw clients
-initialized concurrently, one client created a thread, and the other resumed the
-same thread and observed later state. Exact-turn steering, interrupt, queued input,
-disconnect recovery, and persisted recovery after server restart were also
-demonstrated. The official CLI connected to that listener with `--remote`, and
-`codex queue --remote` operated on the same endpoint.
+A committed, bounded real-server probe (E17) shows only that two read-only raw
+clients can initialize against one explicitly started Codex app-server WebSocket
+listener, each perform a one-row `thread/list`, disconnect, and leave the server
+available for an exact health check and a fresh client. E1-E16 separately record
+sanitized, uncommitted investigation observations about authentication,
+same-server resume and events, steering, interrupt, queueing, reconnect, restart,
+and writer conflicts. Those observations are not executable reproductions in
+this repository and are not acceptance evidence for those capabilities.
 
-That result establishes technical feasibility, not production support. Current
+This narrow result establishes a research direction, not production support or
+shared-write compatibility. Current
 [OpenAI Docs for Codex App Server](https://developers.openai.com/codex/app-server)
 explicitly call the WebSocket transport experimental and unsupported for
 production. The protocol has no atomic "start only if idle" precondition, no
 server capability manifest, no notification replay cursor, and no documented
-multi-client approval election. Local 0.149.0 also showed that
+multi-client approval election. The uncommitted Local-0.149 observations also
+recorded that
 `clientUserMessageId` is not an idempotency key and that a concurrent
 `turn/start` can ambiguously return the already-active turn id. Arbitrary
 simultaneous writers therefore remain unsupported.
@@ -51,25 +54,30 @@ owner exits. There is no automatic takeover.
 | --- | --- |
 | Spawned versus external components, lifecycle, and state | Component boundary and both lifecycle state machines |
 | Endpoint, auth, and initialization matrix | Transport, authentication, and capability matrices |
-| Two-client reproducibility | E3-E5 and committed read-only E17 probe |
-| Discovery, resume, subscription, and active state | Thread discovery and subscription semantics |
-| Start, steer, interrupt, and queue conflicts | Admission and method conflict matrices |
-| One approval handler, timeout, disconnect, and reassignment | Single approval handler design |
-| Reconnect, epoch, compensation, deduplication, and uncertainty | Reconnect and delivery-certainty sections |
-| Version/auth/capability fail-closed behavior | Proposed configuration, initialization, and promotion gates |
-| External process survival | E17 plus structural and integration proof requirements |
+| Two-client reproducibility | Committed E17 reproduces initialize, one-row `thread/list`, disconnect, exact health, and a fresh client only; E3-E5 are uncommitted observations |
+| Discovery, resume, subscription, and active state | Design plus uncommitted E4-E5/E8/E16 observations; no committed resume, active-state, or event reproduction |
+| Start, steer, interrupt, and queue conflicts | Design plus uncommitted E6-E13 observations; no committed mutation or queue reproduction |
+| One approval handler, timeout, disconnect, and reassignment | Design only; no local or committed approval-routing reproduction |
+| Reconnect, epoch, compensation, deduplication, and uncertainty | Design plus uncommitted E8-E9 observations; E17 opens fresh connections but does not reproduce reconnect, resume, replay, or recovery |
+| Version/auth/capability fail-closed behavior | Proposed configuration and promotion gates; committed E17 verifies exact version/profile but does not exercise authentication |
+| External process survival | Committed E17 verifies black-box survival after read-only probe clients; structural and bridge-integration proofs remain required |
 | Desktop support status | Client support matrix: unknown / unsupported |
-| Bounded implementation split | Eight scoped follow-up titles near the end |
+| Bounded implementation split | Five core issues plus one Unix-transport RFC, all required to be created or linked before #8 closes |
 
 ## Evidence and authority
 
-This RFC deliberately separates three kinds of statement:
+This RFC deliberately separates four kinds of statement:
 
 - **Official-current** means the current OpenAI Docs page linked above. That
   page is rolling documentation and itself labels WebSocket experimental.
-- **Local-0.149** means a bounded observation from the exact local
-  `codex-cli 0.149.0` binary. It is not an OpenAI stability promise and must not
-  be generalized to another version.
+- **Local-0.149 observation (E1-E16)** means a sanitized, bounded investigation
+  note from the exact local `codex-cli 0.149.0` binary. The raw harnesses and
+  payloads are not committed, so these rows are not repository-reproducible
+  acceptance evidence and must not be generalized to another version.
+- **Committed Local-0.149 reproduction (E17)** means the sole checked-in
+  real-server procedure in this RFC. It covers only exact identity, read-only
+  initialize/list, observed disconnect, exact health, fresh-client reuse, and
+  the negative code-1006 close result described below.
 - **Design** means a proposed bridge rule or implementation gate.
 
 An earlier official-only search during this investigation did not find an
@@ -236,15 +244,15 @@ approval details, or initialize `codexHome`.
 
 ### Transport matrix
 
-| Form | Official-current | Local-0.149 | Bridge decision |
+| Form | Official-current | Local evidence boundary | Bridge decision |
 | --- | --- | --- | --- |
-| `stdio://` listener | JSONL, default | Works and is current bridge mode | Supported only as an owned spawned child |
-| `ws://127.0.0.1:PORT` listener | Experimental; one RPC per text frame | Works with concurrent clients | Eligible for gated local development; production connector still requires auth |
-| Non-loopback `ws://` listener | Docs say auth should be configured and note a rollout period that may allow no auth | 0.149 refuses startup without `--ws-auth` | Bridge rejects remote plaintext regardless of server behavior |
-| Direct `wss://` listener | Not listed as a listener form | 0.149 rejects it | Unsupported; put a `ws://` listener behind a separately owned TLS terminator |
-| `wss://` remote client | CLI remote form is documented | CLI advertises it | Eligible only with normal TLS verification and bearer auth |
-| `unix://` listener/client | Documented as WebSocket over HTTP Upgrade | CLI advertises it; bounded raw JSON, HTTP, ws+unix, and proxy attempts did not establish a usable response | Unsupported and rejected until a dedicated adapter is reproduced and tested |
-| `off` | Disables local transport | Advertised | Not a connectable endpoint |
+| `stdio://` listener | JSONL, default | Existing bridge implementation and tests, independent of E1-E17 | Supported only as an owned spawned child |
+| `ws://127.0.0.1:PORT` listener | Experimental; one RPC per text frame | Committed E17 covers unauthenticated read-only loopback only; other multi-client behavior is uncommitted | Eligible for gated local research; production connector still requires auth |
+| Non-loopback `ws://` listener | Docs say auth should be configured and note a rollout period that may allow no auth | Sanitized uncommitted E1 observation only | Bridge rejects remote plaintext regardless of server behavior |
+| Direct `wss://` listener | Not listed as a listener form | Sanitized uncommitted 0.149 rejection observation only | Unsupported; put a `ws://` listener behind a separately owned TLS terminator |
+| `wss://` remote client | CLI remote form is documented | Help-surface observation only; no committed real connection | Eligible only after normal TLS verification and bearer-auth reproduction |
+| `unix://` listener/client | Documented as WebSocket over HTTP Upgrade | Sanitized uncommitted, negative, incomplete E14 observation only | Unsupported and rejected until a dedicated adapter is committed and reproduced |
+| `off` | Disables local transport | Help-surface observation only | Not a connectable endpoint |
 
 The current OpenAI Docs statement about unauthenticated non-loopback rollout and
 the 0.149 refusal are intentionally both recorded. Security policy follows the
@@ -252,18 +260,20 @@ stricter behavior and does not depend on either one remaining true.
 
 ### Authentication matrix
 
-| Server configuration | Local-0.149 evidence | Client requirement | Decision |
+| Server configuration | Local evidence boundary | Client requirement | Decision |
 | --- | --- | --- | --- |
-| No auth, loopback WS | Connection accepted | None at handshake | Research probe only; reject in production external mode |
-| No auth, non-loopback WS | Listener refused to start | N/A | Unsupported |
-| Capability token file | CLI flag exists | Raw token as HTTP `Authorization: Bearer` | Supported candidate, token file preferred |
-| Capability token SHA-256 | Missing bearer produced HTTP 401; matching bearer succeeded | Client retains raw high-entropy token; server stores verifier | Supported candidate |
-| Signed bearer | CLI exposes secret, issuer, audience, and skew flags | Client presents a valid issued token | Candidate after expiry/rotation tests |
+| No auth, loopback WS | Committed E17 only | None at handshake | Research probe only; reject in production external mode |
+| No auth, non-loopback WS | Sanitized uncommitted E1 observation only | N/A | Unsupported |
+| Capability token file | Help-surface observation only | Raw token as HTTP `Authorization: Bearer` | Candidate only after issue-local reproduction; token file preferred |
+| Capability token SHA-256 | Sanitized uncommitted E2 observation only | Client retains raw high-entropy token; server stores verifier | Candidate only after issue-local reproduction |
+| Signed bearer | Help-surface observation only | Client presents a valid issued token | Candidate only after expiry/rotation reproduction |
 | Credential in endpoint/CLI argument | Not needed | Leaks through config/process inspection | Forbidden |
 
-Authentication is enforced by the HTTP Upgrade before JSON-RPC `initialize`.
-HTTP 401/403 is a permanent configuration state until an operator reloads
-credentials. It is not an exponential-retry loop.
+Official-current places WebSocket authentication at connection setup, and the
+sanitized uncommitted E2 observation recorded HTTP 401 before JSON-RPC
+`initialize`. The bridge design therefore treats HTTP 401/403 as a permanent
+configuration state until an operator reloads credentials. It is not an
+exponential-retry loop; E2 itself is not a committed auth reproduction.
 
 ### Initialization and capability matrix
 
@@ -346,7 +356,8 @@ be presented as a server generation number.
 
 ## Thread discovery and subscription semantics
 
-The observed and documented operations have distinct meanings:
+Official-current descriptions and the sanitized uncommitted E4-E16 observations
+assign distinct meanings to these operations:
 
 - `thread/list` discovers persisted threads and is paginated. It does not
   subscribe.
@@ -357,7 +368,7 @@ The observed and documented operations have distinct meanings:
 - `thread/unsubscribe` removes that connection's subscription. It is not a writer
   handoff primitive.
 
-Local-0.149 observations:
+Sanitized, uncommitted Local-0.149 observations:
 
 - A second client could resume a thread created by the first client on the same
   app-server.
@@ -477,7 +488,7 @@ uncoordinated writers make the thread unsupported.
 
 ### Method conflict and replay rules
 
-| Method | Precondition | Local-0.149 conflict evidence | Uncertain outcome rule |
+| Method | Precondition | Sanitized, uncommitted Local-0.149 note | Uncertain outcome rule |
 | --- | --- | --- | --- |
 | `thread/start` | Explicit new-thread intent | Non-idempotent by nature | Never replay after possible write |
 | `turn/start` | Fresh read says idle; no local pending mutation; elected writer | Calls while active/concurrent could return success with the **same active turn id**, so success alone is ambiguous | Persist intent before send; never replay after possible write; require a new turn id and reconciled state before commit |
@@ -492,9 +503,11 @@ intent, an exact target, and authorization. The bridge may keep the inbound even
 in its existing durable local queue until the turn completes; use app-server queue
 methods only when the exact version/profile enables them.
 
-The official `codex queue --remote ws://... --thread ...` command succeeded against
-the local shared endpoint. That demonstrates CLI participation, not cross-client
-serialization. A CLI queue or TUI writer can still race bridge preconditions.
+E13 records a sanitized, uncommitted observation that the official
+`codex queue --remote ws://... --thread ...` command succeeded against the local
+shared endpoint. This repository does not yet reproduce that CLI participation
+or cross-client serialization. A CLI queue or TUI writer can still race bridge
+preconditions.
 
 ## Single approval handler
 
@@ -637,42 +650,47 @@ codex queue --help
 codex app-server generate-json-schema --experimental --out <temporary-directory>
 ```
 
-The checked help advertised listener forms `stdio://`, `unix://`,
+The sanitized, uncommitted help-surface check advertised listener forms
+`stdio://`, `unix://`,
 `unix://PATH`, `ws://IP:PORT`, and `off`; remote clients advertised `ws://`,
 `wss://`, and Unix forms. It also advertised capability-token and signed-bearer
 server flags. Direct `wss://` listener input was rejected.
 
 ### Experiment outcomes
 
-| ID | Procedure | Sanitized outcome | Authority |
+| ID | Procedure | Sanitized outcome | Evidence status / authority |
 | --- | --- | --- | --- |
-| E1 | Start non-loopback WS without auth | Startup refused and required capability or signed bearer auth | Local-0.149 |
-| E2 | Configure capability-token SHA-256; connect without and with bearer | Missing bearer returned HTTP 401; matching bearer completed the upgrade | Local-0.149 |
-| E3 | Initialize raw clients A and B concurrently | Both initialized | Local-0.149 |
-| E4 | A starts thread; B discovers and resumes it | Same-server multi-client resume succeeded | Local-0.149 |
-| E5 | A starts work; B resumes/reads, then observes later events | Active state was visible; B saw subsequent state but no historical start event | Local-0.149 |
-| E6 | Steer with exact then stale expected turn id | Exact target succeeded; stale target returned `-32600` | Local-0.149 |
-| E7 | Interrupt exact active turn | Request succeeded and the turn reached interrupted terminal state | Local-0.149 |
-| E8 | Disconnect/reconnect and resume/read | No notification replay; persisted turns recovered through authoritative reads | Local-0.149 |
-| E9 | Restart server with same isolated profile | Persisted turns recovered; client synthesized a new transport epoch | Local-0.149 |
-| E10 | Reuse `clientUserMessageId` for a second start | A second turn was created; field is not idempotent | Local-0.149 |
-| E11 | Submit active/concurrent `turn/start` | Calls could succeed with the same active turn id; result is unsafe/ambiguous | Local-0.149 |
-| E12 | Queue add, then queue start while active | Add worked; start rejected and retained the queued item | Local-0.149 |
-| E13 | Run official `codex queue --remote` on the shared endpoint | CLI used the same endpoint successfully | Local-0.149 |
-| E14 | Try raw JSON, HTTP Upgrade, ws+unix, and proxy approaches to advertised Unix transport | No usable response within the bounded attempts | Local-0.149; negative and incomplete |
-| E15 | Resume one profile thread from two separate server processes | Second server returned active-writer conflict under generic `-32600` | Local-0.149 |
-| E16 | Unsubscribe the subscribed client, then retry writer acquisition elsewhere | Reported unsubscribed; writer remained until owning server exited | Local-0.149 |
-| E17 | Verify exact server version/profile; connect two read-only clients; require an observed peer disconnect for both; require exact HTTP 200 health; connect and disconnect a third client | Identity matched; all three clients initialized and disconnected; health remained exact-200; external server remained alive; Node observed 1006/unclean rather than a server close reply | Local-0.149, committed probe and fake-peer tests |
+| E1 | Start non-loopback WS without auth | Startup refused and required capability or signed bearer auth | Sanitized, uncommitted Local-0.149 observation |
+| E2 | Configure capability-token SHA-256; connect without and with bearer | Missing bearer returned HTTP 401; matching bearer completed the upgrade | Sanitized, uncommitted Local-0.149 observation; not a committed auth test |
+| E3 | Initialize raw clients A and B concurrently | Both initialized | Sanitized, uncommitted Local-0.149 observation |
+| E4 | A starts thread; B discovers and resumes it | Same-server multi-client resume succeeded | Sanitized, uncommitted Local-0.149 observation; not a committed resume test |
+| E5 | A starts work; B resumes/reads, then observes later events | Active state was visible; B saw subsequent state but no historical start event | Sanitized, uncommitted Local-0.149 observation; not a committed active/event test |
+| E6 | Steer with exact then stale expected turn id | Exact target succeeded; stale target returned `-32600` | Sanitized, uncommitted Local-0.149 observation; not a committed steer test |
+| E7 | Interrupt exact active turn | Request succeeded and the turn reached interrupted terminal state | Sanitized, uncommitted Local-0.149 observation; not a committed interrupt test |
+| E8 | Disconnect/reconnect and resume/read | No notification replay; persisted turns recovered through authoritative reads | Sanitized, uncommitted Local-0.149 observation; not a committed reconnect test |
+| E9 | Restart server with same isolated profile | Persisted turns recovered; client synthesized a new transport epoch | Sanitized, uncommitted Local-0.149 observation; not a committed restart test |
+| E10 | Reuse `clientUserMessageId` for a second start | A second turn was created; field is not idempotent | Sanitized, uncommitted Local-0.149 observation; not a committed idempotency test |
+| E11 | Submit active/concurrent `turn/start` | Calls could succeed with the same active turn id; result is unsafe/ambiguous | Sanitized, uncommitted Local-0.149 observation; not a committed race test |
+| E12 | Queue add, then queue start while active | Add worked; start rejected and retained the queued item | Sanitized, uncommitted Local-0.149 observation; not a committed queue test |
+| E13 | Run official `codex queue --remote` on the shared endpoint | CLI used the same endpoint successfully | Sanitized, uncommitted Local-0.149 observation; not a committed CLI/queue test |
+| E14 | Try raw JSON, HTTP Upgrade, ws+unix, and proxy approaches to advertised Unix transport | No usable response within the bounded attempts | Sanitized, uncommitted Local-0.149 observation; negative, incomplete, and not a Unix reproduction |
+| E15 | Resume one profile thread from two separate server processes | Second server returned active-writer conflict under generic `-32600` | Sanitized, uncommitted Local-0.149 observation; not a committed writer-conflict test |
+| E16 | Unsubscribe the subscribed client, then retry writer acquisition elsewhere | Reported unsubscribed; writer remained until owning server exited | Sanitized, uncommitted Local-0.149 observation; not a committed handoff test |
+| E17 | Verify exact server version/profile; connect two read-only clients; initialize and perform one-row `thread/list`; require an observed peer disconnect for both; require exact HTTP 200 health; repeat with a third client | Identity matched; all three clients completed the bounded read-only flow; health remained exact-200; external server remained alive; Node observed 1006/unclean rather than a server close reply | Only committed Local-0.149 real-server reproduction; fake-peer tests cover probe fail-closed behavior but are not additional real-server evidence |
 
 E14 does not prove Unix transport is broken. It proves only that the attempted
 client approaches are insufficient, so the bridge must reject Unix instead of
 guessing a framing or URL convention.
 
 E1-E16 are recorded, sanitized local observations from the investigation. They
-are not represented as committed executable tests by this RFC. E17 is the only
-real-server reproduction committed here; its fake-peer suite commits the
-negative protocol and lifecycle cases described below. That distinction keeps
-the evidence claim narrower than the exploratory work.
+are not represented as committed executable tests by this RFC. In particular,
+this repository does not yet reproduce authentication, thread resume, active
+state, event delivery, steering, interrupt, queue participation, approval
+routing, or Unix transport against a real server. E17 is the only committed
+real-server reproduction; its fake-peer suite checks the probe's negative
+configuration, protocol, and lifecycle behavior, not the missing real-server
+capabilities. That distinction keeps the evidence claim narrower than the
+exploratory work.
 
 ### Committed read-only lifecycle probe
 
@@ -693,7 +711,9 @@ handshakes and the current 0.149.0 code-1006/unclean observation are reported as
 different booleans rather than conflated. The latter is a negative interoperability
 finding, not an acceptable production close contract. The health request disables
 redirects and accepts status 200 exactly. The no-dependency fake WebSocket peer
-suite exercises these failure paths in CI:
+suite exercises these failure paths in CI, including unsafe endpoint forms,
+noncanonical or symlinked profiles and markers, private Unix permissions,
+identity mismatch, and health redirects:
 
 ```bash
 node --test tools/tests/test_codex_shared_server_probe.mjs
@@ -741,6 +761,13 @@ Expected sanitized result:
 {"ok":true,"exactVersionVerified":true,"isolatedProfileVerified":true,"twoClientsInitializedAndDisconnected":true,"twoClientCloseHandshakesClean":false,"healthAfterClientDisconnect":true,"freshClientInitializedAndDisconnected":true,"freshClientCloseHandshakeClean":false}
 ```
 
+Here `"ok":true` means only that the bounded read-only E17 procedure reached
+each required checkpoint and emitted a complete sanitized observation. The two
+explicit `false` close fields preserve the code-1006/unclean result. `ok` does
+not mean a clean WebSocket close, authenticated transport, production
+compatibility, or support for resume, active state, event delivery, steering,
+interrupt, queueing, approval routing, or Unix transport.
+
 The operator-owned server remained alive after all probe clients closed. The
 probe cannot send a process signal because it receives no PID or process handle.
 This is read-only lifecycle evidence, not the production external connector or
@@ -766,21 +793,26 @@ The future implementation is acceptable only if all of these are true:
 6. Configuration tests prove external mode cannot deserialize spawned-only
    fields and cannot fall back to spawned mode.
 
-E17 demonstrates the black-box client property. The structural and integration
-proofs remain mandatory follow-up gates because no production external backend
-exists in this RFC commit.
+E17 is committed evidence only for the bounded black-box read-only survival
+property above. It does not exercise the bridge backend, authentication, clean
+close, mutations, or recovery. The structural and integration proofs remain
+mandatory follow-up gates because no production external backend exists in this
+RFC commit.
 
 ## Client support matrix
 
 | Peer/topology | Documentation | Local evidence | Status |
 | --- | --- | --- | --- |
-| Bridge-owned spawned app-server over stdio | Current bridge architecture; stdio documented | Existing tests and smoke | Supported |
-| Explicit independent app-server plus raw/bridge PoC WS client | WebSocket documented as experimental/unsupported for production | E3-E12 and E17 | Research viable; production unsupported |
-| Official CLI/TUI on explicit remote endpoint | `--remote` documented | Remote queue shared endpoint in E13 | Experimental peer; must obey one-writer policy |
-| CLI and bridge as simultaneous arbitrary writers | No atomic writer arbitration documented | Active-start ambiguity observed | Unsupported |
-| Two independent app-server processes on one profile/thread | Not a documented sharing topology | Active-writer conflict in E15 | Unsupported |
-| Unix-socket shared endpoint | Official-current documents it | No successful bounded raw client proof | Fail closed / unsupported pending follow-up |
-| Direct WSS listener | Not documented as listener | Rejected by 0.149 | Unsupported; use external TLS terminator |
+| Bridge-owned spawned app-server over stdio | Current bridge architecture; stdio documented | Existing bridge tests and smoke, independent of E1-E17 | Supported |
+| Explicit independent app-server plus read-only raw client | WebSocket documented as experimental/unsupported for production | Committed E17: exact identity, initialize/list, disconnect, health, and fresh-client reuse only; close was 1006/unclean | Research viable; production compatibility not established |
+| Same-server resume, active/event observation, and reconnect | Protocol surface described by rolling docs | Sanitized uncommitted E4-E5/E8-E9 observations only | Not repository-reproduced; unsupported |
+| Official CLI/TUI on explicit remote endpoint | `--remote` documented | Sanitized uncommitted E13 observation only | Not repository-reproduced; experimental/unsupported here |
+| CLI and bridge as simultaneous arbitrary writers | No atomic writer arbitration documented | Sanitized uncommitted E10-E13 observations only | Unsupported |
+| Two independent app-server processes on one profile/thread | Not a documented sharing topology | Sanitized uncommitted E15-E16 observations only | Unsupported |
+| Authenticated external endpoint | Authentication is documented | Sanitized uncommitted E1-E2 observations only; E17 is unauthenticated loopback | Not repository-reproduced; unsupported |
+| Shared approvals | No multi-client approval election documented | Design only; no E1-E17 approval reproduction | Unsupported |
+| Unix-socket shared endpoint | Official-current documents it | Sanitized uncommitted, negative, incomplete E14 observation only | Fail closed / unsupported pending RFC and reproduction |
+| Direct WSS listener | Not documented as listener | Sanitized uncommitted 0.149 rejection observation only | Unsupported; use an externally owned TLS terminator design |
 | Desktop-owned endpoint reuse | No documented stable endpoint/discovery or third-party attachment contract found | Not tested | Unknown / unsupported |
 | Codex VS Code extension's internal server reuse | Docs say app-server powers rich clients, but do not expose a reuse contract | Not tested | Unknown / unsupported |
 
@@ -824,11 +856,11 @@ experimental until every applicable gate passes:
 - reconnect/resubscribe/snapshot-buffer ordering and overflow tests pass;
 - mutation uncertainty tests prove no replay after write/timeout/disconnect;
 - two-client races prove the admission matrix, including same-turn-id start;
-- approval routing is demonstrated for two clients or external writes remain
+- approval routing is reproduced for two clients or external writes remain
   disabled;
 - credential redaction and rotation tests pass;
-- a gated real smoke fails when its explicit endpoint/auth/version configuration
-  is missing; a skip is not evidence;
+- each issue-local real smoke required by follow-ups 2-5 fails when its explicit
+  endpoint/auth/version configuration is missing; a skip is not evidence;
 - Desktop remains disabled unless OpenAI documents and the project reproduces a
   supported attachment contract.
 
@@ -838,61 +870,87 @@ production-support claim.
 
 ## Bounded implementation follow-ups
 
-Do not create these issues as part of this RFC. Proposed titles and scopes are:
+Before Issue #8 can close, maintainers must create or link one bounded GitHub
+issue for each of the six work packages below and record those links in this
+section. An equivalent split is acceptable only if it preserves every scope and
+dependency. A required real-server smoke is part of the definition of done for
+items 2-5; it must not be postponed into a standalone catch-all issue or left as
+untracked prose.
 
 1. **P2: promote the exact Codex protocol contract required by shared endpoint
    mode**
+   - Tracking issue: **required before #8 closure**.
    - Resolve the 0.149 compatibility blockers or select a later exact binary.
    - Add queue, unsubscribe, steering, status, and every approval shape used by
      external mode to versioned contracts.
    - Exclude transport and runtime behavior.
 
-2. **P2: add explicit Codex backend configuration and endpoint security
-   validation**
+2. **P2: add explicit Codex backend configuration, endpoint security, and an
+   authenticated connection gate**
+   - Tracking issue: **required before #8 closure**.
    - Add the tagged modes, URL policy, exact-version field, secret sources,
-     redacted debug/errors, and no-fallback tests.
-   - Exclude WebSocket I/O.
+     redacted debug/errors, TLS/auth handshake canary, and no-fallback tests.
+   - Definition of done includes a gated real exact-binary smoke proving the
+     explicit endpoint/auth/version gate. Missing configuration, invalid
+     credentials, or a skipped smoke is a hard failure, not acceptance.
+   - Exclude general RPC transport, reconnect, and mutation behavior.
 
 3. **P2: implement a bounded authenticated WebSocket app-server transport with
    no process ownership**
+   - Tracking issue: **required before #8 closure**.
    - Add text-frame RPC transport, TLS/auth handshake, close semantics, limits,
      priority queues, fake server, and the lifecycle non-ownership proof.
+   - Definition of done includes a gated real exact-binary bridge smoke with two
+     read-only clients, bridge shutdown and crash, exact health, a fresh client,
+     external-server survival, and truthful clean/unclean close reporting.
+     Missing gate configuration or skip is failure.
    - Exclude reconnect and mutations.
 
 4. **P2: persist external transport epochs and reconcile subscriptions after
    reconnect**
+   - Tracking issue: **required before #8 closure**.
    - Add epoch fencing, resume-before-read buffering, bounded pagination,
      terminal deduplication, unavailable state, and restart tests.
+   - Definition of done includes a gated real exact-binary smoke that forces a
+     bounded disconnect/reconnect and operator-owned server restart, then proves
+     resume/read reconciliation without replaying uncertain work. Missing gate
+     configuration or skip is failure.
    - Exclude new mutation policy.
 
-5. **P2: coordinate shared-server turn start, steer, interrupt, and queue
-   operations**
+5. **P2: coordinate shared-server mutations and route approvals through one
+   fail-closed handler**
+   - Tracking issue: **required before #8 closure**.
    - Add the durable intent state machine, per-thread write fence, exact target
-     rules, queue policy, uncertainty handling, and adversarial two-client tests.
-   - Exclude approvals.
-
-6. **P2: route shared-server approvals through one fail-closed handler**
-   - Prove server request routing, add static handler election, single-recipient
-     UI, durable claim, deadlines, denial, resolution, disconnect fencing, and
-     drained reassignment.
+     rules, queue policy, uncertainty handling, adversarial two-client tests,
+     static approval-handler election, single-recipient UI, durable claim,
+     deadlines, denial, resolution, disconnect fencing, and drained
+     reassignment.
+   - Definition of done includes a gated real exact-binary authenticated smoke
+     for two-client start races, exact-id steer/interrupt, queue behavior, and
+     the configured approval route. Missing gate configuration or skip is
+     failure.
    - If routing cannot be proven, permanently gate external writes and document
      read-only support.
 
-7. **P3: verify and implement Codex app-server Unix-socket WebSocket transport**
-   - Produce a platform-specific, deadline-bounded raw handshake reproduction,
-     peer/filesystem permission policy, and cross-platform decision.
+6. **P3 RFC: determine the Codex app-server Unix-socket WebSocket contract**
+   - Tracking issue: **required before #8 closure**.
+   - Produce a sanitized, committed, platform-specific, deadline-bounded raw
+     handshake reproduction, peer/filesystem permission policy, and
+     cross-platform support decision before any implementation issue is opened.
    - Do not silently alias Unix to JSONL or TCP.
-
-8. **P3: add a gated real shared-app-server compatibility smoke**
-   - Exercise two clients, CLI remote participation, auth, reconnect, external
-     survival, and sanitized evidence against one exact binary.
-   - Missing gate configuration must fail explicitly; skip is not acceptance.
 
 ## Final recommendation
 
-Proceed with the first three bounded follow-ups for an opt-in, authenticated,
-read-only external WebSocket backend. Proceed to shared mutations only after the
-exact-version contract, two-client mutation race tests, and single approval
-handler gate are complete. Do not ship arbitrary simultaneous writers, Unix,
+Create or link the five core issues and the Unix RFC before closing #8. The only
+committed real-server reproduction today is E17's bounded, unauthenticated,
+read-only initialize/list/disconnect/health flow, with an explicitly unclean
+code-1006 close. Authentication, resume, active state, event delivery, steering,
+interrupt, queueing, approval routing, and Unix transport remain uncommitted
+observations or design and require the issue-local real smokes above.
+
+Proceed first with the exact contract, then the configuration/security and
+bounded transport issues for an opt-in experimental read-only backend. Proceed
+to shared mutations only after reconnect, two-client race, and single approval
+handler gates are complete. Do not ship arbitrary simultaneous writers, Unix,
 Desktop reuse, direct public listeners, or live approval reassignment on the
 present evidence.
