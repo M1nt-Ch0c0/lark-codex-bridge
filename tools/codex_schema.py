@@ -1970,10 +1970,18 @@ def exact_number_fraction(value: int | float) -> Fraction:
 
 
 def finite_values(schema: dict[str, Any]) -> list[Any] | None:
-    if "const" in schema:
-        return [schema["const"]]
     values = schema.get("enum")
-    return values if isinstance(values, list) else None
+    if "const" not in schema:
+        return values if isinstance(values, list) else None
+    constant = schema["const"]
+    if not isinstance(values, list):
+        return [constant]
+    constant_key = semantic_json_key(constant)
+    return (
+        [constant]
+        if any(semantic_json_key(value) == constant_key for value in values)
+        else []
+    )
 
 
 def classify_bound(
@@ -2574,10 +2582,18 @@ def compare_named_schemas(
                     change("breaking", "tuple_item_schema_shape_changed", f"{path}/items/{index}")
                 )
         if len(before_items) > shared_items:
+            after_additional_items = after.get("additionalItems", True)
+            unrestricted_after_items = (
+                after_additional_items is True or after_additional_items == {}
+            )
             changes.append(
                 change(
-                    "additive",
-                    "tuple_item_constraints_removed",
+                    "additive" if unrestricted_after_items else "breaking",
+                    (
+                        "tuple_item_constraints_removed"
+                        if unrestricted_after_items
+                        else "tuple_shortened_with_restricted_additional_items"
+                    ),
                     f"{path}/items",
                     count=len(before_items) - shared_items,
                 )

@@ -71,6 +71,53 @@ class CodexSchemaTests(unittest.TestCase):
         kinds, _ = self.classified({"enum": [1, True]}, {"const": 1.0})
         self.assertIn(("breaking", "finite_values_removed"), kinds)
 
+    def test_const_and_enum_are_intersected_before_finite_value_comparison(self):
+        kinds, changes = self.classified(
+            {"type": "string", "const": "a", "enum": ["a"]},
+            {"type": "string", "const": "a", "enum": ["b"]},
+        )
+        self.assertIn(("breaking", "finite_values_removed"), kinds)
+        self.assertEqual(codex_schema.finite_values({"const": "a", "enum": ["b"]}), [])
+        self.assertTrue(any(change["classification"] == "breaking" for change in changes))
+
+        numeric_kinds, _ = self.classified(
+            {"const": 1, "enum": [1.0]},
+            {"const": 1, "enum": [True]},
+        )
+        self.assertIn(("breaking", "finite_values_removed"), numeric_kinds)
+
+    def test_shortening_a_closed_or_constrained_tuple_is_breaking(self):
+        before = {
+            "type": "array",
+            "items": [{"type": "string"}, {"type": "integer"}],
+            "additionalItems": False,
+        }
+        closed_after = {
+            "type": "array",
+            "items": [{"type": "string"}],
+            "additionalItems": False,
+        }
+        kinds, _ = self.classified(before, closed_after)
+        self.assertIn(
+            ("breaking", "tuple_shortened_with_restricted_additional_items"),
+            kinds,
+        )
+
+        constrained_after = {
+            "type": "array",
+            "items": [{"type": "string"}],
+            "additionalItems": {"type": "string"},
+        }
+        constrained_kinds, _ = self.classified(before, constrained_after)
+        self.assertIn(
+            ("breaking", "tuple_shortened_with_restricted_additional_items"),
+            constrained_kinds,
+        )
+
+        open_after = {"type": "array", "items": [{"type": "string"}]}
+        open_kinds, _ = self.classified(before, open_after)
+        self.assertIn(("additive", "tuple_item_constraints_removed"), open_kinds)
+
     def test_references_and_schema_drafts_cannot_change_silently(self):
         cases = (
             ({}, {"$ref": "#/definitions/Next"}, "reference_added"),
