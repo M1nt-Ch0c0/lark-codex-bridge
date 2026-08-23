@@ -202,6 +202,29 @@ impl ChildGuard {
     }
 
     async fn stop(mut self) -> Result<()> {
+        #[cfg(windows)]
+        {
+            let pid = self
+                .child
+                .id()
+                .context("smoke-owned app-server had no process id")?
+                .to_string();
+            let result = timeout(
+                CHILD_SHUTDOWN_TIMEOUT,
+                Command::new("taskkill")
+                    .args(["/PID", pid.as_str(), "/T", "/F"])
+                    .stdin(Stdio::null())
+                    .output(),
+            )
+            .await
+            .context("timed out stopping the smoke-owned Windows process tree")?
+            .context("unable to invoke the Windows process-tree terminator")?;
+            ensure!(
+                result.status.success(),
+                "unable to stop the smoke-owned Windows process tree"
+            );
+        }
+        #[cfg(not(windows))]
         self.child
             .start_kill()
             .context("unable to stop the smoke-owned app-server")?;
