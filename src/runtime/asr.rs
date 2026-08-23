@@ -2589,7 +2589,7 @@ mod tests {
                     "-NoProfile",
                     "-NonInteractive",
                     "-Command",
-                    "$acl = Get-Acl -LiteralPath $env:LCB_ACL_TEST_PATH; if ($acl.AreAccessRulesProtected) { exit 0 } else { Write-Error 'DACL inheritance remains enabled'; exit 7 }",
+                    "$path = $env:LCB_ACL_TEST_PATH; if ([System.IO.Directory]::Exists($path)) { $acl = [System.IO.Directory]::GetAccessControl($path) } elseif ([System.IO.File]::Exists($path)) { $acl = [System.IO.File]::GetAccessControl($path) } else { Write-Error 'ACL target is missing'; exit 6 }; if ($acl.AreAccessRulesProtected) { exit 0 } else { Write-Error 'DACL inheritance remains enabled'; exit 7 }",
                 ])
                 .env("LCB_ACL_TEST_PATH", path)
                 .output()
