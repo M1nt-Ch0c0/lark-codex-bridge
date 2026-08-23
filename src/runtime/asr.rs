@@ -2578,11 +2578,12 @@ mod tests {
         windows_private_acl::apply_and_verify(&decoded, false).expect("decoded DACL");
         windows_private_acl::apply_and_verify(&workspace.path().join(ASR_TEMP_MARKER), false)
             .expect("marker DACL");
-        for (kind, path) in [
-            ("unicode root", &unicode_root),
+        let protected_paths: [(&str, &Path); 3] = [
+            ("unicode root", unicode_root.as_path()),
             ("workspace", workspace.path()),
             ("decoded file", decoded.as_path()),
-        ] {
+        ];
+        for (kind, path) in protected_paths {
             let output = std::process::Command::new("powershell.exe")
                 .args([
                     "-NoProfile",
