@@ -2,6 +2,7 @@
 
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
 
 use crate::codex::{
     client::AppServerClient,
@@ -88,6 +89,7 @@ pub async fn handle_server_request(
     contexts: &ContextRegistry,
     attachments: &AttachmentCache,
     asr: &AsrSection,
+    shutdown: &CancellationToken,
 ) {
     if request.method != "item/tool/call" {
         let _ = client
@@ -116,7 +118,29 @@ pub async fn handle_server_request(
 
     let result = match (params.namespace.as_deref(), params.tool.as_str()) {
         (Some("bridge_context"), "resolve") => resolve_context(contexts, &params),
-        (Some("bridge_media"), "read") => read_media(contexts, attachments, asr, &params).await,
+        (Some("bridge_media"), "read") => {
+            match read_media(contexts, attachments, asr, shutdown, &params).await {
+                Ok(outcome) => {
+                    let committed =
+                        outcome.authorized.commit_response() && !shutdown.is_cancelled();
+                    let result = if committed {
+                        outcome.result
+                    } else {
+                        if let Some(token) = outcome.acquisition_token.as_deref() {
+                            let _ = attachments.release_lease(token).await;
+                        }
+                        Err(asr_error(AsrError::Cancelled))
+                    };
+                    let response = match result {
+                        Ok(value) => tool_response(value, true),
+                        Err(value) => tool_response(value, false),
+                    };
+                    let _ = client.respond_request(&mut request, &response).await;
+                    return;
+                }
+                Err(error) => Err(error),
+            }
+        }
         _ => Err(tool_error(
             "unsupported",
             "dynamic tool is not registered by this bridge",
@@ -160,8 +184,9 @@ async fn read_media(
     contexts: &ContextRegistry,
     attachments: &AttachmentCache,
     asr: &AsrSection,
+    shutdown: &CancellationToken,
     params: &DynamicToolCallParams,
-) -> Result<Value, Value> {
+) -> Result<MediaReadOutcome, Value> {
     let arguments =
         serde_json::from_value::<MediaArguments>(params.arguments.clone()).map_err(|_| {
             tool_error(
@@ -184,9 +209,15 @@ async fn read_media(
         )
         .map_err(context_error)?;
     if authorized.media_kind == MediaKind::Audio {
-        return read_audio(attachments, asr, &mut authorized).await;
+        let (result, acquisition_token) =
+            read_audio(attachments, asr, shutdown, &mut authorized).await;
+        return Ok(MediaReadOutcome {
+            result,
+            authorized,
+            acquisition_token,
+        });
     }
-    let cached = attachments
+    let cached = match attachments
         .fetch_cancellable(
             &authorized.message_id,
             &authorized.resource,
@@ -194,64 +225,109 @@ async fn read_media(
             &authorized.cancellation,
         )
         .await
-        .map_err(attachment_error)?;
-    if authorized.is_cancelled() {
-        if cached.lease_was_inserted {
-            let _ = attachments
-                .release_lease(&cached.sha256, authorized.local_turn_row_id)
-                .await;
+    {
+        Ok(cached) => cached,
+        Err(error) => {
+            return Ok(MediaReadOutcome {
+                result: Err(attachment_error(error)),
+                authorized,
+                acquisition_token: None,
+            });
         }
-        return Err(asr_error(AsrError::Cancelled));
+    };
+    let acquisition_token = Some(cached.lease_token.clone());
+    if authorized.is_cancelled() || shutdown.is_cancelled() {
+        let _ = attachments.release_lease(&cached.lease_token).await;
+        return Ok(MediaReadOutcome {
+            result: Err(asr_error(AsrError::Cancelled)),
+            authorized,
+            acquisition_token: None,
+        });
     }
     authorized.settle_read(cached.bytes);
-    let path = cached.path.to_str().ok_or_else(|| {
-        tool_error(
-            "media_unavailable",
-            "cached media path is not representable",
-            false,
-        )
-    })?;
-    Ok(json!({
-        "media": {
-            "kind": resource_kind(cached.kind),
-            "semanticKind": authorized.media_kind,
-            "path": path,
-            "sha256": cached.sha256,
-            "bytes": cached.bytes,
-        }
-    }))
+    let result = cached.path.to_str().map_or_else(
+        || {
+            Err(tool_error(
+                "media_unavailable",
+                "cached media path is not representable",
+                false,
+            ))
+        },
+        |path| {
+            Ok(json!({
+                "media": {
+                    "kind": resource_kind(cached.kind),
+                    "semanticKind": authorized.media_kind,
+                    "path": path,
+                    "sha256": cached.sha256,
+                    "bytes": cached.bytes,
+                }
+            }))
+        },
+    );
+    Ok(MediaReadOutcome {
+        result,
+        authorized,
+        acquisition_token,
+    })
+}
+
+struct MediaReadOutcome {
+    result: Result<Value, Value>,
+    authorized: crate::runtime::context::AuthorizedResource,
+    acquisition_token: Option<String>,
 }
 
 async fn read_audio(
     attachments: &AttachmentCache,
     asr: &AsrSection,
+    shutdown: &CancellationToken,
     authorized: &mut crate::runtime::context::AuthorizedResource,
-) -> Result<Value, Value> {
-    if authorized.is_cancelled() {
-        return Err(asr_error(AsrError::Cancelled));
+) -> (Result<Value, Value>, Option<String>) {
+    if authorized.is_cancelled() || shutdown.is_cancelled() {
+        return (Err(asr_error(AsrError::Cancelled)), None);
+    }
+    if let Some(failure) = authorized.transcript_failure {
+        return (
+            Err(asr_error(match failure {
+                crate::lark::normalize::TranscriptFailure::Invalid => AsrError::InvalidTranscript,
+                crate::lark::normalize::TranscriptFailure::TooLarge => AsrError::TranscriptTooLarge,
+                crate::lark::normalize::TranscriptFailure::NotRetained => {
+                    AsrError::TranscriptUnavailable
+                }
+            })),
+            None,
+        );
     }
     if let Some(inbound) = authorized.transcript.as_deref() {
-        let transcript =
+        if inbound.len() > asr.max_transcript_bytes {
+            return (Err(asr_error(AsrError::TranscriptTooLarge)), None);
+        }
+        let Some(transcript) =
             crate::lark::normalize::normalize_transcript(inbound, asr.max_transcript_bytes)
-                .ok_or_else(|| asr_error(AsrError::TranscriptTooLarge))?;
+        else {
+            return (Err(asr_error(AsrError::InvalidTranscript)), None);
+        };
         let value = audio_transcript_value(
             &transcript,
             TranscriptSource::Inbound,
             authorized.duration_ms,
         );
         authorized.settle_read(0);
-        return Ok(value);
+        return (Ok(value), None);
     }
-    if authorized
-        .duration_ms
-        .is_some_and(|duration| duration > asr.max_duration_ms)
-    {
-        return Err(asr_error(AsrError::TooLong));
+    if authorized.duration_ms.is_some_and(|duration| {
+        duration
+            > asr
+                .max_duration_ms
+                .min(crate::limits::ASR_ABSOLUTE_MAX_DURATION_MS)
+    }) {
+        return (Err(asr_error(AsrError::TooLong)), None);
     }
     if !asr.is_configured() {
-        return Err(asr_error(AsrError::SidecarMissing));
+        return (Err(asr_error(AsrError::SidecarMissing)), None);
     }
-    let cached = attachments
+    let cached = match attachments
         .fetch_cancellable(
             &authorized.message_id,
             &authorized.resource,
@@ -259,31 +335,52 @@ async fn read_audio(
             &authorized.cancellation,
         )
         .await
-        .map_err(|error| match error {
-            AttachError::TooLarge { .. } => asr_error(AsrError::Oversize),
-            AttachError::Cancelled { .. } => asr_error(AsrError::Cancelled),
-            other => attachment_error(other),
-        })?;
-    let transcription = asr::transcribe_file(asr, &cached.path, authorized.duration_ms);
-    tokio::pin!(transcription);
-    let transcript = tokio::select! {
-        biased;
-        () = authorized.cancellation.cancelled() => {
-            if cached.lease_was_inserted {
-                let _ = attachments
-                    .release_lease(&cached.sha256, authorized.local_turn_row_id)
-                    .await;
-            }
-            return Err(asr_error(AsrError::Cancelled));
+    {
+        Ok(cached) => cached,
+        Err(error) => {
+            return (
+                Err(match error {
+                    AttachError::TooLarge { .. } => asr_error(AsrError::Oversize),
+                    AttachError::Cancelled { .. } => asr_error(AsrError::Cancelled),
+                    other => attachment_error(other),
+                }),
+                None,
+            );
         }
-        result = &mut transcription => result.map_err(asr_error)?,
     };
     authorized.settle_read(cached.bytes);
-    Ok(audio_transcript_value(
-        &transcript,
-        TranscriptSource::Sidecar,
+    let acquisition_token = Some(cached.lease_token.clone());
+    let transcript = match asr::transcribe_file_cancellable(
+        asr,
+        &cached.path,
         authorized.duration_ms,
-    ))
+        &authorized.cancellation,
+        shutdown,
+    )
+    .await
+    {
+        Ok(transcript) => transcript,
+        Err(error) => {
+            if error == AsrError::Cancelled {
+                // The unique token belongs only to this read; releasing it
+                // cannot invalidate another overlapping consumer.
+                let _ = attachments.release_lease(&cached.lease_token).await;
+            }
+            return (Err(asr_error(error)), None);
+        }
+    };
+    if authorized.is_cancelled() || shutdown.is_cancelled() {
+        let _ = attachments.release_lease(&cached.lease_token).await;
+        return (Err(asr_error(AsrError::Cancelled)), None);
+    }
+    (
+        Ok(audio_transcript_value(
+            &transcript,
+            TranscriptSource::Sidecar,
+            authorized.duration_ms,
+        )),
+        acquisition_token,
+    )
 }
 
 fn audio_transcript_value(

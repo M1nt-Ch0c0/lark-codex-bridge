@@ -332,6 +332,59 @@ async fn lease_protects_file_from_gc_until_released() {
 }
 
 #[tokio::test]
+async fn overlapping_same_turn_acquisitions_survive_one_cancel_and_gc() {
+    let temp = tempdir().expect("tempdir");
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let dl = downloader(&[("k", b"overlapping")]);
+    let limits = AttachmentLimits {
+        gc_age: Duration::ZERO,
+        max_cache_files: 0,
+        max_cache_bytes: 0,
+        ..AttachmentLimits::default()
+    };
+    let cache = cache(temp.path(), store.clone(), dl, limits);
+    let turn_id = record_turn(&store, "overlapping-turn").await;
+    let first = cache
+        .fetch("om_test", &desc("k", ResourceKind::File), turn_id)
+        .await
+        .expect("first acquisition");
+    let second = cache
+        .fetch("om_test", &desc("k", ResourceKind::File), turn_id)
+        .await
+        .expect("overlapping acquisition");
+    assert_ne!(first.lease_token, second.lease_token);
+    assert_eq!(
+        store
+            .attachment_leases(&first.sha256)
+            .await
+            .expect("both acquisitions")
+            .len(),
+        2
+    );
+
+    assert!(
+        store
+            .release_attachment_lease(&first.lease_token)
+            .await
+            .expect("cancel first acquisition")
+    );
+    let stats = cache.gc().await.expect("gc with overlapping owner");
+    assert_eq!(stats.evicted, 0);
+    assert!(stats.skipped_leased >= 1);
+    assert!(first.path.exists());
+
+    assert!(
+        store
+            .release_attachment_lease(&second.lease_token)
+            .await
+            .expect("release second acquisition")
+    );
+    assert_eq!(cache.gc().await.expect("final gc").evicted, 1);
+    assert!(!first.path.exists());
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
 async fn gc_batch_bounds_rows_inspected_even_when_every_row_is_leased() {
     let temp = tempdir().expect("tempdir");
     let store = StoreHandle::open_in_memory().await.expect("store");
@@ -860,7 +913,7 @@ fn debug_output_never_leaks_content_or_paths() {
         path: Path::new("/home/secret/cache").join(sha_hex(b"secret-bytes")),
         kind: ResourceKind::File,
         bytes: 12,
-        lease_was_inserted: true,
+        lease_token: "alease_test_token".to_owned(),
     };
     let debug = format!("{cached:?}");
     assert!(!debug.contains("secret-bytes"));

@@ -215,6 +215,18 @@ fn config_rejects_unknown_keys_at_every_schema_level() {
 }
 
 #[test]
+fn config_rejects_asr_duration_above_the_absolute_runtime_cap() {
+    let temp = scratch();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        "owners = [\"ou_owner_123456\"]\n[asr]\nmax_duration_ms = 600001\n",
+    )
+    .expect("write config");
+    assert!(BridgeConfig::load(Some(&config_path)).is_err());
+}
+
+#[test]
 fn granular_approval_rejects_unknown_wrapper_and_inner_keys() {
     let wrapper_unknown = r#"
 owners = ["ou_owner_123456"]

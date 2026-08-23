@@ -430,9 +430,9 @@ pub struct CachedAttachment {
     pub kind: ResourceKind,
     /// Object size in bytes.
     pub bytes: u64,
-    /// Whether this fetch inserted the turn/hash lease instead of reusing an
-    /// existing idempotent pair. Cancellation may compensate only when true.
-    pub lease_was_inserted: bool,
+    /// Unique acquisition token. It is intentionally omitted from `Debug` and
+    /// is used only to release this exact caller's GC protection.
+    pub lease_token: String,
 }
 
 impl fmt::Debug for CachedAttachment {
@@ -689,7 +689,7 @@ impl AttachmentCache {
         }
         // Row and lease commit in one transaction (design §10, Task 7 Step 1),
         // so GC can never observe an unleased row and evict it mid-fetch.
-        let lease_inserted = self
+        let lease_token = self
             .commit_lease(&sha, size, desc.kind, turn_row_id, shutdown)
             .await?;
         // Close the file race: a concurrent reconcile may have removed the
@@ -712,9 +712,7 @@ impl AttachmentCache {
         )
         .await?;
         if shutdown.is_some_and(CancellationToken::is_cancelled) {
-            if lease_inserted {
-                let _ = self.store.release_attachment_lease(&sha, turn_row_id).await;
-            }
+            let _ = self.store.release_attachment_lease(&lease_token).await;
             return Err(AttachError::Cancelled {
                 context: "verifying an installed attachment",
             });
@@ -724,7 +722,7 @@ impl AttachmentCache {
             path: final_path,
             kind: desc.kind,
             bytes: size,
-            lease_was_inserted: lease_inserted,
+            lease_token,
         })
     }
 
@@ -735,7 +733,7 @@ impl AttachmentCache {
         kind: ResourceKind,
         turn_row_id: i64,
         cancellation: Option<&CancellationToken>,
-    ) -> Result<bool, AttachError> {
+    ) -> Result<String, AttachError> {
         let Some(cancellation) = cancellation.cloned() else {
             return self
                 .store
@@ -744,18 +742,18 @@ impl AttachmentCache {
                 .map_err(|error| store_err("recording and leasing an attachment", error));
         };
         // Keep the admitted store mutation alive if the reverse-tool future is
-        // dropped. The detached task compensates only a lease inserted by this
-        // exact acquisition; an older idempotent lease is never removed.
+        // dropped. Every transaction returns a unique acquisition token, so a
+        // cancelled caller can never release another simultaneous reader.
         let store = self.store.clone();
         let sha256 = sha256.to_owned();
         tokio::spawn(async move {
-            let inserted = store
+            let lease_token = store
                 .put_attachment_and_lease(&sha256, bytes, resource_kind_str(kind), turn_row_id)
                 .await?;
-            if inserted && cancellation.is_cancelled() {
-                store.release_attachment_lease(&sha256, turn_row_id).await?;
+            if cancellation.is_cancelled() {
+                store.release_attachment_lease(&lease_token).await?;
             }
-            Ok::<bool, StoreError>(inserted)
+            Ok::<String, StoreError>(lease_token)
         })
         .await
         .map_err(|_| AttachError::Io {
@@ -781,13 +779,9 @@ impl AttachmentCache {
     ///
     /// Dynamic tool cancellation uses this narrower boundary so concurrent
     /// reads owned by the same turn keep their independent leases.
-    pub(crate) async fn release_lease(
-        &self,
-        sha256: &str,
-        turn_row_id: i64,
-    ) -> Result<bool, AttachError> {
+    pub(crate) async fn release_lease(&self, lease_token: &str) -> Result<bool, AttachError> {
         self.store
-            .release_attachment_lease(sha256, turn_row_id)
+            .release_attachment_lease(lease_token)
             .await
             .map_err(|error| store_err("releasing an attachment lease", error))
     }

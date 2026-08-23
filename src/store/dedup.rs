@@ -23,16 +23,15 @@ use crate::lark::normalize::{
     ScopeKey,
 };
 use crate::limits::{
-    ASR_TRANSCRIPT_MAX_BYTES, ATTACHMENT_FILE_NAME_MAX_BYTES, ATTACHMENT_MIME_MAX_BYTES,
-    DEDUP_SWEEP_BATCH, OUTBOX_TERMINAL_MAX_BYTES, OUTBOX_TERMINAL_MAX_ROWS,
-    STORE_INBOUND_BEGIN_MAX_KEY_BYTES, STORE_INBOUND_BEGIN_MAX_KEYS, STORE_INBOUND_ID_MAX_BYTES,
-    STORE_INBOUND_MAX_BYTES, STORE_INBOUND_MAX_ROWS, STORE_INBOUND_MESSAGE_TYPE_MAX_BYTES,
-    STORE_INBOUND_PAYLOAD_MAX_BYTES, STORE_INBOUND_RECEIVED_MAX_BYTES,
-    STORE_INBOUND_RECEIVED_MAX_ROWS, STORE_INBOUND_RESOURCE_KEY_MAX_BYTES,
-    STORE_INBOUND_RESOURCE_KEY_MAX_TOTAL_BYTES, STORE_INBOUND_RESOURCE_MAX_COUNT,
-    STORE_INBOUND_SCOPE_MAX_BYTES, STORE_INBOUND_TEXT_MAX_BYTES, STORE_OUTBOX_MAX_QUEUED_BYTES,
-    STORE_OUTBOX_MAX_ROWS, STORE_OUTBOX_PAYLOAD_MAX_BYTES, STORE_RECOVERY_TURN_MAX_BYTES,
-    STORE_RECOVERY_TURN_MAX_ROWS, STORE_REJECTION_REASON_MAX_BYTES,
+    ATTACHMENT_FILE_NAME_MAX_BYTES, ATTACHMENT_MIME_MAX_BYTES, DEDUP_SWEEP_BATCH,
+    OUTBOX_TERMINAL_MAX_BYTES, OUTBOX_TERMINAL_MAX_ROWS, STORE_INBOUND_BEGIN_MAX_KEY_BYTES,
+    STORE_INBOUND_BEGIN_MAX_KEYS, STORE_INBOUND_ID_MAX_BYTES, STORE_INBOUND_MAX_BYTES,
+    STORE_INBOUND_MAX_ROWS, STORE_INBOUND_MESSAGE_TYPE_MAX_BYTES, STORE_INBOUND_PAYLOAD_MAX_BYTES,
+    STORE_INBOUND_RECEIVED_MAX_BYTES, STORE_INBOUND_RECEIVED_MAX_ROWS,
+    STORE_INBOUND_RESOURCE_KEY_MAX_BYTES, STORE_INBOUND_RESOURCE_KEY_MAX_TOTAL_BYTES,
+    STORE_INBOUND_RESOURCE_MAX_COUNT, STORE_INBOUND_SCOPE_MAX_BYTES, STORE_INBOUND_TEXT_MAX_BYTES,
+    STORE_OUTBOX_MAX_QUEUED_BYTES, STORE_OUTBOX_MAX_ROWS, STORE_OUTBOX_PAYLOAD_MAX_BYTES,
+    STORE_RECOVERY_TURN_MAX_BYTES, STORE_RECOVERY_TURN_MAX_ROWS, STORE_REJECTION_REASON_MAX_BYTES,
 };
 use crate::runtime::intake::TenantNamespace;
 
@@ -1076,10 +1075,10 @@ fn encode_event(event: &InboundEvent) -> Result<Vec<u8>, StoreError> {
 }
 
 /// Produces the crash-replay descriptor. Resource keys are bearer-like
-/// capabilities and client-provided transcripts are private content, so
-/// neither is ever handed to SQLite (including its WAL). A restarted bridge
-/// can still settle and route the message, but media is explicitly unavailable
-/// until Lark redelivers the authenticated live event.
+/// capabilities, so they are never handed to SQLite (including its WAL).
+/// Live transcripts travel outside [`InboundEvent`] entirely. A restarted
+/// bridge can still settle and route the message, but media is explicitly
+/// unavailable until Lark redelivers the authenticated live event.
 fn persistable_event(event: &InboundEvent) -> InboundEvent {
     let mut persisted = event.clone();
     persisted.resources.clear();
@@ -1097,7 +1096,6 @@ fn persistable_event(event: &InboundEvent) -> InboundEvent {
         };
         media.key = None;
         media.thumbnail_key = None;
-        media.metadata.transcript = None;
         if media.status == PartStatus::Available {
             media.status = PartStatus::Unavailable;
         }
@@ -1107,8 +1105,9 @@ fn persistable_event(event: &InboundEvent) -> InboundEvent {
 
 fn validate_live_claim(live: &InboundEvent, persisted: &InboundEvent) -> Result<(), StoreError> {
     // Bind the in-memory capability-bearing object to every identity and
-    // policy-relevant field retained durably. Media keys/transcripts and the
-    // resulting availability status are intentionally excluded.
+    // policy-relevant field retained durably. Media keys and the resulting
+    // availability status are intentionally excluded. Transcript content is
+    // structurally absent from both event values.
     if live.event_id != persisted.event_id
         || live.message_id != persisted.message_id
         || live.chat_id != persisted.chat_id
@@ -1197,12 +1196,12 @@ fn same_persisted_media_metadata(left: &MediaPart, right: &MediaPart) -> bool {
     };
     right.key.is_none()
         && right.thumbnail_key.is_none()
-        && right.metadata.transcript.is_none()
         && right.status == expected_status
         && left.metadata.file_name == right.metadata.file_name
         && left.metadata.mime_type == right.metadata.mime_type
         && left.metadata.size_bytes == right.metadata.size_bytes
         && left.metadata.duration_ms == right.metadata.duration_ms
+        && left.metadata.transcript_failure == right.metadata.transcript_failure
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1394,15 +1393,6 @@ fn validate_media_part(media: &MediaPart) -> Result<(), StoreError> {
             });
         }
     }
-    if let Some(transcript) = media.metadata.transcript.as_deref() {
-        if crate::lark::normalize::normalize_transcript(transcript, ASR_TRANSCRIPT_MAX_BYTES)
-            .is_none()
-        {
-            return Err(StoreError::CorruptData {
-                context: "validating inbound media transcript metadata",
-            });
-        }
-    }
     Ok(())
 }
 
@@ -1426,7 +1416,6 @@ fn metadata_variable_bytes(metadata: &MediaMetadata) -> usize {
         .as_deref()
         .map_or(0, str::len)
         .saturating_add(metadata.mime_type.as_deref().map_or(0, str::len))
-        .saturating_add(metadata.transcript.as_deref().map_or(0, str::len))
 }
 
 fn part_variable_bytes(part: &MessagePart) -> usize {
@@ -1757,10 +1746,11 @@ pub(crate) fn scrub_persisted_inbound_secrets(
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| sqlite_error("decoding inbound privacy migration", &error))?
     };
-    for (tenant, stored) in rows {
+    for (tenant, mut stored) in rows {
         let state = stored.state;
         let turn_row_id = stored.turn_row_id;
         let event_id = stored.event_id.clone();
+        scrub_legacy_inbound_payload(&mut stored)?;
         let old = retained_from_stored(stored)?;
         let payload = encode_event(old.event())?;
         let payload_bytes = i64::try_from(payload.len()).unwrap_or(i64::MAX);
@@ -1788,6 +1778,85 @@ pub(crate) fn scrub_persisted_inbound_secrets(
     transaction
         .commit()
         .map_err(|error| sqlite_error("committing inbound privacy migration", &error))
+}
+
+/// Removes the two pre-v6 secret-bearing fields before strict typed decoding.
+/// This compatibility decoder exists only on the one-way v5 -> v6 migration
+/// path; normal reads continue to reject unknown metadata fields.
+fn scrub_legacy_inbound_payload(stored: &mut StoredInbound) -> Result<(), StoreError> {
+    let payload = stored
+        .payload_blob
+        .as_ref()
+        .ok_or(StoreError::CorruptData {
+            context: "scrubbing a missing inbound privacy payload",
+        })?;
+    if payload.len() > STORE_INBOUND_PAYLOAD_MAX_BYTES
+        || usize::try_from(stored.payload_bytes).ok() != Some(payload.len())
+    {
+        return Err(StoreError::CorruptData {
+            context: "scrubbing an invalid inbound privacy payload length",
+        });
+    }
+    let mut value = serde_json::from_slice::<serde_json::Value>(payload).map_err(|_| {
+        StoreError::CorruptData {
+            context: "decoding an inbound privacy payload",
+        }
+    })?;
+    let root = value.as_object_mut().ok_or(StoreError::CorruptData {
+        context: "scrubbing an inbound privacy payload object",
+    })?;
+    root.insert("resources".to_owned(), serde_json::Value::Array(Vec::new()));
+    let parts = root
+        .get_mut("parts")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or(StoreError::CorruptData {
+            context: "scrubbing inbound privacy payload parts",
+        })?;
+    for part in parts {
+        let Some(part) = part.as_object_mut() else {
+            continue;
+        };
+        let is_media = part
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| matches!(kind, "image" | "file" | "sticker" | "audio" | "video"));
+        if !is_media {
+            continue;
+        }
+        let Some(media) = part
+            .get_mut("value")
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        media.insert("key".to_owned(), serde_json::Value::Null);
+        media.insert("thumbnail_key".to_owned(), serde_json::Value::Null);
+        if media.get("status").and_then(serde_json::Value::as_str) == Some("available") {
+            media.insert(
+                "status".to_owned(),
+                serde_json::Value::String("unavailable".to_owned()),
+            );
+        }
+        if let Some(metadata) = media
+            .get_mut("metadata")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            if metadata.remove("transcript").is_some()
+                && !metadata.contains_key("transcript_failure")
+            {
+                metadata.insert(
+                    "transcript_failure".to_owned(),
+                    serde_json::Value::String("not_retained".to_owned()),
+                );
+            }
+        }
+    }
+    let payload = serde_json::to_vec(&value).map_err(|_| StoreError::CorruptData {
+        context: "encoding a scrubbed inbound privacy payload",
+    })?;
+    stored.payload_bytes = i64::try_from(payload.len()).unwrap_or(i64::MAX);
+    stored.payload_blob = Some(payload);
+    Ok(())
 }
 
 fn ensure_inbound_capacity(

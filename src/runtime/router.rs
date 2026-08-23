@@ -9,7 +9,8 @@ use std::time::Duration;
 use futures_util::future::join_all;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
-use tokio::time::{MissedTickBehavior, interval};
+use tokio::time::{MissedTickBehavior, interval, timeout};
+use tokio_util::sync::CancellationToken;
 
 use crate::codex::client::ControlEvent;
 use crate::codex::supervisor::{SupervisorError, SupervisorHandle, SupervisorState};
@@ -605,6 +606,32 @@ struct RouterRetry {
     _queue_permit: OwnedSemaphorePermit,
 }
 
+struct ContextToolTask {
+    epoch: crate::codex::rpc::ConnectionEpoch,
+    shutdown: CancellationToken,
+    task: JoinHandle<()>,
+}
+
+impl ContextToolTask {
+    async fn stop(mut self) {
+        self.shutdown.cancel();
+        if timeout(Duration::from_secs(5), &mut self.task)
+            .await
+            .is_err()
+        {
+            self.task.abort();
+            let _ = (&mut self.task).await;
+        }
+    }
+}
+
+impl Drop for ContextToolTask {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+        self.task.abort();
+    }
+}
+
 struct RouteFailure {
     error: RouteError,
     event: QueuedInboundEvent,
@@ -633,6 +660,20 @@ async fn run_router(
     let mut retries = VecDeque::<RouterRetry>::new();
     let mut retry_tick = interval(Duration::from_millis(250));
     retry_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut stale_sweeper = crate::runtime::asr::StaleWorkspaceSweeper::for_private_root();
+    let asr_configured = settings.asr.is_configured();
+    let startup_sweep = if asr_configured {
+        stale_sweeper.sweep_once()
+    } else {
+        stale_sweeper.sweep_existing_once()
+    };
+    if startup_sweep.is_err() {
+        tracing::warn!("private ASR startup cleanup failed");
+    }
+    let mut stale_sweep = interval(crate::runtime::asr::ASR_STALE_SWEEP_INTERVAL);
+    stale_sweep.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // The startup round above replaces the interval's immediate first tick.
+    stale_sweep.tick().await;
     let mut supervisor_open = true;
     let mut tool_task =
         start_context_tool_task(&supervisor, &attachments, &contexts, settings.asr.clone());
@@ -659,9 +700,9 @@ async fn run_router(
                 if state.is_ok() {
                     supervisor_tx.send_replace(supervisor_access(&supervisor));
                     let current_epoch = supervisor.client().ok().map(|client| client.epoch());
-                    if tool_task.as_ref().map(|(epoch, _)| *epoch) != current_epoch {
-                        if let Some((_, task)) = tool_task.take() {
-                            task.abort();
+                    if tool_task.as_ref().map(|task| task.epoch) != current_epoch {
+                        if let Some(task) = tool_task.take() {
+                            task.stop().await;
                         }
                         tool_task = start_context_tool_task(
                             &supervisor,
@@ -671,8 +712,8 @@ async fn run_router(
                         );
                     }
                 } else {
-                    if let Some((_, task)) = tool_task.take() {
-                        task.abort();
+                    if let Some(task) = tool_task.take() {
+                        task.stop().await;
                     }
                     supervisor_open = false;
                     supervisor_tx.send_replace(SupervisorAccess { epoch: 0, client: None });
@@ -696,6 +737,16 @@ async fn run_router(
                 update_runtime_snapshot(
                     &snapshot, &actors, &receiver, &retries, &active_turns, &settings,
                 );
+            }
+            _ = stale_sweep.tick() => {
+                let result = if asr_configured {
+                    stale_sweeper.sweep_once()
+                } else {
+                    stale_sweeper.sweep_existing_once()
+                };
+                if result.is_err() {
+                    tracing::warn!("private ASR stale workspace sweep failed");
+                }
             }
             command = receiver.recv() => {
                 let Some(command) = command else { break };
@@ -736,8 +787,8 @@ async fn run_router(
                     }
                     RouterCommand::Shutdown { respond } => {
                         shutdown_actors(actors).await;
-                        if let Some((_, task)) = tool_task.take() {
-                            task.abort();
+                        if let Some(task) = tool_task.take() {
+                            task.stop().await;
                         }
                         supervisor.shutdown().await?;
                         reconcile_terminal_attachments(attachments.as_deref()).await?;
@@ -749,8 +800,8 @@ async fn run_router(
         }
     }
     shutdown_actors(actors).await;
-    if let Some((_, task)) = tool_task.take() {
-        task.abort();
+    if let Some(task) = tool_task.take() {
+        task.stop().await;
     }
     supervisor.shutdown().await?;
     reconcile_terminal_attachments(attachments.as_deref()).await?;
@@ -763,33 +814,47 @@ fn start_context_tool_task(
     attachments: &Option<Arc<AttachmentCache>>,
     contexts: &Option<Arc<ContextRegistry>>,
     asr: AsrSection,
-) -> Option<(crate::codex::rpc::ConnectionEpoch, JoinHandle<()>)> {
+) -> Option<ContextToolTask> {
     let attachments = attachments.as_ref().map(Arc::clone)?;
     let contexts = contexts.as_ref().map(Arc::clone)?;
     let client = supervisor.client().ok()?;
     let epoch = client.epoch();
     let mut events = client.take_control_events().ok()?;
+    let shutdown = CancellationToken::new();
+    let task_shutdown = shutdown.clone();
     let task = tokio::spawn(async move {
-        while let Some(event) = events.recv().await {
-            match event {
-                ControlEvent::ServerRequest(request) => {
-                    handle_server_request(
-                        client.as_ref(),
-                        request,
-                        contexts.as_ref(),
-                        attachments.as_ref(),
-                        &asr,
-                    )
-                    .await;
+        loop {
+            tokio::select! {
+                biased;
+                () = task_shutdown.cancelled() => break,
+                event = events.recv() => {
+                    let Some(event) = event else { break };
+                    match event {
+                        ControlEvent::ServerRequest(request) => {
+                            handle_server_request(
+                                client.as_ref(),
+                                request,
+                                contexts.as_ref(),
+                                attachments.as_ref(),
+                                &asr,
+                                &task_shutdown,
+                            )
+                            .await;
+                        }
+                        ControlEvent::ConnectionClosed(_) => break,
+                        ControlEvent::ProtocolDrift
+                        | ControlEvent::UnknownNotification { .. }
+                        | ControlEvent::InvalidNotification { .. } => {}
+                    }
                 }
-                ControlEvent::ConnectionClosed(_) => break,
-                ControlEvent::ProtocolDrift
-                | ControlEvent::UnknownNotification { .. }
-                | ControlEvent::InvalidNotification { .. } => {}
             }
         }
     });
-    Some((epoch, task))
+    Some(ContextToolTask {
+        epoch,
+        shutdown,
+        task,
+    })
 }
 
 async fn reconcile_terminal_attachments(
@@ -1074,8 +1139,8 @@ mod tests {
             .acquire_owned()
             .await
             .expect("permit");
-        QueuedInboundEvent {
-            event: InboundEvent {
+        QueuedInboundEvent::new(
+            InboundEvent {
                 event_id: event_id.to_owned(),
                 message_id: format!("message-{event_id}"),
                 chat_id: "chat-router-attempt".to_owned(),
@@ -1096,7 +1161,7 @@ mod tests {
                 scope: ScopeKey::Chat("chat-router-attempt".to_owned()),
             },
             permit,
-        }
+        )
     }
 
     #[tokio::test]

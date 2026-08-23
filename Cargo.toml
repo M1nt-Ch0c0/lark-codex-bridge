@@ -15,6 +15,7 @@ anyhow = "1.0.104"
 base64 = "0.23.1"
 bytes = "1.12.1"
 clap = { version = "4.6.6", features = ["derive"] }
+command-group = { version = "=5.0.1", features = ["with-tokio"] }
 flate2 = "1.1.9"
 futures-util = "0.3.34"
 fs2 = "0.4.3"
@@ -37,6 +38,9 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
 url = "2.5.8"
 uuid = { version = "1.24.0", features = ["v4", "serde"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-acl = "=0.3.0"
 
 [dev-dependencies]
 assert_cmd = "2.2.2"

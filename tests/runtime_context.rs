@@ -5,7 +5,7 @@ use lark_codex_bridge::{
         api::{ChatMode, ResourceKind},
         normalize::{
             InboundEvent, MediaMetadata as InboundMediaMetadata, MediaPart, MentionIdentity,
-            MessagePart, PartStatus, ResourceDesc, ScopeKey,
+            MessagePart, PartStatus, ResourceDesc, ScopeKey, TranscriptFailure,
         },
     },
     runtime::context::{
@@ -73,6 +73,7 @@ fn draft(message_id: &str) -> ContextDraft {
                     mime_type: Some("image/png".to_owned()),
                     ..MediaMetadata::default()
                 },
+                transcript_failure: None,
             },
         ],
     }
@@ -249,6 +250,7 @@ fn quoted_media_handle_reads_from_the_parent_and_debug_redacts_keys_and_text() {
             },
             thumbnail: None,
             metadata: MediaMetadata::default(),
+            transcript_failure: None,
         }],
     });
     let debug = format!("{context:?}");
@@ -278,6 +280,65 @@ fn quoted_media_handle_reads_from_the_parent_and_debug_redacts_keys_and_text() {
         .expect("authorize quoted media");
     assert_eq!(authorized.message_id, "om_parent");
     assert_eq!(authorized.resource.key, "quoted_secret_key");
+}
+
+#[test]
+fn durable_context_types_have_no_transcript_content_field() {
+    const SENTINEL: &str = "private-transcript-sentinel-7f54";
+    let registry = ContextRegistry::new(config(4, Duration::from_secs(60))).expect("registry");
+    let mut context = draft("om_audio_private");
+    context.message_type = "audio".to_owned();
+    context.parts = vec![DraftPart::Media {
+        kind: MediaKind::Audio,
+        resource: ResourceDesc {
+            kind: ResourceKind::File,
+            key: "audio_secret_key".to_owned(),
+        },
+        thumbnail: None,
+        metadata: MediaMetadata {
+            duration_ms: Some(800),
+            ..MediaMetadata::default()
+        },
+        transcript_failure: Some(TranscriptFailure::NotRetained),
+    }];
+    assert!(!format!("{context:?}").contains(SENTINEL));
+
+    let registered = registry
+        .register_pending(pending(41), context)
+        .expect("register audio context");
+    let snapshot = registry
+        .resolve_for_tool(&registered.context_id, "thread-a", "turn-private")
+        .expect("resolve audio context");
+    let serialized = serde_json::to_string(&snapshot).expect("serialize snapshot");
+    assert!(!serialized.contains(SENTINEL));
+    assert!(!format!("{snapshot:?}").contains(SENTINEL));
+    let TypedPart::Media {
+        handle, metadata, ..
+    } = &snapshot.parts[0]
+    else {
+        panic!("audio media part")
+    };
+    assert!(
+        !serde_json::to_string(metadata)
+            .expect("serialize typed metadata")
+            .contains(SENTINEL)
+    );
+
+    let authorized = registry
+        .authorize_media_for_tool(
+            &registered.context_id,
+            handle,
+            "thread-a",
+            "turn-private",
+            1024,
+        )
+        .expect("authorize exact grant");
+    assert_eq!(authorized.transcript, None);
+    assert_eq!(
+        authorized.transcript_failure,
+        Some(TranscriptFailure::NotRetained)
+    );
+    assert!(!format!("{authorized:?}").contains(SENTINEL));
 }
 
 #[test]
@@ -333,7 +394,7 @@ fn inbound_rich_parts_become_opaque_typed_context_parts() {
                     mime_type: Some("video/mp4".to_owned()),
                     size_bytes: Some(10),
                     duration_ms: Some(20),
-                    transcript: None,
+                    transcript_failure: None,
                 },
                 status: PartStatus::Available,
             }),

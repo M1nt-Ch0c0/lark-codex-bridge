@@ -455,8 +455,7 @@ fn pending_metadata_bytes(event: &InboundEvent) -> usize {
                     .map_or(0, str::len)
                     .saturating_add(media.thumbnail_key.as_deref().map_or(0, str::len))
                     .saturating_add(media.metadata.file_name.as_deref().map_or(0, str::len))
-                    .saturating_add(media.metadata.mime_type.as_deref().map_or(0, str::len))
-                    .saturating_add(media.metadata.transcript.as_deref().map_or(0, str::len)),
+                    .saturating_add(media.metadata.mime_type.as_deref().map_or(0, str::len)),
                 MessagePart::Text { text } => text.len(),
                 MessagePart::Forward { message_id, .. } => {
                     message_id.as_deref().map_or(0, str::len)
@@ -603,17 +602,21 @@ impl ScopeActorHandle {
         let Some(active) = active else {
             return Ok(InterruptOutcome::NoActiveTurn);
         };
+        if let Some((registry, binding)) = &active.context_binding {
+            // Revoke before asking Codex to acknowledge the interrupt. Any
+            // response that already committed is allowed to finish first;
+            // every other media read is forced to return only cancellation.
+            // This ordering makes it impossible for transcript/media content
+            // to follow a successful interrupt acknowledgement.
+            let _ = registry
+                .revoke_turn_and_wait(binding, RevocationReason::Cancelled)
+                .await;
+        }
         active
             .client
             .interrupt_turn(&active.thread_id, &active.turn_id)
             .await
             .map_err(|_| ())?;
-        if let Some((registry, binding)) = &active.context_binding {
-            // Once Codex accepts the interruption, revoke the capability
-            // immediately. Tool work must not wait for a later terminal event
-            // before observing cancellation.
-            let _ = registry.revoke_turn(binding, RevocationReason::Cancelled);
-        }
         Ok(InterruptOutcome::Requested)
     }
 
@@ -965,6 +968,13 @@ async fn process_batch(
         }
     };
     let client_message_id = Uuid::new_v4().to_string();
+    let mut live_transcripts = HashMap::with_capacity(batch.len());
+    for item in &mut batch {
+        let handoff = item.inbound.queued.take_live_transcripts();
+        if !handoff.is_empty() {
+            live_transcripts.insert(item.inbound.key.clone(), handoff);
+        }
+    }
     let pending_contexts = batch
         .iter()
         .map(|item| {
@@ -1011,6 +1021,7 @@ async fn process_batch(
         .collect::<Vec<_>>();
     let assembly = match assemble_turn_inputs(
         &claimed,
+        &mut live_transcripts,
         attachments,
         contexts,
         quote_resolver,
@@ -1339,6 +1350,7 @@ fn deduplicate_batch(batch: Vec<TurnInbound>) -> Vec<TurnInbound> {
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn assemble_turn_inputs(
     claimed: &[ClaimedInbound],
+    live_transcripts: &mut HashMap<InboundKey, crate::lark::normalize::LiveTranscriptHandoff>,
     attachments: Option<&AttachmentCache>,
     contexts: Option<&ContextRegistry>,
     quote_resolver: Option<&dyn QuoteResolver>,
@@ -1383,6 +1395,7 @@ async fn assemble_turn_inputs(
                         lease,
                         &binding,
                         draft.clone(),
+                        crate::lark::normalize::LiveTranscriptHandoff::empty(),
                         "pending_media",
                         false,
                     )?;
@@ -1412,6 +1425,7 @@ async fn assemble_turn_inputs(
                 lease,
                 &binding,
                 draft,
+                live_transcripts.remove(&claimed.key).unwrap_or_default(),
                 wake,
                 event.mentions_bot,
             )?;
@@ -1474,11 +1488,12 @@ fn register_context_input(
     lease: &mut TurnContextLease,
     binding: &PendingBinding,
     draft: ContextDraft,
+    live_transcripts: crate::lark::normalize::LiveTranscriptHandoff,
     wake: &'static str,
     mentioned_self: bool,
 ) -> Result<(), AttachmentAssemblyError> {
     let registered = registry
-        .register_pending(binding.clone(), draft)
+        .register_pending_with_transcripts(binding.clone(), draft, live_transcripts)
         .map_err(|_| AttachmentAssemblyError::Failed)?;
     let reference = serde_json::to_string(&serde_json::json!({
         "id": registered.context_id.as_str(),
