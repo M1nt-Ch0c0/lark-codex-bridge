@@ -63,6 +63,8 @@ struct StalledResponsesServer {
     base_url: String,
     request_seen: Arc<AtomicBool>,
     request_notify: Arc<Notify>,
+    request_closed: Arc<AtomicBool>,
+    close_notify: Arc<Notify>,
     cancel: CancellationToken,
     task: JoinHandle<()>,
 }
@@ -77,9 +79,13 @@ impl StalledResponsesServer {
             .context("unable to inspect the local Responses API stub")?;
         let request_seen = Arc::new(AtomicBool::new(false));
         let request_notify = Arc::new(Notify::new());
+        let request_closed = Arc::new(AtomicBool::new(false));
+        let close_notify = Arc::new(Notify::new());
         let cancel = CancellationToken::new();
         let task_request_seen = request_seen.clone();
         let task_request_notify = request_notify.clone();
+        let task_request_closed = request_closed.clone();
+        let task_close_notify = close_notify.clone();
         let task_cancel = cancel.clone();
         let task = tokio::spawn(async move {
             loop {
@@ -92,6 +98,8 @@ impl StalledResponsesServer {
                 };
                 let connection_seen = task_request_seen.clone();
                 let connection_notify = task_request_notify.clone();
+                let connection_closed = task_request_closed.clone();
+                let connection_close_notify = task_close_notify.clone();
                 let connection_cancel = task_cancel.clone();
                 tokio::spawn(async move {
                     let mut request = Vec::new();
@@ -112,7 +120,19 @@ impl StalledResponsesServer {
                             if request.starts_with(b"POST /v1/responses ") {
                                 connection_seen.store(true, Ordering::SeqCst);
                                 connection_notify.notify_waiters();
-                                connection_cancel.cancelled().await;
+                                loop {
+                                    let closed = tokio::select! {
+                                        () = connection_cancel.cancelled() => return,
+                                        read = stream.read(&mut chunk) => {
+                                            !matches!(read, Ok(read) if read > 0)
+                                        }
+                                    };
+                                    if closed {
+                                        connection_closed.store(true, Ordering::SeqCst);
+                                        connection_close_notify.notify_waiters();
+                                        return;
+                                    }
+                                }
                             }
                             return;
                         }
@@ -124,6 +144,8 @@ impl StalledResponsesServer {
             base_url: format!("http://{address}/v1"),
             request_seen,
             request_notify,
+            request_closed,
+            close_notify,
             cancel,
             task,
         })
@@ -141,6 +163,21 @@ impl StalledResponsesServer {
         })
         .await
         .context("turn did not reach the local Responses API stub")?;
+        Ok(())
+    }
+
+    async fn wait_for_close(&self) -> Result<()> {
+        timeout(STARTUP_TIMEOUT, async {
+            loop {
+                let notified = self.close_notify.notified();
+                if self.request_closed.load(Ordering::SeqCst) {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .context("interrupted turn did not release the local Responses API request")?;
         Ok(())
     }
 }
@@ -289,6 +326,7 @@ async fn real_exact_binary_reconciles_across_socket_and_operator_server_restarts
     let restart_state = coordinator.subscribe_state();
     let unavailable = tokio::spawn(wait_for_unavailable(restart_state, socket_epoch));
     child.stop().await?;
+    wait_until_not_listening(port).await?;
     coordinator
         .note_operator_server_restart()
         .await
@@ -298,6 +336,9 @@ async fn real_exact_binary_reconciles_across_socket_and_operator_server_restarts
         .context("unavailability observer task failed")??;
     child = spawn_server(&binary, &listen_endpoint, &token_path, &codex_home)?;
     wait_until_listening(port).await?;
+    child.ensure_running()?;
+    exact_health(port).await?;
+    child.ensure_running()?;
     let server_restart_epoch =
         wait_for_ready_with_evidence(&coordinator, socket_epoch, "server restart").await?;
     assert_ready_snapshot(&coordinator, &thread_id, server_restart_epoch).await?;
@@ -474,15 +515,121 @@ async fn operator_start_thread(
         .context("operator turn/start response omitted turn id")?
         .to_owned();
     wait_for_model_request(&mut socket, model_stub).await?;
-    operator_request(
-        &mut socket,
-        4,
-        "turn/interrupt",
-        json!({"threadId": thread_id, "turnId": turn_id}),
-    )
-    .await?;
+    operator_interrupt_and_wait_terminal(&mut socket, 4, &thread_id, &turn_id).await?;
+    model_stub.wait_for_close().await?;
+    wait_for_persisted_interrupt(&mut socket, &thread_id, &turn_id).await?;
     close_operator(socket).await;
     Ok((thread_id, turn_id))
+}
+
+async fn operator_interrupt_and_wait_terminal<S>(
+    socket: &mut tokio_tungstenite::WebSocketStream<S>,
+    id: i64,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    socket
+        .send(Message::Text(
+            json!({
+                "id": id,
+                "method": "turn/interrupt",
+                "params": {"threadId": thread_id, "turnId": turn_id}
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .context("unable to send operator turn/interrupt")?;
+    timeout(STARTUP_TIMEOUT, async {
+        let mut response_seen = false;
+        let mut terminal_seen = false;
+        loop {
+            let message = socket
+                .next()
+                .await
+                .context("operator socket closed before interrupt settled")??;
+            let Message::Text(text) = message else {
+                continue;
+            };
+            let value: Value = serde_json::from_str(&text)
+                .context("operator interrupt traffic was not JSON")?;
+            if value["id"] == id {
+                if let Some(error) = value.get("error") {
+                    let code = error.get("code").and_then(Value::as_i64);
+                    let message = error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unspecified protocol error");
+                    bail!(
+                        "operator turn/interrupt returned protocol error code={code:?} message={message}"
+                    );
+                }
+                ensure!(
+                    value.get("result").is_some(),
+                    "operator turn/interrupt response omitted result"
+                );
+                response_seen = true;
+            } else if value["method"] == "turn/completed"
+                && value["params"]["threadId"].as_str() == Some(thread_id)
+                && value["params"]["turn"]["id"].as_str() == Some(turn_id)
+            {
+                ensure!(
+                    value["params"]["turn"]["status"] == "interrupted",
+                    "operator seed turn completed with a non-interrupted status"
+                );
+                terminal_seen = true;
+            }
+            if response_seen && terminal_seen {
+                return Ok(());
+            }
+        }
+    })
+    .await
+    .context("operator turn/interrupt did not reach response and terminal barriers")?
+}
+
+async fn wait_for_persisted_interrupt<S>(
+    socket: &mut tokio_tungstenite::WebSocketStream<S>,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    timeout(STARTUP_TIMEOUT, async {
+        let mut request_id = 5_i64;
+        loop {
+            let turns = operator_request(
+                socket,
+                request_id,
+                "thread/turns/list",
+                json!({"threadId": thread_id, "limit": 100, "sortDirection": "asc"}),
+            )
+            .await?;
+            let row = turns["data"]
+                .as_array()
+                .context("operator thread/turns/list omitted data while settling interrupt")?
+                .iter()
+                .find(|turn| turn["id"].as_str() == Some(turn_id))
+                .context("operator thread/turns/list omitted the interrupted turn")?;
+            if row["status"] == "interrupted" {
+                return Ok(());
+            }
+            ensure!(
+                row["status"] == "inProgress",
+                "operator seed turn persisted an unexpected status"
+            );
+            request_id = request_id
+                .checked_add(1)
+                .context("operator interrupt persistence request id overflowed")?;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .context("operator interrupted turn did not become durably readable")?
 }
 
 async fn wait_for_model_request<S>(
@@ -775,6 +922,19 @@ async fn wait_until_listening(port: u16) -> Result<()> {
         }
         if Instant::now() >= deadline {
             bail!("exact external app-server did not start before the deadline");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_until_not_listening(port: u16) -> Result<()> {
+    let deadline = Instant::now() + CHILD_SHUTDOWN_TIMEOUT;
+    loop {
+        if TcpStream::connect(("127.0.0.1", port)).await.is_err() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("stopped external app-server retained its listener past the deadline");
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

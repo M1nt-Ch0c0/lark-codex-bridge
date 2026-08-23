@@ -64,10 +64,14 @@ cargo test --locked --test external_recovery --test external_reconciliation_stor
 
 The real smoke starts only the explicitly supplied exact binary, lets a
 separate operator harness create one paginated thread and one turn, adopts that
-thread, forces a bridge socket reconnect, stops and restarts the operator-owned
-server, and proves that resume/read reconciliation retained exactly one thread
-and turn. Coordinator shutdown must leave the server healthy; only the harness
-stops its child:
+thread, and blocks that turn against an isolated local Responses endpoint. The
+harness does not restart the server until `turn/interrupt` has produced both its
+correlated response and matching `turn/completed`, the interrupted status is
+readable through `thread/turns/list`, and the model HTTP connection is released.
+It then forces a bridge socket reconnect, proves the old TCP listener is gone,
+starts and health-checks the replacement operator-owned server, and proves that
+resume/read reconciliation retained exactly one thread and turn. Coordinator
+shutdown must leave the server healthy; only the harness stops its child:
 
 ```bash
 CODEX_EXTERNAL_RECONCILIATION_E2E=1 \
