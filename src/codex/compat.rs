@@ -633,6 +633,9 @@ impl WireAdapter {
     ) -> Result<Value, CompatError> {
         match self {
             Self::V0_146_0 => {
+                if value.overrides.exclude_turns.is_some() {
+                    return Err(CompatError::new("thread/resume params"));
+                }
                 validate_v0_146_approval(
                     value.overrides.approval_policy.as_ref(),
                     value.overrides.approvals_reviewer.as_deref(),
@@ -649,10 +652,17 @@ impl WireAdapter {
                     value.overrides.approvals_reviewer.as_deref(),
                     "thread/resume params",
                 )?;
-                encode(
+                let mut encoded = encode(
                     v0_149_0::thread_resume_params(value)?,
                     "thread/resume params",
-                )
+                )?;
+                if let Some(exclude_turns) = value.overrides.exclude_turns {
+                    encoded
+                        .as_object_mut()
+                        .ok_or(CompatError::new("thread/resume params"))?
+                        .insert("excludeTurns".to_owned(), Value::Bool(exclude_turns));
+                }
+                Ok(encoded)
             }
         }
     }
@@ -983,6 +993,28 @@ impl WireAdapter {
         crate::codex::wire::v0_149_0::ThreadStatusChangedNotification,
         "thread/status/changed notification"
     );
+
+    pub fn remote_control_status_changed_notification(
+        self,
+        value: Value,
+    ) -> Result<crate::codex::types::RemoteControlStatusChangedNotification, CompatError> {
+        match self {
+            Self::V0_149_0 => decode(value, "remoteControl/status/changed notification"),
+            Self::V0_146_0 => Err(CompatError::new(
+                "remoteControl/status/changed notification",
+            )),
+        }
+    }
+
+    pub fn thread_goal_cleared_notification(
+        self,
+        value: Value,
+    ) -> Result<crate::codex::types::ThreadGoalClearedNotification, CompatError> {
+        match self {
+            Self::V0_149_0 => decode(value, "thread/goal/cleared notification"),
+            Self::V0_146_0 => Err(CompatError::new("thread/goal/cleared notification")),
+        }
+    }
     shared_incoming_adapter!(
         thread_queue_changed_notification,
         crate::codex::types::ThreadQueueChangedNotification,

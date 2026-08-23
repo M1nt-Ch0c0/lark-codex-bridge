@@ -920,6 +920,33 @@ pub enum RpcProtocolPolicy {
     /// External observe-only connections fault on stale/duplicate responses, server requests,
     /// notifications, and malformed transport records.
     FailClosedExternalObserve,
+    /// External resume/reconciliation connections accept only the promoted thread status and
+    /// terminal item/turn notifications. Reverse requests and every other message still fault.
+    FailClosedExternalResume,
+}
+
+impl RpcProtocolPolicy {
+    const fn is_fail_closed_external(self) -> bool {
+        matches!(
+            self,
+            Self::FailClosedExternalObserve | Self::FailClosedExternalResume
+        )
+    }
+
+    fn allows_notification(self, method: &str) -> bool {
+        match self {
+            Self::Permissive => true,
+            Self::FailClosedExternalObserve => false,
+            Self::FailClosedExternalResume => matches!(
+                method,
+                "remoteControl/status/changed"
+                    | "thread/status/changed"
+                    | "thread/goal/cleared"
+                    | "item/completed"
+                    | "turn/completed"
+            ),
+        }
+    }
 }
 
 /// Starts the sole RPC owner with an explicit inbound protocol policy.
@@ -1073,7 +1100,7 @@ async fn run_actor(
                         ).await {
                             break if cancellation.is_cancelled() {
                                 TransportExit::Cancelled
-                            } else if policy == RpcProtocolPolicy::FailClosedExternalObserve {
+                            } else if policy.is_fail_closed_external() {
                                 TransportExit::ProtocolViolation
                             } else {
                                 TransportExit::TaskFailed
@@ -1081,7 +1108,7 @@ async fn run_actor(
                         }
                     }
                     Some(TransportEvent::ProtocolError(_)) => {
-                        if policy == RpcProtocolPolicy::FailClosedExternalObserve {
+                        if policy.is_fail_closed_external() {
                             break TransportExit::ProtocolViolation;
                         }
                         increment_saturating(&protocol_drift_count);
@@ -1196,7 +1223,7 @@ async fn handle_inbound(
                 }));
             } else {
                 drop(transport_budget);
-                if policy == RpcProtocolPolicy::FailClosedExternalObserve {
+                if policy.is_fail_closed_external() {
                     return false;
                 }
                 increment_saturating(protocol_drift_count);
@@ -1216,7 +1243,7 @@ async fn handle_inbound(
                     code: error.code,
                 }));
             } else {
-                if policy == RpcProtocolPolicy::FailClosedExternalObserve {
+                if policy.is_fail_closed_external() {
                     return false;
                 }
                 increment_saturating(protocol_drift_count);
@@ -1229,7 +1256,7 @@ async fn handle_inbound(
             }
         }
         InboundMessage::Request { id, method, params } => {
-            if policy == RpcProtocolPolicy::FailClosedExternalObserve {
+            if policy.is_fail_closed_external() {
                 return false;
             }
             if server_pending.len() >= RPC_SERVER_REQUEST_CAPACITY
@@ -1256,7 +1283,7 @@ async fn handle_inbound(
             .await;
         }
         InboundMessage::Notification { method, params } => {
-            if policy == RpcProtocolPolicy::FailClosedExternalObserve {
+            if !policy.allows_notification(&method) {
                 return false;
             }
             let authoritative = is_authoritative_notification(&method);
@@ -1748,7 +1775,10 @@ impl io::Write for LimitedCounter {
 }
 
 fn is_authoritative_notification(method: &str) -> bool {
-    matches!(method, "item/completed" | "turn/completed" | "error")
+    matches!(
+        method,
+        "thread/status/changed" | "item/completed" | "turn/completed" | "error"
+    )
 }
 
 fn deadline_after(timeout: Duration) -> Instant {

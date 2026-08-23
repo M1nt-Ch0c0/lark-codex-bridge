@@ -497,13 +497,13 @@ async fn duplicate_and_stale_responses_fault_instead_of_completing_new_work() {
     // duplicate. The duplicate must still fault the epoch before any subsequent work completes.
     match duplicate.list_threads(&ThreadListParams::default()).await {
         Ok(result) => assert!(result.data.is_empty()),
-        Err(ExternalTransportError::Rpc) => {}
+        Err(ExternalTransportError::ConnectionLost) => {}
         Err(error) => panic!("unexpected first duplicate-pair result: {error:?}"),
     }
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(matches!(
         duplicate.list_threads(&ThreadListParams::default()).await,
-        Err(ExternalTransportError::Rpc)
+        Err(ExternalTransportError::ConnectionLost)
     ));
     assert_eq!(duplicate.shutdown().await, TransportExit::ProtocolViolation);
     duplicate_server.finish().await;
@@ -514,7 +514,7 @@ async fn duplicate_and_stale_responses_fault_instead_of_completing_new_work() {
         stale
             .list_threads_with_timeout(&ThreadListParams::default(), Duration::from_millis(20),)
             .await,
-        Err(ExternalTransportError::Rpc)
+        Err(ExternalTransportError::RequestTimeout)
     ));
     tokio::time::sleep(Duration::from_millis(250)).await;
     assert_eq!(stale.shutdown().await, TransportExit::ProtocolViolation);
@@ -629,7 +629,7 @@ async fn pending_overload_is_count_bounded_and_every_waiter_has_a_deadline() {
         for request in requests {
             assert!(matches!(
                 request.await.expect("request task does not panic"),
-                Err(ExternalTransportError::Rpc)
+                Err(ExternalTransportError::RequestTimeout)
             ));
         }
     })

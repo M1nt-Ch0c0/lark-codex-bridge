@@ -406,6 +406,9 @@ impl ThreadResumeParams {
 #[derive(Clone, Default, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadResumeOverrides {
+    /// Return metadata/live state only so bounded turn/item APIs can hydrate authoritative history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude_turns: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_policy: Option<ApprovalPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -747,6 +750,23 @@ pub struct ThreadItemEntry {
 pub struct ThreadStatusChangedNotification {
     pub thread_id: String,
     pub status: Value,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ThreadGoalClearedNotification {
+    pub thread_id: String,
+}
+
+/// Exact 0.149 operational status emitted to every initialized WebSocket. It carries no thread
+/// lifecycle data and is validated then ignored by external reconciliation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoteControlStatusChangedNotification {
+    pub environment_id: Option<String>,
+    pub installation_id: String,
+    pub server_name: String,
+    pub status: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
