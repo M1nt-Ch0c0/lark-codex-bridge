@@ -161,7 +161,9 @@ async fn one_hop_audio_quote_preserves_a_lazy_file_descriptor() {
             "om_parent",
             "oc_allowed",
             "audio",
-            Some(r#"{"file_key":"audio_quote_secret","duration":800}"#),
+            Some(
+                r#"{"file_key":"audio_quote_secret","duration":800,"text":"FETCHED RECOGNITION MUST NOT BYPASS ASR"}"#,
+            ),
             false,
         )
     }))
@@ -174,6 +176,7 @@ async fn one_hop_audio_quote_preserves_a_lazy_file_descriptor() {
         kind,
         resource,
         metadata,
+        transcript_failure,
         ..
     } = &quote.parts[0]
     else {
@@ -182,7 +185,12 @@ async fn one_hop_audio_quote_preserves_a_lazy_file_descriptor() {
     assert_eq!(*kind, MediaKind::Audio);
     assert_eq!(resource.key, "audio_quote_secret");
     assert_eq!(metadata.duration_ms, Some(800));
+    assert_eq!(
+        *transcript_failure,
+        Some(lark_codex_bridge::lark::normalize::TranscriptFailure::NotRetained)
+    );
     assert!(!format!("{quote:?}").contains("audio_quote_secret"));
+    assert!(!format!("{quote:?}").contains("FETCHED RECOGNITION"));
     assert_eq!(
         server
             .requests()

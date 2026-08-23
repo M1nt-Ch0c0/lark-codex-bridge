@@ -213,7 +213,10 @@ impl QuoteResolver for RecordingAudioQuoteResolver {
                         duration_ms: Some(800),
                         ..ContextMediaMetadata::default()
                     },
-                    transcript_failure: None,
+                    // Mirrors a fetched Lark parent carrying valid recognition:
+                    // the text is intentionally absent, while the live-only
+                    // marker must not block byte-backed quote ASR.
+                    transcript_failure: Some(TranscriptFailure::NotRetained),
                 }],
             }
         }

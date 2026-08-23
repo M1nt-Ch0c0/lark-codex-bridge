@@ -1205,6 +1205,7 @@ impl ContextRegistry {
                 .into_iter()
                 .enumerate()
                 .map(|(part_index, part)| {
+                    let part = prepare_live_quote_part(part);
                     materialize_part(
                         part_index,
                         part,
@@ -1486,6 +1487,26 @@ impl Default for ContextRegistry {
         Self::new(ContextRegistryConfig::default())
             .expect("default context registry limits are non-zero")
     }
+}
+
+fn prepare_live_quote_part(mut part: DraftPart) -> DraftPart {
+    let DraftPart::Media {
+        kind,
+        transcript_failure,
+        ..
+    } = &mut part
+    else {
+        return part;
+    };
+    if *kind == MediaKind::Audio && *transcript_failure == Some(TranscriptFailure::NotRetained) {
+        // A quote is resolved live, after authorization and only when the
+        // instruction triggers it. Its fetched recognition text is never
+        // retained or trusted as the transcript, so byte-backed sidecar ASR
+        // remains available. Durable inbound recovery still preserves the
+        // fail-closed `NotRetained` behavior in the ordinary part path.
+        *transcript_failure = None;
+    }
+    part
 }
 
 fn materialize_part(
