@@ -1410,7 +1410,7 @@ mod tests {
     use fs2::FileExt;
     use std::fs::{self, File, OpenOptions};
     use tempfile::tempdir;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::time::timeout;
     use uuid::Uuid;
@@ -1460,7 +1460,7 @@ mod tests {
         panic!("existing-root stale sweep must eventually finish one directory cycle");
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     async fn read_descendant_pid_handshake(process: &mut SupervisedProcess) -> u32 {
         let stdout = process.take_stdout().expect("handshake stdout");
         let mut stdout = BufReader::new(stdout);
@@ -1470,9 +1470,12 @@ mod tests {
             .expect("descendant startup handshake deadline")
             .expect("read descendant startup handshake");
         assert_ne!(read, 0, "descendant startup handshake must not reach EOF");
-        line.trim()
+        let pid = line
+            .trim()
             .parse::<u32>()
-            .expect("descendant pid handshake")
+            .expect("descendant pid handshake");
+        assert!(pid > 0, "descendant pid handshake must be positive");
+        pid
     }
 
     #[cfg(unix)]
@@ -2607,30 +2610,21 @@ mod tests {
     #[tokio::test]
     async fn windows_job_timeout_terminates_a_spawned_descendant() {
         let _process_lock = lock_asr_process_tests();
-        let dir = tempdir().expect("tempdir");
-        let marker = dir.path().join("job-child.pid");
-        let script = stub(
-            dir.path(),
-            "windows-job-tree",
-            "",
-            "@echo off\r\npowershell.exe -NoProfile -NonInteractive -Command \"$p=Start-Process ping.exe -ArgumentList '-t','127.0.0.1' -PassThru; Set-Content -LiteralPath $env:LCB_JOB_TEST_MARKER -Encoding ascii -Value $p.Id; Wait-Process -Id $p.Id\"\r\n",
-        );
-        let mut command = Command::new(script);
+        let mut command = Command::new("powershell.exe");
         command
-            .env("LCB_JOB_TEST_MARKER", &marker)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "try { $p = [System.Diagnostics.Process]::Start('ping.exe', '-t 127.0.0.1'); [Console]::Out.WriteLine($p.Id); [Console]::Out.Flush(); $p.WaitForExit() } catch { [Console]::Out.WriteLine('startup_failed'); [Console]::Out.Flush(); exit 12 }",
+            ])
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
         let mut process = SupervisedProcess::spawn(&mut command, AsrError::SidecarFailed)
             .expect("spawn Job Object tree");
-        timeout(Duration::from_secs(5), async {
-            while !marker.exists() {
-                sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("Windows descendant starts");
+        let pid = read_descendant_pid_handshake(&mut process).await;
         let turn = CancellationToken::new();
         let shutdown = CancellationToken::new();
         assert_eq!(
@@ -2645,18 +2639,12 @@ mod tests {
                 .await,
             Err(AsrError::SidecarFailed)
         );
-        let pid = fs::read_to_string(&marker)
-            .expect("pid")
-            .trim()
-            .parse::<i32>()
-            .expect("strict positive descendant pid");
-        assert!(pid > 0, "descendant pid must be positive");
         let output = std::process::Command::new("powershell.exe")
             .args([
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                "$targetPid = [int]0; if (-not [int]::TryParse($env:LCB_JOB_TEST_PID, [ref]$targetPid) -or $targetPid -le 0) { Write-Error 'invalid descendant pid'; exit 8 }; if (Get-Process -Id $targetPid -ErrorAction SilentlyContinue) { exit 9 } else { exit 0 }",
+                "$targetPid = [int]0; if (-not [int]::TryParse($env:LCB_JOB_TEST_PID, [ref]$targetPid) -or $targetPid -le 0) { exit 8 }; try { $child = [System.Diagnostics.Process]::GetProcessById($targetPid); if ($child.HasExited) { exit 0 } else { exit 9 } } catch [System.ArgumentException] { exit 0 } catch [System.InvalidOperationException] { exit 0 }",
             ])
             .env("LCB_JOB_TEST_PID", pid.to_string())
             .output()
