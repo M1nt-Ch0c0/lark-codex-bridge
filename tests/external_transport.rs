@@ -24,7 +24,7 @@ use lark_codex_bridge::{
     limits::{EXTERNAL_WS_CLOSE_TIMEOUT, EXTERNAL_WS_MESSAGE_BYTES, RPC_INFLIGHT_CAPACITY},
 };
 use serde_json::{Value, json};
-use tokio::{net::TcpListener, task::JoinHandle, time::timeout};
+use tokio::{net::TcpListener, sync::Barrier, task::JoinHandle, time::timeout};
 use tokio_tungstenite::{
     WebSocketStream, accept_hdr_async,
     tungstenite::{
@@ -493,11 +493,18 @@ async fn duplicate_and_stale_responses_fault_instead_of_completing_new_work() {
 
     let duplicate_server = FakeExternalServer::start(vec![Behavior::DuplicateResponse]).await;
     let mut duplicate = connect(&duplicate_server.endpoint, &token_path, 20).await;
+    // The first frame is a valid response and can win the race with the immediately following
+    // duplicate. The duplicate must still fault the epoch before any subsequent work completes.
+    match duplicate.list_threads(&ThreadListParams::default()).await {
+        Ok(result) => assert!(result.data.is_empty()),
+        Err(ExternalTransportError::Rpc) => {}
+        Err(error) => panic!("unexpected first duplicate-pair result: {error:?}"),
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(matches!(
         duplicate.list_threads(&ThreadListParams::default()).await,
         Err(ExternalTransportError::Rpc)
     ));
-    tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(duplicate.shutdown().await, TransportExit::ProtocolViolation);
     duplicate_server.finish().await;
 
@@ -591,15 +598,33 @@ async fn pending_overload_is_count_bounded_and_every_waiter_has_a_deadline() {
     write_token(&token_path);
     let connection = Arc::new(connect(&server.endpoint, &token_path, 40).await);
 
+    let request_count = RPC_INFLIGHT_CAPACITY.saturating_mul(3);
+    let start = Arc::new(Barrier::new(request_count.saturating_add(1)));
     let mut requests = Vec::new();
-    for _ in 0..RPC_INFLIGHT_CAPACITY.saturating_mul(3) {
+    for _ in 0..request_count {
         let connection = Arc::clone(&connection);
+        let start = Arc::clone(&start);
         requests.push(tokio::spawn(async move {
+            start.wait().await;
             connection
-                .list_threads_with_timeout(&ThreadListParams::default(), Duration::from_millis(100))
+                .list_threads_with_timeout(&ThreadListParams::default(), Duration::from_secs(1))
                 .await
         }));
     }
+    start.wait().await;
+    timeout(Duration::from_millis(500), async {
+        while server.runtime_request_count() < RPC_INFLIGHT_CAPACITY {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first bounded inflight window reaches the wire");
+    assert_eq!(
+        server.runtime_request_count(),
+        RPC_INFLIGHT_CAPACITY,
+        "wire-visible concurrent pending work must stop at the inflight cap"
+    );
+
     timeout(Duration::from_secs(2), async {
         for request in requests {
             assert!(matches!(
@@ -610,10 +635,6 @@ async fn pending_overload_is_count_bounded_and_every_waiter_has_a_deadline() {
     })
     .await
     .expect("overloaded callers all finish under their deadlines");
-    assert!(
-        server.runtime_request_count() <= RPC_INFLIGHT_CAPACITY,
-        "wire-visible pending work must not exceed the normal inflight cap"
-    );
 
     let mut connection = Arc::try_unwrap(connection).expect("request clones are dropped");
     assert!(matches!(
