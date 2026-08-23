@@ -879,7 +879,7 @@ untracked prose.
 
 1. **P2: promote the exact Codex protocol contract required by shared endpoint
    mode**
-   - Tracking issue: **required before #8 closure**.
+   - Tracking issue: [#27](https://github.com/M1nt-Ch0c0/lark-codex-bridge/issues/27).
    - Resolve the 0.149 compatibility blockers or select a later exact binary.
    - Add queue, unsubscribe, steering, status, and every approval shape used by
      external mode to versioned contracts.
@@ -887,7 +887,7 @@ untracked prose.
 
 2. **P2: add explicit Codex backend configuration, endpoint security, and an
    authenticated connection gate**
-   - Tracking issue: **required before #8 closure**.
+   - Tracking issue: [#28](https://github.com/M1nt-Ch0c0/lark-codex-bridge/issues/28).
    - Add the tagged modes, URL policy, exact-version field, secret sources,
      redacted debug/errors, TLS/auth handshake canary, and no-fallback tests.
    - Definition of done includes a gated real exact-binary smoke proving the
@@ -897,7 +897,7 @@ untracked prose.
 
 3. **P2: implement a bounded authenticated WebSocket app-server transport with
    no process ownership**
-   - Tracking issue: **required before #8 closure**.
+   - Tracking issue: [#29](https://github.com/M1nt-Ch0c0/lark-codex-bridge/issues/29).
    - Add text-frame RPC transport, TLS/auth handshake, close semantics, limits,
      priority queues, fake server, and the lifecycle non-ownership proof.
    - Definition of done includes a gated real exact-binary bridge smoke with two
@@ -908,7 +908,7 @@ untracked prose.
 
 4. **P2: persist external transport epochs and reconcile subscriptions after
    reconnect**
-   - Tracking issue: **required before #8 closure**.
+   - Tracking issue: [#30](https://github.com/M1nt-Ch0c0/lark-codex-bridge/issues/30).
    - Add epoch fencing, resume-before-read buffering, bounded pagination,
      terminal deduplication, unavailable state, and restart tests.
    - Definition of done includes a gated real exact-binary smoke that forces a
@@ -919,7 +919,7 @@ untracked prose.
 
 5. **P2: coordinate shared-server mutations and route approvals through one
    fail-closed handler**
-   - Tracking issue: **required before #8 closure**.
+   - Tracking issue: [#31](https://github.com/M1nt-Ch0c0/lark-codex-bridge/issues/31).
    - Add the durable intent state machine, per-thread write fence, exact target
      rules, queue policy, uncertainty handling, adversarial two-client tests,
      static approval-handler election, single-recipient UI, durable claim,
@@ -933,7 +933,7 @@ untracked prose.
      read-only support.
 
 6. **P3 RFC: determine the Codex app-server Unix-socket WebSocket contract**
-   - Tracking issue: **required before #8 closure**.
+   - Tracking issue: [#32](https://github.com/M1nt-Ch0c0/lark-codex-bridge/issues/32).
    - Produce a sanitized, committed, platform-specific, deadline-bounded raw
      handshake reproduction, peer/filesystem permission policy, and
      cross-platform support decision before any implementation issue is opened.
