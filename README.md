@@ -182,6 +182,8 @@ LARK_MARKDOWN_E2E_PARENT_MESSAGE_ID=om_… \
 LARK_MARKDOWN_E2E_DESKTOP_SCREENSHOT=/tmp/lark-markdown-desktop.png \
 LARK_MARKDOWN_E2E_MOBILE_SCREENSHOT=/tmp/lark-markdown-mobile.png \
 LARK_MARKDOWN_E2E_ATTESTATION=/tmp/lark-markdown-attestation.json \
+LARK_MARKDOWN_E2E_REVIEWER='独立审核人标识' \
+LARK_MARKDOWN_E2E_REVIEW_PUBLIC_KEY_HEX='预先约定的64位Ed25519公钥hex' \
   cargo test --test lark_markdown_smoke --locked -- --ignored --nocapture
 ```
 
@@ -193,7 +195,7 @@ canonical pixel hash、尺寸与最终 `evidence_sha256`，把这些值写入新
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "nonce": "测试打印的一次性nonce",
   "message_id": "om_测试打印的回复ID",
   "body_sha256": "测试打印的基础正文hash",
@@ -207,6 +209,11 @@ canonical pixel hash、尺寸与最终 `evidence_sha256`，把这些值写入新
     "verdict": "pass", "file_sha256": "移动文件hash",
     "pixel_sha256": "移动canonical pixel hash", "width": 800, "height": 1234
   },
+  "review": {
+    "reviewer": "与环境变量完全一致的独立审核人标识",
+    "public_key_sha256": "测试打印的审核公钥hash",
+    "signature_ed25519": "审核人生成的128位Ed25519签名hex"
+  },
   "evidence_sha256": "测试打印的全字段绑定hash",
   "table": "fenced"
 }
@@ -214,10 +221,17 @@ canonical pixel hash、尺寸与最终 `evidence_sha256`，把这些值写入新
 
 测试在发送前记录三个证据文件的旧 hash，只接受发送完成后变更且能真实解码、像素数有界的
 PNG/JPEG/WebP；桌面与移动截图按解码后的 canonical RGBA 像素比较，因而“相同像素重新编码”
-不会伪装成两份证据。严格 attestation 同时绑定本次可见 marker、nonce、message ID、body/最终
-正文 hash、两张文件及 pixel hash/尺寸；陈旧、无关、同像素或任一字段错配都会失败。显式运行
-ignored smoke 却没有 `LARK_MARKDOWN_E2E=1` 或任一配置会直接失败，不会以 skip 冒充证据。
-截图可能包含会话信息，因此只作为操作者保存的外部验收证据，不应提交仓库。
+不会伪装成两份证据。`evidence_sha256` 以无歧义长度前缀格式绑定本次 nonce、message ID、
+marker/body/最终正文 hash、两张文件及 pixel hash/尺寸、所有视觉 verdict、审核人和审核公钥。
+
+程序只验证文件、像素和字段绑定，**不会声称能从像素中识别 marker 或判断排版**。这两个视觉
+结论必须由独立审核人检查桌面端和移动端截图后签署。审核公钥应在运行前通过独立渠道预先约定，
+对应私钥不得提供给 smoke 进程或截图操作者；审核人用 Ed25519 签署 UTF-8 字节串
+`lark-markdown-independent-review-signature-v3\n<evidence_sha256>\n`。因此任意两张不同图片加
+自填 verdict/attestation、错误审核密钥、陈旧、同像素或字段错配均不能通过；有效签名表示外部
+审核人对绑定图片作了人工确认，而不是程序完成了 OCR。显式运行 ignored smoke 却没有
+`LARK_MARKDOWN_E2E=1` 或任一配置会直接失败，不会以 skip 冒充证据。截图可能包含会话信息，
+因此只作为操作者保存的外部验收证据，不应提交仓库。
 
 仓库只跟踪稳定的产品说明；缺陷和遗留项通过 GitHub Issue 与对应 PR 跟踪。实施计划、
 实时进度、Agent 接管记录和临时测试证据属于本地开发材料，不发布到 Git。

@@ -155,7 +155,7 @@ fn nested_quote_and_list_containers_keep_fences_and_tables_structural() {
     let source = concat!(
         "> - ```rust\n",
         ">   let answer = 42;\n",
-        "> - ```\n",
+        ">   ```\n",
         "> - | name | state |\n",
         ">   | --- | --- |\n",
         ">   | bridge | ready |\n",
@@ -182,6 +182,82 @@ fn nested_quote_and_list_containers_keep_fences_and_tables_structural() {
 }
 
 #[test]
+fn fenced_code_keeps_literal_container_markers_and_false_closers() {
+    let top_level = concat!(
+        "```text\n",
+        "> literal quote\n",
+        "- literal dash\n",
+        "* literal star\n",
+        "+ literal plus\n",
+        "1. literal ordered\n",
+        "- ```\n",
+        "after false closer\n",
+        "```\n",
+    );
+    let expected_top_level = top_level.trim_end();
+
+    let nested = concat!(
+        "> - ```text\n",
+        ">   > literal nested quote\n",
+        ">   - literal nested dash\n",
+        ">   * literal nested star\n",
+        ">   + literal nested plus\n",
+        ">   1. literal nested ordered\n",
+        ">   - ```\n",
+        ">   after nested false closer\n",
+        ">   ```\n",
+    );
+    let expected_nested = concat!(
+        "> ```text\n",
+        "> > literal nested quote\n",
+        "> - literal nested dash\n",
+        "> * literal nested star\n",
+        "> + literal nested plus\n",
+        "> 1. literal nested ordered\n",
+        "> - ```\n",
+        "> after nested false closer\n",
+        "> ```",
+    );
+
+    let mismatched_closers = concat!(
+        "> - ```text\n",
+        "```\n",
+        "> ```\n",
+        ">   still code\n",
+        ">   ```\n",
+    );
+    let expected_mismatched = concat!(
+        "> ~~~text\n",
+        "> ```\n",
+        "> ```\n",
+        "> still code\n",
+        "> ~~~",
+    );
+
+    for rendered in [
+        render_lark_markdown(top_level),
+        stabilize_streaming_markdown(top_level),
+    ] {
+        assert_eq!(rendered, expected_top_level);
+        assert!(rendered.contains("- ```\nafter false closer\n```"));
+    }
+    for rendered in [
+        render_lark_markdown(nested),
+        stabilize_streaming_markdown(nested),
+    ] {
+        assert_eq!(rendered, expected_nested);
+        assert!(rendered.contains("> - ```\n> after nested false closer\n> ```"));
+    }
+    for rendered in [
+        render_lark_markdown(mismatched_closers),
+        stabilize_streaming_markdown(mismatched_closers),
+    ] {
+        assert_eq!(rendered, expected_mismatched);
+        assert!(rendered.contains("> ```\n> ```\n> still code"));
+    }
+}
+
+#[test]
 fn encoded_tags_and_format_controls_are_inert_outside_code() {
     let source = concat!(
         "&lt;at id=\"ou_entity\"&gt;entity name&lt;/at&gt; ",
@@ -204,6 +280,43 @@ fn encoded_tags_and_format_controls_are_inert_outside_code() {
     assert!(!rendered.contains('\u{202e}'));
     assert!(!rendered.contains('\u{200f}'));
     assert!(!rendered.contains('\u{200b}'));
+}
+
+#[test]
+fn entity_reconstruction_is_fully_reparsed_for_both_carriers() {
+    let source = concat!(
+        "&#91;script&#93;&#40;javascript&#58;alert&#40;1&#41;&#41;\n",
+        "&#91;data&#93;&#40;data&#58;text/plain,hello&#41;\n",
+        "&#96;&#96;&#96;rust&NewLine;let answer = 42;\n",
+    );
+    let expected = concat!(
+        "script (unsafe link target)\n",
+        "data (unsafe link target)\n",
+        "```rust\n",
+        "let answer = 42;\n",
+        "```",
+    );
+    for rendered in [
+        render_lark_markdown(source),
+        stabilize_streaming_markdown(source),
+    ] {
+        assert_eq!(rendered, expected);
+        assert!(!rendered.contains("](javascript:"));
+        assert!(!rendered.contains("](data:"));
+        assert!(fences_are_balanced(&rendered));
+    }
+
+    // Removing an encoded HTML wrapper can expose raw fence bytes. The
+    // second structural pass must recognize and close that fence rather than
+    // returning a post/Card2 payload with a dangling delimiter.
+    let exposed = "&lt;b&gt;```text&NewLine;payload";
+    for rendered in [
+        render_lark_markdown(exposed),
+        stabilize_streaming_markdown(exposed),
+    ] {
+        assert_eq!(rendered, "```text\npayload\n```");
+        assert!(fences_are_balanced(&rendered));
+    }
 }
 
 #[test]

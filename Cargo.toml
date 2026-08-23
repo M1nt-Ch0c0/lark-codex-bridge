@@ -39,6 +39,7 @@ uuid = { version = "1.24.0", features = ["v4", "serde"] }
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
+ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["signature"] }
 image = { version = "=0.25.6", default-features = false, features = ["jpeg", "png", "webp"] }
 predicates = "3.1.4"
 tempfile = "3.27.0"

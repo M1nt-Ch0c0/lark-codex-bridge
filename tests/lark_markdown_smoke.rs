@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow, ensure};
+use ed25519_dalek::{Signature, VerifyingKey};
 use image::{GenericImageView, ImageFormat};
 use lark_codex_bridge::lark::api::LarkApi;
 use lark_codex_bridge::lark::config::{LarkEndpoints, TenantBrand};
@@ -55,6 +56,14 @@ async fn run_smoke() -> Result<()> {
     let desktop = PathBuf::from(required_env("LARK_MARKDOWN_E2E_DESKTOP_SCREENSHOT")?);
     let mobile = PathBuf::from(required_env("LARK_MARKDOWN_E2E_MOBILE_SCREENSHOT")?);
     let attestation = PathBuf::from(required_env("LARK_MARKDOWN_E2E_ATTESTATION")?);
+    let reviewer = required_env("LARK_MARKDOWN_E2E_REVIEWER")?;
+    ensure!(
+        reviewer.len() <= 200 && reviewer.chars().all(|character| !character.is_control()),
+        "LARK_MARKDOWN_E2E_REVIEWER must be at most 200 bytes without control characters"
+    );
+    let review_public_key =
+        parse_review_public_key(&required_env("LARK_MARKDOWN_E2E_REVIEW_PUBLIC_KEY_HEX")?)?;
+    let review_public_key_sha256 = sha256(review_public_key.as_bytes());
 
     let before = EvidenceBefore {
         desktop: snapshot(&desktop, MAX_SCREENSHOT_BYTES)?,
@@ -76,8 +85,8 @@ async fn run_smoke() -> Result<()> {
     let send_completed_at = SystemTime::now();
 
     eprintln!(
-        "sent Markdown acceptance reply {}; visible marker nonce {}; body sha256 {}; payload sha256 {}; capture distinct desktop/mobile screenshots with the complete visible marker and write the typed attestation",
-        sent.message_id, nonce, body_sha256, markdown_sha256
+        "sent Markdown acceptance reply {}; visible marker nonce {}; body sha256 {}; payload sha256 {}; independent reviewer {}; review public-key sha256 {}; capture distinct desktop/mobile screenshots and obtain the reviewer's Ed25519-signed attestation",
+        sent.message_id, nonce, body_sha256, markdown_sha256, reviewer, review_public_key_sha256,
     );
     let timeout = evidence_timeout();
     let deadline = Instant::now() + timeout;
@@ -87,6 +96,9 @@ async fn run_smoke() -> Result<()> {
         body_sha256: &body_sha256,
         markdown_sha256: &markdown_sha256,
         marker_sha256: &marker_sha256,
+        reviewer: &reviewer,
+        review_public_key: &review_public_key,
+        review_public_key_sha256: &review_public_key_sha256,
     };
     let mut announced_evidence = None;
     loop {
@@ -175,6 +187,9 @@ struct ExpectedAttestation<'a> {
     body_sha256: &'a str,
     markdown_sha256: &'a str,
     marker_sha256: &'a str,
+    reviewer: &'a str,
+    review_public_key: &'a VerifyingKey,
+    review_public_key_sha256: &'a str,
 }
 
 #[derive(Deserialize)]
@@ -188,8 +203,17 @@ struct SmokeAttestation {
     marker: MarkerAttestation,
     desktop: ScreenshotAttestation,
     mobile: ScreenshotAttestation,
+    review: ReviewAttestation,
     evidence_sha256: String,
     table: TableVerdict,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewAttestation {
+    reviewer: String,
+    public_key_sha256: String,
+    signature_ed25519: String,
 }
 
 #[derive(Deserialize)]
@@ -249,7 +273,13 @@ fn evidence_ready(
         return Ok(false);
     };
     let binding = evidence_binding(&expected, &desktop, &mobile);
-    Ok(attestation.version == 2
+    let signature_valid = review_signature_is_valid(
+        &attestation.review.signature_ed25519,
+        &expected,
+        &desktop,
+        &mobile,
+    );
+    Ok(attestation.version == 3
         && attestation.nonce == expected.nonce
         && attestation.message_id == expected.message_id
         && attestation.body_sha256 == expected.body_sha256
@@ -266,8 +296,11 @@ fn evidence_ready(
         && attestation.mobile.pixel_sha256 == mobile.pixel_sha256
         && attestation.mobile.width == mobile.width
         && attestation.mobile.height == mobile.height
+        && attestation.review.reviewer == expected.reviewer
+        && attestation.review.public_key_sha256 == expected.review_public_key_sha256
         && attestation.evidence_sha256 == binding
-        && attestation.table == TableVerdict::Fenced)
+        && attestation.table == TableVerdict::Fenced
+        && signature_valid)
 }
 
 fn fresh_distinct_images(
@@ -351,31 +384,97 @@ fn evidence_binding(
     desktop: &ImageEvidence,
     mobile: &ImageEvidence,
 ) -> String {
-    let canonical = format!(
-        concat!(
-            "lark-markdown-evidence-v2\n",
-            "nonce:{}\nmessage_id:{}\nbody_sha256:{}\nmarkdown_sha256:{}\n",
-            "marker_sha256:{}\n",
-            "desktop_file_sha256:{}\ndesktop_pixel_sha256:{}\n",
-            "desktop_width:{}\ndesktop_height:{}\n",
-            "mobile_file_sha256:{}\nmobile_pixel_sha256:{}\n",
-            "mobile_width:{}\nmobile_height:{}\n",
-        ),
-        expected.nonce,
-        expected.message_id,
-        expected.body_sha256,
-        expected.markdown_sha256,
-        expected.marker_sha256,
-        desktop.file_sha256,
-        desktop.pixel_sha256,
-        desktop.width,
-        desktop.height,
-        mobile.file_sha256,
-        mobile.pixel_sha256,
-        mobile.width,
-        mobile.height,
+    let mut canonical = String::from("lark-markdown-evidence-v3\n");
+    binding_field(&mut canonical, "nonce", expected.nonce);
+    binding_field(&mut canonical, "message_id", expected.message_id);
+    binding_field(&mut canonical, "body_sha256", expected.body_sha256);
+    binding_field(&mut canonical, "markdown_sha256", expected.markdown_sha256);
+    binding_field(&mut canonical, "marker_verdict", "visible_in_both");
+    binding_field(&mut canonical, "marker_sha256", expected.marker_sha256);
+    binding_field(&mut canonical, "desktop_verdict", "pass");
+    binding_field(&mut canonical, "desktop_file_sha256", &desktop.file_sha256);
+    binding_field(
+        &mut canonical,
+        "desktop_pixel_sha256",
+        &desktop.pixel_sha256,
+    );
+    binding_field(&mut canonical, "desktop_width", &desktop.width.to_string());
+    binding_field(
+        &mut canonical,
+        "desktop_height",
+        &desktop.height.to_string(),
+    );
+    binding_field(&mut canonical, "mobile_verdict", "pass");
+    binding_field(&mut canonical, "mobile_file_sha256", &mobile.file_sha256);
+    binding_field(&mut canonical, "mobile_pixel_sha256", &mobile.pixel_sha256);
+    binding_field(&mut canonical, "mobile_width", &mobile.width.to_string());
+    binding_field(&mut canonical, "mobile_height", &mobile.height.to_string());
+    binding_field(&mut canonical, "table_verdict", "fenced");
+    binding_field(&mut canonical, "reviewer", expected.reviewer);
+    binding_field(
+        &mut canonical,
+        "review_public_key_sha256",
+        expected.review_public_key_sha256,
     );
     sha256(canonical.as_bytes())
+}
+
+fn binding_field(canonical: &mut String, name: &str, value: &str) {
+    write!(canonical, "{name}:{}:", value.len()).expect("writing to a string cannot fail");
+    canonical.push_str(value);
+    canonical.push('\n');
+}
+
+fn review_signature_message(binding: &str) -> String {
+    format!("lark-markdown-independent-review-signature-v3\n{binding}\n")
+}
+
+fn review_signature_is_valid(
+    encoded_signature: &str,
+    expected: &ExpectedAttestation<'_>,
+    desktop: &ImageEvidence,
+    mobile: &ImageEvidence,
+) -> bool {
+    let Some(signature_bytes) = decode_fixed_hex::<64>(encoded_signature) else {
+        return false;
+    };
+    let signature = Signature::from_bytes(&signature_bytes);
+    let binding = evidence_binding(expected, desktop, mobile);
+    expected
+        .review_public_key
+        .verify_strict(review_signature_message(&binding).as_bytes(), &signature)
+        .is_ok()
+}
+
+fn parse_review_public_key(encoded: &str) -> Result<VerifyingKey> {
+    let bytes = decode_fixed_hex::<32>(encoded).ok_or_else(|| {
+        anyhow!("LARK_MARKDOWN_E2E_REVIEW_PUBLIC_KEY_HEX must be exactly 64 hexadecimal digits")
+    })?;
+    VerifyingKey::from_bytes(&bytes)
+        .map_err(|_| anyhow!("LARK_MARKDOWN_E2E_REVIEW_PUBLIC_KEY_HEX is not a valid Ed25519 key"))
+}
+
+fn decode_fixed_hex<const N: usize>(encoded: &str) -> Option<[u8; N]> {
+    let bytes = encoded.as_bytes();
+    if bytes.len() != N.saturating_mul(2) {
+        return None;
+    }
+    let mut decoded = [0_u8; N];
+    for (index, output) in decoded.iter_mut().enumerate() {
+        let high = hex_nibble(bytes[index * 2])?;
+        let low = hex_nibble(bytes[index * 2 + 1])?;
+        *output = (high << 4) | low;
+    }
+    Some(decoded)
+}
+
+const fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn changed_file(
@@ -460,6 +559,7 @@ fn required_env(name: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
     use tempfile::tempdir;
 
     #[test]
@@ -481,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn evidence_rejects_same_pixels_reencoding_wrong_marker_and_stale_files() {
+    fn evidence_requires_independent_signature_and_rejects_mismatches() {
         let temp = tempdir().expect("tempdir");
         let desktop = temp.path().join("desktop.png");
         let mobile = temp.path().join("mobile.png");
@@ -494,27 +594,83 @@ mod tests {
         image::DynamicImage::ImageRgb8(mobile_image)
             .save(&mobile)
             .expect("mobile PNG");
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let review_public_key = signing_key.verifying_key();
+        let review_public_key_sha256 = sha256(review_public_key.as_bytes());
         let expected = ExpectedAttestation {
             nonce: "nonce",
             message_id: "om_message",
             body_sha256: "body-hash",
             markdown_sha256: "markdown-hash",
             marker_sha256: "marker-hash",
+            reviewer: "independent-reviewer",
+            review_public_key: &review_public_key,
+            review_public_key_sha256: &review_public_key_sha256,
         };
         let desktop_evidence = image_evidence(&desktop);
         let mobile_evidence = image_evidence(&mobile);
+
+        // These are just two unrelated generated images. Every self-filled
+        // semantic field is correct, but without the independently held
+        // review key the evidence must remain rejected.
         write_attestation(
             &attestation,
             expected,
             expected.marker_sha256,
             &desktop_evidence,
             &mobile_evidence,
+            None,
         );
         let before = EvidenceBefore {
             desktop: None,
             mobile: None,
             attestation: None,
         };
+        assert!(
+            !evidence_ready(
+                EvidencePaths {
+                    desktop: &desktop,
+                    mobile: &mobile,
+                    attestation: &attestation,
+                },
+                &before,
+                expected,
+                SystemTime::UNIX_EPOCH,
+            )
+            .expect("unsigned self-attestation")
+        );
+
+        let unrelated_signing_key = SigningKey::from_bytes(&[8; 32]);
+        write_attestation(
+            &attestation,
+            expected,
+            expected.marker_sha256,
+            &desktop_evidence,
+            &mobile_evidence,
+            Some(&unrelated_signing_key),
+        );
+        assert!(
+            !evidence_ready(
+                EvidencePaths {
+                    desktop: &desktop,
+                    mobile: &mobile,
+                    attestation: &attestation,
+                },
+                &before,
+                expected,
+                SystemTime::UNIX_EPOCH,
+            )
+            .expect("signature by an untrusted key")
+        );
+
+        write_attestation(
+            &attestation,
+            expected,
+            expected.marker_sha256,
+            &desktop_evidence,
+            &mobile_evidence,
+            Some(&signing_key),
+        );
         assert!(
             evidence_ready(
                 EvidencePaths {
@@ -526,7 +682,7 @@ mod tests {
                 expected,
                 SystemTime::UNIX_EPOCH,
             )
-            .expect("valid evidence")
+            .expect("independently signed evidence")
         );
 
         assert!(
@@ -549,6 +705,7 @@ mod tests {
             "unrelated-marker-hash",
             &desktop_evidence,
             &mobile_evidence,
+            Some(&signing_key),
         );
         assert!(
             !evidence_ready(
@@ -580,6 +737,7 @@ mod tests {
             expected.marker_sha256,
             &desktop_evidence,
             &reencoded,
+            Some(&signing_key),
         );
         assert!(
             !evidence_ready(
@@ -627,12 +785,22 @@ mod tests {
         marker_sha256: &str,
         desktop: &ImageEvidence,
         mobile: &ImageEvidence,
+        signing_key: Option<&SigningKey>,
     ) {
         let binding = evidence_binding(&expected, desktop, mobile);
+        let signature = signing_key.map_or_else(
+            || "00".repeat(64),
+            |key| {
+                hex_digest(
+                    key.sign(review_signature_message(&binding).as_bytes())
+                        .to_bytes(),
+                )
+            },
+        );
         std::fs::write(
             path,
             serde_json::to_vec(&serde_json::json!({
-                "version": 2,
+                "version": 3,
                 "nonce": expected.nonce,
                 "message_id": expected.message_id,
                 "body_sha256": expected.body_sha256,
@@ -654,6 +822,11 @@ mod tests {
                     "pixel_sha256": mobile.pixel_sha256,
                     "width": mobile.width,
                     "height": mobile.height,
+                },
+                "review": {
+                    "reviewer": expected.reviewer,
+                    "public_key_sha256": expected.review_public_key_sha256,
+                    "signature_ed25519": signature,
                 },
                 "evidence_sha256": binding,
                 "table": "fenced",

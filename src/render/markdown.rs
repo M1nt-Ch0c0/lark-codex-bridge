@@ -32,38 +32,48 @@ enum MarkdownCarrier {
 
 fn project_markdown(input: &str, carrier: MarkdownCarrier) -> String {
     let sanitized = sanitize_text(input);
-    let lines: Vec<&str> = sanitized.lines().collect();
+    let projected = project_markdown_once(&sanitized, carrier);
+
+    // Inline sanitization can remove an HTML wrapper immediately before raw
+    // Markdown delimiters. Re-run the complete block parser over the emitted
+    // representation so anything exposed by that removal is validated and,
+    // in particular, no newly exposed fence can remain unclosed. The first
+    // pass has already consumed every decodable entity outside code, so this
+    // converges in one additional pass while code spans/blocks remain data.
+    project_markdown_once(&projected, carrier)
+}
+
+fn project_markdown_once(input: &str, carrier: MarkdownCarrier) -> String {
+    let lines: Vec<&str> = input.lines().collect();
     let mut rendered = Vec::new();
     let mut index = 0;
 
     while index < lines.len() {
         let line = parse_container_line(lines[index]);
-        if let Some(source_fence) = parse_opening_fence(line.body) {
+        if let Some((source_fence, context)) = parse_fence_opening(lines[index]) {
             let mut end = index + 1;
             while end < lines.len() {
-                let candidate = parse_container_line(lines[end]);
-                if candidate.quoted == line.quoted
-                    && is_closing_fence(candidate.body, &source_fence)
-                {
+                let (candidate, complete_context) = context.content_body(lines[end]);
+                if complete_context && is_closing_fence(candidate, &source_fence) {
                     break;
                 }
                 end += 1;
             }
             let content = lines[index + 1..end]
                 .iter()
-                .map(|content| parse_container_line(content).body.to_owned())
+                .map(|content| context.content_body(content).0.to_owned())
                 .collect::<Vec<_>>();
             let (canonical, content) = canonical_fence(content, source_fence.language);
             push_line(
                 &mut rendered,
-                quote_line(line.quoted, canonical.opening_line()),
+                quote_line(context.quoted, canonical.opening_line()),
             );
             for content_line in content {
-                push_line(&mut rendered, quote_line(line.quoted, content_line));
+                push_line(&mut rendered, quote_line(context.quoted, content_line));
             }
             push_line(
                 &mut rendered,
-                quote_line(line.quoted, canonical.closing_line()),
+                quote_line(context.quoted, canonical.closing_line()),
             );
             index = if end < lines.len() { end + 1 } else { end };
             continue;
@@ -314,11 +324,14 @@ fn atomic_fence_boundary(text: &str, boundary: usize) -> usize {
     if boundary == line_start || boundary == line_end {
         return boundary;
     }
-    let line = parse_container_line(&text[line_start..line_end]);
+    let line = &text[line_start..line_end];
     let active = open_fence_at_end(&text[..line_start]);
     let delimiter_is_atomic = active.as_ref().map_or_else(
-        || parse_opening_fence(line.body).is_some(),
-        |open| line.quoted == open.quoted && is_closing_fence(line.body, &open.fence),
+        || parse_fence_opening(line).is_some(),
+        |open| {
+            let (body, complete_context) = open.context.content_body(line);
+            complete_context && is_closing_fence(body, &open.fence)
+        },
     );
     if delimiter_is_atomic {
         line_start
@@ -348,17 +361,110 @@ struct Fence {
 
 struct OpenFence {
     fence: Fence,
-    quoted: bool,
+    context: FenceContext,
 }
 
 impl OpenFence {
     fn opening_line(&self) -> String {
-        quote_line(self.quoted, self.fence.opening_line())
+        quote_line(self.context.quoted, self.fence.opening_line())
     }
 
     fn closing_line(&self) -> String {
-        quote_line(self.quoted, self.fence.closing_line())
+        quote_line(self.context.quoted, self.fence.closing_line())
     }
+}
+
+#[derive(Clone, Debug)]
+struct FenceContext {
+    containers: Vec<FenceContainer>,
+    quoted: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FenceContainer {
+    Quote,
+    Indent(usize),
+}
+
+impl FenceContext {
+    /// Removes only the containers captured by the opening fence and reports
+    /// whether every captured container matched. In particular, a body line
+    /// beginning with `>`, `-`, `*`, `+`, or an ordered-list marker is never
+    /// reparsed as a new generic container.
+    fn content_body<'a>(&self, line: &'a str) -> (&'a str, bool) {
+        let mut body = line;
+        for container in &self.containers {
+            match *container {
+                FenceContainer::Quote => {
+                    let candidate = body.trim_start_matches([' ', '\t']);
+                    let Some(rest) = candidate.strip_prefix('>') else {
+                        return (body, false);
+                    };
+                    body = rest
+                        .strip_prefix(' ')
+                        .or_else(|| rest.strip_prefix('\t'))
+                        .unwrap_or(rest);
+                }
+                FenceContainer::Indent(width) => {
+                    let Some(rest) = strip_container_indent(body, width) else {
+                        return (body, false);
+                    };
+                    body = rest;
+                }
+            }
+        }
+        (body, true)
+    }
+}
+
+fn strip_container_indent(line: &str, required: usize) -> Option<&str> {
+    let mut columns = 0_usize;
+    let mut bytes = 0_usize;
+    for character in line.chars() {
+        match character {
+            ' ' => columns = columns.saturating_add(1),
+            '\t' => columns = columns.saturating_add(4 - columns % 4),
+            _ => break,
+        }
+        bytes = bytes.saturating_add(character.len_utf8());
+        if columns >= required {
+            return line.get(bytes..);
+        }
+    }
+    None
+}
+
+fn parse_fence_opening(line: &str) -> Option<(Fence, FenceContext)> {
+    let mut body = line.trim_start();
+    let mut containers = Vec::new();
+    let mut quoted = false;
+    loop {
+        if let Some(rest) = body.strip_prefix('>') {
+            quoted = true;
+            containers.push(FenceContainer::Quote);
+            body = rest.trim_start();
+            continue;
+        }
+        if let Some((width, rest)) = ["- ", "* ", "+ "]
+            .iter()
+            .find_map(|prefix| body.strip_prefix(prefix).map(|rest| (prefix.len(), rest)))
+        {
+            containers.push(FenceContainer::Indent(width));
+            body = rest.trim_start();
+            continue;
+        }
+        let digits = body.chars().take_while(char::is_ascii_digit).count();
+        if digits > 0 {
+            let rest = &body[digits..];
+            if let Some(rest) = rest.strip_prefix(". ").or_else(|| rest.strip_prefix(") ")) {
+                containers.push(FenceContainer::Indent(digits.saturating_add(2)));
+                body = rest.trim_start();
+                continue;
+            }
+        }
+        break;
+    }
+    parse_opening_fence(body).map(|fence| (fence, FenceContext { containers, quoted }))
 }
 
 #[derive(Clone, Copy)]
@@ -540,16 +646,13 @@ fn is_closing_fence(line: &str, open: &Fence) -> bool {
 fn open_fence_at_end(text: &str) -> Option<OpenFence> {
     let mut open: Option<OpenFence> = None;
     for line in text.lines() {
-        let parsed = parse_container_line(line);
         if let Some(current) = open.as_ref() {
-            if parsed.quoted == current.quoted && is_closing_fence(parsed.body, &current.fence) {
+            let (body, complete_context) = current.context.content_body(line);
+            if complete_context && is_closing_fence(body, &current.fence) {
                 open = None;
             }
-        } else {
-            open = parse_opening_fence(parsed.body).map(|fence| OpenFence {
-                fence,
-                quoted: parsed.quoted,
-            });
+        } else if let Some((fence, context)) = parse_fence_opening(line) {
+            open = Some(OpenFence { fence, context });
         }
     }
     open
