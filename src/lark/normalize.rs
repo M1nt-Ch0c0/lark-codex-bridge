@@ -176,6 +176,18 @@ pub enum PartStatus {
     Unavailable,
 }
 
+/// Non-content classification retained when an inbound audio transcript was
+/// present but could not be accepted. This prevents a malformed client value
+/// from silently falling through to the local sidecar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptFailure {
+    /// The value was empty, non-textual, or contained forbidden controls.
+    Invalid,
+    /// The value exceeded the bridge's structural inbound transcript bound.
+    TooLarge,
+}
+
 /// Safe metadata accompanying a media descriptor. String values are bounded
 /// and validated before retention and are redacted from `Debug`.
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -193,6 +205,11 @@ pub struct MediaMetadata {
     /// Client-supplied speech recognition text, when the inbound payload
     /// already includes a bounded transcript.
     pub transcript: Option<String>,
+    /// Why a present inbound transcript was rejected, without retaining its
+    /// content. Absent means either no transcript was supplied or `transcript`
+    /// contains the accepted value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_failure: Option<TranscriptFailure>,
 }
 
 impl fmt::Debug for MediaMetadata {
@@ -213,6 +230,7 @@ impl fmt::Debug for MediaMetadata {
                 "transcript_len",
                 &self.transcript.as_deref().map_or(0, str::len),
             )
+            .field("transcript_failure", &self.transcript_failure)
             .finish_non_exhaustive()
     }
 }
@@ -890,21 +908,25 @@ fn audio_content(value: &Value) -> ExtractedContent {
         mentions_all: false,
         resources: Vec::new(),
         parts: vec![MessagePart::Audio(media_part_with_transcript(
-            key, value, transcript,
+            key,
+            value,
+            transcript.text,
+            transcript.failure,
         ))],
     }
 }
 
 fn media_part(key: Option<String>, thumbnail_key: Option<String>, value: &Value) -> MediaPart {
-    media_part_inner(key, thumbnail_key, value, None)
+    media_part_inner(key, thumbnail_key, value, None, None)
 }
 
 fn media_part_with_transcript(
     key: Option<String>,
     value: &Value,
     transcript: Option<String>,
+    transcript_failure: Option<TranscriptFailure>,
 ) -> MediaPart {
-    media_part_inner(key, None, value, transcript)
+    media_part_inner(key, None, value, transcript, transcript_failure)
 }
 
 fn media_part_inner(
@@ -912,6 +934,7 @@ fn media_part_inner(
     thumbnail_key: Option<String>,
     value: &Value,
     transcript: Option<String>,
+    transcript_failure: Option<TranscriptFailure>,
 ) -> MediaPart {
     let status = if key.is_some() {
         PartStatus::Available
@@ -931,6 +954,7 @@ fn media_part_inner(
             size_bytes: content_u64(value, &["file_size", "size"]),
             duration_ms: content_u64(value, &["duration_ms", "duration"]),
             transcript,
+            transcript_failure,
         },
         status,
     }
@@ -939,32 +963,83 @@ fn media_part_inner(
 /// Trims and bounds recognition text from inbound payloads or sidecar stdout.
 #[must_use]
 pub fn normalize_transcript(text: &str, max_bytes: usize) -> Option<String> {
+    match classify_transcript(text, max_bytes) {
+        TranscriptCandidate::Available(text) => Some(text),
+        TranscriptCandidate::Absent
+        | TranscriptCandidate::Invalid
+        | TranscriptCandidate::TooLarge => None,
+    }
+}
+
+#[derive(Default)]
+struct TranscriptMetadata {
+    text: Option<String>,
+    failure: Option<TranscriptFailure>,
+}
+
+enum TranscriptCandidate {
+    Absent,
+    Available(String),
+    Invalid,
+    TooLarge,
+}
+
+fn classify_transcript(text: &str, max_bytes: usize) -> TranscriptCandidate {
     let trimmed = text.trim();
-    if trimmed.is_empty() || trimmed.len() > max_bytes {
-        return None;
+    if trimmed.is_empty() {
+        return TranscriptCandidate::Invalid;
+    }
+    if trimmed.len() > max_bytes {
+        return TranscriptCandidate::TooLarge;
     }
     if trimmed
         .chars()
         .any(|ch| ch.is_control() && ch != '\n' && ch != '\t')
     {
-        return None;
+        return TranscriptCandidate::Invalid;
     }
-    Some(trimmed.to_owned())
+    TranscriptCandidate::Available(trimmed.to_owned())
 }
 
-fn content_transcript(value: &Value) -> Option<String> {
-    const KEYS: &[&str] = &["text", "recognition", "transcript", "recognized_text"];
+fn classify_transcript_value(value: &Value) -> TranscriptCandidate {
+    value.as_str().map_or(TranscriptCandidate::Invalid, |text| {
+        classify_transcript(text, ASR_TRANSCRIPT_MAX_BYTES)
+    })
+}
+
+fn transcript_metadata(candidate: TranscriptCandidate) -> TranscriptMetadata {
+    match candidate {
+        TranscriptCandidate::Absent => TranscriptMetadata::default(),
+        TranscriptCandidate::Available(text) => TranscriptMetadata {
+            text: Some(text),
+            failure: None,
+        },
+        TranscriptCandidate::Invalid => TranscriptMetadata {
+            text: None,
+            failure: Some(TranscriptFailure::Invalid),
+        },
+        TranscriptCandidate::TooLarge => TranscriptMetadata {
+            text: None,
+            failure: Some(TranscriptFailure::TooLarge),
+        },
+    }
+}
+
+fn content_transcript(value: &Value) -> TranscriptMetadata {
+    const KEYS: &[&str] = &["text", "transcript", "recognized_text"];
     for key in KEYS {
-        if let Some(text) = content_string(value, key)
-            .and_then(|text| normalize_transcript(&text, ASR_TRANSCRIPT_MAX_BYTES))
-        {
-            return Some(text);
+        if let Some(candidate) = value.get(*key) {
+            return transcript_metadata(classify_transcript_value(candidate));
         }
     }
-    value
-        .get("recognition")
-        .and_then(|recognition| content_string(recognition, "text"))
-        .and_then(|text| normalize_transcript(&text, ASR_TRANSCRIPT_MAX_BYTES))
+    let Some(recognition) = value.get("recognition") else {
+        return transcript_metadata(TranscriptCandidate::Absent);
+    };
+    if let Some(text) = recognition.get("text") {
+        transcript_metadata(classify_transcript_value(text))
+    } else {
+        transcript_metadata(classify_transcript_value(recognition))
+    }
 }
 
 fn content_string(value: &Value, key: &str) -> Option<String> {

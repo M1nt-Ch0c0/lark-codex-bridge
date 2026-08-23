@@ -21,7 +21,7 @@ use crate::lark::{
     api::{ChatMode, ResourceKind},
     normalize::{
         InboundEvent, MediaMetadata as InboundMediaMetadata, MediaPart, MessagePart, PartStatus,
-        ResourceDesc,
+        ResourceDesc, TranscriptFailure,
     },
 };
 
@@ -298,9 +298,6 @@ pub struct MediaMetadata {
     /// Duration for audio/video, if known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
-    /// Client-supplied recognition text, if the inbound payload included it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub transcript: Option<String>,
 }
 
 /// Typed part returned by context resolution. Resource keys never appear here.
@@ -348,7 +345,7 @@ pub enum TypedPart {
 }
 
 /// Input part accepted during registration, before opaque handles are minted.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum DraftPart {
     /// Plain normalized text.
     Text(String),
@@ -362,6 +359,11 @@ pub enum DraftPart {
         thumbnail: Option<ResourceDesc>,
         /// Non-authoritative display metadata.
         metadata: MediaMetadata,
+        /// Raw recognition text retained only until the capability grant is
+        /// materialized. It never enters [`TypedPart`] or [`ContextSnapshot`].
+        transcript: Option<String>,
+        /// Non-content rejection classification for a supplied transcript.
+        transcript_failure: Option<TranscriptFailure>,
     },
     /// Structured interactive card content.
     Card(Value),
@@ -379,6 +381,41 @@ pub enum DraftPart {
         /// Stable explanation.
         reason: String,
     },
+}
+
+impl fmt::Debug for DraftPart {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text(text) => formatter
+                .debug_struct("Text")
+                .field("chars", &text.chars().count())
+                .finish_non_exhaustive(),
+            Self::Media {
+                kind,
+                thumbnail,
+                metadata,
+                transcript,
+                transcript_failure,
+                ..
+            } => formatter
+                .debug_struct("Media")
+                .field("kind", kind)
+                .field("has_thumbnail", &thumbnail.is_some())
+                .field("metadata", metadata)
+                .field("transcript_len", &transcript.as_deref().map_or(0, str::len))
+                .field("transcript_failure", transcript_failure)
+                .finish_non_exhaustive(),
+            Self::Card(_) => formatter.write_str("Card([REDACTED])"),
+            Self::Forward { status, .. } => formatter
+                .debug_struct("Forward")
+                .field("status", status)
+                .finish_non_exhaustive(),
+            Self::Unsupported { message_type, .. } => formatter
+                .debug_struct("Unsupported")
+                .field("message_type_len", &message_type.len())
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 /// Availability of a typed part that does not carry a downloadable handle.
@@ -476,6 +513,8 @@ impl ContextDraft {
                 resource: resource.clone(),
                 thumbnail: None,
                 metadata: MediaMetadata::default(),
+                transcript: None,
+                transcript_failure: None,
             }));
         }
         if parts.is_empty() {
@@ -568,6 +607,8 @@ fn draft_media_part(kind: MediaKind, resource_kind: ResourceKind, media: &MediaP
             key: key.clone(),
         }),
         metadata: media_metadata(&media.metadata),
+        transcript: media.metadata.transcript.clone(),
+        transcript_failure: media.metadata.transcript_failure,
     }
 }
 
@@ -577,7 +618,6 @@ fn media_metadata(metadata: &InboundMediaMetadata) -> MediaMetadata {
         mime_type: metadata.mime_type.clone(),
         size_bytes: metadata.size_bytes,
         duration_ms: metadata.duration_ms,
-        transcript: metadata.transcript.clone(),
     }
 }
 
@@ -657,6 +697,8 @@ pub struct AuthorizedResource {
     pub resource: ResourceDesc,
     /// Inbound recognition text that can skip the sidecar.
     pub transcript: Option<String>,
+    /// Why a supplied transcript was rejected before content retention.
+    pub transcript_failure: Option<TranscriptFailure>,
     /// Declared duration, used to refuse over-long audio before download.
     pub duration_ms: Option<u64>,
     /// Cancellation tied to the exact context/turn capability. This is kept
@@ -684,6 +726,7 @@ impl fmt::Debug for AuthorizedResource {
                 "transcript_len",
                 &self.transcript.as_deref().map_or(0, str::len),
             )
+            .field("transcript_failure", &self.transcript_failure)
             .field("duration_ms", &self.duration_ms)
             .finish_non_exhaustive()
     }
@@ -709,6 +752,7 @@ struct ResourceGrant {
     kind: MediaKind,
     resource: ResourceDesc,
     transcript: Option<String>,
+    transcript_failure: Option<TranscriptFailure>,
     duration_ms: Option<u64>,
 }
 
@@ -1048,6 +1092,8 @@ fn materialize_part(
             resource,
             thumbnail,
             metadata,
+            transcript,
+            transcript_failure,
         } => {
             let handle = unique_media_handle(grants);
             grants.insert(
@@ -1055,7 +1101,8 @@ fn materialize_part(
                 ResourceGrant {
                     kind,
                     resource,
-                    transcript: metadata.transcript.clone(),
+                    transcript,
+                    transcript_failure,
                     duration_ms: metadata.duration_ms,
                 },
             );
@@ -1067,6 +1114,7 @@ fn materialize_part(
                         kind: MediaKind::Image,
                         resource,
                         transcript: None,
+                        transcript_failure: None,
                         duration_ms: None,
                     },
                 );
@@ -1198,6 +1246,7 @@ fn authorized_resource(
         local_turn_row_id: entry.pending_binding.local_turn_row_id,
         resource: grant.resource.clone(),
         transcript: grant.transcript.clone(),
+        transcript_failure: grant.transcript_failure,
         duration_ms: grant.duration_ms,
         cancellation: entry.cancellation.clone(),
     })

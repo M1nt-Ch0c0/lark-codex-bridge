@@ -9,9 +9,10 @@ use lark_codex_bridge::lark::normalize::{
     InboundEvent, MediaMetadata, MediaPart, MentionIdentity, MessagePart, PartStatus, ScopeKey,
 };
 use lark_codex_bridge::limits::{
-    OUTBOX_TERMINAL_MAX_ROWS, STORE_OUTBOX_CLAIM_MAX_BYTES, STORE_OUTBOX_MAX_QUEUED_BYTES,
-    STORE_OUTBOX_PAYLOAD_MAX_BYTES, STORE_RECOVERY_TURN_MAX_BYTES, STORE_RECOVERY_TURN_MAX_ROWS,
-    STORE_REQUEST_MAX_BYTES, STORE_WRITER_BYTE_BUDGET, STORE_WRITER_CAPACITY,
+    OUTBOX_TERMINAL_MAX_ROWS, STORE_ATTACHMENT_LEASE_MAX_ROWS, STORE_OUTBOX_CLAIM_MAX_BYTES,
+    STORE_OUTBOX_MAX_QUEUED_BYTES, STORE_OUTBOX_PAYLOAD_MAX_BYTES, STORE_RECOVERY_TURN_MAX_BYTES,
+    STORE_RECOVERY_TURN_MAX_ROWS, STORE_REQUEST_MAX_BYTES, STORE_WRITER_BYTE_BUDGET,
+    STORE_WRITER_CAPACITY,
 };
 use lark_codex_bridge::runtime::intake::DurableIntake;
 use lark_codex_bridge::runtime::intake::TenantNamespace;
@@ -235,7 +236,7 @@ async fn migration_two_persists_strict_inbound_payload_columns() {
     let temp = tempdir().expect("tempdir");
     let path = temp.path().join("store.sqlite");
     let store = StoreHandle::open(&path).await.expect("open");
-    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 5);
+    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 6);
     store.shutdown().await.expect("shutdown");
 
     let connection = rusqlite::Connection::open(&path).expect("inspect");
@@ -372,6 +373,7 @@ async fn extended_inbound_payload_v1_round_trips_mentions_parts_and_metadata() {
             size_bytes: Some(123),
             duration_ms: Some(456),
             transcript: None,
+            transcript_failure: None,
         },
         status: PartStatus::Available,
     })];
@@ -456,7 +458,7 @@ async fn file_store_applies_pragmas_and_persists_every_typed_table() {
     assert!(pragmas.foreign_keys);
     assert_eq!(pragmas.busy_timeout_ms, 5_000);
     assert_eq!(pragmas.synchronous, 1);
-    assert_eq!(pragmas.user_version, 5);
+    assert_eq!(pragmas.user_version, 6);
     store
         .upsert_scope(&scope, temp.path(), "fp")
         .await
@@ -492,7 +494,7 @@ async fn file_store_applies_pragmas_and_persists_every_typed_table() {
     store.shutdown().await.expect("shutdown");
 
     let store = StoreHandle::open(&path).await.expect("reopen");
-    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 5);
+    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 6);
     assert!(store.scope_row(&scope).await.expect("scope").is_some());
     assert_eq!(
         store
@@ -531,13 +533,118 @@ async fn file_store_applies_pragmas_and_persists_every_typed_table() {
 }
 
 #[tokio::test]
+async fn migration_six_preserves_legacy_lease_as_one_unique_acquisition() {
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("legacy-lease.sqlite");
+    let store = StoreHandle::open(&path).await.expect("open");
+    let turn_id = store
+        .record_turn(turn("legacy-lease-turn", TurnState::Starting))
+        .await
+        .expect("turn");
+    let token = store
+        .put_attachment_and_lease("legacy-hash", 1, "file", turn_id)
+        .await
+        .expect("seed lease");
+    store.shutdown().await.expect("shutdown");
+
+    let connection = rusqlite::Connection::open(&path).expect("legacy setup");
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP INDEX attachment_leases_sha256;
+             DROP INDEX attachment_leases_turn;
+             ALTER TABLE attachment_leases RENAME TO attachment_leases_v6;
+             CREATE TABLE attachment_leases (
+                 sha256 TEXT NOT NULL,
+                 turn_row_id INTEGER NOT NULL,
+                 created_ms INTEGER NOT NULL,
+                 PRIMARY KEY (sha256, turn_row_id),
+                 FOREIGN KEY (sha256) REFERENCES attachments (sha256) ON DELETE CASCADE,
+                 FOREIGN KEY (turn_row_id) REFERENCES turns (id) ON DELETE CASCADE
+             );
+             INSERT INTO attachment_leases (sha256, turn_row_id, created_ms)
+             SELECT sha256, turn_row_id, created_ms FROM attachment_leases_v6;
+             DROP TABLE attachment_leases_v6;
+             PRAGMA user_version = 5;",
+        )
+        .expect("downgrade lease table to v5 shape");
+    drop(connection);
+
+    let store = StoreHandle::open(&path).await.expect("migrate v5 to v6");
+    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 6);
+    let leases = store
+        .attachment_leases("legacy-hash")
+        .await
+        .expect("migrated lease");
+    assert_eq!(leases.len(), 1);
+    assert_ne!(leases[0].lease_token, token);
+    assert!(leases[0].lease_token.starts_with("legacy-"));
+    let overlapping = store
+        .add_attachment_lease("legacy-hash", turn_id)
+        .await
+        .expect("independent post-migration acquisition");
+    assert_ne!(overlapping, leases[0].lease_token);
+    assert_eq!(
+        store
+            .attachment_leases("legacy-hash")
+            .await
+            .expect("both leases")
+            .len(),
+        2
+    );
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn attachment_lease_capacity_is_enforced_before_an_extra_acquisition() {
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("lease-capacity.sqlite");
+    let store = StoreHandle::open(&path).await.expect("open");
+    let turn_id = store
+        .record_turn(turn("lease-capacity-turn", TurnState::Starting))
+        .await
+        .expect("turn");
+    store
+        .put_attachment("capacity-hash", 1, "file")
+        .await
+        .expect("attachment");
+    store.shutdown().await.expect("shutdown");
+
+    let mut connection = rusqlite::Connection::open(&path).expect("seed capacity");
+    let transaction = connection.transaction().expect("transaction");
+    {
+        let mut insert = transaction
+            .prepare(
+                "INSERT INTO attachment_leases
+                     (lease_token, sha256, turn_row_id, created_ms)
+                 VALUES (?1, 'capacity-hash', ?2, 1)",
+            )
+            .expect("prepare leases");
+        for index in 0..STORE_ATTACHMENT_LEASE_MAX_ROWS {
+            insert
+                .execute(rusqlite::params![format!("capacity-{index:016x}"), turn_id])
+                .expect("seed bounded lease");
+        }
+    }
+    transaction.commit().expect("commit leases");
+    drop(connection);
+
+    let store = StoreHandle::open(&path).await.expect("reopen");
+    assert!(matches!(
+        store.add_attachment_lease("capacity-hash", turn_id).await,
+        Err(StoreError::CapacityExceeded { .. })
+    ));
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
 async fn rejects_future_schema_versions_without_mutating_the_database() {
     let temp = tempdir().expect("tempdir");
     let path = temp.path().join("future.sqlite");
     {
         let connection = rusqlite::Connection::open(&path).expect("seed");
         connection
-            .pragma_update(None, "user_version", 6_u32)
+            .pragma_update(None, "user_version", 7_u32)
             .expect("version");
     }
     assert!(matches!(
@@ -548,7 +655,7 @@ async fn rejects_future_schema_versions_without_mutating_the_database() {
     let version: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .expect("version");
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
 }
 
 #[tokio::test]
@@ -1006,39 +1113,47 @@ async fn exact_attachment_lease_release_preserves_sibling_turn_resources() {
         .record_turn(turn("exact-release", TurnState::Starting))
         .await
         .expect("turn");
-    for sha in ["first", "second"] {
-        assert!(
-            store
-                .put_attachment_and_lease(sha, 1, "file", turn_id)
-                .await
-                .expect("attachment and lease")
-        );
-    }
-    assert!(
-        !store
-            .put_attachment_and_lease("first", 1, "file", turn_id)
-            .await
-            .expect("idempotent existing lease")
-    );
+    let first_token = store
+        .put_attachment_and_lease("first", 1, "file", turn_id)
+        .await
+        .expect("first acquisition");
+    let overlapping_token = store
+        .put_attachment_and_lease("first", 1, "file", turn_id)
+        .await
+        .expect("overlapping acquisition");
+    let sibling_token = store
+        .put_attachment_and_lease("second", 1, "file", turn_id)
+        .await
+        .expect("sibling acquisition");
+    assert_ne!(first_token, overlapping_token);
+    assert_ne!(first_token, sibling_token);
 
     assert!(
         store
-            .release_attachment_lease("first", turn_id)
+            .release_attachment_lease(&first_token)
             .await
             .expect("exact release")
     );
     assert!(
         !store
-            .release_attachment_lease("first", turn_id)
+            .release_attachment_lease(&first_token)
             .await
             .expect("idempotent exact release")
     );
-    assert!(
+    assert_eq!(
         store
             .attachment_leases("first")
             .await
-            .expect("first leases")
-            .is_empty()
+            .expect("overlapping lease survives")
+            .len(),
+        1
+    );
+    assert!(
+        !store
+            .delete_attachment("first")
+            .await
+            .expect("still protected"),
+        "one cancelled consumer must not expose another consumer to GC"
     );
     assert_eq!(
         store

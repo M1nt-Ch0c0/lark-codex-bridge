@@ -84,10 +84,12 @@ CODEX_E2E=1 cargo test --test codex_smoke --locked -- --ignored --nocapture
 
 飞书语音气泡默认**不会**把 `localAudio` 交给 Codex。`bridge_media.read` 对音频按需转写后只回传文本：
 
-1. 入站 payload 已带客户端识别文本时仍只保存在 turn-scoped media capability 中，`bridge_media.read` 按 `max_transcript_bytes` 校验后使用，不会提前混入 prompt，也不会调用 sidecar；
-2. 否则用 `ffmpeg` 在 owner-only 临时目录中解码为 16 kHz WAV，再跑配置的本地 sidecar；Bridge 对 stdout 做有界读取，并接受纯文本或带 `text` 字段的 sherpa JSON；
-3. turn 中断会取消下载/解码/sidecar 并回收本次精确租约和临时目录；异常退出残留的私有 ASR 目录会在后续启动时做有界老化清理；
-4. 缺 sidecar、解码失败、空/超限转写、过长音频、取消或临时目录失败会返回稳定错误码（`sidecar_missing` / `unsupported_codec` / `empty_transcript` / `transcript_too_large` / `too_long` / `oversize` / `sidecar_failed` / `cancelled` / `temporary_storage_failed`），不会静默丢 part。
+1. 入站 payload 已带客户端识别文本时，原文只进入 turn-scoped media grant；`ContextSnapshot` / `TypedPart`、prompt 和 `Debug` 都不含原文。只有 `bridge_media.read` 会按 `max_transcript_bytes` 校验并返回它。客户端明确给出畸形或超限文本时分别返回 `invalid_transcript` / `transcript_too_large`，不会误降级到 sidecar；
+2. 否则用 `ffmpeg` 在 Bridge 专属私有根目录中解码为 16 kHz WAV，再跑配置的本地 sidecar。Unix 目录/文件会显式设置并复核为 `0700` / `0600`（不依赖 umask）；Windows 会在写入内容前设置并复核仅当前用户与 `SYSTEM` 的 protected DACL。Bridge 对 stdout 做有界读取，并接受纯文本或带 `text` 字段的 sherpa JSON；
+3. `ffmpeg` 和 sidecar 都在完整的进程组（Windows 为 Job Object）中运行。turn 中断、Bridge shutdown、超时或 future drop 会终止整棵进程树并等待回收；每次媒体读取持有独立 lease token，同一 turn/hash 的重叠读取不会相互释放 GC 保护；
+4. `max_duration_ms` 可下调但绝不能超过 10 分钟；Bridge 还会在 `ffmpeg` 运行期间限制固定 PCM 投影的 WAV 字节数，并在交给 sidecar 前再次验证时长和大小，防止小型压缩输入膨胀；
+5. 异常退出残留目录会在启动时和运行期间定时做有界、只匹配 Bridge workspace 的 no-follow 清理；无关目录项不会耗尽匹配扫描额度；
+6. 缺 sidecar、解码失败、空/畸形/超限转写、过长音频、取消或私有目录失败都会返回稳定错误码（`sidecar_missing` / `unsupported_codec` / `empty_transcript` / `invalid_transcript` / `transcript_too_large` / `too_long` / `oversize` / `sidecar_failed` / `cancelled` / `temporary_storage_failed`），不会静默丢 part。
 
 推荐 sidecar 是 [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) 上的 SenseVoice Small。仓库不内置模型权重；未配置 sidecar 时图片/文件读取不受影响。
 
@@ -100,12 +102,12 @@ max_duration_ms = 600000
 max_transcript_bytes = 32768
 ```
 
-`command` 可省略。`args` 按声明顺序传给 sidecar，解码后的 WAV 路径始终作为最后一个参数。`max_transcript_bytes` 必须在 `1..=32768` 内。
+`command` 可省略。`args` 按声明顺序传给 sidecar，解码后的 WAV 路径始终作为最后一个参数。`max_duration_ms` 必须在 `1..=600000` 内，`max_transcript_bytes` 必须在 `1..=32768` 内。
 相对路径相对配置文件目录解析；单个程序名（如 `ffmpeg`）走 `PATH`。
 
 sherpa-onnx-offline 的 stdout 可含配置转储；Bridge 会在有界输出中提取首个 JSON
 `text`。仓库提供的 [`scripts/sensevoice-sidecar.sh`](scripts/sensevoice-sidecar.sh)
-用 `exec` 直接启动识别器，使 Bridge 的进程监督和取消边界覆盖实际识别进程。本机冒烟：
+当前脚本用 `exec` 直接启动识别器以减少一层 shell；安全性不依赖这一点，Bridge 的进程组/Job Object 也会覆盖未 `exec` 的子孙进程。本机真实模型冒烟默认 `#[ignore]`，只在显式提供模型、样本和 `LARK_ASR_SMOKE=1` 时运行：
 
 ```bash
 export SENSEVOICE_BIN=$HOME/lark-codex-bridge-asr/sherpa-onnx-v1.13.6-osx-arm64-static-no-tts/bin/sherpa-onnx-offline

@@ -12,11 +12,11 @@ use thiserror::Error;
 use crate::codex::process::CodexProcessConfig;
 use crate::codex::types::{ApprovalPolicy, SandboxMode};
 use crate::limits::{
-    ASR_MAX_ARG_BYTES, ASR_MAX_ARGS, ASR_MAX_DURATION_MS, ASR_TRANSCRIPT_MAX_BYTES,
-    DEFAULT_ACTIVE_TURN_PERMITS, DEFAULT_MAX_SCOPE_ACTORS, MAX_CONFIG_ALLOW_ROOT_BYTES,
-    MAX_CONFIG_ALLOW_ROOTS, MAX_CONFIG_ALLOWED_GROUP_BYTES, MAX_CONFIG_ALLOWED_GROUPS,
-    MAX_CONFIG_ALLOWED_SENDER_BYTES, MAX_CONFIG_ALLOWED_SENDERS, MAX_CONFIG_OWNER_BYTES,
-    MAX_CONFIG_OWNERS,
+    ASR_ABSOLUTE_MAX_DURATION_MS, ASR_MAX_ARG_BYTES, ASR_MAX_ARGS, ASR_MAX_DURATION_MS,
+    ASR_TRANSCRIPT_MAX_BYTES, DEFAULT_ACTIVE_TURN_PERMITS, DEFAULT_MAX_SCOPE_ACTORS,
+    MAX_CONFIG_ALLOW_ROOT_BYTES, MAX_CONFIG_ALLOW_ROOTS, MAX_CONFIG_ALLOWED_GROUP_BYTES,
+    MAX_CONFIG_ALLOWED_GROUPS, MAX_CONFIG_ALLOWED_SENDER_BYTES, MAX_CONFIG_ALLOWED_SENDERS,
+    MAX_CONFIG_OWNER_BYTES, MAX_CONFIG_OWNERS,
 };
 use crate::runtime::policy::{AccessPolicy, PlatformRoots};
 
@@ -517,6 +517,7 @@ impl AsrSection {
             return Err(ConfigError::AsrArgsTooLarge);
         }
         if self.max_duration_ms == 0
+            || self.max_duration_ms > ASR_ABSOLUTE_MAX_DURATION_MS
             || self.max_transcript_bytes == 0
             || self.max_transcript_bytes > ASR_TRANSCRIPT_MAX_BYTES
         {

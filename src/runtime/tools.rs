@@ -2,6 +2,7 @@
 
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
 
 use crate::codex::{
     client::AppServerClient,
@@ -88,6 +89,7 @@ pub async fn handle_server_request(
     contexts: &ContextRegistry,
     attachments: &AttachmentCache,
     asr: &AsrSection,
+    shutdown: &CancellationToken,
 ) {
     if request.method != "item/tool/call" {
         let _ = client
@@ -116,7 +118,9 @@ pub async fn handle_server_request(
 
     let result = match (params.namespace.as_deref(), params.tool.as_str()) {
         (Some("bridge_context"), "resolve") => resolve_context(contexts, &params),
-        (Some("bridge_media"), "read") => read_media(contexts, attachments, asr, &params).await,
+        (Some("bridge_media"), "read") => {
+            read_media(contexts, attachments, asr, shutdown, &params).await
+        }
         _ => Err(tool_error(
             "unsupported",
             "dynamic tool is not registered by this bridge",
@@ -160,6 +164,7 @@ async fn read_media(
     contexts: &ContextRegistry,
     attachments: &AttachmentCache,
     asr: &AsrSection,
+    shutdown: &CancellationToken,
     params: &DynamicToolCallParams,
 ) -> Result<Value, Value> {
     let arguments =
@@ -176,7 +181,7 @@ async fn read_media(
         .authorize_media_for_tool(&context_id, &handle, &params.thread_id, &params.turn_id)
         .map_err(context_error)?;
     if authorized.media_kind == MediaKind::Audio {
-        return read_audio(attachments, asr, &authorized).await;
+        return read_audio(attachments, asr, shutdown, &authorized).await;
     }
     let cached = attachments
         .fetch_cancellable(
@@ -187,12 +192,8 @@ async fn read_media(
         )
         .await
         .map_err(attachment_error)?;
-    if authorized.is_cancelled() {
-        if cached.lease_was_inserted {
-            let _ = attachments
-                .release_lease(&cached.sha256, authorized.local_turn_row_id)
-                .await;
-        }
+    if authorized.is_cancelled() || shutdown.is_cancelled() {
+        let _ = attachments.release_lease(&cached.lease_token).await;
         return Err(asr_error(AsrError::Cancelled));
     }
     let path = cached.path.to_str().ok_or_else(|| {
@@ -216,25 +217,37 @@ async fn read_media(
 async fn read_audio(
     attachments: &AttachmentCache,
     asr: &AsrSection,
+    shutdown: &CancellationToken,
     authorized: &crate::runtime::context::AuthorizedResource,
 ) -> Result<Value, Value> {
-    if authorized.is_cancelled() {
+    if authorized.is_cancelled() || shutdown.is_cancelled() {
         return Err(asr_error(AsrError::Cancelled));
     }
+    if let Some(failure) = authorized.transcript_failure {
+        return Err(asr_error(match failure {
+            crate::lark::normalize::TranscriptFailure::Invalid => AsrError::InvalidTranscript,
+            crate::lark::normalize::TranscriptFailure::TooLarge => AsrError::TranscriptTooLarge,
+        }));
+    }
     if let Some(inbound) = authorized.transcript.as_deref() {
+        if inbound.len() > asr.max_transcript_bytes {
+            return Err(asr_error(AsrError::TranscriptTooLarge));
+        }
         let transcript =
             crate::lark::normalize::normalize_transcript(inbound, asr.max_transcript_bytes)
-                .ok_or_else(|| asr_error(AsrError::TranscriptTooLarge))?;
+                .ok_or_else(|| asr_error(AsrError::InvalidTranscript))?;
         return Ok(audio_transcript_value(
             &transcript,
             TranscriptSource::Inbound,
             authorized.duration_ms,
         ));
     }
-    if authorized
-        .duration_ms
-        .is_some_and(|duration| duration > asr.max_duration_ms)
-    {
+    if authorized.duration_ms.is_some_and(|duration| {
+        duration
+            > asr
+                .max_duration_ms
+                .min(crate::limits::ASR_ABSOLUTE_MAX_DURATION_MS)
+    }) {
         return Err(asr_error(AsrError::TooLong));
     }
     if !asr.is_configured() {
@@ -253,19 +266,24 @@ async fn read_audio(
             AttachError::Cancelled { .. } => asr_error(AsrError::Cancelled),
             other => attachment_error(other),
         })?;
-    let transcription = asr::transcribe_file(asr, &cached.path, authorized.duration_ms);
-    tokio::pin!(transcription);
-    let transcript = tokio::select! {
-        biased;
-        () = authorized.cancellation.cancelled() => {
-            if cached.lease_was_inserted {
-                let _ = attachments
-                    .release_lease(&cached.sha256, authorized.local_turn_row_id)
-                    .await;
+    let transcript = match asr::transcribe_file_cancellable(
+        asr,
+        &cached.path,
+        authorized.duration_ms,
+        &authorized.cancellation,
+        shutdown,
+    )
+    .await
+    {
+        Ok(transcript) => transcript,
+        Err(error) => {
+            if error == AsrError::Cancelled {
+                // The unique token belongs only to this read; releasing it
+                // cannot invalidate another overlapping consumer.
+                let _ = attachments.release_lease(&cached.lease_token).await;
             }
-            return Err(asr_error(AsrError::Cancelled));
+            return Err(asr_error(error));
         }
-        result = &mut transcription => result.map_err(asr_error)?,
     };
     Ok(audio_transcript_value(
         &transcript,

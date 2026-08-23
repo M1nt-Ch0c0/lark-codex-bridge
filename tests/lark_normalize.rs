@@ -15,10 +15,12 @@ use lark_codex_bridge::lark::error::{LarkError, LarkErrorKind};
 use lark_codex_bridge::lark::http::LarkHttp;
 use lark_codex_bridge::lark::normalize::{
     Degradation, InboundEvent, MessagePart, NormalizeOutcome, Normalizer, PartStatus, ScopeKey,
+    TranscriptFailure,
 };
 use lark_codex_bridge::lark::token::TenantTokenProvider;
 use lark_codex_bridge::limits::{
-    LARK_CHAT_MODE_CACHE_CAPACITY, LARK_CHAT_MODE_CACHE_TTL, LARK_MAX_EVENT_PAYLOAD_BYTES,
+    ASR_TRANSCRIPT_MAX_BYTES, LARK_CHAT_MODE_CACHE_CAPACITY, LARK_CHAT_MODE_CACHE_TTL,
+    LARK_MAX_EVENT_PAYLOAD_BYTES,
 };
 use larkstub::{Handler, RecordedRequest, StubResponse, StubServer};
 use secrecy::SecretString;
@@ -674,6 +676,57 @@ async fn audio_client_transcript_stays_lazy_in_metadata_only() {
             );
         }
         _ => panic!("expected one audio part"),
+    }
+}
+
+#[tokio::test]
+async fn malformed_and_oversize_audio_transcripts_keep_non_content_failure_classification() {
+    let server = StubServer::start(im_stub(|_| chat_mode_ok("group"), failing)).await;
+    let normalizer = normalizer_for(&server);
+    for (message_id, transcript, expected) in [
+        (
+            "om_audio_invalid",
+            serde_json::json!({"nested": "must-not-fall-back"}),
+            TranscriptFailure::Invalid,
+        ),
+        (
+            "om_audio_oversize",
+            serde_json::Value::String("x".repeat(ASR_TRANSCRIPT_MAX_BYTES + 1)),
+            TranscriptFailure::TooLarge,
+        ),
+    ] {
+        let payload = make_event(
+            "oc_group_chat",
+            "group",
+            message_id,
+            "audio",
+            &serde_json::json!({
+                "file_key": "aud_key",
+                "duration": 2100,
+                "text": transcript,
+                "recognition": {"text": "must-not-replace-a-present-invalid-value"}
+            }),
+            None,
+            &serde_json::json!([]),
+        );
+        let (event, _) = unwrap_event(
+            normalizer
+                .normalize(payload.as_bytes())
+                .await
+                .expect("audio rejection metadata should normalize"),
+        );
+        let [MessagePart::Audio(media)] = event.parts.as_slice() else {
+            panic!("expected audio part")
+        };
+        assert_eq!(media.metadata.transcript, None);
+        assert_eq!(media.metadata.transcript_failure, Some(expected));
+        let debug = format!("{:?}", media.metadata);
+        assert!(!debug.contains("must-not"));
+        assert!(
+            !serde_json::to_string(&media.metadata)
+                .expect("serialize normalized metadata")
+                .contains("must-not")
+        );
     }
 }
 

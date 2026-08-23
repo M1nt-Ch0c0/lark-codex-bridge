@@ -18,6 +18,7 @@ use lark_codex_bridge::lark::config::TenantBrand;
 use lark_codex_bridge::lark::credentials::LarkCredentials;
 use lark_codex_bridge::lark::normalize::{
     InboundEvent, MediaMetadata, MediaPart, MessagePart, PartStatus, ResourceDesc, ScopeKey,
+    TranscriptFailure,
 };
 use lark_codex_bridge::limits::{
     ROUTER_ACTIVE_TURN_HARD_LIMIT, ROUTER_COMMAND_BYTE_BUDGET, ROUTER_RETRY_CAPACITY,
@@ -3437,6 +3438,19 @@ fn audio_part(transcript: Option<&str>) -> MessagePart {
     })
 }
 
+fn rejected_audio_part(failure: TranscriptFailure) -> MessagePart {
+    MessagePart::Audio(MediaPart {
+        key: Some("aud_key".to_owned()),
+        thumbnail_key: None,
+        metadata: MediaMetadata {
+            duration_ms: Some(800),
+            transcript_failure: Some(failure),
+            ..MediaMetadata::default()
+        },
+        status: PartStatus::Available,
+    })
+}
+
 async fn start_audio_router(
     config: BridgeConfig,
     store: StoreHandle,
@@ -3893,6 +3907,82 @@ async fn configured_inbound_transcript_limit_is_enforced_only_at_media_read() {
 }
 
 #[tokio::test]
+async fn rejected_inbound_transcripts_never_download_or_fall_back_to_sidecar() {
+    for (suffix, failure, expected_code) in [
+        ("invalid", TranscriptFailure::Invalid, "invalid_transcript"),
+        (
+            "oversize",
+            TranscriptFailure::TooLarge,
+            "transcript_too_large",
+        ),
+    ] {
+        let mut config = validated_config();
+        let temp = tempdir().expect("tempdir");
+        let marker = temp.path().join(format!("must-not-run-{suffix}"));
+        config.asr = asr_config(
+            stub_program(
+                temp.path(),
+                &format!("asr-rejected-{suffix}"),
+                r#"printf 'invoked\n' >> "$1"; exit 99"#,
+                "@echo off\r\necho invoked>>\"%~1\"\r\nexit /b 99\r\n",
+            ),
+            ffmpeg_stub(temp.path()),
+            vec![marker.to_string_lossy().into_owned()],
+        );
+        let store = StoreHandle::open_in_memory().await.expect("store");
+        let download_count = Arc::new(AtomicUsize::new(0));
+        let cache = Arc::new(
+            AttachmentCache::open(
+                &temp.path().join(format!("attachments-{suffix}")),
+                store.clone(),
+                Arc::new(PendingAttachmentDownloader {
+                    started: Arc::clone(&download_count),
+                    started_notify: Arc::new(Notify::new()),
+                }),
+                AttachmentLimits::default(),
+            )
+            .expect("attachment cache"),
+        );
+        let (router, control, namespace, workspace) =
+            start_audio_router(config, store.clone(), cache).await;
+        let event_id = format!("event-audio-rejected-{suffix}");
+        let thread_id = format!("thread-audio-rejected-{suffix}");
+        let turn_id = format!("turn-audio-rejected-{suffix}");
+        let mut inbound = event(&event_id, "owner-runtime-scope");
+        inbound.message_type = "audio".to_owned();
+        inbound.text.clear();
+        inbound.parts = vec![rejected_audio_part(failure)];
+        let (context_id, handle, _) = route_audio_event(
+            &router, &store, &namespace, &control, &workspace, suffix, inbound, &thread_id,
+            &turn_id,
+        )
+        .await;
+        let response = read_media(
+            &control,
+            &thread_id,
+            &turn_id,
+            &format!("server-audio-rejected-{suffix}"),
+            &context_id,
+            &handle,
+        )
+        .await;
+        assert_eq!(response["result"]["success"], false);
+        let body: Value = serde_json::from_str(
+            response["result"]["contentItems"][0]["text"]
+                .as_str()
+                .expect("tool response text"),
+        )
+        .expect("tool response JSON");
+        assert_eq!(body["error"]["code"], expected_code);
+        assert_eq!(download_count.load(Ordering::SeqCst), 0);
+        assert!(!marker.exists());
+        send_turn_completed(&control, &thread_id, &turn_id, "completed").await;
+        router.shutdown().await.expect("shutdown");
+        store.shutdown().await.expect("store shutdown");
+    }
+}
+
+#[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn interrupt_cancels_an_active_audio_download_and_returns_a_tool_result() {
     let mut config = validated_config();
@@ -4021,7 +4111,7 @@ async fn interrupt_cancels_an_active_sidecar_and_releases_its_exact_lease() {
         stub_program(
             temp.path(),
             "asr-block-until-cancelled",
-            r#"printf '%s' "$$" > "$1"; exec sleep 60"#,
+            r#"sleep 60 & child=$!; printf '%s' "$child" > "$1"; wait "$child""#,
             "@echo off\r\necho invoked>\"%~1\"\r\n:loop\r\ngoto loop\r\n",
         ),
         ffmpeg_stub(temp.path()),
@@ -4139,7 +4229,7 @@ async fn interrupt_cancels_an_active_sidecar_and_releases_its_exact_lease() {
             }
         })
         .await
-        .expect("exec-ed sidecar process exits on cancellation");
+        .expect("non-exec sidecar grandchild exits on cancellation");
     }
     send_turn_completed(
         &control,

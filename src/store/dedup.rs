@@ -1142,6 +1142,11 @@ fn validate_media_part(media: &MediaPart) -> Result<(), StoreError> {
             });
         }
     }
+    if media.metadata.transcript.is_some() && media.metadata.transcript_failure.is_some() {
+        return Err(StoreError::CorruptData {
+            context: "validating mutually exclusive inbound transcript metadata",
+        });
+    }
     Ok(())
 }
 
