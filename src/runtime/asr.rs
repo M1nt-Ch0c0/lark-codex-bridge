@@ -2580,18 +2580,27 @@ mod tests {
         windows_private_acl::apply_and_verify(&decoded, false).expect("decoded DACL");
         windows_private_acl::apply_and_verify(&workspace.path().join(ASR_TEMP_MARKER), false)
             .expect("marker DACL");
-        for path in [&unicode_root, workspace.path(), decoded.as_path()] {
+        for (kind, path) in [
+            ("unicode root", &unicode_root),
+            ("workspace", workspace.path()),
+            ("decoded file", decoded.as_path()),
+        ] {
             let output = std::process::Command::new("powershell.exe")
                 .args([
                     "-NoProfile",
                     "-NonInteractive",
                     "-Command",
-                    "if ((Get-Acl -LiteralPath $args[0]).AreAccessRulesProtected) { exit 0 } else { exit 7 }",
+                    "$acl = Get-Acl -LiteralPath $env:LCB_ACL_TEST_PATH; if ($acl.AreAccessRulesProtected) { exit 0 } else { Write-Error 'DACL inheritance remains enabled'; exit 7 }",
                 ])
-                .arg(path)
+                .env("LCB_ACL_TEST_PATH", path)
                 .output()
                 .expect("query protected DACL");
-            assert!(output.status.success(), "DACL must have SE_DACL_PROTECTED");
+            assert!(
+                output.status.success(),
+                "{kind} DACL must have SE_DACL_PROTECTED (status: {}; stderr: {})",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
         }
     }
 
