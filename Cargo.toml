@@ -10,6 +10,11 @@ readme = "README.md"
 keywords = ["codex", "feishu", "lark", "agent", "bridge"]
 categories = ["command-line-utilities", "development-tools"]
 
+[package.metadata.cargo-machete]
+# This dependency is intentionally pre-positioned for the independently
+# reviewed CLI tracing feature; it is unused on this feature branch alone.
+ignored = ["tracing-subscriber"]
+
 [dependencies]
 anyhow = "1.0.104"
 base64 = "0.23.1"
