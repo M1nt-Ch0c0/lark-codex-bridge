@@ -41,7 +41,7 @@ fn config(mode: &str, marker: &Path) -> NodeSidecarConfig {
         arguments: vec![mode.to_owned(), marker.to_string_lossy().into_owned()],
         event_capacity: 1,
         write_capacity: 16,
-        handshake_timeout: Duration::from_secs(2),
+        handshake_timeout: Duration::from_secs(10),
         handler_timeout: Duration::from_secs(2),
         shutdown_grace: Duration::from_secs(2),
         ..NodeSidecarConfig::default()
@@ -50,8 +50,8 @@ fn config(mode: &str, marker: &Path) -> NodeSidecarConfig {
 
 fn fast_config(mode: &str, marker: &Path) -> NodeSidecarConfig {
     NodeSidecarConfig {
-        handshake_timeout: Duration::from_millis(500),
-        initial_connect_timeout: Duration::from_millis(750),
+        handshake_timeout: Duration::from_secs(5),
+        initial_connect_timeout: Duration::from_secs(5),
         healthy_uptime: Duration::from_secs(2),
         handler_timeout: Duration::from_secs(1),
         shutdown_grace: Duration::from_millis(250),
@@ -226,11 +226,16 @@ async fn incompatible_version_and_configuration_timeout_fail_startup() {
     assert_eq!(frame_error.kind(), LarkErrorKind::ProtocolViolation);
 
     let mut timeout_config = config("silence", &marker);
-    timeout_config.handshake_timeout = Duration::from_millis(150);
+    timeout_config.handshake_timeout = Duration::from_secs(5);
     let timeout_error = NodeSidecar::start(timeout_config, credentials(), Arc::clone(&handler))
         .await
         .expect_err("configuration response must be bounded");
     assert_eq!(timeout_error.kind(), LarkErrorKind::Retryable);
+    assert_eq!(
+        std::fs::read_to_string(PathBuf::from(format!("{}.configured", marker.display())))
+            .expect("configuration request evidence"),
+        "seen",
+    );
     assert!(!format!("{timeout_error:?}").contains("fake-secret-never-log"));
 
     let mut invalid_bounds = config("lifecycle", &marker);
@@ -286,12 +291,19 @@ async fn startup_protocol_and_timeout_paths_kill_non_exec_descendants() {
         let marker = temp.path().join(mode);
         let mut sidecar_config = fast_config(mode, &marker);
         if mode == "timeout-descendant" {
-            sidecar_config.handshake_timeout = Duration::from_millis(150);
+            sidecar_config.handshake_timeout = Duration::from_secs(5);
         }
         let error = NodeSidecar::start(sidecar_config, credentials(), Arc::clone(&handler))
             .await
             .expect_err("bootstrap failure must be returned");
         assert_eq!(error.kind(), expected_kind);
+        if mode == "timeout-descendant" {
+            assert_eq!(
+                std::fs::read_to_string(PathBuf::from(format!("{}.configured", marker.display())))
+                    .expect("configuration request evidence"),
+                "seen",
+            );
+        }
         assert_heartbeat_stops(&marker).await;
     }
 }

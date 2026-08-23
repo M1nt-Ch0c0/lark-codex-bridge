@@ -104,7 +104,10 @@ function connect(frame) {
 }
 
 function configure(frame) {
-  if (mode === 'silence' || mode === 'timeout-descendant') return;
+  if (mode === 'silence' || mode === 'timeout-descendant') {
+    fs.writeFileSync(`${marker}.configured`, 'seen');
+    return;
+  }
   if (mode === 'configure-failed') {
     configured = true;
     write({ v: VERSION, type: 'response', id: frame.id, ok: true });
