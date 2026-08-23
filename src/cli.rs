@@ -22,6 +22,7 @@ use crate::{
         transport::LarkTransport,
     },
     limits::PROBE_TIMEOUT,
+    runtime::adoption::{ThreadAdoptionAvailability, ThreadAdoptionGate},
 };
 
 #[derive(Debug, Parser)]
@@ -78,6 +79,8 @@ pub enum CodexCommand {
         #[arg(long, default_value = "codex")]
         binary: PathBuf,
     },
+    /// Print the fail-closed persisted-thread adoption capability as JSON.
+    AdoptionStatus,
 }
 
 impl fmt::Debug for CodexCommand {
@@ -87,6 +90,7 @@ impl fmt::Debug for CodexCommand {
                 .debug_struct("Probe")
                 .field("binary_bytes", &binary.as_os_str().len())
                 .finish(),
+            Self::AdoptionStatus => formatter.write_str("AdoptionStatus"),
         }
     }
 }
@@ -180,6 +184,9 @@ pub async fn run_with(cli: Cli) -> Result<()> {
         Command::Codex {
             command: CodexCommand::Probe { binary },
         } => probe_codex(binary).await,
+        Command::Codex {
+            command: CodexCommand::AdoptionStatus,
+        } => report_thread_adoption_status(),
         Command::Lark {
             command:
                 LarkCommand::Auth {
@@ -201,6 +208,31 @@ pub async fn run_with(cli: Cli) -> Result<()> {
             command: LarkCommand::Probe,
         } => lark_probe().await,
     }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadAdoptionReport {
+    available: bool,
+    classification: ThreadAdoptionAvailability,
+    guidance: &'static str,
+    requires_explicit_handoff: bool,
+    shared_endpoint_issue: u8,
+}
+
+fn report_thread_adoption_status() -> Result<()> {
+    let availability = ThreadAdoptionGate.availability();
+    let report = ThreadAdoptionReport {
+        available: false,
+        classification: availability,
+        guidance: availability.guidance(),
+        requires_explicit_handoff: true,
+        shared_endpoint_issue: 8,
+    };
+    let line =
+        serde_json::to_string(&report).context("unable to encode thread-adoption status report")?;
+    println!("{line}");
+    Ok(())
 }
 
 async fn run_bridge(config: Option<PathBuf>) -> Result<()> {

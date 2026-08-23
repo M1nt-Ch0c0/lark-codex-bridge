@@ -24,6 +24,20 @@ fn version_matches_the_package_version() {
 }
 
 #[test]
+fn adoption_status_is_machine_readable_and_fail_closed() {
+    cargo_bin_cmd!("lark-codex-bridge")
+        .args(["codex", "adoption-status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"available\":false"))
+        .stdout(predicate::str::contains(
+            "\"classification\":\"unavailable_no_reliable_writer_release\"",
+        ))
+        .stdout(predicate::str::contains("thread/resume").not())
+        .stdout(predicate::str::contains("CODEX_HOME").not());
+}
+
+#[test]
 fn probe_reports_a_missing_codex_binary_without_panicking() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let missing_binary = temp.path().join("missing-codex");

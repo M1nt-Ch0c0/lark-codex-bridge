@@ -305,6 +305,14 @@ pub const TURN_BATCH_MAX_MESSAGES: usize = 64;
 pub const TURN_BATCH_TEXT_BYTE_BUDGET: usize = 768 * 1024;
 /// Maximum bytes parsed as one recognized first-stage bridge command.
 pub const BRIDGE_COMMAND_MAX_BYTES: usize = 16 * 1024;
+/// Maximum opaque pagination cursor accepted by the persisted-thread command surface.
+pub const THREAD_DISCOVERY_CURSOR_MAX_BYTES: usize = 512;
+/// Maximum stable thread selector accepted by an explicit adoption request.
+pub const THREAD_ADOPTION_SELECTOR_MAX_BYTES: usize = 128;
+/// Maximum candidate summaries a future enabled discovery page may expose.
+pub const THREAD_DISCOVERY_MAX_RESULTS: usize = 20;
+/// Maximum encoded bytes a future enabled discovery page may expose.
+pub const THREAD_DISCOVERY_MAX_PAGE_BYTES: usize = 16 * 1024;
 
 /// Maximum characters (Unicode scalar values) in one projected reply message
 /// before deterministic splitting. A part never exceeds this bound.
