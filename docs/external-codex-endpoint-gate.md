@@ -55,8 +55,9 @@ disabled until their transport and mutation/reconciliation issues land.
   bytes; one trailing newline is accepted.
 - Endpoint URLs, hosts, paths, authorization headers, bearer values, raw RPC
   payloads, initialize `codexHome`, and thread IDs do not appear in ordinary
-  errors or `Debug`. A stable `ext-…` hash label identifies non-secret endpoint
-  configuration.
+  errors or `Debug`. A stable `ext-…` label containing the complete SHA-256
+  digest identifies non-secret endpoint configuration without truncating the
+  durable identity used by later reconciliation and write fences.
 
 Credential rotation is explicit: atomically replace the private token file,
 drain the old connection, and start a new admission check/reconnect. The gate

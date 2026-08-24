@@ -205,7 +205,7 @@ impl fmt::Debug for ExternalEndpointConfig {
     }
 }
 
-/// Opaque, stable identifier for non-secret endpoint configuration.
+/// Opaque, collision-resistant identifier for non-secret endpoint configuration.
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct EndpointLabel(String);
 
@@ -719,9 +719,9 @@ fn endpoint_label(
         ExternalCapabilityProfile::ObserveShared => b"observe_shared".as_slice(),
     });
     let digest = hasher.finalize();
-    let mut encoded = String::with_capacity(15);
+    let mut encoded = String::with_capacity(68);
     encoded.push_str("ext-");
-    for byte in digest.iter().take(6) {
+    for byte in digest {
         encoded.push(char::from(HEX[usize::from(byte >> 4)]));
         encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
@@ -750,5 +750,22 @@ mod tests {
         assert!(validate_endpoint("ws://localhost:1234/app-server").is_err());
         assert!(validate_endpoint("ws://192.0.2.10:1234/app-server").is_err());
         assert!(validate_endpoint("wss://codex.example.invalid/app-server").is_ok());
+    }
+
+    #[test]
+    fn endpoint_label_retains_the_complete_sha256_identity() {
+        let endpoint =
+            validate_endpoint("ws://127.0.0.1:1234/app-server").expect("literal loopback endpoint");
+        let label = endpoint_label(
+            &endpoint,
+            &Version::new(0, 149, 0),
+            ExternalCapabilityProfile::ObserveShared,
+        );
+
+        assert_eq!(
+            label.as_str(),
+            "ext-51b10b2f97227b2b887fad3d07115e67f9e2c59449c0d10593dada049b87fa07"
+        );
+        assert_eq!(label.as_str().len(), 68);
     }
 }
