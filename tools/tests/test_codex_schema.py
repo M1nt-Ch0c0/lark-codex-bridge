@@ -1208,10 +1208,12 @@ class CodexSchemaTests(unittest.TestCase):
                 )
         self.assertIn("work limit", str(raised.exception))
 
-        with self.assertRaises(codex_schema.SchemaToolError) as raised:
-            with codex_schema.operation_budget(timeout=0.001):
-                time.sleep(0.01)
-                codex_schema.active_budget().checkpoint()
+        with mock.patch.object(
+            codex_schema.time, "monotonic", side_effect=[100.0, 100.002]
+        ):
+            with self.assertRaises(codex_schema.SchemaToolError) as raised:
+                with codex_schema.operation_budget(timeout=0.001):
+                    codex_schema.active_budget().checkpoint()
         self.assertIn("deadline", str(raised.exception))
         self.assertNotIn(payload_sentinel, str(raised.exception))
 
