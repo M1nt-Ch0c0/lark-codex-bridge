@@ -1323,6 +1323,10 @@ impl SupervisedProcess {
         self.child
             .as_mut()
             .expect("supervised child exists until reaped")
+            // Poll only the leader here. JobObjectChild::try_wait also polls
+            // the completion port, which can consume the job-empty event that
+            // its later whole-job wait needs in order to finish.
+            .inner_mut()
             .try_wait()
     }
 
