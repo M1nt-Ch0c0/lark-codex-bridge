@@ -10,7 +10,11 @@ use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, SystemTime};
 
-use command_group::{AsyncCommandGroup, AsyncGroupChild};
+#[cfg(windows)]
+use process_wrap::tokio::JobObject;
+#[cfg(unix)]
+use process_wrap::tokio::ProcessGroup;
+use process_wrap::tokio::{KillOnDrop, TokioChildWrapper, TokioCommandWrap};
 use tempfile::{Builder as TempDirBuilder, TempDir};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -1295,26 +1299,30 @@ fn bounded_transcript(text: &str, max_bytes: usize) -> Result<String, AsrError> 
 }
 
 struct SupervisedProcess {
-    child: Option<AsyncGroupChild>,
+    child: Option<Box<dyn TokioChildWrapper>>,
 }
 
 impl SupervisedProcess {
     fn spawn(command: &mut Command, spawn_error: AsrError) -> Result<Self, AsrError> {
-        let mut group = command.group();
-        group.kill_on_drop(true);
+        let command = std::mem::replace(command, Command::new(""));
+        let mut group = TokioCommandWrap::from(command);
+        group.wrap(KillOnDrop);
+        #[cfg(unix)]
+        group.wrap(ProcessGroup::leader());
+        #[cfg(windows)]
+        group.wrap(JobObject);
         let child = group.spawn().map_err(|_| spawn_error)?;
         Ok(Self { child: Some(child) })
     }
 
     fn take_stdout(&mut self) -> Option<tokio::process::ChildStdout> {
-        self.child.as_mut()?.inner().stdout.take()
+        self.child.as_mut()?.stdout().take()
     }
 
     fn try_wait_leader(&mut self) -> std::io::Result<Option<ExitStatus>> {
         self.child
             .as_mut()
             .expect("supervised child exists until reaped")
-            .inner()
             .try_wait()
     }
 
@@ -1326,7 +1334,7 @@ impl SupervisedProcess {
         // A successful leader may still have spawned descendants. Always close
         // the entire group/job before releasing the private workspace.
         let _ = child.start_kill();
-        let waited = child.wait().await;
+        let waited = Box::into_pin(child.wait()).await;
         self.child.take();
         waited
     }
@@ -1334,7 +1342,7 @@ impl SupervisedProcess {
     async fn terminate_and_wait(&mut self) {
         if let Some(mut child) = self.child.take() {
             let _ = child.start_kill();
-            let _ = child.wait().await;
+            let _ = Box::into_pin(child.wait()).await;
         }
     }
 
@@ -1397,7 +1405,7 @@ impl Drop for SupervisedProcess {
             let _ = child.start_kill();
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                 runtime.spawn(async move {
-                    let _ = child.wait().await;
+                    let _ = Box::into_pin(child.wait()).await;
                 });
             }
         }

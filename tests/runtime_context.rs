@@ -284,7 +284,6 @@ fn quoted_media_handle_reads_from_the_parent_and_debug_redacts_keys_and_text() {
 
 #[test]
 fn durable_context_types_have_no_transcript_content_field() {
-    const SENTINEL: &str = "private-transcript-sentinel-7f54";
     let registry = ContextRegistry::new(config(4, Duration::from_secs(60))).expect("registry");
     let mut context = draft("om_audio_private");
     context.message_type = "audio".to_owned();
@@ -301,8 +300,6 @@ fn durable_context_types_have_no_transcript_content_field() {
         },
         transcript_failure: Some(TranscriptFailure::NotRetained),
     }];
-    assert!(!format!("{context:?}").contains(SENTINEL));
-
     let registered = registry
         .register_pending(pending(41), context)
         .expect("register audio context");
@@ -310,18 +307,17 @@ fn durable_context_types_have_no_transcript_content_field() {
         .resolve_for_tool(&registered.context_id, "thread-a", "turn-private")
         .expect("resolve audio context");
     let serialized = serde_json::to_string(&snapshot).expect("serialize snapshot");
-    assert!(!serialized.contains(SENTINEL));
-    assert!(!format!("{snapshot:?}").contains(SENTINEL));
+    let serialized_value: serde_json::Value =
+        serde_json::from_str(&serialized).expect("parse snapshot");
+    assert_no_key_named_transcript(&serialized_value);
     let TypedPart::Media {
         handle, metadata, ..
     } = &snapshot.parts[0]
     else {
         panic!("audio media part")
     };
-    assert!(
-        !serde_json::to_string(metadata)
-            .expect("serialize typed metadata")
-            .contains(SENTINEL)
+    assert_no_key_named_transcript(
+        &serde_json::to_value(metadata).expect("serialize typed metadata"),
     );
 
     let authorized = registry
@@ -338,7 +334,24 @@ fn durable_context_types_have_no_transcript_content_field() {
         authorized.transcript_failure,
         Some(TranscriptFailure::NotRetained)
     );
-    assert!(!format!("{authorized:?}").contains(SENTINEL));
+    assert!(format!("{authorized:?}").contains("has_live_transcript: false"));
+}
+
+fn assert_no_key_named_transcript(value: &serde_json::Value) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            assert!(!fields.contains_key("transcript"));
+            for value in fields.values() {
+                assert_no_key_named_transcript(value);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                assert_no_key_named_transcript(value);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[test]

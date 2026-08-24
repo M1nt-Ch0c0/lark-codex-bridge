@@ -135,8 +135,8 @@ max_transcript_bytes = 32768
 相对路径相对配置文件目录解析；单个程序名（如 `ffmpeg`）走 `PATH`。
 
 sherpa-onnx-offline 的 stdout 可含配置转储；Bridge 会在有界输出中提取首个 JSON
-`text`。仓库提供的 [`scripts/sensevoice-sidecar.sh`](scripts/sensevoice-sidecar.sh)
-当前脚本用 `exec` 直接启动识别器以减少一层 shell；安全性不依赖这一点，Bridge 的进程组/Job Object 也会覆盖未 `exec` 的子孙进程。本机真实模型冒烟默认 `#[ignore]`，只在显式提供模型、样本和 `LARK_ASR_SMOKE=1` 时运行：
+`text`。仓库提供的包装脚本 [`scripts/sensevoice-sidecar.sh`](scripts/sensevoice-sidecar.sh)
+用 `exec` 直接启动识别器以减少一层 shell；安全性不依赖这一点，Bridge 的进程组/Job Object 也会覆盖未 `exec` 的子孙进程。本机真实模型冒烟默认 `#[ignore]`，只在显式提供模型、样本和 `LARK_ASR_SMOKE=1` 时运行：
 
 ```bash
 export SENSEVOICE_BIN=$HOME/lark-codex-bridge-asr/sherpa-onnx-v1.13.6-osx-arm64-static-no-tts/bin/sherpa-onnx-offline

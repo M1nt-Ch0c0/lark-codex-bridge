@@ -613,12 +613,9 @@ struct ContextToolTask {
 }
 
 impl ContextToolTask {
-    async fn stop(mut self) {
+    async fn stop(mut self, cleanup_timeout: Duration) {
         self.shutdown.cancel();
-        if timeout(Duration::from_secs(5), &mut self.task)
-            .await
-            .is_err()
-        {
+        if timeout(cleanup_timeout, &mut self.task).await.is_err() {
             self.task.abort();
             let _ = (&mut self.task).await;
         }
@@ -660,16 +657,12 @@ async fn run_router(
     let mut retries = VecDeque::<RouterRetry>::new();
     let mut retry_tick = interval(Duration::from_millis(250));
     retry_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut stale_sweeper = crate::runtime::asr::StaleWorkspaceSweeper::for_private_root();
     let asr_configured = settings.asr.is_configured();
-    let startup_sweep = if asr_configured {
-        stale_sweeper.sweep_once()
-    } else {
-        stale_sweeper.sweep_existing_once()
-    };
-    if startup_sweep.is_err() {
-        tracing::warn!("private ASR startup cleanup failed");
-    }
+    let mut stale_sweep_task = Some(run_stale_sweep(
+        crate::runtime::asr::StaleWorkspaceSweeper::for_private_root(),
+        asr_configured,
+    ));
+    let mut stale_sweeper = crate::runtime::asr::StaleWorkspaceSweeper::for_private_root();
     let mut stale_sweep = interval(crate::runtime::asr::ASR_STALE_SWEEP_INTERVAL);
     stale_sweep.set_missed_tick_behavior(MissedTickBehavior::Delay);
     // The startup round above replaces the interval's immediate first tick.
@@ -702,7 +695,7 @@ async fn run_router(
                     let current_epoch = supervisor.client().ok().map(|client| client.epoch());
                     if tool_task.as_ref().map(|task| task.epoch) != current_epoch {
                         if let Some(task) = tool_task.take() {
-                            task.stop().await;
+                            task.stop(settings.shutdown_cleanup_timeout).await;
                         }
                         tool_task = start_context_tool_task(
                             &supervisor,
@@ -713,7 +706,7 @@ async fn run_router(
                     }
                 } else {
                     if let Some(task) = tool_task.take() {
-                        task.stop().await;
+                        task.stop(settings.shutdown_cleanup_timeout).await;
                     }
                     supervisor_open = false;
                     supervisor_tx.send_replace(SupervisorAccess { epoch: 0, client: None });
@@ -738,15 +731,26 @@ async fn run_router(
                     &snapshot, &actors, &receiver, &retries, &active_turns, &settings,
                 );
             }
-            _ = stale_sweep.tick() => {
-                let result = if asr_configured {
-                    stale_sweeper.sweep_once()
+            completed = async {
+                stale_sweep_task
+                    .as_mut()
+                    .expect("stale sweep task exists behind select guard")
+                    .await
+            }, if stale_sweep_task.is_some() => {
+                stale_sweep_task = None;
+                if let Ok((sweeper, result)) = completed {
+                    stale_sweeper = sweeper;
+                    if result.is_err() {
+                        tracing::warn!("private ASR stale workspace sweep failed");
+                    }
                 } else {
-                    stale_sweeper.sweep_existing_once()
-                };
-                if result.is_err() {
-                    tracing::warn!("private ASR stale workspace sweep failed");
+                    tracing::warn!("private ASR stale workspace sweep task failed");
+                    stale_sweeper = crate::runtime::asr::StaleWorkspaceSweeper::for_private_root();
                 }
+            }
+            _ = stale_sweep.tick(), if stale_sweep_task.is_none() => {
+                stale_sweep_task = Some(run_stale_sweep(stale_sweeper, asr_configured));
+                stale_sweeper = crate::runtime::asr::StaleWorkspaceSweeper::for_private_root();
             }
             command = receiver.recv() => {
                 let Some(command) = command else { break };
@@ -788,8 +792,9 @@ async fn run_router(
                     RouterCommand::Shutdown { respond } => {
                         shutdown_actors(actors).await;
                         if let Some(task) = tool_task.take() {
-                            task.stop().await;
+                            task.stop(settings.shutdown_cleanup_timeout).await;
                         }
+                        finish_stale_sweep(stale_sweep_task).await;
                         supervisor.shutdown().await?;
                         reconcile_terminal_attachments(attachments.as_deref()).await?;
                         let _ = respond.send(());
@@ -801,11 +806,40 @@ async fn run_router(
     }
     shutdown_actors(actors).await;
     if let Some(task) = tool_task.take() {
-        task.stop().await;
+        task.stop(settings.shutdown_cleanup_timeout).await;
     }
+    finish_stale_sweep(stale_sweep_task).await;
     supervisor.shutdown().await?;
     reconcile_terminal_attachments(attachments.as_deref()).await?;
     Ok(())
+}
+
+type StaleSweepTask = JoinHandle<(
+    crate::runtime::asr::StaleWorkspaceSweeper,
+    Result<(), crate::runtime::asr::AsrError>,
+)>;
+
+fn run_stale_sweep(
+    mut sweeper: crate::runtime::asr::StaleWorkspaceSweeper,
+    asr_configured: bool,
+) -> StaleSweepTask {
+    tokio::task::spawn_blocking(move || {
+        let result = if asr_configured {
+            sweeper.sweep_once()
+        } else {
+            sweeper.sweep_existing_once()
+        };
+        (sweeper, result)
+    })
+}
+
+async fn finish_stale_sweep(task: Option<StaleSweepTask>) {
+    let Some(task) = task else { return };
+    match task.await {
+        Ok((_, Ok(()))) => {}
+        Ok((_, Err(_))) => tracing::warn!("private ASR stale workspace sweep failed"),
+        Err(_) => tracing::warn!("private ASR stale workspace sweep task failed"),
+    }
 }
 
 #[allow(clippy::ref_option, clippy::too_many_arguments)]

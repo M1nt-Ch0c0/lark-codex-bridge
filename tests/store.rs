@@ -922,6 +922,72 @@ async fn migration_seven_preserves_legacy_lease_as_one_unique_acquisition() {
 }
 
 #[tokio::test]
+async fn migration_six_rejects_active_legacy_leases_over_the_runtime_cap() {
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("legacy-lease-over-cap.sqlite");
+    let mut connection = rusqlite::Connection::open(&path).expect("legacy setup");
+    connection
+        .execute_batch(
+            "CREATE TABLE attachments (
+                 sha256 TEXT PRIMARY KEY,
+                 bytes INTEGER NOT NULL,
+                 kind TEXT NOT NULL,
+                 created_ms INTEGER NOT NULL,
+                 last_used_ms INTEGER NOT NULL
+             );
+             CREATE TABLE turns (
+                 id INTEGER PRIMARY KEY,
+                 state TEXT NOT NULL,
+                 uncertain INTEGER NOT NULL
+             );
+             CREATE TABLE attachment_leases (
+                 sha256 TEXT NOT NULL,
+                 turn_row_id INTEGER NOT NULL,
+                 created_ms INTEGER NOT NULL
+             );
+             INSERT INTO attachments VALUES ('legacy-hash', 1, 'file', 1, 1);
+             INSERT INTO turns VALUES (1, 'running', 0);
+             PRAGMA user_version = 5;",
+        )
+        .expect("create minimal v5 store");
+    let transaction = connection.transaction().expect("seed transaction");
+    {
+        let mut insert = transaction
+            .prepare(
+                "INSERT INTO attachment_leases (sha256, turn_row_id, created_ms)
+                 VALUES ('legacy-hash', 1, 1)",
+            )
+            .expect("prepare legacy lease");
+        for _ in 0..=STORE_ATTACHMENT_LEASE_MAX_ROWS {
+            insert.execute([]).expect("seed legacy lease");
+        }
+    }
+    transaction.commit().expect("commit legacy leases");
+    drop(connection);
+
+    assert!(matches!(
+        StoreHandle::open(&path).await,
+        Err(StoreError::CapacityExceeded {
+            context: "migrating attachment leases"
+        })
+    ));
+    let connection = rusqlite::Connection::open(&path).expect("inspect rolled-back store");
+    let version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .expect("version");
+    let leases: i64 = connection
+        .query_row("SELECT COUNT(*) FROM attachment_leases", [], |row| {
+            row.get(0)
+        })
+        .expect("legacy lease count");
+    assert_eq!(version, 5);
+    assert_eq!(
+        u64::try_from(leases).expect("non-negative lease count"),
+        STORE_ATTACHMENT_LEASE_MAX_ROWS + 1
+    );
+}
+
+#[tokio::test]
 async fn attachment_lease_capacity_is_enforced_before_an_extra_acquisition() {
     let temp = tempdir().expect("tempdir");
     let path = temp.path().join("lease-capacity.sqlite");
