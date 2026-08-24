@@ -433,10 +433,10 @@ async fn wait_for_ready_with_evidence(
         loop {
             let observed = *state.borrow_and_update();
             eprintln!("external_reconciliation_state phase={phase} state={observed:?}");
-            if let Some(epoch) = observed.ready_epoch()
-                && epoch > prior_epoch
-            {
-                return Ok(epoch);
+            if let Some(epoch) = observed.ready_epoch() {
+                if epoch > prior_epoch {
+                    return Ok(epoch);
+                }
             }
             state
                 .changed()

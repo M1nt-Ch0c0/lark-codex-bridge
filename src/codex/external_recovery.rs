@@ -275,10 +275,10 @@ impl ExternalRecoveryCoordinator {
         let mut state = self.state.clone();
         let wait = async move {
             loop {
-                if let Some(epoch) = state.borrow_and_update().ready_epoch()
-                    && epoch > prior_epoch
-                {
-                    return Ok(epoch);
+                if let Some(epoch) = state.borrow_and_update().ready_epoch() {
+                    if epoch > prior_epoch {
+                        return Ok(epoch);
+                    }
                 }
                 state
                     .changed()
@@ -1131,12 +1131,12 @@ impl TerminalProjection {
         for item in &turn.items {
             self.add_item(&turn.id, item)?;
         }
-        if let Some(prior) = self.turns.insert(turn.id.clone(), status)
-            && prior != status
-        {
-            return Err(ThreadFailure::Uncertain(
-                ExternalUncertaintyReason::ConflictingTerminal,
-            ));
+        if let Some(prior) = self.turns.insert(turn.id.clone(), status) {
+            if prior != status {
+                return Err(ThreadFailure::Uncertain(
+                    ExternalUncertaintyReason::ConflictingTerminal,
+                ));
+            }
         }
         self.ensure_entry_bounds()
     }
@@ -1170,12 +1170,12 @@ impl TerminalProjection {
     fn add_event(&mut self, event: ExternalReadEvent) -> Result<(), ThreadFailure> {
         let (turn, item) = terminal_from_event(event).map_err(ThreadFailure::Epoch)?;
         if let Some(turn) = turn {
-            if let Some(prior) = self.turns.insert(turn.turn_id, turn.status)
-                && prior != turn.status
-            {
-                return Err(ThreadFailure::Uncertain(
-                    ExternalUncertaintyReason::ConflictingTerminal,
-                ));
+            if let Some(prior) = self.turns.insert(turn.turn_id, turn.status) {
+                if prior != turn.status {
+                    return Err(ThreadFailure::Uncertain(
+                        ExternalUncertaintyReason::ConflictingTerminal,
+                    ));
+                }
             }
         }
         if let Some(item) = item {
