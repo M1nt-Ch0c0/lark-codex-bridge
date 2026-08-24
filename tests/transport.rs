@@ -594,6 +594,8 @@ async fn version_probe_rejects_malformed_and_unsupported_versions() {
         "codex-cli 0.145.9",
         "codex-cli 0.147.0",
         "codex-cli 0.149.0",
+        "codex-cli 0.146.0-rc.1",
+        "codex-cli 0.146.0+build.1",
     ] {
         let (_directory, binary) = fake_codex(output);
         let result = probe_version(&CodexProcessConfig {
