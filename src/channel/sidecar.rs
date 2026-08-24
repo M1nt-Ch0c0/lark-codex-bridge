@@ -12,8 +12,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use command_group::{AsyncCommandGroup as _, AsyncGroupChild};
 use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
+#[cfg(windows)]
+use process_wrap::tokio::JobObject;
+#[cfg(unix)]
+use process_wrap::tokio::ProcessGroup;
+use process_wrap::tokio::{KillOnDrop, TokioChildWrapper, TokioCommandWrap};
 use secrecy::ExposeSecret as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -369,30 +373,33 @@ enum SessionEnd {
 /// Windows, an owned Job object. `start_kill` targets that whole ownership
 /// boundary, including non-exec wrapper descendants.
 struct OwnedChildGroup {
-    child: AsyncGroupChild,
+    child: Box<dyn TokioChildWrapper>,
 }
 
 impl OwnedChildGroup {
-    fn new(child: AsyncGroupChild) -> Self {
+    fn new(child: Box<dyn TokioChildWrapper>) -> Self {
         Self { child }
     }
 
     fn inner(&mut self) -> &mut tokio::process::Child {
-        self.child.inner()
+        self.child.inner_mut()
     }
 
     async fn wait_leader(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        self.child.inner().wait().await
+        self.child.inner_mut().wait().await
     }
 
     async fn terminate_and_reap(&mut self, grace: Duration) {
         // This is deliberately attempted even after the leader has exited:
         // descendants may still own the process group/Job and inherited pipes.
         let _ = self.child.start_kill();
-        if timeout(grace, self.child.wait()).await.is_err() {
+        if timeout(grace, Box::into_pin(self.child.wait()))
+            .await
+            .is_err()
+        {
             tracing::warn!("node sidecar process group did not reap within its bound");
             let _ = self.child.start_kill();
-            let _ = timeout(grace, self.child.inner().wait()).await;
+            let _ = timeout(grace, self.child.inner_mut().wait()).await;
         }
     }
 }
@@ -470,9 +477,13 @@ impl ChildSession {
                 command.env(name, value);
             }
         }
+        let mut command = TokioCommandWrap::from(command);
+        command.wrap(KillOnDrop);
+        #[cfg(unix)]
+        command.wrap(ProcessGroup::leader());
+        #[cfg(windows)]
+        command.wrap(JobObject);
         let child = command
-            .group()
-            .kill_on_drop(true)
             .spawn()
             .map_err(|_| LarkError::retryable("spawning the node sidecar"))?;
         let mut child = OwnedChildGroup::new(child);
