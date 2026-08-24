@@ -1817,6 +1817,7 @@ mod tests {
             ttl: Duration::from_secs(60),
             max_contexts: 4,
             max_parts_per_context: 4,
+            ..ContextRegistryConfig::default()
         })
         .expect("registry");
         let registered = registry
@@ -1847,6 +1848,7 @@ mod tests {
                 handle,
                 "thread-private",
                 "turn-private",
+                1,
             )
             .expect("authorize exact grant");
         assert_eq!(authorized.transcript.as_deref(), Some(SENTINEL));

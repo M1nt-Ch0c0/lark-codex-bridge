@@ -922,46 +922,55 @@ async fn migration_seven_preserves_legacy_lease_as_one_unique_acquisition() {
 }
 
 #[tokio::test]
-async fn migration_six_rejects_active_legacy_leases_over_the_runtime_cap() {
+async fn migration_seven_rejects_active_legacy_leases_over_the_runtime_cap() {
     let temp = tempdir().expect("tempdir");
     let path = temp.path().join("legacy-lease-over-cap.sqlite");
+    let store = StoreHandle::open(&path)
+        .await
+        .expect("create current store");
+    store.shutdown().await.expect("shutdown current store");
+
     let mut connection = rusqlite::Connection::open(&path).expect("legacy setup");
-    connection
-        .execute_batch(
-            "CREATE TABLE attachments (
-                 sha256 TEXT PRIMARY KEY,
-                 bytes INTEGER NOT NULL,
-                 kind TEXT NOT NULL,
-                 created_ms INTEGER NOT NULL,
-                 last_used_ms INTEGER NOT NULL
-             );
-             CREATE TABLE turns (
-                 id INTEGER PRIMARY KEY,
-                 state TEXT NOT NULL,
-                 uncertain INTEGER NOT NULL
-             );
-             CREATE TABLE attachment_leases (
-                 sha256 TEXT NOT NULL,
-                 turn_row_id INTEGER NOT NULL,
-                 created_ms INTEGER NOT NULL
-             );
-             INSERT INTO attachments VALUES ('legacy-hash', 1, 'file', 1, 1);
-             INSERT INTO turns VALUES (1, 'running', 0);
-             PRAGMA user_version = 5;",
-        )
-        .expect("create minimal v5 store");
+    downgrade_attachment_lease_schema_to_v5(&connection);
     let transaction = connection.transaction().expect("seed transaction");
     {
-        let mut insert = transaction
+        let mut insert_attachment = transaction
+            .prepare(
+                "INSERT INTO attachments (sha256, bytes, kind, created_ms, last_used_ms)
+                 VALUES (?1, 1, 'file', 1, 1)",
+            )
+            .expect("prepare legacy attachment");
+        let mut insert_turn = transaction
+            .prepare(
+                "INSERT INTO turns (
+                     id, scope_key, client_message_id, state, uncertain, created_ms, updated_ms
+                 ) VALUES (?1, 'im:legacy', ?2, 'running', 0, 1, 1)",
+            )
+            .expect("prepare legacy turn");
+        let mut insert_lease = transaction
             .prepare(
                 "INSERT INTO attachment_leases (sha256, turn_row_id, created_ms)
-                 VALUES ('legacy-hash', 1, 1)",
+                 VALUES (?1, ?2, 1)",
             )
             .expect("prepare legacy lease");
-        for _ in 0..=STORE_ATTACHMENT_LEASE_MAX_ROWS {
-            insert.execute([]).expect("seed legacy lease");
+        for index in 0..=STORE_ATTACHMENT_LEASE_MAX_ROWS {
+            let row_id = i64::try_from(index + 1).expect("bounded row id");
+            let hash = format!("legacy-hash-{row_id}");
+            let message_id = format!("legacy-turn-{row_id}");
+            insert_attachment
+                .execute(rusqlite::params![&hash])
+                .expect("seed legacy attachment");
+            insert_turn
+                .execute(rusqlite::params![row_id, message_id])
+                .expect("seed legacy turn");
+            insert_lease
+                .execute(rusqlite::params![hash, row_id])
+                .expect("seed legacy lease");
         }
     }
+    transaction
+        .pragma_update(None, "user_version", 6_u32)
+        .expect("rewind schema version");
     transaction.commit().expect("commit legacy leases");
     drop(connection);
 
@@ -980,7 +989,7 @@ async fn migration_six_rejects_active_legacy_leases_over_the_runtime_cap() {
             row.get(0)
         })
         .expect("legacy lease count");
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
     assert_eq!(
         u64::try_from(leases).expect("non-negative lease count"),
         STORE_ATTACHMENT_LEASE_MAX_ROWS + 1

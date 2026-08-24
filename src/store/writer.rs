@@ -192,7 +192,7 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
             let transaction = connection
                 .transaction()
                 .map_err(|error| sqlite_error("starting a migration transaction", &error))?;
-            prepare_migration(&transaction, migration.version)?;
+            prepare_migration(&transaction, migration.name)?;
             transaction
                 .execute_batch(migration.sql)
                 .map_err(|error| sqlite_error("applying a migration", &error))?;
@@ -218,9 +218,9 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
 
 fn prepare_migration(
     transaction: &rusqlite::Transaction<'_>,
-    version: u32,
+    migration_name: &str,
 ) -> Result<(), StoreError> {
-    if version != 6 {
+    if migration_name != "tokenize attachment lease acquisitions" {
         return Ok(());
     }
     transaction
