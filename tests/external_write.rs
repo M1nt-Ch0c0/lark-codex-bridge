@@ -1104,6 +1104,75 @@ async fn approvals_have_one_recipient_one_response_deadlines_and_duplicate_fenci
 }
 
 #[tokio::test]
+async fn approval_response_without_resolution_is_bounded_and_fenced() {
+    let server = FakeWriteServer::start().await;
+    let scratch = tempfile::tempdir().expect("scratch");
+    let token_path = scratch.path().join("bearer");
+    write_token(&token_path);
+    let (source, recipient) = actors(scratch.path());
+    let (store, mut coordinator, label) =
+        seeded_coordinator(&server, &token_path, &source, &recipient).await;
+    let turn_id = result_id(
+        coordinator
+            .start_turn(
+                source,
+                "intent-unresolved-approval-owner",
+                start_params("message-unresolved-approval-owner"),
+            )
+            .await
+            .expect("approval owner turn"),
+    );
+
+    server
+        .push_bridge(reverse_request(
+            "approval-without-resolution",
+            "item/commandExecution/requestApproval",
+            &turn_id,
+            None,
+        ))
+        .await;
+    let prompt = timeout(TEST_TIMEOUT, coordinator.recv_approval())
+        .await
+        .expect("command prompt deadline")
+        .expect("command prompt");
+    coordinator
+        .resolve_approval(recipient, prompt.approval_id.clone(), command_decline())
+        .await
+        .expect("one response is accepted");
+    assert_eq!(
+        server.approval_responses(1).await[0]["id"],
+        "approval-without-resolution"
+    );
+
+    wait_approval_state(
+        &store,
+        &label,
+        &prompt.approval_id,
+        ExternalApprovalState::Uncertain,
+    )
+    .await;
+    timeout(TEST_TIMEOUT, async {
+        loop {
+            let endpoint = store
+                .external_endpoint_epoch(&label)
+                .await
+                .expect("endpoint read")
+                .expect("endpoint");
+            if endpoint.state == ExternalEndpointState::Unavailable {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("missing resolution fences endpoint within the request deadline");
+
+    drop(coordinator);
+    store.shutdown().await.expect("store shutdown");
+    server.finish().await;
+}
+
+#[tokio::test]
 async fn drained_approval_actor_reassignment_is_serialized_and_closes_the_old_coordinator() {
     let server = FakeWriteServer::start().await;
     let scratch = tempfile::tempdir().expect("scratch");

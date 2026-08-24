@@ -34,7 +34,8 @@ use crate::{
         },
     },
     limits::{
-        EXTERNAL_WRITE_SHUTDOWN_TIMEOUT, MAX_OUTBOUND_VALUE_WIRE_BYTES, ROUTING_ID_BYTE_LIMIT,
+        CONTROL_RPC_TIMEOUT, EXTERNAL_WRITE_SHUTDOWN_TIMEOUT, MAX_OUTBOUND_VALUE_WIRE_BYTES,
+        ROUTING_ID_BYTE_LIMIT,
     },
     runtime::policy::AuthorizedLarkActor,
     store::{
@@ -599,7 +600,6 @@ async fn run_write_actor(
     deadline_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     while !fatal {
         tokio::select! {
-            biased;
             () = cancellation.cancelled() => break,
             event = connection.recv_event() => {
                 match event {
@@ -669,7 +669,7 @@ async fn run_write_actor(
                 }
             }
             _ = deadline_tick.tick(), if !approvals.is_empty() => {
-                fatal = deny_expired_approvals(
+                fatal = settle_expired_approvals(
                     &mutation,
                     &store,
                     endpoint_label.as_str(),
@@ -1340,6 +1340,10 @@ async fn receive_approval(
         let _ = mutation.abandon_approval(&mut request);
         return Err(ExternalWriteError::Uncertain);
     }
+    if approvals.len() >= APPROVAL_CAPACITY {
+        let _ = mutation.abandon_approval(&mut request);
+        return Err(ExternalWriteError::Uncertain);
+    }
     let request_key = request_key_from_value(
         &serde_json::to_value(request.request_id()).map_err(|_| ExternalWriteError::Transport)?,
     )
@@ -1483,10 +1487,11 @@ async fn resolve_pending_approval(
         return Err(ExternalWriteError::Uncertain);
     }
     pending.responded = true;
+    pending.deadline = tokio::time::Instant::now() + settings.request_timeout;
     Ok(())
 }
 
-async fn deny_expired_approvals(
+async fn settle_expired_approvals(
     mutation: &ExternalMutationClient,
     store: &StoreHandle,
     endpoint_label: &str,
@@ -1495,6 +1500,24 @@ async fn deny_expired_approvals(
     approvals: &mut HashMap<String, PendingApproval>,
 ) -> Result<(), ExternalWriteError> {
     let now = tokio::time::Instant::now();
+    let unresolved_response = approvals.iter().find_map(|(approval_id, pending)| {
+        (pending.responded && pending.deadline <= now).then(|| approval_id.clone())
+    });
+    if let Some(approval_id) = unresolved_response {
+        let pending = approvals
+            .remove(&approval_id)
+            .ok_or(ExternalWriteError::Uncertain)?;
+        let _ = store
+            .resolve_external_approval(
+                endpoint_label,
+                pending.request.thread_id(),
+                &approval_id,
+                epoch,
+                ExternalApprovalResolution::Uncertain,
+            )
+            .await;
+        return Err(ExternalWriteError::Uncertain);
+    }
     let expired = approvals
         .iter()
         .filter(|(_, pending)| !pending.responded && pending.deadline <= now)
@@ -1912,6 +1935,7 @@ fn validate_command<T: Serialize>(intent_id: &str, params: &T) -> Result<(), Ext
 
 fn validate_settings(settings: &ExternalWriteSettings) -> Result<(), ExternalWriteError> {
     if settings.request_timeout.is_zero()
+        || settings.request_timeout > CONTROL_RPC_TIMEOUT
         || settings.approval_timeout.is_zero()
         || settings.client_actor.is_empty()
         || settings.client_actor.len() > 256

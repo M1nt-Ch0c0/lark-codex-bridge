@@ -53,8 +53,11 @@ swap claim. Deadlines are bounded by both local policy and the remote automatic
 resolution deadline; timeout or prompt-channel overflow sends a typed default
 denial (empty permissions for a permissions request). Completion is not final
 until the matching `serverRequest/resolved` notification is durably recorded.
-Disconnect while a claim is unresolved makes it uncertain instead of
-reassigning or answering twice.
+The in-memory approval set is capped, and a response that does not receive its
+matching resolution notification within one bounded request deadline fences
+the claim and endpoint as uncertain. Disconnect or capacity exhaustion while a
+claim is unresolved likewise fails closed instead of retaining unbounded state,
+reassigning, or answering twice.
 
 `ExternalWriteCoordinator::reassign_approval_actor` serializes a handler
 change with the command stream. It succeeds only when all mutation fences,
