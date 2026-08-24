@@ -69,7 +69,7 @@ pub enum ProcessError {
     },
     #[error("Codex version output must exactly match `codex-cli X.Y.Z`")]
     InvalidVersionOutput,
-    #[error("Codex {found} is unsupported; expected an exact reviewed version (0.146.0)")]
+    #[error("Codex {found} is unsupported; expected an exact reviewed version")]
     UnsupportedVersion { found: Version },
     #[error("Codex app-server stdio was already transferred")]
     StdioAlreadyTaken,
