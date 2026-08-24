@@ -147,6 +147,8 @@ class FakeCodexServer {
       userAgent:
         this.scenario === "wrong-version"
           ? "codex_cli_rs/0.148.0 (fake)"
+          : this.scenario === "bare-user-agent"
+            ? `codex_cli_rs/${EXPECTED_VERSION}`
           : `codex_cli_rs/${EXPECTED_VERSION} (fake)`,
       codexHome,
       platformFamily: "unix",
@@ -339,6 +341,22 @@ const healthFailure = { code: 1, output: { ok: false, stage: "health" } };
 
 test("accepts exact identity, clean closes, exact health, and reconnect", async () => {
   await scenario("success", {
+    code: 0,
+    output: {
+      ok: true,
+      exactVersionVerified: true,
+      isolatedProfileVerified: true,
+      twoClientsInitializedAndDisconnected: true,
+      twoClientCloseHandshakesClean: true,
+      healthAfterClientDisconnect: true,
+      freshClientInitializedAndDisconnected: true,
+      freshClientCloseHandshakeClean: true,
+    },
+  });
+});
+
+test("accepts an exact server version at the end of userAgent", async () => {
+  await scenario("bare-user-agent", {
     code: 0,
     output: {
       ok: true,

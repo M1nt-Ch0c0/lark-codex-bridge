@@ -201,7 +201,7 @@ function exactServerVersion(userAgent) {
     return null;
   }
   const versions = [
-    ...userAgent.matchAll(/\/(\d+\.\d+\.\d+)(?=\s|\()/g),
+    ...userAgent.matchAll(/\/(\d+\.\d+\.\d+)(?=\s|\(|$)/g),
   ];
   return versions.length === 1 ? versions[0][1] : null;
 }
