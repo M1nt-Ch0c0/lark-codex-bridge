@@ -1467,6 +1467,79 @@ mod tests {
     use super::*;
     use tokio::time::{Duration, timeout};
 
+    #[test]
+    fn live_transcript_content_is_excluded_from_durable_context_types() {
+        const SENTINEL: &str = "private-transcript-sentinel-7f54";
+        let event = InboundEvent {
+            event_id: "event-private-audio".to_owned(),
+            message_id: "message-private-audio".to_owned(),
+            chat_id: "chat-private-audio".to_owned(),
+            sender_id: "sender-private-audio".to_owned(),
+            chat_type: ChatMode::P2p,
+            thread_id: None,
+            root_id: None,
+            reply_to_message_id: None,
+            text: String::new(),
+            mentions_bot: false,
+            mention_all: false,
+            sender_is_human: true,
+            mentions: Vec::new(),
+            parts: vec![MessagePart::Audio(MediaPart {
+                key: Some("audio-private-key".to_owned()),
+                thumbnail_key: None,
+                metadata: InboundMediaMetadata {
+                    duration_ms: Some(800),
+                    transcript_failure: Some(TranscriptFailure::NotRetained),
+                    ..InboundMediaMetadata::default()
+                },
+                status: PartStatus::Available,
+            })],
+            resources: Vec::new(),
+            message_type: "audio".to_owned(),
+            create_time_ms: 123,
+            scope: crate::lark::normalize::ScopeKey::Chat("chat-private-audio".to_owned()),
+        };
+        let handoff = LiveTranscriptHandoff::bound(&event, vec![(0, SENTINEL.to_owned())]);
+        let registry = ContextRegistry::new(ContextRegistryConfig {
+            ttl: Duration::from_secs(60),
+            max_contexts: 4,
+            max_parts_per_context: 4,
+        })
+        .expect("registry");
+        let registered = registry
+            .register_pending_with_transcripts(
+                PendingBinding {
+                    codex_thread_id: "thread-private".to_owned(),
+                    local_turn_row_id: 41,
+                },
+                ContextDraft::from_inbound(&event),
+                handoff,
+            )
+            .expect("register audio context with live transcript");
+        let snapshot = registry
+            .resolve_for_tool(&registered.context_id, "thread-private", "turn-private")
+            .expect("resolve audio context");
+        assert!(
+            !serde_json::to_string(&snapshot)
+                .expect("serialize snapshot")
+                .contains(SENTINEL)
+        );
+        assert!(!format!("{snapshot:?}").contains(SENTINEL));
+        let TypedPart::Media { handle, .. } = &snapshot.parts[0] else {
+            panic!("audio media part")
+        };
+        let authorized = registry
+            .authorize_media_for_tool(
+                &registered.context_id,
+                handle,
+                "thread-private",
+                "turn-private",
+            )
+            .expect("authorize exact grant");
+        assert_eq!(authorized.transcript.as_deref(), Some(SENTINEL));
+        assert!(!format!("{authorized:?}").contains(SENTINEL));
+    }
+
     #[tokio::test]
     async fn revocation_forbids_an_uncommitted_media_response() {
         let gate = Arc::new(ResponseGate::default());
