@@ -357,8 +357,8 @@ fn carriers_apply_explicit_safe_url_schemes_and_keep_malformed_tails() {
     assert!(post.contains("[secure](https://example.com/a_(b))"));
     assert!(post.contains("[plain](http://example.com)"));
     assert!(post.contains("[mail](mailto:user@example.com)"));
-    assert!(post.contains("script (unsafe link target)"));
-    assert!(post.contains("bidi (unsafe link target)"));
+    assert!(post.contains("script (javascript:alert(1)) (unsafe link target)"));
+    assert!(post.contains("bidi (https://example.com/%E2%80%AEtxt) (unsafe link target)"));
     assert!(post.contains("[http://example.com/plain](http://example.com/plain)"));
     assert!(post.contains("Image: bad (unsafe image target)"));
     assert!(post.contains("https://example.com trailing words"));
@@ -366,11 +366,59 @@ fn carriers_apply_explicit_safe_url_schemes_and_keep_malformed_tails() {
 
     let card = stabilize_streaming_markdown(source);
     assert!(card.contains("[secure](https://example.com/a_(b))"));
-    assert!(card.contains("plain (unsafe link target)"));
-    assert!(card.contains("mail (unsafe link target)"));
+    assert!(card.contains("plain (http://example.com) (unsafe link target)"));
+    assert!(card.contains("mail (mailto:user@example.com) (unsafe link target)"));
     assert!(card.contains("http://example.com/plain (unsafe link target)"));
     assert!(!card.contains("[plain](http://"));
     assert!(!card.contains("[mail](mailto:"));
+}
+
+#[test]
+fn query_string_links_and_autolinks_stay_active_in_both_carriers() {
+    let source = concat!(
+        "[docs](https://example.com/search?a=1&b=2#frag) ",
+        "[params](https://example.com/q?a=1&b=2;c=3) ",
+        "<https://example.com/plain?x=1&y=2>\n",
+        "![icon](https://example.com/i.png?a=1&b=2)",
+    );
+    let expected = concat!(
+        "[docs](https://example.com/search?a=1&b=2#frag) ",
+        "[params](https://example.com/q?a=1&b=2;c=3) ",
+        "[https://example.com/plain?x=1&y=2](https://example.com/plain?x=1&y=2)\n",
+        "Image: icon (https://example.com/i.png?a=1&b=2)",
+    );
+    for rendered in [
+        render_lark_markdown(source),
+        stabilize_streaming_markdown(source),
+    ] {
+        assert_eq!(rendered, expected);
+    }
+}
+
+#[test]
+fn decodable_entities_in_link_targets_are_rejected_but_the_url_text_survives() {
+    let source = concat!(
+        "[amp](https://example.com/y?a=1&amp;b=2)\n",
+        "[hex](https://example.com/p&#x29;q=1)\n",
+        "[dec](https://example.com/p&#41;q=1)\n",
+        "<https://example.com/auto?a=1&amp;b=2>",
+    );
+    let expected = concat!(
+        "amp (https://example.com/y?a=1＆b=2) (unsafe link target)\n",
+        "hex (https://example.com/p）q=1) (unsafe link target)\n",
+        "dec (https://example.com/p）q=1) (unsafe link target)\n",
+        "https://example.com/auto?a=1＆b=2 (unsafe link target)",
+    );
+    for rendered in [
+        render_lark_markdown(source),
+        stabilize_streaming_markdown(source),
+    ] {
+        assert_eq!(rendered, expected);
+        assert!(!rendered.contains("&amp;"));
+        assert!(!rendered.contains("&#x29;"));
+        assert!(!rendered.contains("&#41;"));
+        assert!(!rendered.contains("](https://example.com"));
+    }
 }
 
 #[test]
@@ -401,13 +449,13 @@ fn escaped_closing_delimiters_use_backslash_parity_in_both_carriers() {
         r"![target_even](data:text/plain,owned\\) trailing",
     );
     let expected = concat!(
-        r"odd\] (unsafe link target)",
+        r"odd\] (javascript:alert(1)) (unsafe link target)",
         "\n",
-        r"even\\ (unsafe link target)",
+        r"even\\ (javascript:alert(2)) (unsafe link target)",
         "\n",
-        r"odd_three\\\] (unsafe link target)",
+        r"odd_three\\\] (data:text/plain,owned) (unsafe link target)",
         "\n",
-        r"even_four\\\\ (unsafe link target)",
+        r"even_four\\\\ (data:text/plain,owned) (unsafe link target)",
         "\n",
         r"Image: odd\] (unsafe image target)",
         "\n",
@@ -417,13 +465,13 @@ fn escaped_closing_delimiters_use_backslash_parity_in_both_carriers() {
         "\n",
         r"Image: even_four\\\\ (unsafe image target)",
         "\n",
-        "target_odd (unsafe link target) trailing",
+        r"target_odd (javascript:owned\)) (unsafe link target) trailing",
         "\n",
-        "target_even (unsafe link target) trailing",
+        r"target_even (javascript:owned\\) (unsafe link target) trailing",
         "\n",
-        "Image: target_odd (unsafe image target) trailing",
+        r"Image: target_odd (unsafe image target) trailing",
         "\n",
-        "Image: target_even (unsafe image target) trailing",
+        r"Image: target_even (unsafe image target) trailing",
     );
 
     for rendered in [
@@ -431,10 +479,10 @@ fn escaped_closing_delimiters_use_backslash_parity_in_both_carriers() {
         stabilize_streaming_markdown(source),
     ] {
         assert_eq!(rendered, expected);
+        // The unsafe scheme stays visible as inert text (matching the
+        // autolink degradation) but can never reactivate as link syntax.
         assert!(!rendered.contains("](javascript:"));
         assert!(!rendered.contains("](data:"));
-        assert!(!rendered.contains("javascript:"));
-        assert!(!rendered.contains("data:text/plain"));
     }
 }
 

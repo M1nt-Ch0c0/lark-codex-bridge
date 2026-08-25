@@ -81,6 +81,34 @@ fn standalone_final_is_the_final_answer() {
 }
 
 #[test]
+fn final_render_remasks_addresses_exposed_by_html_stripping() {
+    let projector = ReplyProjector::with_defaults();
+    // The pre-render mask cannot see through raw HTML: `<b>` breaks the
+    // terminal label and the dotted comment moves the last dot. Rendering
+    // strips both, exposing clean addresses that the post-render mask must
+    // still catch.
+    let turn = outcome(
+        vec![agent(
+            "a1",
+            "contact user@<b>example.com</b> or admin@<!--x.y-->example.org",
+            Some(MessagePhase::FinalAnswer),
+        )],
+        TurnStatus::Completed,
+    );
+
+    match projector.project_final(&turn) {
+        ProjectedReply::Final { parts } => {
+            assert_eq!(
+                parts,
+                vec!["contact user[at]example.com or admin[at]example.org"]
+            );
+        }
+        ProjectedReply::ProgressFinal { .. } => panic!("no progress card exists"),
+        ProjectedReply::Empty => panic!("expected a standalone final"),
+    }
+}
+
+#[test]
 fn final_only_turn_produces_no_progress() {
     let mut projector = ReplyProjector::with_defaults();
     let now = Instant::now();

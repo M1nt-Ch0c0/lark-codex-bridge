@@ -991,7 +991,7 @@ fn sanitize_inline_bounded(
                     output.push_str(inner);
                     output.push(')');
                 } else if looks_like_url_target(inner, budget)? {
-                    output.push_str(inner);
+                    output.push_str(&sanitize_inline_bounded(inner, carrier, budget)?);
                     output.push_str(" (unsafe link target)");
                 } else if !looks_like_html_tag(inner) {
                     // Not an HTML tag, but raw angle syntax is outside both
@@ -1130,8 +1130,15 @@ fn preserve_or_degrade_link(
             if safe_link_target(target, carrier, budget)? {
                 return Ok(Some((format!("[{label}]({target})"), end + 1 - opening)));
             }
+            // Keep the rejected target visible as inert text, matching the
+            // autolink degradation. Sanitizing decodes any entity into its
+            // full-width form, so the text can never reactivate as link
+            // syntax in the second pass.
             return Ok(Some((
-                format!("{label} (unsafe link target)"),
+                format!(
+                    "{label} ({}) (unsafe link target)",
+                    sanitize_inline_bounded(target, carrier, budget)?
+                ),
                 end + 1 - opening,
             )));
         }
@@ -1249,8 +1256,8 @@ fn safe_link_target(
                 || matches!(character, '<' | '>' | '"' | '\'' | '\\')
                 || character.is_whitespace()
         })
-        || target.contains('&')
         || decoded_url_has_unsafe_controls(target)
+        || has_decodable_entity(target, budget)?
     {
         return Ok(false);
     }
@@ -1261,6 +1268,27 @@ fn safe_link_target(
         MarkdownCarrier::Post => matches!(url.scheme(), "https" | "http" | "mailto"),
         MarkdownCarrier::Card2 => url.scheme() == "https",
     })
+}
+
+/// A bare `&` is legitimate query syntax, but a sequence this pipeline can
+/// decode (`&amp;`, `&#41;`, …) must stay rejected: an active link emits its
+/// target verbatim, and a later decode — the second projection pass or the
+/// Lark renderer — could turn the entity back into a delimiter byte that was
+/// never validated.
+fn has_decodable_entity(
+    target: &str,
+    budget: &mut InlineWorkBudget,
+) -> Result<bool, InlineWorkExhausted> {
+    let bytes = target.as_bytes();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        budget.charge(1)?;
+        if bytes[cursor] == b'&' && decode_entity(&target[cursor..], budget)?.is_some() {
+            return Ok(true);
+        }
+        cursor += 1;
+    }
+    Ok(false)
 }
 
 fn looks_like_url_target(

@@ -439,7 +439,10 @@ impl ReplyProjector {
         if trimmed.is_empty() {
             ProjectedReply::Empty
         } else {
-            let markdown = render_lark_markdown(trimmed);
+            // Rendering strips raw HTML, which can expose an address the
+            // pre-render mask could not recognize (`user@<b>example.com</b>`).
+            // Re-mask the rendered Markdown so the exposure never ships.
+            let markdown = email_mask(&render_lark_markdown(trimmed));
             if markdown.is_empty() {
                 return ProjectedReply::Empty;
             }
@@ -776,14 +779,16 @@ mod tests {
         let projected = ReplyProjector::with_defaults().project_final(&outcome);
         let measured = take_measured_projection_work();
 
-        // One classification visit per source byte, one output-byte write,
-        // and exactly one constant-time decision per `@` candidate. Every
-        // qualifying one-byte `@` expands to the four-byte `[at]` marker.
+        // The pre-render mask pays one classification visit per source byte,
+        // one output-byte write, and exactly one constant-time decision per
+        // `@` candidate. Every qualifying one-byte `@` expands to the
+        // four-byte `[at]` marker. The post-render remask then revisits the
+        // masked text — three bytes longer per pair — and finds no `@`.
         assert_eq!(
             measured.email_mask,
             target_bytes
-                .saturating_mul(2)
-                .saturating_add(pair_count.saturating_mul(4)),
+                .saturating_mul(4)
+                .saturating_add(pair_count.saturating_mul(10)),
         );
         assert!(
             measured.markdown_inline <= target_bytes.saturating_mul(7),
@@ -793,7 +798,7 @@ mod tests {
         );
         assert!(
             measured.email_mask.saturating_add(measured.markdown_inline)
-                <= target_bytes.saturating_mul(10),
+                <= target_bytes.saturating_mul(14),
             "{target_bytes} source bytes consumed {measured:?}",
         );
 
