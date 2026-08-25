@@ -35,7 +35,7 @@ use super::{ConnectionState, InboundSource};
 use crate::codex::supervisor::AppServerSupervisor;
 use crate::lark::bridge::InboundEventHandler;
 use crate::lark::credentials::LarkCredentials;
-use crate::lark::error::LarkError;
+use crate::lark::error::{LarkError, LarkErrorKind};
 use crate::limits::{
     CHANNEL_SIDECAR_ACK_GRACE, CHANNEL_SIDECAR_CONNECT_TIMEOUT, CHANNEL_SIDECAR_EVENT_CAPACITY,
     CHANNEL_SIDECAR_FRAME_BYTES, CHANNEL_SIDECAR_HANDLER_TIMEOUT,
@@ -164,7 +164,8 @@ impl NodeSidecar {
     /// # Errors
     ///
     /// Returns a static classification if the executable cannot start, the
-    /// first handshake is malformed/incompatible, or configuration times out.
+    /// first handshake is malformed/incompatible, configuration times out, or
+    /// the provider permanently rejects the session.
     pub async fn start(
         config: NodeSidecarConfig,
         credentials: LarkCredentials,
@@ -319,6 +320,10 @@ async fn supervise(
                         publish(&state, ConnectionState::Stopped);
                         return;
                     }
+                    SessionEnd::Failed => {
+                        // The fatal state frame already published Degraded.
+                        return;
+                    }
                     SessionEnd::Crashed { was_healthy } => {
                         if was_healthy {
                             failures = 0;
@@ -333,6 +338,15 @@ async fn supervise(
                         &state,
                         ConnectionState::Degraded {
                             reason: "node_sidecar_startup_failed".to_owned(),
+                        },
+                    );
+                    return;
+                }
+                if error.kind() == LarkErrorKind::PermanentAuth {
+                    publish(
+                        &state,
+                        ConnectionState::Degraded {
+                            reason: "node_sidecar_provider_auth_failed".to_owned(),
                         },
                     );
                     return;
@@ -365,7 +379,11 @@ fn publish(state: &watch::Sender<ConnectionState>, next: ConnectionState) {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SessionEnd {
-    Crashed { was_healthy: bool },
+    Crashed {
+        was_healthy: bool,
+    },
+    /// A fatal provider failure was reported; supervision must not restart.
+    Failed,
     Shutdown,
 }
 
@@ -582,16 +600,47 @@ impl ChildSession {
             }),
             self.max_frame_bytes,
         )?;
-        let line = timeout(config.handshake_timeout, self.stdout.next())
-            .await
-            .map_err(|_| LarkError::retryable("waiting for node sidecar configuration"))?
-            .ok_or_else(|| LarkError::retryable("reading node sidecar configuration"))?
-            .map_err(|_| {
-                LarkError::protocol("node sidecar configuration response exceeds the frame bound")
-            })?;
-        let response: ResponseFrame = serde_json::from_str(&line)
-            .map_err(|_| LarkError::protocol("decoding node sidecar configuration response"))?;
-        response.validate(&id)
+        timeout(config.handshake_timeout, async {
+            loop {
+                let line = self
+                    .stdout
+                    .next()
+                    .await
+                    .ok_or_else(|| LarkError::retryable("reading node sidecar configuration"))?
+                    .map_err(|_| {
+                        LarkError::protocol(
+                            "node sidecar configuration response exceeds the frame bound",
+                        )
+                    })?;
+                let base: BaseFrame = serde_json::from_str(&line)
+                    .map_err(|_| LarkError::protocol("decoding a node sidecar frame"))?;
+                base.validate()?;
+                if base.kind == "response" && base.id == id {
+                    let response: ResponseFrame = serde_json::from_str(&line).map_err(|_| {
+                        LarkError::protocol("decoding node sidecar configuration response")
+                    })?;
+                    return response.validate(&id);
+                }
+                // The SDK may dispatch a redelivered event before the correlated
+                // response is queued; route it like a steady-state frame instead
+                // of faulting the bootstrap on the interleaving.
+                match handle_line(
+                    &line,
+                    &self.state,
+                    &self.writes,
+                    &self.events,
+                    &self.active_ids,
+                    self.max_frame_bytes,
+                )? {
+                    FrameEffect::Failed { .. } | FrameEffect::Stopped => {
+                        return Err(LarkError::retryable("configuring the node sidecar"));
+                    }
+                    FrameEffect::Continue | FrameEffect::Connected | FrameEffect::Disconnected => {}
+                }
+            }
+        })
+        .await
+        .map_err(|_| LarkError::retryable("waiting for node sidecar configuration"))?
     }
 
     async fn wait_until_connected(&mut self, deadline: Duration) -> Result<(), LarkError> {
@@ -623,7 +672,12 @@ impl ChildSession {
                             self.max_frame_bytes,
                         )? {
                             FrameEffect::Connected => return Ok(()),
-                            FrameEffect::Failed | FrameEffect::Stopped => {
+                            FrameEffect::Failed { fatal: true } => {
+                                return Err(LarkError::permanent_auth(
+                                    "the node sidecar reported a permanent provider failure",
+                                ));
+                            }
+                            FrameEffect::Failed { fatal: false } | FrameEffect::Stopped => {
                                 return Err(LarkError::retryable(
                                     "establishing the initial node sidecar connection",
                                 ));
@@ -674,7 +728,10 @@ impl ChildSession {
                                 Ok(FrameEffect::Connected) => {
                                     connected_since.get_or_insert_with(Instant::now);
                                 }
-                                Ok(FrameEffect::Disconnected | FrameEffect::Failed | FrameEffect::Stopped) => {
+                                Ok(FrameEffect::Failed { fatal: true }) => {
+                                    return self.terminal().await;
+                                }
+                                Ok(FrameEffect::Disconnected | FrameEffect::Failed { fatal: false } | FrameEffect::Stopped) => {
                                     was_healthy |= connected_for(
                                         connected_since.as_ref(),
                                         self.healthy_uptime,
@@ -717,6 +774,14 @@ impl ChildSession {
         self.child.terminate_and_reap(self.shutdown_grace).await;
         self.abort_tasks();
         SessionEnd::Crashed { was_healthy }
+    }
+
+    /// A permanent provider failure cannot succeed on restart: reap the
+    /// process epoch and end supervision instead of entering backoff.
+    async fn terminal(&mut self) -> SessionEnd {
+        self.child.terminate_and_reap(self.shutdown_grace).await;
+        self.abort_tasks();
+        SessionEnd::Failed
     }
 
     async fn graceful_shutdown(&mut self) -> SessionEnd {
@@ -785,7 +850,7 @@ enum FrameEffect {
     Continue,
     Connected,
     Disconnected,
-    Failed,
+    Failed { fatal: bool },
     Stopped,
 }
 
@@ -1185,6 +1250,9 @@ struct StateFrame {
     attempt: Option<u32>,
     #[serde(default)]
     delay_ms: Option<u64>,
+    /// Optional fail-closed marker on `failed`; absent means restartable.
+    #[serde(default)]
+    fatal: bool,
 }
 
 impl StateFrame {
@@ -1209,9 +1277,14 @@ impl StateFrame {
             ),
             "failed" => (
                 ConnectionState::Degraded {
-                    reason: "node_sidecar_connection_failed".to_owned(),
+                    reason: if self.fatal {
+                        "node_sidecar_provider_auth_failed"
+                    } else {
+                        "node_sidecar_connection_failed"
+                    }
+                    .to_owned(),
                 },
-                FrameEffect::Failed,
+                FrameEffect::Failed { fatal: self.fatal },
             ),
             "stopped" => (ConnectionState::Stopped, FrameEffect::Stopped),
             _ => return Err(LarkError::protocol("node sidecar state is unknown")),

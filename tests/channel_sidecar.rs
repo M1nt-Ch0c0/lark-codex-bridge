@@ -286,6 +286,85 @@ async fn initial_connection_failure_is_terminal_for_this_start_and_kills_the_tre
 }
 
 #[tokio::test]
+async fn event_frames_may_precede_the_correlated_configure_response() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let marker = temp.path().join("early-event");
+    let handler: InboundEventHandler = Arc::new(|_payload| async { Ok(None) }.boxed());
+
+    let handle = NodeSidecar::start(fast_config("early-event", &marker), credentials(), handler)
+        .await
+        .expect("a redelivered event must not fault the configure round-trip");
+    wait_for_file(&marker).await;
+    assert_eq!(
+        std::fs::read_to_string(&marker).expect("early ack evidence"),
+        "early-event-acked",
+        "the early event must reach durable intake and earn its positive ack",
+    );
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn fatal_provider_failure_during_bootstrap_fails_closed() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let marker = temp.path().join("fatal-bootstrap");
+    let handler: InboundEventHandler = Arc::new(|_payload| async { Ok(None) }.boxed());
+
+    let error = NodeSidecar::start(
+        fast_config("fatal-bootstrap", &marker),
+        credentials(),
+        handler,
+    )
+    .await
+    .expect_err("a fatal provider failure must fail closed");
+
+    assert_eq!(error.kind(), LarkErrorKind::PermanentAuth);
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert_eq!(
+        std::fs::read_to_string(PathBuf::from(format!("{}.runs", marker.display())))
+            .expect("bootstrap run count"),
+        "1",
+        "a fatal provider failure must degrade instead of restarting forever",
+    );
+}
+
+#[tokio::test]
+async fn fatal_provider_failure_after_connect_degrades_without_restart() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let marker = temp.path().join("fatal-failed");
+    let handler: InboundEventHandler = Arc::new(|_payload| async { Ok(None) }.boxed());
+    let handle = NodeSidecar::start(fast_config("fatal-failed", &marker), credentials(), handler)
+        .await
+        .expect("initial sidecar connection");
+    let mut state = handle.subscribe_state();
+
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if matches!(*state.borrow(), ConnectionState::Degraded { .. }) {
+                return;
+            }
+            state.changed().await.expect("sidecar state channel");
+        }
+    })
+    .await
+    .expect("terminal degraded state");
+    assert_eq!(
+        *state.borrow(),
+        ConnectionState::Degraded {
+            reason: "node_sidecar_provider_auth_failed".to_owned(),
+        },
+    );
+
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert_eq!(
+        std::fs::read_to_string(PathBuf::from(format!("{}.runs", marker.display())))
+            .expect("process run count"),
+        "1",
+        "a fatal provider failure must not enter the restart schedule",
+    );
+    handle.shutdown().await;
+}
+
+#[tokio::test]
 async fn startup_protocol_and_timeout_paths_kill_non_exec_descendants() {
     let handler: InboundEventHandler = Arc::new(|_payload| async { Ok(None) }.boxed());
 

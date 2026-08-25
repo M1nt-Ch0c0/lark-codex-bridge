@@ -25,6 +25,8 @@ const countedModes = new Set([
   'duplicate-active',
   'connect-crash',
   'configure-failed',
+  'fatal-bootstrap',
+  'fatal-failed',
 ]);
 let run = 1;
 if (marker && countedModes.has(mode)) {
@@ -116,6 +118,34 @@ function configure(frame) {
     setTimeout(() => process.exit(19), 100);
     return;
   }
+  if (mode === 'early-event') {
+    configured = true;
+    // A redelivered event may race ahead of the correlated configure response.
+    write({ v: VERSION, type: 'event', id: 'event-early', payload: { ordinal: 'early' } });
+    write({ v: VERSION, type: 'response', id: frame.id, ok: true });
+    state('connecting', 1);
+    state('connected');
+    return;
+  }
+  if (mode === 'fatal-bootstrap') {
+    configured = true;
+    write({ v: VERSION, type: 'response', id: frame.id, ok: true });
+    state('connecting', 1);
+    write({ v: VERSION, type: 'state', id: 'state-fatal-1', state: 'failed', fatal: true });
+    setTimeout(() => process.exit(1), 100);
+    return;
+  }
+  if (mode === 'fatal-failed') {
+    configured = true;
+    write({ v: VERSION, type: 'response', id: frame.id, ok: true });
+    state('connecting', 1);
+    state('connected');
+    setTimeout(() => {
+      write({ v: VERSION, type: 'state', id: 'state-fatal-1', state: 'failed', fatal: true });
+      setTimeout(() => process.exit(1), 100);
+    }, 100);
+    return;
+  }
 
   secondRun = Boolean(marker && fs.existsSync(marker));
   connect(frame);
@@ -185,6 +215,10 @@ function handle(frame) {
     return;
   }
   if (frame.type === 'event_ack') {
+    if (mode === 'early-event' && frame.id === 'event-early' && frame.ok) {
+      fs.writeFileSync(marker, 'early-event-acked');
+      return;
+    }
     if (mode === 'duplicate-active' && run > 1
         && frame.id === 'event-duplicate' && frame.ok) {
       fs.writeFileSync(`${marker}.second`, 'correlation-released');

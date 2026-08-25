@@ -88,7 +88,7 @@ function writeFrame(value) {
   return true;
 }
 
-function sendState(state, attempt, delayMs) {
+function sendState(state, attempt, delayMs, fatal) {
   // The Rust bootstrap expects its correlated configure response before any
   // asynchronous SDK state callback. JavaScript cannot interleave callbacks
   // while configure() flips this flag and publishes the initial snapshot.
@@ -101,7 +101,20 @@ function sendState(state, attempt, delayMs) {
   };
   if (Number.isSafeInteger(attempt) && attempt > 0) frame.attempt = attempt;
   if (Number.isSafeInteger(delayMs) && delayMs >= 0) frame.delay_ms = delayMs;
+  if (fatal === true) frame.fatal = true;
   if (!writeFrame(frame)) safeStderr('state_frame_dropped');
+}
+
+// The SDK only gives up on a bootstrap code it considers non-retryable, or
+// when reconnect attempts are exhausted. Mirror the native transport's
+// fail-closed classification: an explicit bootstrap rejection is permanent
+// (revoked credentials, disabled app, connection limit), while system busy
+// and exhausted reconnects stay restartable. Only the numeric code is read;
+// server-provided messages never leave this process.
+function isFatalSdkError(error) {
+  const message = error && typeof error.message === 'string' ? error.message : '';
+  const match = /pullConnectConfig failed: code=(\d+)/.exec(message);
+  return match !== null && Number(match[1]) !== 1;
 }
 
 function exitAfterProtocolFlush(code) {
@@ -195,8 +208,8 @@ async function configure(frame) {
       sendState('reconnecting', Math.max(1, status.reconnectAttempts || 1));
     },
     onReconnected: () => sendState('connected'),
-    onError: () => {
-      sendState('failed');
+    onError: (error) => {
+      sendState('failed', undefined, undefined, isFatalSdkError(error));
       exitAfterProtocolFlush(1);
     },
   });

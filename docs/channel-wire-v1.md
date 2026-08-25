@@ -38,7 +38,10 @@ Startup is:
    negotiated frame, in-flight-event, and ack-timeout bounds.
 3. Node → Rust correlated successful `response` after `WSClient.start` accepts
    the dispatcher. This is protocol configuration acceptance, not connection
-   readiness. SDK state callbacks are held until that response is queued.
+   readiness. SDK state callbacks are held until that response is queued. A
+   redelivered event may still race ahead of the response after a crash
+   restart; Rust routes such a frame through the normal durable intake path
+   and keeps waiting for its correlation instead of faulting the bootstrap.
 4. Node → Rust `state: "connected"` from `onReady` (or the SDK's authoritative
    status snapshot). `NodeSidecar::start` succeeds only after this frame. A
    terminal `failed`, process exit, stdout EOF, or 30-second connection deadline
@@ -50,7 +53,13 @@ a cleared environment. They are redacted from `Debug`, errors, and tracing.
 Steady-state frames are:
 
 - Node → Rust `state` (`connecting`, `connected`, `reconnecting`, `backoff`,
-  `failed`, or `stopped`);
+  `failed`, or `stopped`). A `failed` frame may carry the optional
+  `fatal: true` marker when the SDK rejected the session permanently (a
+  bootstrap code the reference client treats as non-retryable, such as a
+  revoked secret or disabled app, but not system busy). Rust fails closed on
+  it: it publishes the terminal `Degraded` state and stops supervision instead
+  of entering the restart schedule. Restartable `failed` frames omit the
+  field, so version-1 peers remain wire compatible;
 - Node → Rust `event` with a bounded correlation `id` and the raw Lark event
   envelope in `payload`;
 - Rust → Node `event_ack` with the same id and `ok: true`, or `ok: false` plus
@@ -112,4 +121,7 @@ supervised with a fresh handshake on every process epoch; the bridge never
 switches live sources mid-run. Restart delay escalates through the existing
 bounded jittered schedule (30-second cap) and resets only after one process
 epoch remains continuously connected for 30 seconds, preventing
-connected-then-crash loops from staying at the minimum delay.
+connected-then-crash loops from staying at the minimum delay. The one
+exception is a `failed` frame marked `fatal`: a permanent provider rejection
+cannot succeed on restart, so supervision degrades terminally instead of
+looping.
