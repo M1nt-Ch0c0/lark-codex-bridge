@@ -204,6 +204,39 @@ impl LarkApi {
             .await
     }
 
+    /// Replies with a Lark rich-text `post` whose only element is `tag=md`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified error on token, transport, or server failure, or
+    /// [`LarkError::Exhausted`] when the serialized body exceeds
+    /// [`LARK_MAX_SEND_BODY_BYTES`].
+    pub async fn reply_post_markdown(
+        &self,
+        message_id: &str,
+        markdown: &str,
+    ) -> Result<MessageRef, LarkError> {
+        self.reply(message_id, "post", post_markdown_content(markdown)?, false)
+            .await
+    }
+
+    /// Replies inside a topic thread with a Lark rich-text `post` whose only
+    /// element is `tag=md`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified error on token, transport, or server failure, or
+    /// [`LarkError::Exhausted`] when the serialized body exceeds
+    /// [`LARK_MAX_SEND_BODY_BYTES`].
+    pub async fn reply_post_markdown_in_thread(
+        &self,
+        message_id: &str,
+        markdown: &str,
+    ) -> Result<MessageRef, LarkError> {
+        self.reply(message_id, "post", post_markdown_content(markdown)?, true)
+            .await
+    }
+
     /// Replies to a message with an interactive card.
     ///
     /// # Errors
@@ -562,13 +595,6 @@ impl LarkApi {
         content: String,
         in_thread: bool,
     ) -> Result<MessageRef, LarkError> {
-        #[derive(Serialize)]
-        struct ReplyBody {
-            msg_type: &'static str,
-            content: String,
-            #[serde(skip_serializing_if = "is_false")]
-            reply_in_thread: bool,
-        }
         #[derive(Deserialize)]
         struct ReplyData {
             message_id: Option<String>,
@@ -692,6 +718,14 @@ struct SendBody<'a> {
     content: String,
 }
 
+#[derive(Serialize)]
+struct ReplyBody {
+    msg_type: &'static str,
+    content: String,
+    #[serde(skip_serializing_if = "is_false")]
+    reply_in_thread: bool,
+}
+
 // serde's `skip_serializing_if` always passes the field by reference.
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_false(value: &bool) -> bool {
@@ -700,16 +734,46 @@ fn is_false(value: &bool) -> bool {
 
 fn text_content(text: &str) -> Result<String, LarkError> {
     serde_json::to_string(&serde_json::json!({ "text": text }))
-        .map_err(|_| LarkError::protocol("serializing a text message"))
+        .map_err(|_| LarkError::invalid_request("serializing a text message"))
+}
+
+fn post_markdown_content(markdown: &str) -> Result<String, LarkError> {
+    serde_json::to_string(&serde_json::json!({
+        "zh_cn": {
+            "content": [[{
+                "tag": "md",
+                "text": markdown,
+            }]],
+        },
+    }))
+    .map_err(|_| LarkError::invalid_request("serializing a Markdown post message"))
+}
+
+/// Returns the exact serialized byte length of a Markdown-post reply body.
+///
+/// The path and authorization header are not part of Lark's message-body cap.
+/// Callers use this before splitting so JSON escaping and the optional topic
+/// flag are included rather than estimating from source character count.
+#[must_use]
+pub fn post_markdown_reply_body_len(markdown: &str, in_thread: bool) -> usize {
+    let Ok(content) = post_markdown_content(markdown) else {
+        return usize::MAX;
+    };
+    serde_json::to_vec(&ReplyBody {
+        msg_type: "post",
+        content,
+        reply_in_thread: in_thread,
+    })
+    .map_or(usize::MAX, |body| body.len())
 }
 
 fn card_content(card: &Value) -> Result<String, LarkError> {
-    serde_json::to_string(card).map_err(|_| LarkError::protocol("serializing a card"))
+    serde_json::to_string(card).map_err(|_| LarkError::invalid_request("serializing a card"))
 }
 
 fn check_send_body(body: &impl Serialize) -> Result<(), LarkError> {
     let len = serde_json::to_vec(body)
-        .map_err(|_| LarkError::protocol("serializing an outbound body"))?
+        .map_err(|_| LarkError::invalid_request("serializing an outbound body"))?
         .len();
     if len > LARK_MAX_SEND_BODY_BYTES {
         return Err(LarkError::exhausted(
@@ -741,7 +805,7 @@ fn check_path_segment(id: &str) -> Result<(), LarkError> {
     {
         return Ok(());
     }
-    Err(LarkError::protocol(
+    Err(LarkError::invalid_request(
         "server-issued ID contains unsafe characters",
     ))
 }

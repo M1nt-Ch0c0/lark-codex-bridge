@@ -231,4 +231,13 @@ FROM attachment_leases_v1;
 DROP TABLE attachment_leases_v1;
 ",
     },
+    Migration {
+        version: 7,
+        name: "fence versioned Markdown outbox payloads",
+        // No table shape changes are needed: outbox payloads are deliberately
+        // opaque JSON. Advancing `user_version` is nevertheless required so a
+        // v1-only binary refuses to open a database after this binary may have
+        // persisted payload v2 rows it cannot understand.
+        sql: "SELECT 1;",
+    },
 ];
