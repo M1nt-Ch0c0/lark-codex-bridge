@@ -1009,6 +1009,7 @@ fn authorized_actors() -> Result<(AuthorizedLarkActor, AuthorizedLarkActor)> {
         concurrency: ConcurrencyConfig::default(),
         codex: CodexSection::default(),
         paths: PathsSection::default(),
+        ..BridgeConfig::default()
     };
     let policy =
         AccessPolicy::from_config(&config).context("unable to build Lark access policy")?;

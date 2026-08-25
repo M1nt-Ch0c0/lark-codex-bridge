@@ -1275,6 +1275,7 @@ fn actors(_root: &Path) -> (AuthorizedLarkActor, AuthorizedLarkActor) {
         concurrency: ConcurrencyConfig::default(),
         codex: CodexSection::default(),
         paths: PathsSection::default(),
+        ..BridgeConfig::default()
     };
     let policy = AccessPolicy::from_config(&config).expect("policy");
     let source = policy
