@@ -25,6 +25,9 @@ use crate::lark::{
         MessagePart, PartStatus, ResourceDesc, TranscriptFailure,
     },
 };
+use crate::limits::{
+    ATTACHMENT_MAX_BYTES, ATTACHMENT_MAX_PER_MESSAGE, ATTACHMENT_TURN_TOTAL_BYTES,
+};
 
 const DEFAULT_CONTEXT_TTL: Duration = Duration::from_secs(10 * 60);
 const DEFAULT_MAX_CONTEXTS: usize = 4_096;
@@ -39,6 +42,12 @@ pub struct ContextRegistryConfig {
     pub max_contexts: usize,
     /// Maximum number of typed parts accepted for a single message.
     pub max_parts_per_context: usize,
+    /// Maximum attempted media reads charged to one turn.
+    pub max_media_reads_per_turn: usize,
+    /// Aggregate media bytes charged to one turn.
+    pub max_media_read_bytes_per_turn: u64,
+    /// Pessimistic reservation for a not-yet-materialized media handle.
+    pub max_media_read_bytes_per_item: u64,
 }
 
 impl Default for ContextRegistryConfig {
@@ -47,6 +56,9 @@ impl Default for ContextRegistryConfig {
             ttl: DEFAULT_CONTEXT_TTL,
             max_contexts: DEFAULT_MAX_CONTEXTS,
             max_parts_per_context: DEFAULT_MAX_PARTS,
+            max_media_reads_per_turn: ATTACHMENT_MAX_PER_MESSAGE,
+            max_media_read_bytes_per_turn: ATTACHMENT_TURN_TOTAL_BYTES,
+            max_media_read_bytes_per_item: u64::try_from(ATTACHMENT_MAX_BYTES).unwrap_or(u64::MAX),
         }
     }
 }
@@ -259,12 +271,94 @@ pub struct ThreadSnapshot {
     pub root_message_id: Option<String>,
 }
 
-/// Immediate quoted/replied-to message metadata.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+/// Stable outcome of resolving one directly quoted message.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuoteStatus {
+    /// The direct parent was fetched and normalized.
+    Available,
+    /// Lark reports that the direct parent was deleted or no longer exists.
+    Deleted,
+    /// The app is not authorized to read the direct parent.
+    Unauthorized,
+    /// The parent body or descriptor metadata exceeds a local bound.
+    Oversize,
+    /// The parent message kind is not supported by this bridge version.
+    Unsupported,
+    /// The parent could not be resolved at this time.
+    Unavailable,
+}
+
+/// Immediate quoted/replied-to message snapshot.
+#[derive(Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QuoteSnapshot {
     /// Immediate parent message ID.
     pub message_id: String,
+    /// Open Lark wire type, omitted when the parent could not be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_type: Option<String>,
+    /// Stable resolution/degradation state.
+    pub status: QuoteStatus,
+    /// Sanitized parent parts. Resource keys are replaced with opaque handles.
+    pub parts: Vec<TypedPart>,
+}
+
+impl fmt::Debug for QuoteSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("QuoteSnapshot")
+            .field("message_id_len", &self.message_id.len())
+            .field(
+                "message_type_len",
+                &self.message_type.as_deref().map_or(0, str::len),
+            )
+            .field("status", &self.status)
+            .field("part_count", &self.parts.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Input form of a quote before opaque resource handles are minted.
+#[derive(Clone, PartialEq)]
+pub struct QuoteDraft {
+    /// Immediate parent message ID from the trusted receive event.
+    pub message_id: String,
+    /// Open Lark wire type, when known.
+    pub message_type: Option<String>,
+    /// Stable resolution/degradation state.
+    pub status: QuoteStatus,
+    /// Sanitized parent parts, containing resource descriptors only while the
+    /// context is pending registration.
+    pub parts: Vec<DraftPart>,
+}
+
+impl fmt::Debug for QuoteDraft {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("QuoteDraft")
+            .field("message_id_len", &self.message_id.len())
+            .field(
+                "message_type_len",
+                &self.message_type.as_deref().map_or(0, str::len),
+            )
+            .field("status", &self.status)
+            .field("part_count", &self.parts.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl QuoteDraft {
+    /// Builds the stable unresolved form used when no resolver is installed.
+    #[must_use]
+    pub fn unavailable(message_id: String) -> Self {
+        Self {
+            message_id,
+            message_type: None,
+            status: QuoteStatus::Unavailable,
+            parts: Vec::new(),
+        }
+    }
 }
 
 /// Semantic media kind exposed to the model.
@@ -284,7 +378,7 @@ pub enum MediaKind {
 }
 
 /// Optional, non-authoritative metadata for one media part.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Default, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaMetadata {
     /// Safe display name selected by the bridge.
@@ -301,8 +395,23 @@ pub struct MediaMetadata {
     pub duration_ms: Option<u64>,
 }
 
+impl fmt::Debug for MediaMetadata {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MediaMetadata")
+            .field("name_len", &self.name.as_deref().map_or(0, str::len))
+            .field(
+                "mime_type_len",
+                &self.mime_type.as_deref().map_or(0, str::len),
+            )
+            .field("size_bytes", &self.size_bytes)
+            .field("duration_ms", &self.duration_ms)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Typed part returned by context resolution. Resource keys never appear here.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TypedPart {
     /// Plain normalized text.
@@ -343,6 +452,43 @@ pub enum TypedPart {
         /// Stable explanation suitable for a tool result.
         reason: String,
     },
+}
+
+impl fmt::Debug for TypedPart {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text { text } => formatter
+                .debug_struct("Text")
+                .field("text_len", &text.len())
+                .finish(),
+            Self::Media {
+                kind,
+                handle,
+                thumbnail_handle,
+                metadata,
+            } => formatter
+                .debug_struct("Media")
+                .field("kind", kind)
+                .field("handle", handle)
+                .field("thumbnail_handle", thumbnail_handle)
+                .field("metadata", metadata)
+                .finish(),
+            Self::Card { .. } => formatter.write_str("Card([REDACTED])"),
+            Self::Forward { message_id, status } => formatter
+                .debug_struct("Forward")
+                .field("message_id_len", &message_id.as_deref().map_or(0, str::len))
+                .field("status", status)
+                .finish(),
+            Self::Unsupported {
+                message_type,
+                reason,
+            } => formatter
+                .debug_struct("Unsupported")
+                .field("message_type_len", &message_type.len())
+                .field("reason", reason)
+                .finish(),
+        }
+    }
 }
 
 /// Input part accepted during registration, before opaque handles are minted.
@@ -442,7 +588,7 @@ pub struct ContextDraft {
     /// Topic and reply-root metadata.
     pub thread: ThreadSnapshot,
     /// Immediate quoted/replied-to message, if any.
-    pub quote: Option<QuoteSnapshot>,
+    pub quote: Option<QuoteDraft>,
     /// Open Lark wire message type.
     pub message_type: String,
     /// Lark create time in milliseconds since the Unix epoch.
@@ -542,9 +688,7 @@ impl ContextDraft {
             quote: event
                 .reply_to_message_id
                 .as_ref()
-                .map(|message_id| QuoteSnapshot {
-                    message_id: message_id.clone(),
-                }),
+                .map(|message_id| QuoteDraft::unavailable(message_id.clone())),
             message_type: event.message_type.clone(),
             create_time_ms: event.create_time_ms,
             parts,
@@ -552,7 +696,7 @@ impl ContextDraft {
     }
 }
 
-fn draft_part_from_inbound(part: &MessagePart) -> DraftPart {
+pub(crate) fn draft_part_from_inbound(part: &MessagePart) -> DraftPart {
     match part {
         MessagePart::Text { text } => DraftPart::Text(text.clone()),
         MessagePart::Image(media) => draft_media_part(MediaKind::Image, ResourceKind::Image, media),
@@ -697,6 +841,7 @@ pub struct AuthorizedResource {
     /// Cancellation tied to the exact context/turn capability. This is kept
     /// crate-private so callers cannot mint or replace lifecycle authority.
     pub(crate) cancellation: CancellationToken,
+    read_charge: Option<ReadCharge>,
     response_operation: ResponseOperation,
 }
 
@@ -705,6 +850,15 @@ impl AuthorizedResource {
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.cancellation.is_cancelled()
+    }
+
+    /// Replaces this attempt's pessimistic byte reservation with the exact
+    /// materialized size. Failed attempts deliberately retain their charge so
+    /// retries cannot bypass the turn budget.
+    pub(crate) fn settle_read(&mut self, actual_bytes: u64) {
+        if let Some(charge) = self.read_charge.as_mut() {
+            charge.settle(actual_bytes);
+        }
     }
 
     /// Establishes the response-vs-revocation linearization point. A `true`
@@ -747,11 +901,83 @@ pub struct ContextRegistryStats {
 
 #[derive(Clone)]
 struct ResourceGrant {
+    message_id: String,
     kind: MediaKind,
     resource: ResourceDesc,
     transcript: Option<String>,
     transcript_failure: Option<TranscriptFailure>,
     duration_ms: Option<u64>,
+}
+
+struct TurnReadMeter {
+    reads: usize,
+    charged_bytes: u64,
+    observed_bytes: HashMap<MediaHandle, u64>,
+    max_reads: usize,
+    max_bytes: u64,
+}
+
+impl TurnReadMeter {
+    fn new(config: ContextRegistryConfig) -> Self {
+        Self {
+            reads: 0,
+            charged_bytes: 0,
+            observed_bytes: HashMap::new(),
+            max_reads: config.max_media_reads_per_turn,
+            max_bytes: config.max_media_read_bytes_per_turn,
+        }
+    }
+
+    fn reserve(
+        &mut self,
+        handle: &MediaHandle,
+        max_unobserved_bytes: u64,
+    ) -> Result<u64, ContextError> {
+        let reserved_bytes = self
+            .observed_bytes
+            .get(handle)
+            .copied()
+            .unwrap_or(max_unobserved_bytes);
+        if self.reads >= self.max_reads
+            || self.charged_bytes.saturating_add(reserved_bytes) > self.max_bytes
+        {
+            return Err(error(
+                ContextErrorCode::CapacityExceeded,
+                "turn media read budget is exhausted",
+                false,
+            ));
+        }
+        self.reads = self.reads.saturating_add(1);
+        self.charged_bytes = self.charged_bytes.saturating_add(reserved_bytes);
+        Ok(reserved_bytes)
+    }
+}
+
+struct ReadCharge {
+    meter: Arc<Mutex<TurnReadMeter>>,
+    handle: MediaHandle,
+    reserved_bytes: u64,
+    settled: bool,
+}
+
+impl ReadCharge {
+    fn settle(&mut self, actual_bytes: u64) {
+        if self.settled {
+            return;
+        }
+        let mut meter = self
+            .meter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        meter.charged_bytes = meter
+            .charged_bytes
+            .saturating_sub(self.reserved_bytes)
+            .saturating_add(actual_bytes);
+        meter
+            .observed_bytes
+            .insert(self.handle.clone(), actual_bytes);
+        self.settled = true;
+    }
 }
 
 enum EntryState {
@@ -766,6 +992,7 @@ struct ContextEntry {
     expires_at: Instant,
     snapshot: ContextSnapshot,
     grants: HashMap<MediaHandle, ResourceGrant>,
+    read_meter: Arc<Mutex<TurnReadMeter>>,
     cancellation: CancellationToken,
     response_gate: Arc<ResponseGate>,
 }
@@ -886,7 +1113,14 @@ impl ContextRegistry {
     ///
     /// Returns `invalid_request` when any bound or the TTL is zero.
     pub fn new(config: ContextRegistryConfig) -> Result<Self, ContextError> {
-        if config.ttl.is_zero() || config.max_contexts == 0 || config.max_parts_per_context == 0 {
+        if config.ttl.is_zero()
+            || config.max_contexts == 0
+            || config.max_parts_per_context == 0
+            || config.max_media_reads_per_turn == 0
+            || config.max_media_read_bytes_per_turn == 0
+            || config.max_media_read_bytes_per_item == 0
+            || config.max_media_read_bytes_per_item > config.max_media_read_bytes_per_turn
+        {
             return Err(error(
                 ContextErrorCode::InvalidRequest,
                 "context registry limits must be non-zero",
@@ -919,7 +1153,8 @@ impl ContextRegistry {
         draft: ContextDraft,
         mut live_transcripts: LiveTranscriptHandoff,
     ) -> Result<RegisteredContext, ContextError> {
-        if draft.parts.len() > self.config.max_parts_per_context {
+        let quote_parts = draft.quote.as_ref().map_or(0, |quote| quote.parts.len());
+        if draft.parts.len().saturating_add(quote_parts) > self.config.max_parts_per_context {
             return Err(error(
                 ContextErrorCode::InvalidRequest,
                 "context contains too many typed parts",
@@ -937,16 +1172,56 @@ impl ContextRegistry {
         })?;
         let mut state = self.lock();
         make_capacity(&mut state, self.config.max_contexts, now)?;
+        let read_meter = state
+            .entries
+            .values()
+            .find(|entry| entry.pending_binding == binding)
+            .map_or_else(
+                || Arc::new(Mutex::new(TurnReadMeter::new(self.config))),
+                |entry| Arc::clone(&entry.read_meter),
+            );
         let context_id = unique_context_id(&state);
         let mut grants = HashMap::new();
+        let message_id = draft.message_id.clone();
         let parts = draft
             .parts
             .into_iter()
             .enumerate()
             .map(|(part_index, part)| {
-                materialize_part(part_index, part, &mut live_transcripts, &mut grants)
+                materialize_part(
+                    part_index,
+                    part,
+                    &message_id,
+                    &mut live_transcripts,
+                    &mut grants,
+                )
             })
             .collect();
+        let quote = draft.quote.map(|quote| {
+            let quote_message_id = quote.message_id.clone();
+            let mut quote_transcripts = LiveTranscriptHandoff::empty();
+            let parts = quote
+                .parts
+                .into_iter()
+                .enumerate()
+                .map(|(part_index, part)| {
+                    let part = prepare_live_quote_part(part);
+                    materialize_part(
+                        part_index,
+                        part,
+                        &quote_message_id,
+                        &mut quote_transcripts,
+                        &mut grants,
+                    )
+                })
+                .collect();
+            QuoteSnapshot {
+                message_id: quote.message_id,
+                message_type: quote.message_type,
+                status: quote.status,
+                parts,
+            }
+        });
         let snapshot = ContextSnapshot {
             event_id: draft.event_id,
             message_id: draft.message_id,
@@ -954,7 +1229,7 @@ impl ContextRegistry {
             chat: draft.chat,
             mentions: draft.mentions,
             thread: draft.thread,
-            quote: draft.quote,
+            quote,
             message_type: draft.message_type,
             create_time_ms: draft.create_time_ms,
             parts,
@@ -967,6 +1242,7 @@ impl ContextRegistry {
                 expires_at,
                 snapshot,
                 grants,
+                read_meter,
                 cancellation: CancellationToken::new(),
                 response_gate: Arc::new(ResponseGate::default()),
             },
@@ -1079,12 +1355,13 @@ impl ContextRegistry {
         let mut state = self.lock();
         let entry = state.entries.get_mut(context_id).ok_or_else(not_found)?;
         authorize_entry(entry, caller, now)?;
-        authorized_resource(entry, handle)
+        authorized_resource(entry, handle, self.config.max_media_read_bytes_per_item)
     }
 
     /// Authorizes media from the trusted `threadId`/`turnId` tool envelope.
-    /// Like [`Self::resolve_for_tool`], this safely handles a tool call that
-    /// races ahead of explicit activation.
+    /// `max_materialized_bytes` must be the same single-object cap enforced by
+    /// the downstream attachment cache. Like [`Self::resolve_for_tool`], this
+    /// safely handles a tool call that races ahead of explicit activation.
     ///
     /// # Errors
     ///
@@ -1096,13 +1373,14 @@ impl ContextRegistry {
         handle: &MediaHandle,
         codex_thread_id: &str,
         codex_turn_id: &str,
+        max_materialized_bytes: u64,
     ) -> Result<AuthorizedResource, ContextError> {
         validate_tool_binding(codex_thread_id, codex_turn_id)?;
         let now = Instant::now();
         let mut state = self.lock();
         let entry = state.entries.get_mut(context_id).ok_or_else(not_found)?;
         authorize_entry_for_tool(entry, codex_thread_id, codex_turn_id, now)?;
-        authorized_resource(entry, handle)
+        authorized_resource(entry, handle, max_materialized_bytes)
     }
 
     /// Revokes a single context and erases all underlying resource grants.
@@ -1211,9 +1489,30 @@ impl Default for ContextRegistry {
     }
 }
 
+fn prepare_live_quote_part(mut part: DraftPart) -> DraftPart {
+    let DraftPart::Media {
+        kind,
+        transcript_failure,
+        ..
+    } = &mut part
+    else {
+        return part;
+    };
+    if *kind == MediaKind::Audio && *transcript_failure == Some(TranscriptFailure::NotRetained) {
+        // A quote is resolved live, after authorization and only when the
+        // instruction triggers it. Its fetched recognition text is never
+        // retained or trusted as the transcript, so byte-backed sidecar ASR
+        // remains available. Durable inbound recovery still preserves the
+        // fail-closed `NotRetained` behavior in the ordinary part path.
+        *transcript_failure = None;
+    }
+    part
+}
+
 fn materialize_part(
     part_index: usize,
     part: DraftPart,
+    message_id: &str,
     live_transcripts: &mut LiveTranscriptHandoff,
     grants: &mut HashMap<MediaHandle, ResourceGrant>,
 ) -> TypedPart {
@@ -1238,6 +1537,7 @@ fn materialize_part(
             grants.insert(
                 handle.clone(),
                 ResourceGrant {
+                    message_id: message_id.to_owned(),
                     kind,
                     resource,
                     transcript,
@@ -1250,6 +1550,7 @@ fn materialize_part(
                 grants.insert(
                     thumbnail_handle.clone(),
                     ResourceGrant {
+                        message_id: message_id.to_owned(),
                         kind: MediaKind::Image,
                         resource,
                         transcript: None,
@@ -1371,6 +1672,7 @@ fn authorize_entry_for_tool(
 fn authorized_resource(
     entry: &ContextEntry,
     handle: &MediaHandle,
+    max_unobserved_bytes: u64,
 ) -> Result<AuthorizedResource, ContextError> {
     let grant = entry.grants.get(handle).ok_or_else(|| {
         error(
@@ -1386,8 +1688,13 @@ fn authorized_resource(
             false,
         )
     })?;
+    let reserved_bytes = entry
+        .read_meter
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .reserve(handle, max_unobserved_bytes)?;
     Ok(AuthorizedResource {
-        message_id: entry.snapshot.message_id.clone(),
+        message_id: grant.message_id.clone(),
         media_kind: grant.kind,
         local_turn_row_id: entry.pending_binding.local_turn_row_id,
         resource: grant.resource.clone(),
@@ -1395,6 +1702,12 @@ fn authorized_resource(
         transcript_failure: grant.transcript_failure,
         duration_ms: grant.duration_ms,
         cancellation: entry.cancellation.clone(),
+        read_charge: Some(ReadCharge {
+            meter: Arc::clone(&entry.read_meter),
+            handle: handle.clone(),
+            reserved_bytes,
+            settled: false,
+        }),
         response_operation,
     })
 }
@@ -1504,6 +1817,7 @@ mod tests {
             ttl: Duration::from_secs(60),
             max_contexts: 4,
             max_parts_per_context: 4,
+            ..ContextRegistryConfig::default()
         })
         .expect("registry");
         let registered = registry
@@ -1534,6 +1848,7 @@ mod tests {
                 handle,
                 "thread-private",
                 "turn-private",
+                1,
             )
             .expect("authorize exact grant");
         assert_eq!(authorized.transcript.as_deref(), Some(SENTINEL));

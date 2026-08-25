@@ -27,6 +27,7 @@ use crate::runtime::attachments::{AttachmentCache, AttachmentLimits, ChannelReso
 use crate::runtime::context::ContextRegistry;
 use crate::runtime::intake::{DurableIntake, TenantNamespace};
 use crate::runtime::policy::AccessPolicy;
+use crate::runtime::quote::LarkQuoteResolver;
 use crate::runtime::router::{RouteAttemptError, RouteError, Router, RouterHandle, RouterSettings};
 use crate::runtime::scope::DurableReplySink;
 use crate::store::{StoreError, StoreHandle};
@@ -244,6 +245,7 @@ where
         return Err(AppError::Attachments);
     }
     let context_registry = Arc::new(ContextRegistry::default());
+    let quote_resolver = Arc::new(LarkQuoteResolver::new(api.clone(), policy.clone()));
     let Ok(InboundRuntime {
         source,
         events: inbound,
@@ -273,7 +275,7 @@ where
         stop_store_after_error(store).await;
         return Err(AppError::Outbound);
     };
-    let Ok(router) = Router::start_with_contexts(
+    let Ok(router) = Router::start_with_contexts_and_quotes(
         store.clone(),
         tenant,
         policy,
@@ -282,6 +284,7 @@ where
         outbound.sink(),
         Arc::clone(&attachment_cache),
         context_registry,
+        quote_resolver,
     )
     .await
     else {

@@ -79,9 +79,10 @@ impl fmt::Debug for ResourceData {
 /// Raw message fields returned by `GET /open-apis/im/v1/messages/{id}`.
 ///
 /// The raw item keeps `thread_id` even when the receive event dropped it,
-/// which the normalization milestone relies on for topic backfill. Message
-/// content is deliberately not retained.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// which normalization relies on for topic backfill. The optional body is
+/// retained only for the authorized, one-hop quote resolver. Its custom
+/// `Debug` implementation exposes lengths and flags, never message content.
+#[derive(Clone, PartialEq, Eq)]
 pub struct RawMessage {
     /// `message_id` (`om_…`).
     pub message_id: String,
@@ -89,6 +90,10 @@ pub struct RawMessage {
     pub chat_id: String,
     /// Wire `chat_type` (`p2p`/`group`), kept as an open string.
     pub chat_type: String,
+    /// Sender identifier returned for the fetched item.
+    pub sender_id: Option<String>,
+    /// Open sender kind (`user`/`app`/…), used to fail closed on non-humans.
+    pub sender_type: Option<String>,
     /// Wire `msg_type` (`text`/`image`/…), kept as an open string.
     pub message_type: String,
     /// Reply-chain root `message_id`, when the message is a reply.
@@ -97,6 +102,38 @@ pub struct RawMessage {
     pub parent_id: Option<String>,
     /// Topic `thread_id` (`omt_…`) for messages inside a topic thread.
     pub thread_id: Option<String>,
+    /// Whether Lark marks the message deleted.
+    pub deleted: bool,
+    /// Serialized message body content, when returned by Lark.
+    pub content: Option<String>,
+}
+
+impl fmt::Debug for RawMessage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RawMessage")
+            .field("message_id_len", &self.message_id.len())
+            .field("chat_id_len", &self.chat_id.len())
+            .field("chat_type_len", &self.chat_type.len())
+            .field(
+                "sender_id_len",
+                &self.sender_id.as_deref().map_or(0, str::len),
+            )
+            .field(
+                "sender_type_len",
+                &self.sender_type.as_deref().map_or(0, str::len),
+            )
+            .field("message_type_len", &self.message_type.len())
+            .field("has_root", &self.root_id.is_some())
+            .field("has_parent", &self.parent_id.is_some())
+            .field("has_thread", &self.thread_id.is_some())
+            .field("deleted", &self.deleted)
+            .field(
+                "content_bytes",
+                &self.content.as_deref().map_or(0, str::len),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 /// `OpenAPI` client bound to one tenant's endpoints and token cache.
@@ -284,10 +321,23 @@ impl LarkApi {
             message_id: Option<String>,
             chat_id: Option<String>,
             chat_type: Option<String>,
+            sender: Option<MessageSender>,
             msg_type: Option<String>,
             root_id: Option<String>,
             parent_id: Option<String>,
             thread_id: Option<String>,
+            #[serde(default)]
+            deleted: bool,
+            body: Option<MessageBody>,
+        }
+        #[derive(Deserialize)]
+        struct MessageBody {
+            content: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct MessageSender {
+            id: Option<String>,
+            sender_type: Option<String>,
         }
 
         check_path_segment(message_id)?;
@@ -308,6 +358,9 @@ impl LarkApi {
                 }
             })
             .ok_or_else(|| LarkError::protocol("message response missing the items array"))?;
+        let (sender_id, sender_type) = item
+            .sender
+            .map_or((None, None), |sender| (sender.id, sender.sender_type));
         Ok(RawMessage {
             message_id: item
                 .message_id
@@ -316,10 +369,14 @@ impl LarkApi {
                 .chat_id
                 .ok_or_else(|| LarkError::protocol("message item missing chat_id"))?,
             chat_type: item.chat_type.unwrap_or_default(),
+            sender_id,
+            sender_type,
             message_type: item.msg_type.unwrap_or_default(),
             root_id: item.root_id,
             parent_id: item.parent_id,
             thread_id: item.thread_id,
+            deleted: item.deleted,
+            content: item.body.and_then(|body| body.content),
         })
     }
 

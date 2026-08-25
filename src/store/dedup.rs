@@ -3,7 +3,9 @@
 //! Inbound event dedup registration and its state machine.
 //!
 //! Legal transitions are `received → accepted → completed|rejected` plus
-//! `received → rejected`; terminal states are final. Anything else is a
+//! `received → completed|rejected`; terminal states are final. The direct
+//! `received → completed` edge settles intentionally staged or ignored work
+//! that must never create a Codex turn. Anything else is a
 //! [`StoreError::InvalidTransition`], so a duplicate redelivery within the
 //! TTL can never restart Codex (design §5.3).
 
@@ -236,6 +238,8 @@ impl InboundRejectionKind {
 /// Result of an idempotent received-row rejection attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InboundDisposition {
+    /// This call completed a received row without associating a turn.
+    Completed,
     /// This call changed received to rejected.
     Rejected,
     /// The same rejection was already committed.
@@ -281,14 +285,14 @@ impl StoreHandle {
                 .map_err(|error| sqlite_error("starting inbound registration", &error))?;
 
             if let Some(stored) = read_inbound_row(&transaction, &tenant, &event_id)? {
-                return registration_from_stored(stored, tenant_namespace, true);
+                return registration_from_stored(stored, tenant_namespace, true, Some(&incoming));
             }
 
             let candidates = read_message_candidates(&transaction, &tenant, &message_id)?;
             match candidates.as_slice() {
                 [] => {}
                 [stored] => {
-                    return registration_from_stored(stored.clone(), tenant_namespace, false);
+                    return registration_from_stored(stored.clone(), tenant_namespace, false, None);
                 }
                 _ => {
                     return Err(StoreError::CorruptData {
@@ -345,6 +349,39 @@ impl StoreHandle {
         turn: super::NewTurnRow,
         events: &[InboundKey],
     ) -> Result<BeginTurnOutcome, StoreError> {
+        self.begin_turn_and_claim_inbound_inner(
+            turn,
+            events.iter().cloned().map(|key| (key, None)).collect(),
+        )
+        .await
+    }
+
+    /// Runtime-only claim path that substitutes the authenticated live event
+    /// after validating the corresponding durable, secret-free descriptor.
+    /// Crash recovery deliberately uses [`Self::begin_turn_and_claim_inbound`]
+    /// and therefore degrades media to unavailable instead of persisting a
+    /// reusable Lark resource key or transcript.
+    pub(crate) async fn begin_turn_and_claim_inbound_live(
+        &self,
+        turn: super::NewTurnRow,
+        events: Vec<(InboundKey, InboundEvent)>,
+    ) -> Result<BeginTurnOutcome, StoreError> {
+        self.begin_turn_and_claim_inbound_inner(
+            turn,
+            events
+                .into_iter()
+                .map(|(key, event)| (key, Some(event)))
+                .collect(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn begin_turn_and_claim_inbound_inner(
+        &self,
+        turn: super::NewTurnRow,
+        events: Vec<(InboundKey, Option<InboundEvent>)>,
+    ) -> Result<BeginTurnOutcome, StoreError> {
         if turn.state != super::TurnState::Starting {
             return Err(StoreError::InvalidTransition {
                 context: "creating an inbound turn outside the starting state",
@@ -357,7 +394,8 @@ impl StoreHandle {
         }
         let mut unique = HashSet::with_capacity(events.len());
         let mut key_bytes = 0_usize;
-        for key in events {
+        let mut live_bytes = 0_usize;
+        for (key, live) in &events {
             validate_id(&key.event_id, "validating a claimed inbound event ID")?;
             let tenant = key.tenant.as_hex();
             key_bytes = key_bytes
@@ -368,6 +406,15 @@ impl StoreHandle {
                     context: "validating unique inbound claim keys",
                 });
             }
+            if let Some(live) = live {
+                validate_event(live)?;
+                if live.event_id != key.event_id || live.scope.to_string() != turn.scope_key {
+                    return Err(StoreError::CorruptData {
+                        context: "validating a live inbound claim identity",
+                    });
+                }
+                live_bytes = live_bytes.saturating_add(inbound_event_variable_bytes(live));
+            }
         }
         if key_bytes > STORE_INBOUND_BEGIN_MAX_KEY_BYTES {
             return Err(StoreError::PayloadTooLarge {
@@ -375,19 +422,20 @@ impl StoreHandle {
                 limit: u64::try_from(STORE_INBOUND_BEGIN_MAX_KEY_BYTES).unwrap_or(u64::MAX),
             });
         }
-        let events = events.to_vec();
-        let request_size = key_bytes.saturating_add(request_bytes(&[
-            &turn.scope_key,
-            &turn.client_message_id,
-            turn.codex_thread_id.as_deref().unwrap_or_default(),
-        ]));
+        let request_size = key_bytes
+            .saturating_add(live_bytes)
+            .saturating_add(request_bytes(&[
+                &turn.scope_key,
+                &turn.client_message_id,
+                turn.codex_thread_id.as_deref().unwrap_or_default(),
+            ]));
         self.run_sized(request_size, move |connection| {
             let transaction = connection
                 .transaction()
                 .map_err(|error| sqlite_error("starting inbound turn claim", &error))?;
             let mut received = Vec::new();
             let mut skipped = Vec::new();
-            for key in events {
+            for (key, live) in events {
                 let tenant = key.tenant.as_hex();
                 let stored = read_inbound_row(&transaction, &tenant, &key.event_id)?.ok_or(
                     StoreError::NotFound {
@@ -407,7 +455,13 @@ impl StoreHandle {
                                 context: "claiming an associated received row",
                             });
                         }
-                        let retained = retained_from_stored(stored)?;
+                        let persisted = retained_from_stored(stored)?;
+                        let retained = if let Some(live) = live {
+                            validate_live_claim(&live, persisted.event())?;
+                            RetainedInbound::new(Box::new(live), persisted.retained_bytes())
+                        } else {
+                            persisted
+                        };
                         received.push((key, retained));
                     }
                     InboundEventState::Accepted
@@ -709,6 +763,82 @@ impl StoreHandle {
         .await
     }
 
+    /// Idempotently completes one received row without creating a turn.
+    ///
+    /// This is the durable settlement boundary for intentionally staged P2P
+    /// media metadata and ignored group/topic media. The replay payload is
+    /// erased atomically, and no user content or resource key is copied into
+    /// a reason column.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified store error for an unknown/corrupt row, an
+    /// already-claimed row, or a failed SQLite transaction.
+    pub async fn complete_received_without_turn(
+        &self,
+        key: &InboundKey,
+    ) -> Result<InboundDisposition, StoreError> {
+        let key = key.clone();
+        let request_size = key.tenant.as_hex().len() + key.event_id.len();
+        self.run_sized(request_size, move |connection| {
+            let transaction = connection
+                .transaction()
+                .map_err(|error| sqlite_error("starting no-turn inbound completion", &error))?;
+            let tenant = key.tenant.as_hex();
+            let stored = read_inbound_row(&transaction, &tenant, &key.event_id)?.ok_or(
+                StoreError::NotFound {
+                    context: "completing an unknown inbound row without a turn",
+                },
+            )?;
+            let disposition = match stored.state {
+                InboundEventState::Received => {
+                    let _ = retained_from_stored(stored)?;
+                    let changed = transaction
+                        .execute(
+                            "UPDATE inbound_events
+                             SET state = 'completed', payload_version = NULL,
+                                 payload_blob = NULL, payload_bytes = 0, updated_ms = ?3
+                             WHERE tenant = ?1 AND event_id = ?2
+                               AND state = 'received' AND turn_row_id IS NULL",
+                            params![tenant, key.event_id, now_ms()],
+                        )
+                        .map_err(|error| {
+                            sqlite_error("completing a received row without a turn", &error)
+                        })?;
+                    if changed != 1 {
+                        return Err(StoreError::CorruptData {
+                            context: "completing a concurrently changed inbound row",
+                        });
+                    }
+                    InboundDisposition::Completed
+                }
+                InboundEventState::Completed if stored.turn_row_id.is_none() => {
+                    InboundDisposition::AlreadyCompleted
+                }
+                InboundEventState::Accepted => {
+                    if stored.turn_row_id.is_none() {
+                        return Err(StoreError::CorruptData {
+                            context: "completing an unassociated accepted inbound row",
+                        });
+                    }
+                    return Err(StoreError::InvalidTransition {
+                        context: "completing an already-claimed inbound row without a turn",
+                    });
+                }
+                InboundEventState::Completed | InboundEventState::Rejected => {
+                    return Err(StoreError::InvalidTransition {
+                        context: "completing a terminal inbound row without a turn",
+                    });
+                }
+            };
+            transaction
+                .commit()
+                .map_err(|error| sqlite_error("committing no-turn inbound completion", &error))?;
+            Ok(disposition)
+        })
+        .await
+    }
+
     /// Atomically enqueues a notice and rejects one currently received row.
     ///
     /// # Errors
@@ -930,7 +1060,8 @@ fn validate_optional_id(value: Option<&str>, context: &'static str) -> Result<()
 
 fn encode_event(event: &InboundEvent) -> Result<Vec<u8>, StoreError> {
     validate_event(event)?;
-    let dto = InboundPayloadV1::from_event(event);
+    let persistable = persistable_event(event);
+    let dto = InboundPayloadV1::from_event(&persistable);
     let payload = serde_json::to_vec(&dto).map_err(|_| StoreError::CorruptData {
         context: "encoding an inbound payload",
     })?;
@@ -941,6 +1072,136 @@ fn encode_event(event: &InboundEvent) -> Result<Vec<u8>, StoreError> {
         });
     }
     Ok(payload)
+}
+
+/// Produces the crash-replay descriptor. Resource keys are bearer-like
+/// capabilities, so they are never handed to SQLite (including its WAL).
+/// Live transcripts travel outside [`InboundEvent`] entirely. A restarted
+/// bridge can still settle and route the message, but media is explicitly
+/// unavailable until Lark redelivers the authenticated live event.
+fn persistable_event(event: &InboundEvent) -> InboundEvent {
+    let mut persisted = event.clone();
+    persisted.resources.clear();
+    for part in &mut persisted.parts {
+        let media = match part {
+            MessagePart::Image(media)
+            | MessagePart::File(media)
+            | MessagePart::Sticker(media)
+            | MessagePart::Audio(media)
+            | MessagePart::Video(media) => media,
+            MessagePart::Text { .. }
+            | MessagePart::Forward { .. }
+            | MessagePart::Card { .. }
+            | MessagePart::Unsupported { .. } => continue,
+        };
+        media.key = None;
+        media.thumbnail_key = None;
+        if media.status == PartStatus::Available {
+            media.status = PartStatus::Unavailable;
+        }
+    }
+    persisted
+}
+
+fn validate_live_claim(live: &InboundEvent, persisted: &InboundEvent) -> Result<(), StoreError> {
+    // Bind the in-memory capability-bearing object to every identity and
+    // policy-relevant field retained durably. Media keys and the resulting
+    // availability status are intentionally excluded. Transcript content is
+    // structurally absent from both event values.
+    if live.event_id != persisted.event_id
+        || live.message_id != persisted.message_id
+        || live.chat_id != persisted.chat_id
+        || live.sender_id != persisted.sender_id
+        || live.chat_type != persisted.chat_type
+        || live.thread_id != persisted.thread_id
+        || live.root_id != persisted.root_id
+        || live.reply_to_message_id != persisted.reply_to_message_id
+        || live.text != persisted.text
+        || live.mentions_bot != persisted.mentions_bot
+        || live.mention_all != persisted.mention_all
+        || live.sender_is_human != persisted.sender_is_human
+        || live.mentions != persisted.mentions
+        || live.message_type != persisted.message_type
+        || live.create_time_ms != persisted.create_time_ms
+        || live.scope != persisted.scope
+    {
+        return Err(StoreError::CorruptData {
+            context: "binding a live inbound event to its durable descriptor",
+        });
+    }
+    let live_parts = if live.parts.is_empty() {
+        parts_from_v1(&live.message_type, &live.text, &live.resources)
+    } else {
+        live.parts.clone()
+    };
+    if live_parts.len() != persisted.parts.len() {
+        return Err(StoreError::CorruptData {
+            context: "binding live inbound part count",
+        });
+    }
+    for (live_part, persisted_part) in live_parts.iter().zip(&persisted.parts) {
+        let same_shape = match (live_part, persisted_part) {
+            (MessagePart::Text { text: left }, MessagePart::Text { text: right }) => left == right,
+            (MessagePart::Image(left), MessagePart::Image(right))
+            | (MessagePart::File(left), MessagePart::File(right))
+            | (MessagePart::Sticker(left), MessagePart::Sticker(right))
+            | (MessagePart::Audio(left), MessagePart::Audio(right))
+            | (MessagePart::Video(left), MessagePart::Video(right)) => {
+                same_persisted_media_metadata(left, right)
+            }
+            (
+                MessagePart::Forward {
+                    message_id: left_id,
+                    status: left_status,
+                },
+                MessagePart::Forward {
+                    message_id: right_id,
+                    status: right_status,
+                },
+            ) => left_id == right_id && left_status == right_status,
+            (
+                MessagePart::Card {
+                    status: left_status,
+                },
+                MessagePart::Card {
+                    status: right_status,
+                },
+            ) => left_status == right_status,
+            (
+                MessagePart::Unsupported {
+                    message_type: left_type,
+                    status: left_status,
+                },
+                MessagePart::Unsupported {
+                    message_type: right_type,
+                    status: right_status,
+                },
+            ) => left_type == right_type && left_status == right_status,
+            _ => false,
+        };
+        if !same_shape {
+            return Err(StoreError::CorruptData {
+                context: "binding live inbound part shapes",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn same_persisted_media_metadata(left: &MediaPart, right: &MediaPart) -> bool {
+    let expected_status = if left.status == PartStatus::Available {
+        PartStatus::Unavailable
+    } else {
+        left.status
+    };
+    right.key.is_none()
+        && right.thumbnail_key.is_none()
+        && right.status == expected_status
+        && left.metadata.file_name == right.metadata.file_name
+        && left.metadata.mime_type == right.metadata.mime_type
+        && left.metadata.size_bytes == right.metadata.size_bytes
+        && left.metadata.duration_ms == right.metadata.duration_ms
+        && left.metadata.transcript_failure == right.metadata.transcript_failure
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1386,10 +1647,23 @@ fn registration_from_stored(
     stored: StoredInbound,
     tenant: TenantNamespace,
     exact: bool,
+    live: Option<&InboundEvent>,
 ) -> Result<DedupOutcome, StoreError> {
     let key = InboundKey::new(tenant, stored.event_id.clone());
     if stored.state == InboundEventState::Received {
-        let retained = retained_from_stored(stored)?;
+        let persisted = retained_from_stored(stored)?;
+        let retained = if exact
+            && live.is_some_and(|event| {
+                validate_event(event).is_ok()
+                    && validate_live_claim(event, persisted.event()).is_ok()
+            }) {
+            RetainedInbound::new(
+                Box::new(live.expect("checked live event").clone()),
+                persisted.retained_bytes(),
+            )
+        } else {
+            persisted
+        };
         return Ok(DedupOutcome::ReplayReceived(retained));
     }
     if stored.state == InboundEventState::Accepted && stored.turn_row_id.is_none() {
@@ -1443,6 +1717,146 @@ fn retained_from_stored(stored: StoredInbound) -> Result<RetainedInbound, StoreE
         });
     }
     Ok(RetainedInbound::new(Box::new(event), payload.len()))
+}
+
+/// Rewrites pre-v6 replay payloads so an upgrade cannot leave Lark resource
+/// capabilities or transcripts in live SQLite rows. The writer follows this
+/// with a WAL truncation and `VACUUM` to remove historical page images too.
+pub(crate) fn scrub_persisted_inbound_secrets(
+    connection: &mut rusqlite::Connection,
+) -> Result<(), StoreError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|error| sqlite_error("starting inbound privacy migration", &error))?;
+    let rows = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT event_id, message_id, scope_key, state, payload_version,
+                        payload_blob, payload_bytes, turn_row_id, rejection_reason, tenant
+                 FROM inbound_events
+                 WHERE state IN ('received', 'accepted')
+                 ORDER BY tenant, event_id",
+            )
+            .map_err(|error| sqlite_error("preparing inbound privacy migration", &error))?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(9)?, decode_stored_row(row)?))
+            })
+            .map_err(|error| sqlite_error("reading inbound privacy migration", &error))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| sqlite_error("decoding inbound privacy migration", &error))?
+    };
+    for (tenant, mut stored) in rows {
+        let state = stored.state;
+        let turn_row_id = stored.turn_row_id;
+        let event_id = stored.event_id.clone();
+        scrub_legacy_inbound_payload(&mut stored)?;
+        let old = retained_from_stored(stored)?;
+        let payload = encode_event(old.event())?;
+        let payload_bytes = i64::try_from(payload.len()).unwrap_or(i64::MAX);
+        let changed = transaction
+            .execute(
+                "UPDATE inbound_events
+                 SET payload_blob = ?1, payload_bytes = ?2
+                 WHERE tenant = ?3 AND event_id = ?4 AND state = ?5 AND turn_row_id IS ?6",
+                params![
+                    payload,
+                    payload_bytes,
+                    tenant,
+                    event_id,
+                    state.as_str(),
+                    turn_row_id,
+                ],
+            )
+            .map_err(|error| sqlite_error("rewriting inbound privacy payload", &error))?;
+        if changed != 1 {
+            return Err(StoreError::CorruptData {
+                context: "rewriting one inbound privacy payload",
+            });
+        }
+    }
+    transaction
+        .commit()
+        .map_err(|error| sqlite_error("committing inbound privacy migration", &error))
+}
+
+/// Removes the two pre-v6 secret-bearing fields before strict typed decoding.
+/// This compatibility decoder exists only on the one-way v5 -> v6 migration
+/// path; normal reads continue to reject unknown metadata fields.
+fn scrub_legacy_inbound_payload(stored: &mut StoredInbound) -> Result<(), StoreError> {
+    let payload = stored
+        .payload_blob
+        .as_ref()
+        .ok_or(StoreError::CorruptData {
+            context: "scrubbing a missing inbound privacy payload",
+        })?;
+    if payload.len() > STORE_INBOUND_PAYLOAD_MAX_BYTES
+        || usize::try_from(stored.payload_bytes).ok() != Some(payload.len())
+    {
+        return Err(StoreError::CorruptData {
+            context: "scrubbing an invalid inbound privacy payload length",
+        });
+    }
+    let mut value = serde_json::from_slice::<serde_json::Value>(payload).map_err(|_| {
+        StoreError::CorruptData {
+            context: "decoding an inbound privacy payload",
+        }
+    })?;
+    let root = value.as_object_mut().ok_or(StoreError::CorruptData {
+        context: "scrubbing an inbound privacy payload object",
+    })?;
+    root.insert("resources".to_owned(), serde_json::Value::Array(Vec::new()));
+    let parts = root
+        .get_mut("parts")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or(StoreError::CorruptData {
+            context: "scrubbing inbound privacy payload parts",
+        })?;
+    for part in parts {
+        let Some(part) = part.as_object_mut() else {
+            continue;
+        };
+        let is_media = part
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| matches!(kind, "image" | "file" | "sticker" | "audio" | "video"));
+        if !is_media {
+            continue;
+        }
+        let Some(media) = part
+            .get_mut("value")
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        media.insert("key".to_owned(), serde_json::Value::Null);
+        media.insert("thumbnail_key".to_owned(), serde_json::Value::Null);
+        if media.get("status").and_then(serde_json::Value::as_str) == Some("available") {
+            media.insert(
+                "status".to_owned(),
+                serde_json::Value::String("unavailable".to_owned()),
+            );
+        }
+        if let Some(metadata) = media
+            .get_mut("metadata")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            if metadata.remove("transcript").is_some()
+                && !metadata.contains_key("transcript_failure")
+            {
+                metadata.insert(
+                    "transcript_failure".to_owned(),
+                    serde_json::Value::String("not_retained".to_owned()),
+                );
+            }
+        }
+    }
+    let payload = serde_json::to_vec(&value).map_err(|_| StoreError::CorruptData {
+        context: "encoding a scrubbed inbound privacy payload",
+    })?;
+    stored.payload_bytes = i64::try_from(payload.len()).unwrap_or(i64::MAX);
+    stored.payload_blob = Some(payload);
+    Ok(())
 }
 
 fn ensure_inbound_capacity(

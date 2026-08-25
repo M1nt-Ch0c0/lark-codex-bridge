@@ -375,6 +375,26 @@ pub const TURN_BATCH_MAX_MESSAGES: usize = 64;
 pub const TURN_BATCH_TEXT_BYTE_BUDGET: usize = 768 * 1024;
 /// Maximum bytes parsed as one recognized first-stage bridge command.
 pub const BRIDGE_COMMAND_MAX_BYTES: usize = 16 * 1024;
+/// Maximum opaque pagination cursor accepted by the persisted-thread command surface.
+pub const THREAD_DISCOVERY_CURSOR_MAX_BYTES: usize = 512;
+/// Maximum stable thread selector accepted by an explicit adoption request.
+pub const THREAD_ADOPTION_SELECTOR_MAX_BYTES: usize = 128;
+/// Maximum candidate summaries a future enabled discovery page may expose.
+pub const THREAD_DISCOVERY_MAX_RESULTS: usize = 20;
+/// Maximum encoded bytes a future enabled discovery page may expose.
+pub const THREAD_DISCOVERY_MAX_PAGE_BYTES: usize = 16 * 1024;
+
+/// Lifetime of attachment descriptors staged by one direct-message scope.
+/// Bytes are never downloaded while a descriptor is pending.
+pub const PENDING_MEDIA_TTL: Duration = Duration::from_secs(10 * 60);
+/// Maximum attachment messages staged by one direct-message scope.
+pub const PENDING_MEDIA_MAX_COUNT: usize = 16;
+/// Aggregate variable metadata bytes retained by one pending-media queue.
+pub const PENDING_MEDIA_MAX_METADATA_BYTES: usize = 256 * 1024;
+/// Maximum serialized content accepted from a directly quoted Lark message.
+pub const QUOTE_CONTENT_MAX_BYTES: usize = 256 * 1024;
+/// Maximum typed parts accepted from one directly quoted message.
+pub const QUOTE_MAX_PARTS: usize = 16;
 
 /// Maximum characters (Unicode scalar values) in one projected reply message
 /// before deterministic splitting. A part never exceeds this bound.

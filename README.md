@@ -122,6 +122,55 @@ CODEX_E2E=1 cargo test --test codex_smoke --locked -- --ignored --nocapture
 外部端点门禁另有精确 0.149 binary + bearer 的真实 smoke；它要求显式环境配置，缺项会
 直接失败，完整命令见
 [`docs/external-codex-endpoint-gate.md`](docs/external-codex-endpoint-gate.md#verification)。
+
+### Persisted thread adoption（当前禁用）
+
+顺序接管既有 Codex thread 当前明确 fail closed。受支持的 app-server 契约可以用
+`thread/resume` 取得 writer，但没有经验证的、在 app-server 继续运行时释放该 writer 的操作；
+本地退订或丢弃 bridge route 不等于释放远端 ownership。因此 bridge 不列出候选、不调用
+`thread/resume`、不写 scope mapping，也不会以 idle 状态猜测 thread 已无人持有。
+
+`/threads`、`/adopt <selector> --handoff-complete` 和 `/release` 已保留为显式命令语法；当前
+slash handler 尚未接线，且任何未来 handler 都必须先通过零状态 capability gate。可用下面的
+只读诊断查看稳定分类（不读取 `CODEX_HOME`，也不启动 Codex）：
+
+```bash
+cargo run --locked -- codex adoption-status
+```
+
+完整的负向互操作证据、生命周期规则和未来启用条件见
+[`docs/thread-adoption.md`](docs/thread-adoption.md)。实时多客户端共享不属于该顺序交接方案，
+由 [Issue #8](https://github.com/M1nt-Ch0c0/lark-codex-bridge/issues/8) 单独研究。
+
+## 会话富媒体与单跳引用
+
+- 私聊图片、视频和文件只暂存有界描述符，不下载、不启动 Codex；下一条普通文字把当前
+  pending media 合并进同一个 turn。队列受 10 分钟 TTL、16 条和 256 KiB 元数据上限约束，
+  消费、显式引用、`/cancel`、`/new`、`/stop`、中断、scope 回收和超时都会清理。
+- 私聊语音是独立的完整输入，会直接触发 turn，但不会消费之前暂存的图片/文件。语音字节和
+  ASR 仍只在 `bridge_media.read` 时发生。
+- 群聊/话题里未触发的图片、视频、文件和语音直接忽略并做无 turn 的 durable settlement；
+  不创建 scope actor，不进入 pending/context/附件缓存，也不运行 ASR。
+- 群聊/话题用“直接 @机器人并回复媒体消息”触发。Bridge 在当前触发消息通过 sender/group/
+  mention 策略后只拉取直接父消息一跳，并对父消息 sender 再独立执行 human/owner/sender/group
+  授权；资源 key 留在 turn-scoped capability registry，
+  `bridge_context.resolve` 只返回 opaque handle。删除、无权限、超限、不支持和暂时不可用均有
+  稳定状态，不递归读取引用链或聊天历史。
+
+真实移动端引用 smoke 是人工操作、显式门控的测试。运行后按终端提示，在指定群里先发送一条
+不 `@bot` 的图片/视频/文件/语音，再用飞书移动端直接回复该消息并 `@bot` 附带给出的 marker。
+启用路径会验证 standalone 群媒体完成 no-turn settlement 且未创建 actor/context/cache 工作，随后
+验证触发消息策略、父消息发送者授权、单跳引用解析、opaque handle（序列化结果不含 resource key）
+以及通过有界附件缓存的真实按需读取；全过程不打印 resource key 或媒体内容。未设置 gate 时会
+明确报告 skip，而 skip 不算验收证据。
+
+```bash
+LARK_MEDIA_E2E=1 LARK_E2E_APP_ID=… LARK_E2E_APP_SECRET=… LARK_E2E_TENANT=feishu \
+LARK_MEDIA_E2E_GROUP_CHAT_ID=oc_… \
+  cargo test --test lark_smoke --locked real_mobile_group_quote_resolves_direct_media_parent \
+  -- --ignored --nocapture
+```
+
 ## 本地语音转写（ASR sidecar）
 
 飞书语音气泡默认**不会**把 `localAudio` 交给 Codex。`bridge_media.read` 对音频按需转写后只回传文本：
