@@ -2533,6 +2533,147 @@ async fn debounce_quote_reset_and_control_interrupt_invalidate_held_pending_rese
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
+async fn debounce_prepare_failure_keeps_the_scope_actor_alive() {
+    let config = validated_config();
+    let workspace = config
+        .default_workspace
+        .clone()
+        .expect("validated default workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config).with_test_timings(
+        Duration::from_millis(300),
+        Duration::from_secs(60),
+        Duration::from_millis(10),
+    );
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        Arc::new(UnavailableRejectionSink),
+    )
+    .await
+    .expect("router");
+    let scope = ScopeKey::Chat("chat-runtime-scope".to_owned());
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("debounce-first", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("route first message");
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if router
+                .scope_snapshot(&scope)
+                .await
+                .expect("snapshot")
+                .is_some_and(|snapshot| snapshot.state == ScopeState::Debouncing)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first message opens the debounce window");
+
+    // A stale media event inside the debounce window fails `prepare_inbound`:
+    // its rejection notice cannot be projected through the sink.
+    let mut stale = image_event("debounce-stale-image", "debounce_stale_key");
+    stale.create_time_ms = 0;
+    router
+        .route(queued_registered(&store, &namespace, stale).await)
+        .await
+        .expect("route stale image");
+
+    // The already assembled batch must still be processed.
+    let start_thread = control.next_request().await;
+    assert_eq!(start_thread["method"], "thread/start");
+    control
+        .respond(
+            &start_thread,
+            thread_result("thread-debounce-failure", &workspace),
+        )
+        .await;
+    let start_turn = control.next_request().await;
+    assert_eq!(start_turn["method"], "turn/start");
+    assert_eq!(
+        start_turn["params"]["input"]
+            .as_array()
+            .expect("input array")
+            .len(),
+        1,
+        "the failed item is dropped while the first message keeps its turn"
+    );
+    respond_turn_started(&control, &start_turn, "turn-debounce-failure").await;
+    send_turn_completed(
+        &control,
+        "thread-debounce-failure",
+        "turn-debounce-failure",
+        "completed",
+    )
+    .await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["debounce-first"],
+        InboundEventState::Completed,
+    )
+    .await;
+
+    // The actor survives the transient prepare failure and still accepts work.
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("debounce-after-failure", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("actor still routes after a debounce prepare failure");
+    let resume = control.next_request().await;
+    assert_eq!(resume["method"], "thread/resume");
+    control
+        .respond(
+            &resume,
+            thread_result("thread-debounce-failure", &workspace),
+        )
+        .await;
+    let second_turn = control.next_request().await;
+    assert_eq!(second_turn["method"], "turn/start");
+    respond_turn_started(&control, &second_turn, "turn-debounce-recovered").await;
+    send_turn_completed(
+        &control,
+        "thread-debounce-failure",
+        "turn-debounce-recovered",
+        "completed",
+    )
+    .await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["debounce-after-failure"],
+        InboundEventState::Completed,
+    )
+    .await;
+
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn pending_media_ttl_remains_truthful_while_an_unrelated_turn_is_active() {
     let config = validated_config();
     let workspace = config.default_workspace.clone().expect("workspace");

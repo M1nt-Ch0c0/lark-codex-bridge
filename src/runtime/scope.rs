@@ -742,8 +742,11 @@ async fn run_scope_actor(
                                     Ok(Some(next)) => next,
                                     Ok(None) => continue,
                                     Err(kind) => {
+                                        // Match the first-item path: drop only the
+                                        // failed item and keep the actor alive so the
+                                        // assembled batch is still processed.
                                         set_state(&state, ScopeState::Failed { kind });
-                                        break 'actor;
+                                        break;
                                     }
                                 };
                                 if is_audio_event(&next.inbound.queued.event) {
