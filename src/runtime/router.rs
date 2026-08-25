@@ -265,10 +265,7 @@ impl Router {
     /// # Errors
     ///
     /// Returns the same static classifications as [`Self::start`].
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "production startup keeps its independently owned dependencies explicit"
-    )]
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_with_contexts(
         store: StoreHandle,
         tenant: TenantNamespace,
@@ -292,10 +289,7 @@ impl Router {
         .await
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the shared startup path accepts the same explicit dependency set"
-    )]
+    #[allow(clippy::too_many_arguments)]
     async fn start_inner(
         store: StoreHandle,
         tenant: TenantNamespace,
@@ -594,11 +588,7 @@ async fn run_router(
                         if let Some((_, task)) = tool_task.take() {
                             task.abort();
                         }
-                        tool_task = start_context_tool_task(
-                            &supervisor,
-                            attachments.as_ref(),
-                            contexts.as_ref(),
-                        );
+                        tool_task = start_context_tool_task(&supervisor, attachments.as_ref(), contexts.as_ref());
                     }
                 } else {
                     if let Some((_, task)) = tool_task.take() {
@@ -783,16 +773,18 @@ async fn route_one(
     contexts: Option<&Arc<ContextRegistry>>,
     actors: &mut HashMap<String, ScopeActorHandle>,
     queued: QueuedInboundEvent,
-) -> Result<(), RouteFailure> {
+) -> Result<(), Box<RouteFailure>> {
     let decision = policy.decide(&queued.event);
     let key = InboundKey::new(tenant.clone(), queued.event.event_id.clone());
     if let Some(kind) = decision.rejection_kind() {
         return reject_with_notice(store, sink.as_ref(), &key, &queued.event, kind)
             .await
-            .map_err(|error| RouteFailure {
-                error,
-                event: queued,
-                retryable: true,
+            .map_err(|error| {
+                Box::new(RouteFailure {
+                    error,
+                    event: queued,
+                    retryable: true,
+                })
             });
     }
     let scope_key = queued.event.scope.to_string();
@@ -814,10 +806,12 @@ async fn route_one(
                     InboundRejectionKind::Overloaded,
                 )
                 .await
-                .map_err(|error| RouteFailure {
-                    error,
-                    event: queued,
-                    retryable: true,
+                .map_err(|error| {
+                    Box::new(RouteFailure {
+                        error,
+                        event: queued,
+                        retryable: true,
+                    })
                 });
             }
         }
@@ -837,11 +831,11 @@ async fn route_one(
         );
     }
     let Some(actor) = actors.get(&scope_key) else {
-        return Err(RouteFailure {
+        return Err(Box::new(RouteFailure {
             error: RouteError::ActorUnavailable,
             event: queued,
             retryable: false,
-        });
+        }));
     };
     let route = actor.try_route(key.clone(), queued);
     match route {
@@ -856,17 +850,19 @@ async fn route_one(
                 InboundRejectionKind::Overloaded,
             )
             .await
-            .map_err(|error| RouteFailure {
-                error,
-                event: queued,
-                retryable: true,
+            .map_err(|error| {
+                Box::new(RouteFailure {
+                    error,
+                    event: queued,
+                    retryable: true,
+                })
             })
         }
-        Err(ActorRouteError::Closed(queued)) => Err(RouteFailure {
+        Err(ActorRouteError::Closed(queued)) => Err(Box::new(RouteFailure {
             error: RouteError::ActorUnavailable,
             event: *queued,
             retryable: false,
-        }),
+        })),
     }
 }
 
