@@ -206,7 +206,9 @@ where
     tracing::info!("bridge runtime starting");
     let policy = AccessPolicy::from_config(&config).map_err(|_| AppError::Config)?;
     let router_settings = RouterSettings::from_config(&config);
-    let process_config = config.codex.process_config();
+    // The long-running external WebSocket transport is intentionally not part of the endpoint
+    // admission-gate change. An explicitly external backend can never fall back to spawning.
+    let process_config = config.codex.process_config().ok_or(AppError::Supervisor)?;
     let database_path = config.paths.database.clone();
     let attachment_cache_path = config.paths.attachment_cache.clone();
     let tenant = TenantNamespace::from_credentials(&credentials);

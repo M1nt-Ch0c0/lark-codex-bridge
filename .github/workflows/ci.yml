@@ -65,6 +65,17 @@ jobs:
       - run: cargo fetch --locked
       - run: cargo build --offline --locked
       - run: cargo test --offline --locked --test schema_contracts
+      - name: Run exact authenticated external endpoint gate smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          codex_binary="$GITHUB_WORKSPACE/.codex-ci/0.149.0/node_modules/.bin/codex"
+          CODEX_EXTERNAL_GATE_E2E=1 \
+          CODEX_EXTERNAL_GATE_BINARY="$codex_binary" \
+          CODEX_EXTERNAL_GATE_EXPECTED_VERSION=0.149.0 \
+            cargo test --locked --test external_endpoint_smoke \
+              real_exact_binary_enforces_external_auth_version_and_capability_gate \
+              -- --ignored --exact --nocapture
 
   fmt:
     name: Format (rustfmt)
@@ -299,6 +310,18 @@ jobs:
             python tools/codex_schema.py sync \
               --binary "$codex_binary" --check
           done
+      - name: Run exact authenticated external endpoint gate smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          codex_binary="$GITHUB_WORKSPACE/.codex-ci/0.149.0/node_modules/.bin/codex"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then codex_binary="$codex_binary.cmd"; fi
+          CODEX_EXTERNAL_GATE_E2E=1 \
+          CODEX_EXTERNAL_GATE_BINARY="$codex_binary" \
+          CODEX_EXTERNAL_GATE_EXPECTED_VERSION=0.149.0 \
+            cargo test --locked --test external_endpoint_smoke \
+              real_exact_binary_enforces_external_auth_version_and_capability_gate \
+              -- --ignored --exact --nocapture
       - run: cargo nextest run --all-targets --all-features --profile ci --locked -E 'not binary(channel_sidecar)'
       - run: cargo test --test channel_sidecar --locked -- --test-threads=1
       - run: cargo build --locked

@@ -9,6 +9,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
+use crate::codex::external::CodexBackendConfig;
 use crate::codex::process::CodexProcessConfig;
 use crate::codex::types::{ApprovalPolicy, SandboxMode};
 use crate::limits::{
@@ -62,6 +63,8 @@ pub enum ConfigError {
     InvalidDefaultWorkspace,
     #[error("unable to determine safe platform filesystem roots")]
     PlatformRoots,
+    #[error("bridge configuration contains an invalid Codex backend")]
+    InvalidCodexBackend,
     #[error("bridge configuration contains an invalid ASR sidecar command")]
     InvalidAsrCommand,
     #[error("bridge configuration has too many ASR sidecar arguments")]
@@ -94,6 +97,7 @@ impl fmt::Debug for ConfigError {
             Self::InvalidRuntimePath => "InvalidRuntimePath",
             Self::InvalidDefaultWorkspace => "InvalidDefaultWorkspace",
             Self::PlatformRoots => "PlatformRoots",
+            Self::InvalidCodexBackend => "InvalidCodexBackend",
             Self::InvalidAsrCommand => "InvalidAsrCommand",
             Self::TooManyAsrArgs => "TooManyAsrArgs",
             Self::AsrArgsTooLarge => "AsrArgsTooLarge",
@@ -229,6 +233,10 @@ impl BridgeConfig {
         {
             return Err(ConfigError::AllowRootsTooLarge);
         }
+        self.codex
+            .backend
+            .validate()
+            .map_err(|_| ConfigError::InvalidCodexBackend)?;
         self.asr.validate()?;
         if self.channel.node_binary.as_os_str().is_empty()
             || self.channel.sidecar_entrypoint.as_os_str().is_empty()
@@ -335,8 +343,7 @@ impl Default for ConcurrencyConfig {
 /// Codex process and policy settings.
 #[derive(Clone, Serialize)]
 pub struct CodexSection {
-    pub binary: PathBuf,
-    pub codex_home: Option<PathBuf>,
+    pub backend: CodexBackendConfig,
     pub model: Option<String>,
     pub sandbox: SandboxMode,
     pub approval_policy: ApprovalPolicy,
@@ -349,8 +356,7 @@ impl<'de> Deserialize<'de> for CodexSection {
     {
         let config = CodexSectionConfig::deserialize(deserializer)?;
         Ok(Self {
-            binary: config.binary,
-            codex_home: config.codex_home,
+            backend: config.backend,
             model: config.model,
             sandbox: config.sandbox,
             approval_policy: config.approval_policy.into(),
@@ -361,8 +367,7 @@ impl<'de> Deserialize<'de> for CodexSection {
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct CodexSectionConfig {
-    binary: PathBuf,
-    codex_home: Option<PathBuf>,
+    backend: CodexBackendConfig,
     model: Option<String>,
     sandbox: SandboxMode,
     approval_policy: ConfigApprovalPolicy,
@@ -372,8 +377,7 @@ impl Default for CodexSectionConfig {
     fn default() -> Self {
         let defaults = CodexSection::default();
         Self {
-            binary: defaults.binary,
-            codex_home: defaults.codex_home,
+            backend: defaults.backend,
             model: defaults.model,
             sandbox: defaults.sandbox,
             approval_policy: ConfigApprovalPolicy::default(),
@@ -442,8 +446,7 @@ impl From<StrictGranularApprovalPolicy> for crate::codex::types::GranularApprova
 impl Default for CodexSection {
     fn default() -> Self {
         Self {
-            binary: PathBuf::from("codex"),
-            codex_home: None,
+            backend: CodexBackendConfig::default(),
             model: None,
             sandbox: SandboxMode::WorkspaceWrite,
             approval_policy: ApprovalPolicy::Named("never".to_owned()),
@@ -453,11 +456,8 @@ impl Default for CodexSection {
 
 impl CodexSection {
     #[must_use]
-    pub fn process_config(&self) -> CodexProcessConfig {
-        CodexProcessConfig {
-            binary: self.binary.clone(),
-            codex_home: self.codex_home.clone(),
-        }
+    pub fn process_config(&self) -> Option<CodexProcessConfig> {
+        self.backend.spawned_process_config()
     }
 }
 
@@ -469,11 +469,7 @@ impl fmt::Debug for CodexSection {
         };
         formatter
             .debug_struct("CodexSection")
-            .field("binary", &"[configured]")
-            .field(
-                "codex_home",
-                &self.codex_home.as_ref().map(|_| "[configured]"),
-            )
+            .field("backend", &self.backend)
             .field("model_configured", &self.model.is_some())
             .field("sandbox", &self.sandbox)
             .field("approval_policy_kind", &approval_policy_kind)

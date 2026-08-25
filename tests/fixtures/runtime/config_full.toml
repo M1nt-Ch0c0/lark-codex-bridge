@@ -11,11 +11,14 @@ active_turn_permits = 9
 max_scope_actors = 31
 
 [codex]
-binary = "/opt/codex/bin/codex"
-codex_home = "/opt/codex/home"
 model = "gpt-5.6"
 sandbox = "read-only"
 approval_policy = "on-request"
+
+[codex.backend]
+mode = "spawned_stdio"
+binary = "/opt/codex/bin/codex"
+codex_home = "/opt/codex/home"
 
 [paths]
 database = "state/bridge.sqlite3"

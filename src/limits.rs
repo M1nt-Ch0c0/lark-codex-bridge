@@ -31,6 +31,18 @@ pub const THREAD_PROJECTION_BYTE_BUDGET: usize = 4 * 1024 * 1024;
 pub const ROUTING_ID_BYTE_LIMIT: usize = 1024;
 pub const MAX_STDERR_LINE_BYTES: usize = 64 * 1024;
 pub const MAX_VERSION_OUTPUT_BYTES: usize = 64 * 1024;
+/// Maximum UTF-8 bytes in one configured external Codex WebSocket endpoint.
+pub const MAX_EXTERNAL_ENDPOINT_BYTES: usize = 2 * 1024;
+/// Maximum encoded bytes in a configured external credential-source path.
+pub const MAX_EXTERNAL_SECRET_PATH_BYTES: usize = 4 * 1024;
+/// Maximum bytes read from an external bearer-token file.
+pub const MAX_EXTERNAL_AUTH_TOKEN_BYTES: usize = 4 * 1024;
+/// One-shot external gate frame/message bound; the gate never transfers thread history.
+pub const EXTERNAL_GATE_MESSAGE_BYTES: usize = 256 * 1024;
+/// Aggregate inbound bytes accepted while waiting for one external-gate response.
+pub const EXTERNAL_GATE_TOTAL_BYTES: usize = 1024 * 1024;
+/// Inbound frames accepted while waiting for one external-gate response.
+pub const EXTERNAL_GATE_MAX_MESSAGES: usize = 64;
 pub const HIGH_PRIORITY_BURST: usize = 8;
 pub const TRANSPORT_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 pub const TRANSPORT_HIGH_BYTE_BUDGET: usize = TRANSPORT_BYTE_BUDGET;
@@ -67,6 +79,8 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 pub const CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 pub const INTERRUPT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Whole admission deadline for authentication, initialize/version validation, and list canary.
+pub const EXTERNAL_GATE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Shared timeout for every Lark HTTP request (matches the reference
 /// bootstrap request timeout).
 pub const LARK_HTTP_TIMEOUT: Duration = Duration::from_secs(15);
