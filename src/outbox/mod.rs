@@ -1,15 +1,19 @@
 //! Durable outbound queue: versioned payloads, the bounded send pump, and the
-//! [`DurableReplySink`](crate::runtime::scope::DurableReplySink) adapter.
+//! [`OutboxReplySink`] adapter.
 //!
-//! The store layer owns the rows and the atomic state machine; this module owns
-//! the `payload` codec, the `pump` send loop, and the `sink` runtime boundary.
+//! The store (see [`crate::store`]) owns the rows and the atomic
+//! state machine; this module owns the codec (`payload`), the send loop
+//! (`pump`), and the runtime boundary (`sink`).
 
 #![allow(clippy::doc_markdown)]
 
 mod payload;
-mod pump;
+pub(crate) mod pump;
 mod sink;
 
 pub use payload::{OUTBOX_PAYLOAD_VERSION, OutboxError, OutboxOperation};
-pub use pump::{DeliveryClass, OutboxHandle, OutboxPump, OutboxPumpConfig, classify_delivery};
+pub use pump::{
+    AppliedCertainty, DeliveryClass, DeliveryDecision, OutboxHandle, OutboxPump, OutboxPumpConfig,
+    Retryability, classify_delivery, delivery_decision,
+};
 pub use sink::OutboxReplySink;

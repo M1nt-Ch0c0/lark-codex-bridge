@@ -10,9 +10,9 @@
 //! `synchronous = NORMAL`, and a bounded `busy_timeout`; schema changes are
 //! `user_version` migrations ([`schema`]).
 //!
-//! Typed query groups live in `dedup` (inbound event registration and
-//! state machine), `sessions` (scopes/threads/turns), `outbox` (durable
-//! outbound queue), and `attachments` (content-addressed cache rows and
+//! Typed query groups live in `dedup` (inbound event registration and state
+//! machine), `sessions` (scopes/threads/turns), `outbox` (durable outbound
+//! queue), and `attachments` (content-addressed cache rows and
 //! leases).
 //!
 //! Redaction: errors and `Debug` output carry static contexts, states, IDs,

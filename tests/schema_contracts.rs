@@ -115,12 +115,25 @@ macro_rules! assert_contract {
         let fixture = contract($version);
 
         let initialize = exchange(&fixture, "initialize");
-        serde_json::from_value::<wire::$wire::InitializeParams>(initialize["params"].clone())
+        let initialize_params =
+            serde_json::from_value::<wire::$wire::InitializeParams>(initialize["params"].clone())
             .expect("initialize params should decode as generated wire");
+        assert_eq!(
+            initialize["params"]["clientInfo"]["version"].as_str(),
+            Some(env!("CARGO_PKG_VERSION")),
+            "contract client version must track the package version"
+        );
+        assert_eq!(
+            serde_json::to_value(initialize_params).expect("initialize params should re-encode"),
+            initialize["params"]
+        );
         let response =
             serde_json::from_value::<wire::$wire::InitializeResponse>(initialize["result"].clone())
                 .expect("initialize response should decode as generated wire");
-        assert!(compat::$compat::initialize_response(response).is_ok());
+        let stable = compat::$compat::initialize_response(response)
+            .expect("initialize response should map to stable domain");
+        assert_eq!(stable.platform_family, "unix");
+        assert_eq!(stable.platform_os, "linux");
 
         let start = exchange(&fixture, "thread/start");
         serde_json::from_value::<wire::$wire::ThreadStartParams>(start["params"].clone())
@@ -130,7 +143,9 @@ macro_rules! assert_contract {
                 .expect("thread/start response should decode as generated wire");
         let stable = compat::$compat::thread_start_response(response)
             .expect("thread/start response should map to stable domain");
+        assert_eq!(stable.thread.id, "thread-contract-1");
         assert_eq!(stable.thread.cli_version, $version);
+        assert_eq!(stable.approvals_reviewer, "user");
 
         let list = exchange(&fixture, "thread/list");
         serde_json::from_value::<wire::$wire::ThreadListParams>(list["params"].clone())
@@ -141,6 +156,8 @@ macro_rules! assert_contract {
         let stable = compat::$compat::thread_list_response(response)
             .expect("thread/list response should map to stable domain");
         assert_eq!(stable.data.len(), 1);
+        assert_eq!(stable.data[0].id, "thread-contract-1");
+        assert_eq!(stable.next_cursor, None);
 
         let read = exchange(&fixture, "thread/read");
         serde_json::from_value::<wire::$wire::ThreadReadParams>(read["params"].clone())
@@ -158,7 +175,10 @@ macro_rules! assert_contract {
         let response =
             serde_json::from_value::<wire::$wire::ThreadResumeResponse>(resume["result"].clone())
                 .expect("thread/resume response should decode as generated wire");
-        assert!(compat::$compat::thread_resume_response(response).is_ok());
+        let stable = compat::$compat::thread_resume_response(response)
+            .expect("thread/resume response should map to stable domain");
+        assert_eq!(stable.thread.id, "thread-contract-1");
+        assert_eq!(stable.model, "gpt-5.6");
 
         let turn_start = exchange(&fixture, "turn/start");
         serde_json::from_value::<wire::$wire::TurnStartParams>(turn_start["params"].clone())
@@ -166,7 +186,10 @@ macro_rules! assert_contract {
         let response =
             serde_json::from_value::<wire::$wire::TurnStartResponse>(turn_start["result"].clone())
                 .expect("turn/start response should decode as generated wire");
-        assert!(compat::$compat::turn_start_response(response).is_ok());
+        let stable = compat::$compat::turn_start_response(response)
+            .expect("turn/start response should map to stable domain");
+        assert_eq!(stable.turn.id, "turn-contract-1");
+        assert_eq!(stable.turn.status, types::TurnStatus::InProgress);
 
         let interrupt = exchange(&fixture, "turn/interrupt");
         serde_json::from_value::<wire::$wire::TurnInterruptParams>(interrupt["params"].clone())
@@ -175,35 +198,53 @@ macro_rules! assert_contract {
             interrupt["result"].clone(),
         )
         .expect("turn/interrupt response should decode as generated wire");
-        assert!(compat::$compat::turn_interrupt_response(response).is_ok());
+        let stable = compat::$compat::turn_interrupt_response(response)
+            .expect("turn/interrupt response should map to stable domain");
+        assert_eq!(
+            serde_json::to_value(stable).expect("interrupt result should re-encode"),
+            json!({})
+        );
 
         let started = notification(&fixture, "thread/started");
         let params = serde_json::from_value::<wire::$wire::ThreadStartedNotification>(
             started["params"].clone(),
         )
         .expect("thread/started should decode as generated wire");
-        assert!(compat::$compat::thread_started_notification(params).is_ok());
+        let stable = compat::$compat::thread_started_notification(params)
+            .expect("thread/started should map to stable domain");
+        assert_eq!(stable.thread.id, "thread-contract-1");
+        assert_eq!(stable.thread.cli_version, $version);
 
         let turn_started = notification(&fixture, "turn/started");
         let params = serde_json::from_value::<wire::$wire::TurnStartedNotification>(
             turn_started["params"].clone(),
         )
         .expect("turn/started should decode as generated wire");
-        assert!(compat::$compat::turn_started_notification(params).is_ok());
+        let stable = compat::$compat::turn_started_notification(params)
+            .expect("turn/started should map to stable domain");
+        assert_eq!(stable.thread_id, "thread-contract-1");
+        assert_eq!(stable.turn.id, "turn-contract-1");
 
         let item_started = notification(&fixture, "item/started");
         let params = serde_json::from_value::<wire::$wire::ItemStartedNotification>(
             item_started["params"].clone(),
         )
         .expect("item/started should decode as generated wire");
-        assert!(compat::$compat::item_started_notification(params).is_ok());
+        let stable = compat::$compat::item_started_notification(params)
+            .expect("item/started should map to stable domain");
+        assert_eq!(stable.turn_id, "turn-contract-1");
+        assert_eq!(stable.started_at_ms, 1_786_478_401_000);
+        assert_eq!(stable.item.kind(), "agentMessage");
 
         let delta = notification(&fixture, "item/agentMessage/delta");
         let params = serde_json::from_value::<wire::$wire::AgentMessageDeltaNotification>(
             delta["params"].clone(),
         )
         .expect("agent delta should decode as generated wire");
-        assert!(compat::$compat::agent_message_delta_notification(params).is_ok());
+        let stable = compat::$compat::agent_message_delta_notification(params)
+            .expect("agent delta should map to stable domain");
+        assert_eq!(stable.item_id, "item-contract-1");
+        assert_eq!(stable.delta, "contract delta");
 
         let output = notification(&fixture, "item/commandExecution/outputDelta");
         let params =
@@ -211,43 +252,74 @@ macro_rules! assert_contract {
                 output["params"].clone(),
             )
             .expect("command output should decode as generated wire");
-        assert!(compat::$compat::command_output_delta_notification(params).is_ok());
+        let stable = compat::$compat::command_output_delta_notification(params)
+            .expect("command output should map to stable domain");
+        assert_eq!(stable.item_id, "command-contract-1");
+        assert_eq!(stable.delta, "bounded output");
 
         let completed = notification(&fixture, "item/completed");
         let params = serde_json::from_value::<wire::$wire::ItemCompletedNotification>(
             completed["params"].clone(),
         )
         .expect("item/completed should decode as generated wire");
-        assert!(compat::$compat::item_completed_notification(params).is_ok());
+        let stable = compat::$compat::item_completed_notification(params)
+            .expect("item/completed should map to stable domain");
+        assert_eq!(stable.completed_at_ms, 1_786_478_402_000);
+        assert_eq!(stable.item.kind(), "agentMessage");
+        let types::ThreadItem::AgentMessage { text, phase, .. } = stable.item else {
+            panic!("fixture item should stay an agent message")
+        };
+        assert_eq!(text, "contract output");
+        assert_eq!(phase, Some(types::MessagePhase::FinalAnswer));
 
         let usage = notification(&fixture, "thread/tokenUsage/updated");
         let params = serde_json::from_value::<wire::$wire::ThreadTokenUsageUpdatedNotification>(
             usage["params"].clone(),
         )
         .expect("token usage should decode as generated wire");
-        assert!(compat::$compat::token_usage_updated_notification(params).is_ok());
+        let stable = compat::$compat::token_usage_updated_notification(params)
+            .expect("token usage should map to stable domain");
+        assert_eq!(stable.turn_id, "turn-contract-1");
+        assert_eq!(stable.token_usage.total.total_tokens, 16);
+        assert_eq!(stable.token_usage.model_context_window, Some(100_000));
 
         let error = notification(&fixture, "error");
         let params =
             serde_json::from_value::<wire::$wire::ErrorNotification>(error["params"].clone())
                 .expect("error should decode as generated wire");
-        assert!(compat::$compat::error_notification(params).is_ok());
+        let stable = compat::$compat::error_notification(params)
+            .expect("error notification should map to stable domain");
+        assert_eq!(stable.turn_id, "turn-contract-1");
+        assert!(!stable.will_retry);
 
         let completed = notification(&fixture, "turn/completed");
         let params = serde_json::from_value::<wire::$wire::TurnCompletedNotification>(
             completed["params"].clone(),
         )
         .expect("turn/completed should decode as generated wire");
-        assert!(compat::$compat::turn_completed_notification(params).is_ok());
+        let stable = compat::$compat::turn_completed_notification(params)
+            .expect("turn/completed should map to stable domain");
+        assert_eq!(stable.thread_id, "thread-contract-1");
+        assert_eq!(stable.turn.id, "turn-contract-1");
+        assert_eq!(stable.turn.status, types::TurnStatus::Completed);
 
         let reverse = &fixture["reverseRequests"][0];
         let params =
             serde_json::from_value::<wire::$wire::DynamicToolCallParams>(reverse["params"].clone())
                 .expect("dynamic tool call should decode as generated wire");
-        assert!(compat::$compat::dynamic_tool_call_params(params).is_ok());
+        let stable = compat::$compat::dynamic_tool_call_params(params)
+            .expect("dynamic tool call should map to stable domain");
+        assert_eq!(stable.call_id, "call-contract-1");
+        assert_eq!(stable.namespace, None);
+        assert_eq!(stable.arguments, json!({"key": "value"}));
         let stable: types::DynamicToolCallResponse =
             serde_json::from_value(reverse["result"].clone()).expect("stable tool response");
-        assert!(compat::$compat::dynamic_tool_call_response(&stable).is_ok());
+        let mapped = compat::$compat::dynamic_tool_call_response(&stable)
+            .expect("dynamic tool response should map to generated wire");
+        assert_eq!(
+            serde_json::to_value(mapped).expect("dynamic tool response should re-encode"),
+            reverse["result"]
+        );
     }};
 }
 
@@ -472,28 +544,37 @@ fn supported_adapter_maps_every_incoming_notification_and_reverse_request() {
 
 #[test]
 fn fixture_notification_order_is_the_production_router_order() {
-    let fixture = contract("0.146.0");
-    let fixture_order: Vec<&str> = fixture["normalNotificationOrder"]
-        .as_array()
-        .expect("normalNotificationOrder should be an array")
-        .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .expect("notification method should be a string")
-        })
-        .collect();
-    assert_eq!(fixture_order, NORMAL_NOTIFICATION_ORDER);
-    let fixture_methods: std::collections::BTreeSet<&str> = fixture["notifications"]
-        .as_array()
-        .expect("notifications should be an array")
-        .iter()
-        .map(|entry| entry["method"].as_str().expect("method should be a string"))
-        .collect();
-    assert_eq!(
-        fixture_methods,
-        CONSUMED_NOTIFICATION_METHODS.iter().copied().collect()
-    );
+    for version in ["0.146.0", "0.149.0"] {
+        let fixture = contract(version);
+        let fixture_order: Vec<&str> = fixture["normalNotificationOrder"]
+            .as_array()
+            .expect("normalNotificationOrder should be an array")
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .expect("notification method should be a string")
+            })
+            .collect();
+        assert_eq!(fixture_order, NORMAL_NOTIFICATION_ORDER, "{version}");
+        let fixture_methods: std::collections::BTreeSet<&str> = fixture["notifications"]
+            .as_array()
+            .expect("notifications should be an array")
+            .iter()
+            .map(|entry| entry["method"].as_str().expect("method should be a string"))
+            .collect();
+        let mut expected_methods: std::collections::BTreeSet<&str> =
+            CONSUMED_NOTIFICATION_METHODS.iter().copied().collect();
+        if version == "0.149.0" {
+            expected_methods.extend(
+                SharedWireProfile::QueueShared
+                    .required_notifications()
+                    .iter()
+                    .copied(),
+            );
+        }
+        assert_eq!(fixture_methods, expected_methods, "{version}");
+    }
 }
 
 #[test]
@@ -586,6 +667,18 @@ fn supported_adapter_rejects_outgoing_values_outside_the_0_146_schema() {
     };
     assert!(adapter.thread_start_params(&start).is_err());
 
+    let start = types::ThreadStartParams {
+        project_id: Some("project-contract-1".to_owned()),
+        ..types::ThreadStartParams::default()
+    };
+    assert!(adapter.thread_start_params(&start).is_err());
+    assert_eq!(
+        WireAdapter::V0_149_0
+            .thread_start_params(&start)
+            .expect("0.149 should retain its promoted project id")["projectId"],
+        "project-contract-1"
+    );
+
     let mut turn = types::TurnStartParams::new("thread-contract-1", vec![]);
     turn.summary = Some("future-summary".to_owned());
     assert!(adapter.turn_start_params(&turn).is_err());
@@ -607,6 +700,28 @@ fn unknown_generated_enum_values_fail_soft_at_the_stable_boundary() {
     assert_eq!(
         stable.turn.status,
         types::TurnStatus::Unknown("futureTerminalState".to_owned())
+    );
+
+    let generated: wire::v0_146_0::ItemCompletedNotification = serde_json::from_value(json!({
+        "threadId": "thread-contract-1",
+        "turnId": "turn-contract-1",
+        "completedAtMs": 1,
+        "item": {
+            "id": "item-contract-1",
+            "type": "agentMessage",
+            "text": "future phase",
+            "phase": "future_phase"
+        }
+    }))
+    .expect("generated item should retain an unknown message phase");
+    let stable = compat::v0_146_0::item_completed_notification(generated)
+        .expect("unknown message phase should map without failing");
+    let types::ThreadItem::AgentMessage { phase, .. } = stable.item else {
+        panic!("unknown-phase fixture should remain an agent message")
+    };
+    assert_eq!(
+        phase,
+        Some(types::MessagePhase::Unknown("future_phase".to_owned()))
     );
 }
 
@@ -831,6 +946,56 @@ fn promoted_shared_notifications_and_approvals_cross_the_stable_boundary() {
 }
 
 #[test]
+fn promoted_approval_variants_encode_with_the_exact_schema_keys() {
+    let adapter = WireAdapter::V0_149_0;
+    let execpolicy = types::CommandExecutionRequestApprovalResult {
+        decision: types::CommandExecutionApprovalDecision::AcceptWithExecpolicyAmendment {
+            amendment: types::ExecpolicyAmendment {
+                execpolicy_amendment: vec!["allow prefix".to_owned()],
+            },
+        },
+    };
+    assert_eq!(
+        adapter
+            .command_execution_request_approval_response(&execpolicy)
+            .expect("execpolicy amendment should encode"),
+        json!({
+            "decision": {
+                "acceptWithExecpolicyAmendment": {
+                    "execpolicy_amendment": ["allow prefix"]
+                }
+            }
+        })
+    );
+
+    let network = types::CommandExecutionRequestApprovalResult {
+        decision: types::CommandExecutionApprovalDecision::ApplyNetworkPolicyAmendment {
+            amendment: types::NetworkPolicyAmendmentEnvelope {
+                network_policy_amendment: types::NetworkPolicyAmendment {
+                    action: types::NetworkPolicyAction::Allow,
+                    host: "example.invalid".to_owned(),
+                },
+            },
+        },
+    };
+    assert_eq!(
+        adapter
+            .command_execution_request_approval_response(&network)
+            .expect("network amendment should encode"),
+        json!({
+            "decision": {
+                "applyNetworkPolicyAmendment": {
+                    "network_policy_amendment": {
+                        "action": "allow",
+                        "host": "example.invalid"
+                    }
+                }
+            }
+        })
+    );
+}
+
+#[test]
 fn promoted_shared_unknown_values_are_preserved_or_rejected_by_policy() {
     let adapter = WireAdapter::V0_149_0;
     let unsubscribe = adapter
@@ -865,6 +1030,43 @@ fn promoted_shared_unknown_values_are_preserved_or_rejected_by_policy() {
         serde_json::from_value::<types::PermissionsRequestApprovalResult>(json!({
             "permissions": {},
             "scope": "futureScope"
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<types::PermissionsRequestApprovalResult>(json!({
+            "permissions": "not-an-object"
+        }))
+        .is_err()
+    );
+
+    for params in [
+        json!({"threadId": "thread-contract-1", "sortDirection": "sideways"}),
+        json!({
+            "threadId": "thread-contract-1",
+            "turnId": "turn-contract-1",
+            "sortDirection": "sideways"
+        }),
+    ] {
+        if params.get("turnId").is_some() {
+            let stable: types::ThreadItemsListParams =
+                serde_json::from_value(params).expect("stable open sort direction");
+            assert!(adapter.thread_items_list_params(&stable).is_err());
+        } else {
+            let stable: types::ThreadTurnsListParams =
+                serde_json::from_value(params).expect("stable open sort direction");
+            assert!(adapter.thread_turns_list_params(&stable).is_err());
+        }
+    }
+
+    assert!(
+        serde_json::from_value::<types::TurnSteerParams>(json!({
+            "threadId": "thread-contract-1",
+            "expectedTurnId": "turn-contract-1",
+            "input": [],
+            "additionalContext": {
+                "source": {"kind": "futureKind", "value": "opaque"}
+            }
         }))
         .is_err()
     );

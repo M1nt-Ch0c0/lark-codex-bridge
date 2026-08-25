@@ -624,11 +624,25 @@ pub struct TurnSteerParams {
     pub expected_turn_id: String,
     pub input: Vec<UserInput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub additional_context: Option<Map<String, Value>>,
+    pub additional_context: Option<BTreeMap<String, AdditionalContextEntry>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_user_message_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub responsesapi_client_metadata: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AdditionalContextKind {
+    Application,
+    Untrusted,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdditionalContextEntry {
+    pub kind: AdditionalContextKind,
+    pub value: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -701,7 +715,15 @@ pub struct ThreadTurnsListParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sort_direction: Option<SortDirection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub items_view: Option<String>,
+    pub items_view: Option<TurnItemsView>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TurnItemsView {
+    NotLoaded,
+    Summary,
+    Full,
 }
 
 #[derive(Clone, Deserialize, PartialEq, Serialize)]
@@ -796,6 +818,7 @@ pub struct CommandExecutionRequestApprovalParams {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecpolicyAmendment {
+    #[serde(rename = "execpolicy_amendment")]
     pub execpolicy_amendment: Vec<String>,
 }
 
@@ -816,6 +839,7 @@ pub enum NetworkPolicyAction {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkPolicyAmendmentEnvelope {
+    #[serde(rename = "network_policy_amendment")]
     pub network_policy_amendment: NetworkPolicyAmendment,
 }
 
@@ -874,10 +898,18 @@ pub struct PermissionsRequestApprovalParams {
     pub item_id: String,
     pub started_at_ms: i64,
     pub cwd: PathBuf,
-    pub permissions: Value,
+    pub permissions: PermissionProfile,
     #[serde(flatten)]
     pub details: Map<String, Value>,
 }
+
+/// An exact JSON object carried by permission approval requests and grants.
+///
+/// The profile's nested fields remain version-specific protocol data, but the
+/// selected schema always requires the top-level value to be an object.
+#[derive(Clone, Default, Deserialize, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct PermissionProfile(pub Map<String, Value>);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -888,7 +920,7 @@ pub enum PermissionGrantScope {
 
 #[derive(Clone, Deserialize, PartialEq, Serialize)]
 pub struct PermissionsRequestApprovalResult {
-    pub permissions: Value,
+    pub permissions: PermissionProfile,
     #[serde(default)]
     pub scope: Option<PermissionGrantScope>,
     #[serde(default, rename = "strictAutoReview")]
