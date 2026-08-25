@@ -207,7 +207,7 @@ async fn read_media(
             &params.turn_id,
             max_materialized_bytes,
         )
-        .map_err(context_error)?;
+        .map_err(|error| context_error(&error))?;
     if authorized.media_kind == MediaKind::Audio {
         let (result, acquisition_token) =
             read_audio(attachments, asr, shutdown, &mut authorized).await;
