@@ -207,14 +207,6 @@ ALTER TABLE threads ADD COLUMN context_tools_version INTEGER NOT NULL DEFAULT 0
     },
     Migration {
         version: 6,
-        name: "remove durable media capabilities and transcripts",
-        // The data rewrite is implemented by the writer immediately before
-        // this marker migration because it must decode and validate the
-        // versioned application payload rather than mutate JSON in SQL.
-        sql: "SELECT 1;",
-    },
-    Migration {
-        version: 7,
         name: "tokenize attachment lease acquisitions",
         sql: "
 ALTER TABLE attachment_leases RENAME TO attachment_leases_v1;
@@ -246,6 +238,14 @@ DROP TABLE attachment_leases_v1;
         // opaque JSON. Advancing `user_version` is nevertheless required so a
         // v1-only binary refuses to open a database after this binary may have
         // persisted payload v2 rows it cannot understand.
+        sql: "SELECT 1;",
+    },
+    Migration {
+        version: 8,
+        name: "remove durable media capabilities and transcripts",
+        // The data rewrite is implemented by the writer immediately before
+        // this marker migration because it must decode and validate the
+        // versioned application payload rather than mutate JSON in SQL.
         sql: "SELECT 1;",
     },
 ];
