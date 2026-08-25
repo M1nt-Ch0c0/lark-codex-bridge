@@ -14,13 +14,15 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::lark::{
     api::{ChatMode, ResourceKind},
     normalize::{
-        InboundEvent, MediaMetadata as InboundMediaMetadata, MediaPart, MessagePart, PartStatus,
-        ResourceDesc,
+        InboundEvent, LiveTranscriptHandoff, MediaMetadata as InboundMediaMetadata, MediaPart,
+        MessagePart, PartStatus, ResourceDesc, TranscriptFailure,
     },
 };
 
@@ -344,7 +346,7 @@ pub enum TypedPart {
 }
 
 /// Input part accepted during registration, before opaque handles are minted.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum DraftPart {
     /// Plain normalized text.
     Text(String),
@@ -358,6 +360,8 @@ pub enum DraftPart {
         thumbnail: Option<ResourceDesc>,
         /// Non-authoritative display metadata.
         metadata: MediaMetadata,
+        /// Non-content rejection classification for a supplied transcript.
+        transcript_failure: Option<TranscriptFailure>,
     },
     /// Structured interactive card content.
     Card(Value),
@@ -375,6 +379,39 @@ pub enum DraftPart {
         /// Stable explanation.
         reason: String,
     },
+}
+
+impl fmt::Debug for DraftPart {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text(text) => formatter
+                .debug_struct("Text")
+                .field("chars", &text.chars().count())
+                .finish_non_exhaustive(),
+            Self::Media {
+                kind,
+                thumbnail,
+                metadata,
+                transcript_failure,
+                ..
+            } => formatter
+                .debug_struct("Media")
+                .field("kind", kind)
+                .field("has_thumbnail", &thumbnail.is_some())
+                .field("metadata", metadata)
+                .field("transcript_failure", transcript_failure)
+                .finish_non_exhaustive(),
+            Self::Card(_) => formatter.write_str("Card([REDACTED])"),
+            Self::Forward { status, .. } => formatter
+                .debug_struct("Forward")
+                .field("status", status)
+                .finish_non_exhaustive(),
+            Self::Unsupported { message_type, .. } => formatter
+                .debug_struct("Unsupported")
+                .field("message_type_len", &message_type.len())
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 /// Availability of a typed part that does not carry a downloadable handle.
@@ -472,6 +509,7 @@ impl ContextDraft {
                 resource: resource.clone(),
                 thumbnail: None,
                 metadata: MediaMetadata::default(),
+                transcript_failure: None,
             }));
         }
         if parts.is_empty() {
@@ -564,6 +602,7 @@ fn draft_media_part(kind: MediaKind, resource_kind: ResourceKind, media: &MediaP
             key: key.clone(),
         }),
         metadata: media_metadata(&media.metadata),
+        transcript_failure: media.metadata.transcript_failure,
     }
 }
 
@@ -640,7 +679,6 @@ pub struct RegisteredContext {
 }
 
 /// A descriptor returned only after context, thread, turn, and handle checks.
-#[derive(Clone, PartialEq, Eq)]
 pub struct AuthorizedResource {
     /// Lark message that owns the resource.
     pub message_id: String,
@@ -650,6 +688,31 @@ pub struct AuthorizedResource {
     pub local_turn_row_id: i64,
     /// Key and endpoint kind consumed by `AttachmentCache`.
     pub resource: ResourceDesc,
+    /// Inbound recognition text that can skip the sidecar.
+    pub transcript: Option<String>,
+    /// Why a supplied transcript was rejected before content retention.
+    pub transcript_failure: Option<TranscriptFailure>,
+    /// Declared duration, used to refuse over-long audio before download.
+    pub duration_ms: Option<u64>,
+    /// Cancellation tied to the exact context/turn capability. This is kept
+    /// crate-private so callers cannot mint or replace lifecycle authority.
+    pub(crate) cancellation: CancellationToken,
+    response_operation: ResponseOperation,
+}
+
+impl AuthorizedResource {
+    /// Whether the owning turn has already revoked this resource grant.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
+
+    /// Establishes the response-vs-revocation linearization point. A `true`
+    /// result authorizes one response while interrupt acknowledgement waits for
+    /// this operation to be dropped; `false` forbids returning media content.
+    pub(crate) fn commit_response(&self) -> bool {
+        self.response_operation.commit()
+    }
 }
 
 impl fmt::Debug for AuthorizedResource {
@@ -660,7 +723,10 @@ impl fmt::Debug for AuthorizedResource {
             .field("media_kind", &self.media_kind)
             .field("local_turn_row_id", &self.local_turn_row_id)
             .field("resource", &self.resource)
-            .finish()
+            .field("has_live_transcript", &self.transcript.is_some())
+            .field("transcript_failure", &self.transcript_failure)
+            .field("duration_ms", &self.duration_ms)
+            .finish_non_exhaustive()
     }
 }
 
@@ -683,6 +749,9 @@ pub struct ContextRegistryStats {
 struct ResourceGrant {
     kind: MediaKind,
     resource: ResourceDesc,
+    transcript: Option<String>,
+    transcript_failure: Option<TranscriptFailure>,
+    duration_ms: Option<u64>,
 }
 
 enum EntryState {
@@ -697,6 +766,95 @@ struct ContextEntry {
     expires_at: Instant,
     snapshot: ContextSnapshot,
     grants: HashMap<MediaHandle, ResourceGrant>,
+    cancellation: CancellationToken,
+    response_gate: Arc<ResponseGate>,
+}
+
+#[derive(Default)]
+struct ResponseGateState {
+    revoked: bool,
+    active: usize,
+}
+
+#[derive(Default)]
+struct ResponseGate {
+    state: Mutex<ResponseGateState>,
+    idle: Notify,
+}
+
+impl ResponseGate {
+    fn acquire(self: &Arc<Self>) -> Option<ResponseOperation> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.revoked {
+            return None;
+        }
+        state.active = state.active.saturating_add(1);
+        Some(ResponseOperation {
+            gate: Arc::clone(self),
+        })
+    }
+
+    fn revoke(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.revoked = true;
+        if state.active == 0 {
+            self.idle.notify_waiters();
+        }
+    }
+
+    async fn wait_idle(&self) {
+        loop {
+            let notified = self.idle.notified();
+            if self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .active
+                == 0
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+struct ResponseOperation {
+    gate: Arc<ResponseGate>,
+}
+
+impl ResponseOperation {
+    fn commit(&self) -> bool {
+        let state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.revoked {
+            return false;
+        }
+        true
+    }
+}
+
+impl Drop for ResponseOperation {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active = state.active.saturating_sub(1);
+        if state.active == 0 {
+            self.gate.idle.notify_waiters();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -752,6 +910,15 @@ impl ContextRegistry {
         binding: PendingBinding,
         draft: ContextDraft,
     ) -> Result<RegisteredContext, ContextError> {
+        self.register_pending_with_transcripts(binding, draft, LiveTranscriptHandoff::empty())
+    }
+
+    pub(crate) fn register_pending_with_transcripts(
+        &self,
+        binding: PendingBinding,
+        draft: ContextDraft,
+        mut live_transcripts: LiveTranscriptHandoff,
+    ) -> Result<RegisteredContext, ContextError> {
         if draft.parts.len() > self.config.max_parts_per_context {
             return Err(error(
                 ContextErrorCode::InvalidRequest,
@@ -775,7 +942,10 @@ impl ContextRegistry {
         let parts = draft
             .parts
             .into_iter()
-            .map(|part| materialize_part(part, &mut grants))
+            .enumerate()
+            .map(|(part_index, part)| {
+                materialize_part(part_index, part, &mut live_transcripts, &mut grants)
+            })
             .collect();
         let snapshot = ContextSnapshot {
             event_id: draft.event_id,
@@ -797,6 +967,8 @@ impl ContextRegistry {
                 expires_at,
                 snapshot,
                 grants,
+                cancellation: CancellationToken::new(),
+                response_gate: Arc::new(ResponseGate::default()),
             },
         );
         Ok(RegisteredContext {
@@ -971,6 +1143,37 @@ impl ContextRegistry {
         revoked
     }
 
+    /// Revokes a turn and waits until every media operation that linearized
+    /// before revocation has sent (or abandoned) its response. This is used by
+    /// interrupt handling so an acknowledged interrupt cannot be followed by
+    /// transcript/media content from the cancelled turn.
+    pub async fn revoke_turn_and_wait(
+        &self,
+        binding: &PendingBinding,
+        reason: RevocationReason,
+    ) -> usize {
+        let (revoked, gates) = {
+            let mut state = self.lock();
+            let mut revoked = 0;
+            let mut gates = Vec::new();
+            for entry in state.entries.values_mut() {
+                if &entry.pending_binding == binding
+                    && !matches!(entry.state, EntryState::Revoked { .. })
+                {
+                    let gate = Arc::clone(&entry.response_gate);
+                    revoke_entry(entry, reason);
+                    gates.push(gate);
+                    revoked += 1;
+                }
+            }
+            (revoked, gates)
+        };
+        for gate in gates {
+            gate.wait_idle().await;
+        }
+        revoked
+    }
+
     /// Returns bounded aggregate counts without exposing capability IDs.
     #[must_use]
     pub fn stats(&self) -> ContextRegistryStats {
@@ -1009,7 +1212,9 @@ impl Default for ContextRegistry {
 }
 
 fn materialize_part(
+    part_index: usize,
     part: DraftPart,
+    live_transcripts: &mut LiveTranscriptHandoff,
     grants: &mut HashMap<MediaHandle, ResourceGrant>,
 ) -> TypedPart {
     match part {
@@ -1019,9 +1224,27 @@ fn materialize_part(
             resource,
             thumbnail,
             metadata,
+            transcript_failure,
         } => {
+            let transcript = (kind == MediaKind::Audio)
+                .then(|| live_transcripts.take_for_part(part_index))
+                .flatten();
+            let transcript_failure = if transcript.is_some() {
+                None
+            } else {
+                transcript_failure
+            };
             let handle = unique_media_handle(grants);
-            grants.insert(handle.clone(), ResourceGrant { kind, resource });
+            grants.insert(
+                handle.clone(),
+                ResourceGrant {
+                    kind,
+                    resource,
+                    transcript,
+                    transcript_failure,
+                    duration_ms: metadata.duration_ms,
+                },
+            );
             let thumbnail_handle = thumbnail.map(|resource| {
                 let thumbnail_handle = unique_media_handle(grants);
                 grants.insert(
@@ -1029,6 +1252,9 @@ fn materialize_part(
                     ResourceGrant {
                         kind: MediaKind::Image,
                         resource,
+                        transcript: None,
+                        transcript_failure: None,
+                        duration_ms: None,
                     },
                 );
                 thumbnail_handle
@@ -1153,11 +1379,23 @@ fn authorized_resource(
             false,
         )
     })?;
+    let response_operation = entry.response_gate.acquire().ok_or_else(|| {
+        error(
+            ContextErrorCode::Unavailable,
+            "context capability was revoked",
+            false,
+        )
+    })?;
     Ok(AuthorizedResource {
         message_id: entry.snapshot.message_id.clone(),
         media_kind: grant.kind,
         local_turn_row_id: entry.pending_binding.local_turn_row_id,
         resource: grant.resource.clone(),
+        transcript: grant.transcript.clone(),
+        transcript_failure: grant.transcript_failure,
+        duration_ms: grant.duration_ms,
+        cancellation: entry.cancellation.clone(),
+        response_operation,
     })
 }
 
@@ -1182,6 +1420,8 @@ fn revoke_entry(entry: &mut ContextEntry, reason: RevocationReason) {
     if matches!(entry.state, EntryState::Revoked { .. }) {
         return;
     }
+    entry.cancellation.cancel();
+    entry.response_gate.revoke();
     entry.state = EntryState::Revoked { reason };
     entry.grants.clear();
 }
@@ -1219,5 +1459,130 @@ const fn error(code: ContextErrorCode, message: &'static str, retryable: bool) -
         code,
         message,
         retryable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::{Duration, timeout};
+
+    #[test]
+    fn live_transcript_content_is_excluded_from_durable_context_types() {
+        const SENTINEL: &str = "private-transcript-sentinel-7f54";
+        let event = InboundEvent {
+            event_id: "event-private-audio".to_owned(),
+            message_id: "message-private-audio".to_owned(),
+            chat_id: "chat-private-audio".to_owned(),
+            sender_id: "sender-private-audio".to_owned(),
+            chat_type: ChatMode::P2p,
+            thread_id: None,
+            root_id: None,
+            reply_to_message_id: None,
+            text: String::new(),
+            mentions_bot: false,
+            mention_all: false,
+            sender_is_human: true,
+            mentions: Vec::new(),
+            parts: vec![MessagePart::Audio(MediaPart {
+                key: Some("audio-private-key".to_owned()),
+                thumbnail_key: None,
+                metadata: InboundMediaMetadata {
+                    duration_ms: Some(800),
+                    transcript_failure: Some(TranscriptFailure::NotRetained),
+                    ..InboundMediaMetadata::default()
+                },
+                status: PartStatus::Available,
+            })],
+            resources: Vec::new(),
+            message_type: "audio".to_owned(),
+            create_time_ms: 123,
+            scope: crate::lark::normalize::ScopeKey::Chat("chat-private-audio".to_owned()),
+        };
+        let handoff = LiveTranscriptHandoff::bound(&event, vec![(0, SENTINEL.to_owned())]);
+        let registry = ContextRegistry::new(ContextRegistryConfig {
+            ttl: Duration::from_secs(60),
+            max_contexts: 4,
+            max_parts_per_context: 4,
+        })
+        .expect("registry");
+        let registered = registry
+            .register_pending_with_transcripts(
+                PendingBinding {
+                    codex_thread_id: "thread-private".to_owned(),
+                    local_turn_row_id: 41,
+                },
+                ContextDraft::from_inbound(&event),
+                handoff,
+            )
+            .expect("register audio context with live transcript");
+        let snapshot = registry
+            .resolve_for_tool(&registered.context_id, "thread-private", "turn-private")
+            .expect("resolve audio context");
+        assert!(
+            !serde_json::to_string(&snapshot)
+                .expect("serialize snapshot")
+                .contains(SENTINEL)
+        );
+        assert!(!format!("{snapshot:?}").contains(SENTINEL));
+        let TypedPart::Media { handle, .. } = &snapshot.parts[0] else {
+            panic!("audio media part")
+        };
+        let authorized = registry
+            .authorize_media_for_tool(
+                &registered.context_id,
+                handle,
+                "thread-private",
+                "turn-private",
+            )
+            .expect("authorize exact grant");
+        assert_eq!(authorized.transcript.as_deref(), Some(SENTINEL));
+        assert!(!format!("{authorized:?}").contains(SENTINEL));
+    }
+
+    #[tokio::test]
+    async fn revocation_forbids_an_uncommitted_media_response() {
+        let gate = Arc::new(ResponseGate::default());
+        let operation = gate.acquire().expect("active response operation");
+
+        gate.revoke();
+        assert!(
+            !operation.commit(),
+            "a response cannot commit after revocation linearizes"
+        );
+
+        let waiting_gate = Arc::clone(&gate);
+        let waiter = tokio::spawn(async move { waiting_gate.wait_idle().await });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "interrupt acknowledgement waits for the cancelled response"
+        );
+        drop(operation);
+        timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("response barrier becomes idle")
+            .expect("waiter joins");
+    }
+
+    #[tokio::test]
+    async fn committed_media_response_finishes_before_revocation_acknowledgement() {
+        let gate = Arc::new(ResponseGate::default());
+        let operation = gate.acquire().expect("active response operation");
+        assert!(operation.commit(), "response linearizes before revocation");
+
+        gate.revoke();
+        let waiting_gate = Arc::clone(&gate);
+        let waiter = tokio::spawn(async move { waiting_gate.wait_idle().await });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "revocation acknowledgement cannot pass a committed response"
+        );
+        drop(operation);
+        timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("committed response drains")
+            .expect("waiter joins");
     }
 }

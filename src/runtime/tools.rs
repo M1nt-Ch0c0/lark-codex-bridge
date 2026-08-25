@@ -2,6 +2,7 @@
 
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
 
 use crate::codex::{
     client::AppServerClient,
@@ -12,10 +13,12 @@ use crate::codex::{
         DynamicToolSpec,
     },
 };
+use crate::config::AsrSection;
 use crate::lark::api::ResourceKind;
 use crate::runtime::{
+    asr::{self, AsrError, TranscriptSource},
     attachments::{AttachError, AttachmentCache, DownloadKind},
-    context::{ContextError, ContextErrorCode, ContextId, ContextRegistry, MediaHandle},
+    context::{ContextError, ContextErrorCode, ContextId, ContextRegistry, MediaHandle, MediaKind},
 };
 
 /// Version persisted with Codex threads that were created with these tools.
@@ -85,6 +88,8 @@ pub async fn handle_server_request(
     mut request: ServerRequest,
     contexts: &ContextRegistry,
     attachments: &AttachmentCache,
+    asr: &AsrSection,
+    shutdown: &CancellationToken,
 ) {
     if request.method != "item/tool/call" {
         let _ = client
@@ -93,29 +98,49 @@ pub async fn handle_server_request(
         return;
     }
 
-    let params =
-        match request.params.clone().ok_or(()).and_then(|value| {
+    let Ok(params) =
+        request.params.clone().ok_or(()).and_then(|value| {
             serde_json::from_value::<DynamicToolCallParams>(value).map_err(|_| ())
-        }) {
-            Ok(params) => params,
-            Err(()) => {
-                respond_tool_error(
-                    client,
-                    &mut request,
-                    &tool_error(
-                        "invalid_request",
-                        "dynamic tool parameters are invalid",
-                        false,
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
+        })
+    else {
+        respond_tool_error(
+            client,
+            &mut request,
+            &tool_error(
+                "invalid_request",
+                "dynamic tool parameters are invalid",
+                false,
+            ),
+        )
+        .await;
+        return;
+    };
 
     let result = match (params.namespace.as_deref(), params.tool.as_str()) {
         (Some("bridge_context"), "resolve") => resolve_context(contexts, &params),
-        (Some("bridge_media"), "read") => read_media(contexts, attachments, &params).await,
+        (Some("bridge_media"), "read") => {
+            match read_media(contexts, attachments, asr, shutdown, &params).await {
+                Ok(outcome) => {
+                    let committed =
+                        outcome.authorized.commit_response() && !shutdown.is_cancelled();
+                    let result = if committed {
+                        outcome.result
+                    } else {
+                        if let Some(token) = outcome.acquisition_token.as_deref() {
+                            let _ = attachments.release_lease(token).await;
+                        }
+                        Err(asr_error(AsrError::Cancelled))
+                    };
+                    let response = match result {
+                        Ok(value) => tool_response(&value, true),
+                        Err(value) => tool_response(&value, false),
+                    };
+                    let _ = client.respond_request(&mut request, &response).await;
+                    return;
+                }
+                Err(error) => Err(error),
+            }
+        }
         _ => Err(tool_error(
             "unsupported",
             "dynamic tool is not registered by this bridge",
@@ -124,8 +149,8 @@ pub async fn handle_server_request(
     };
 
     let response = match result {
-        Ok(value) => tool_response(value, true),
-        Err(value) => tool_response(value, false),
+        Ok(value) => tool_response(&value, true),
+        Err(value) => tool_response(&value, false),
     };
     let _ = client.respond_request(&mut request, &response).await;
 }
@@ -152,14 +177,16 @@ fn resolve_context(
                 retryable: false,
             })
         })
-        .map_err(context_error)
+        .map_err(|error| context_error(&error))
 }
 
 async fn read_media(
     contexts: &ContextRegistry,
     attachments: &AttachmentCache,
+    asr: &AsrSection,
+    shutdown: &CancellationToken,
     params: &DynamicToolCallParams,
-) -> Result<Value, Value> {
+) -> Result<MediaReadOutcome, Value> {
     let arguments =
         serde_json::from_value::<MediaArguments>(params.arguments.clone()).map_err(|_| {
             tool_error(
@@ -172,31 +199,198 @@ async fn read_media(
     let handle = MediaHandle::from_external(arguments.handle);
     let authorized = contexts
         .authorize_media_for_tool(&context_id, &handle, &params.thread_id, &params.turn_id)
-        .map_err(context_error)?;
-    let cached = attachments
-        .fetch(
+        .map_err(|error| context_error(&error))?;
+    if authorized.media_kind == MediaKind::Audio {
+        let (result, acquisition_token) = read_audio(attachments, asr, shutdown, &authorized).await;
+        return Ok(MediaReadOutcome {
+            result,
+            authorized,
+            acquisition_token,
+        });
+    }
+    let cached = match attachments
+        .fetch_cancellable(
             &authorized.message_id,
             &authorized.resource,
             authorized.local_turn_row_id,
+            &authorized.cancellation,
         )
         .await
-        .map_err(attachment_error)?;
-    let path = cached.path.to_str().ok_or_else(|| {
-        tool_error(
-            "media_unavailable",
-            "cached media path is not representable",
-            false,
-        )
-    })?;
-    Ok(json!({
-        "media": {
-            "kind": resource_kind(cached.kind),
-            "semanticKind": authorized.media_kind,
-            "path": path,
-            "sha256": cached.sha256,
-            "bytes": cached.bytes,
+    {
+        Ok(cached) => cached,
+        Err(error) => {
+            return Ok(MediaReadOutcome {
+                result: Err(attachment_error(&error)),
+                authorized,
+                acquisition_token: None,
+            });
         }
-    }))
+    };
+    let acquisition_token = Some(cached.lease_token.clone());
+    if authorized.is_cancelled() || shutdown.is_cancelled() {
+        let _ = attachments.release_lease(&cached.lease_token).await;
+        return Ok(MediaReadOutcome {
+            result: Err(asr_error(AsrError::Cancelled)),
+            authorized,
+            acquisition_token: None,
+        });
+    }
+    let result = cached.path.to_str().map_or_else(
+        || {
+            Err(tool_error(
+                "media_unavailable",
+                "cached media path is not representable",
+                false,
+            ))
+        },
+        |path| {
+            Ok(json!({
+                "media": {
+                    "kind": resource_kind(cached.kind),
+                    "semanticKind": authorized.media_kind,
+                    "path": path,
+                    "sha256": cached.sha256,
+                    "bytes": cached.bytes,
+                }
+            }))
+        },
+    );
+    Ok(MediaReadOutcome {
+        result,
+        authorized,
+        acquisition_token,
+    })
+}
+
+struct MediaReadOutcome {
+    result: Result<Value, Value>,
+    authorized: crate::runtime::context::AuthorizedResource,
+    acquisition_token: Option<String>,
+}
+
+async fn read_audio(
+    attachments: &AttachmentCache,
+    asr: &AsrSection,
+    shutdown: &CancellationToken,
+    authorized: &crate::runtime::context::AuthorizedResource,
+) -> (Result<Value, Value>, Option<String>) {
+    if authorized.is_cancelled() || shutdown.is_cancelled() {
+        return (Err(asr_error(AsrError::Cancelled)), None);
+    }
+    if let Some(failure) = authorized.transcript_failure {
+        return (
+            Err(asr_error(match failure {
+                crate::lark::normalize::TranscriptFailure::Invalid => AsrError::InvalidTranscript,
+                crate::lark::normalize::TranscriptFailure::TooLarge => AsrError::TranscriptTooLarge,
+                crate::lark::normalize::TranscriptFailure::NotRetained => {
+                    AsrError::TranscriptUnavailable
+                }
+            })),
+            None,
+        );
+    }
+    if let Some(inbound) = authorized.transcript.as_deref() {
+        if inbound.len() > asr.max_transcript_bytes {
+            return (Err(asr_error(AsrError::TranscriptTooLarge)), None);
+        }
+        let Some(transcript) =
+            crate::lark::normalize::normalize_transcript(inbound, asr.max_transcript_bytes)
+        else {
+            return (Err(asr_error(AsrError::InvalidTranscript)), None);
+        };
+        return (
+            Ok(audio_transcript_value(
+                &transcript,
+                TranscriptSource::Inbound,
+                authorized.duration_ms,
+            )),
+            None,
+        );
+    }
+    if authorized.duration_ms.is_some_and(|duration| {
+        duration
+            > asr
+                .max_duration_ms
+                .min(crate::limits::ASR_ABSOLUTE_MAX_DURATION_MS)
+    }) {
+        return (Err(asr_error(AsrError::TooLong)), None);
+    }
+    if !asr.is_configured() {
+        return (Err(asr_error(AsrError::SidecarMissing)), None);
+    }
+    let cached = match attachments
+        .fetch_cancellable(
+            &authorized.message_id,
+            &authorized.resource,
+            authorized.local_turn_row_id,
+            &authorized.cancellation,
+        )
+        .await
+    {
+        Ok(cached) => cached,
+        Err(error) => {
+            return (
+                Err(match error {
+                    AttachError::TooLarge { .. } => asr_error(AsrError::Oversize),
+                    AttachError::Cancelled { .. } => asr_error(AsrError::Cancelled),
+                    other => attachment_error(&other),
+                }),
+                None,
+            );
+        }
+    };
+    let acquisition_token = Some(cached.lease_token.clone());
+    let transcript = match asr::transcribe_file_cancellable(
+        asr,
+        &cached.path,
+        authorized.duration_ms,
+        &authorized.cancellation,
+        shutdown,
+    )
+    .await
+    {
+        Ok(transcript) => transcript,
+        Err(error) => {
+            if error == AsrError::Cancelled {
+                // The unique token belongs only to this read; releasing it
+                // cannot invalidate another overlapping consumer.
+                let _ = attachments.release_lease(&cached.lease_token).await;
+            }
+            return (Err(asr_error(error)), None);
+        }
+    };
+    if authorized.is_cancelled() || shutdown.is_cancelled() {
+        let _ = attachments.release_lease(&cached.lease_token).await;
+        return (Err(asr_error(AsrError::Cancelled)), None);
+    }
+    (
+        Ok(audio_transcript_value(
+            &transcript,
+            TranscriptSource::Sidecar,
+            authorized.duration_ms,
+        )),
+        acquisition_token,
+    )
+}
+
+fn audio_transcript_value(
+    transcript: &str,
+    source: TranscriptSource,
+    duration_ms: Option<u64>,
+) -> Value {
+    json!({
+        "media": {
+            "kind": "audio",
+            "semanticKind": "audio",
+            "transcript": transcript,
+            "source": source.as_str(),
+            "durationMs": duration_ms,
+        }
+    })
+}
+
+fn asr_error(error: AsrError) -> Value {
+    tool_error(error.code(), error.message(), false)
 }
 
 fn resource_kind(kind: ResourceKind) -> &'static str {
@@ -206,11 +400,11 @@ fn resource_kind(kind: ResourceKind) -> &'static str {
     }
 }
 
-fn context_error(error: ContextError) -> Value {
+fn context_error(error: &ContextError) -> Value {
     json!({"error": error})
 }
 
-fn attachment_error(error: AttachError) -> Value {
+fn attachment_error(error: &AttachError) -> Value {
     let retryable = matches!(
         error,
         AttachError::Cancelled { .. }
@@ -235,10 +429,10 @@ fn tool_error(code: &'static str, message: &'static str, retryable: bool) -> Val
     })
 }
 
-fn tool_response(value: Value, success: bool) -> DynamicToolCallResponse {
+fn tool_response(value: &Value, success: bool) -> DynamicToolCallResponse {
     DynamicToolCallResponse {
         content_items: vec![DynamicToolCallOutputContentItem::InputText {
-            text: serde_json::to_string(&value).unwrap_or_else(|_| {
+            text: serde_json::to_string(value).unwrap_or_else(|_| {
                 "{\"error\":{\"code\":\"serialization_failed\",\"message\":\"tool response serialization failed\",\"retryable\":false}}".to_owned()
             }),
         }],
@@ -247,6 +441,6 @@ fn tool_response(value: Value, success: bool) -> DynamicToolCallResponse {
 }
 
 async fn respond_tool_error(client: &AppServerClient, request: &mut ServerRequest, error: &Value) {
-    let response = tool_response(error.clone(), false);
+    let response = tool_response(error, false);
     let _ = client.respond_request(request, &response).await;
 }
