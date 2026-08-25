@@ -236,7 +236,7 @@ fn tool_error(code: &'static str, message: &'static str, retryable: bool) -> Val
 fn tool_response(value: &Value, success: bool) -> DynamicToolCallResponse {
     DynamicToolCallResponse {
         content_items: vec![DynamicToolCallOutputContentItem::InputText {
-            text: serde_json::to_string(&value).unwrap_or_else(|_| {
+            text: serde_json::to_string(value).unwrap_or_else(|_| {
                 "{\"error\":{\"code\":\"serialization_failed\",\"message\":\"tool response serialization failed\",\"retryable\":false}}".to_owned()
             }),
         }],
