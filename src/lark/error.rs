@@ -23,6 +23,11 @@ pub enum LarkErrorKind {
 /// codes, and sizes.
 #[derive(Clone, PartialEq, Eq)]
 pub enum LarkError {
+    /// The local request failed validation before any HTTP write was started.
+    InvalidRequest {
+        /// Static description of the rejected request invariant.
+        context: &'static str,
+    },
     /// Bad credentials or forbidden access; do not retry.
     PermanentAuth {
         /// Static description of the operation that failed.
@@ -56,6 +61,12 @@ pub enum LarkError {
 }
 
 impl LarkError {
+    /// Builds a permanent local preflight failure.
+    #[must_use]
+    pub fn invalid_request(context: &'static str) -> Self {
+        Self::InvalidRequest { context }
+    }
+
     /// Builds a [`LarkError::PermanentAuth`] without a code.
     #[must_use]
     pub fn permanent_auth(context: &'static str) -> Self {
@@ -95,7 +106,9 @@ impl LarkError {
         match self {
             Self::PermanentAuth { .. } => LarkErrorKind::PermanentAuth,
             Self::Retryable { .. } => LarkErrorKind::Retryable,
-            Self::ProtocolViolation { .. } => LarkErrorKind::ProtocolViolation,
+            Self::InvalidRequest { .. } | Self::ProtocolViolation { .. } => {
+                LarkErrorKind::ProtocolViolation
+            }
             Self::Exhausted { .. } => LarkErrorKind::Exhausted,
         }
     }
@@ -104,6 +117,9 @@ impl LarkError {
 impl fmt::Display for LarkError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let code = match self {
+            Self::InvalidRequest { context } => {
+                return write!(formatter, "invalid local Lark request while {context}");
+            }
             Self::PermanentAuth { context, code } => {
                 write!(
                     formatter,
@@ -142,9 +158,16 @@ impl std::error::Error for LarkError {}
 /// tokens; these can never succeed on retry.
 pub(crate) const PERMANENT_AUTH_CODES: std::ops::RangeInclusive<i64> = 99_991_661..=99_991_672;
 
+/// Lark envelope codes explicitly documented as transient for `OpenAPI` calls.
+/// `99991400` is returned with HTTP 400 when an application exceeds an API
+/// frequency limit, so HTTP status alone is insufficient to identify it.
+pub(crate) const TRANSIENT_OPENAPI_CODES: &[i64] = &[99_991_400];
+
 /// Classifies a Lark envelope `code`: `0` is success, the permanent-auth
-/// range is [`LarkError::PermanentAuth`], everything else is
-/// [`LarkError::Retryable`]. Server-provided messages are discarded.
+/// range is [`LarkError::PermanentAuth`], documented transient codes are
+/// [`LarkError::Retryable`], and every other explicit business rejection is a
+/// permanent [`LarkError::ProtocolViolation`]. Server-provided messages are
+/// discarded.
 pub(crate) fn check_code(code: i64, context: &'static str) -> Result<(), LarkError> {
     match code {
         0 => Ok(()),
@@ -152,7 +175,11 @@ pub(crate) fn check_code(code: i64, context: &'static str) -> Result<(), LarkErr
             context,
             code: Some(code),
         }),
-        code => Err(LarkError::Retryable {
+        code if TRANSIENT_OPENAPI_CODES.contains(&code) => Err(LarkError::Retryable {
+            context,
+            code: Some(code),
+        }),
+        code => Err(LarkError::ProtocolViolation {
             context,
             code: Some(code),
         }),

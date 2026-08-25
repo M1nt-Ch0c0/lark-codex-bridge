@@ -1045,7 +1045,13 @@ async fn route_one(
     };
     let route = actor.try_route(key.clone(), queued);
     match route {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            tracing::debug!(
+                queued_messages = actor.snapshot().queued_messages,
+                "inbound event queued for scope"
+            );
+            Ok(())
+        }
         Err(ActorRouteError::Capacity(queued)) => {
             let queued = *queued;
             reject_with_notice(
@@ -1107,6 +1113,7 @@ async fn reject_with_notice(
     store
         .reject_received_and_enqueue_notice(key, reason, notice)
         .await?;
+    tracing::info!(reason = reason.as_str(), "inbound event rejected by policy");
     Ok(())
 }
 

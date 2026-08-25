@@ -589,7 +589,14 @@ async fn version_probe_executes_the_binary_directly_with_version_argument() {
 #[cfg(unix)]
 #[tokio::test]
 async fn version_probe_rejects_malformed_and_unsupported_versions() {
-    for output in ["codex 0.146.0", "codex-cli 0.145.9"] {
+    for output in [
+        "codex 0.146.0",
+        "codex-cli 0.145.9",
+        "codex-cli 0.147.0",
+        "codex-cli 0.149.0",
+        "codex-cli 0.146.0-rc.1",
+        "codex-cli 0.146.0+build.1",
+    ] {
         let (_directory, binary) = fake_codex(output);
         let result = probe_version(&CodexProcessConfig {
             binary,
@@ -598,15 +605,6 @@ async fn version_probe_rejects_malformed_and_unsupported_versions() {
         .await;
         assert!(result.is_err(), "probe must reject {output:?}");
     }
-
-    let (_directory, binary) = fake_codex("codex-cli 0.147.0");
-    let version = probe_version(&CodexProcessConfig {
-        binary,
-        codex_home: None,
-    })
-    .await
-    .expect("newer stable versions should be accepted");
-    assert_eq!(version, semver::Version::new(0, 147, 0));
 }
 
 #[cfg(unix)]

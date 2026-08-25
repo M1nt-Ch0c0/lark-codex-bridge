@@ -412,7 +412,9 @@ fn map_lark_error(error: LarkError) -> AttachError {
     let kind = match error {
         LarkError::PermanentAuth { .. } => DownloadKind::PermanentAuth,
         LarkError::Retryable { .. } => DownloadKind::Retryable,
-        LarkError::ProtocolViolation { .. } => DownloadKind::Protocol,
+        LarkError::InvalidRequest { .. } | LarkError::ProtocolViolation { .. } => {
+            DownloadKind::Protocol
+        }
         LarkError::Exhausted { .. } => DownloadKind::Exhausted,
     };
     AttachError::Download { kind }

@@ -12,5 +12,8 @@ mod pump;
 mod sink;
 
 pub use payload::{OUTBOX_PAYLOAD_VERSION, OutboxError, OutboxOperation};
-pub use pump::{DeliveryClass, OutboxHandle, OutboxPump, OutboxPumpConfig, classify_delivery};
+pub use pump::{
+    AppliedCertainty, DeliveryClass, DeliveryDecision, OutboxHandle, OutboxPump, OutboxPumpConfig,
+    Retryability, classify_delivery, delivery_decision,
+};
 pub use sink::OutboxReplySink;

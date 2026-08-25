@@ -185,6 +185,7 @@ where
 ///
 /// Returns only content-free classifications. Components started before a
 /// later startup failure are stopped before the error is returned.
+#[allow(clippy::too_many_lines)]
 pub async fn run_config_with_outbound_until<F, S>(
     config: BridgeConfig,
     credentials: LarkCredentials,
@@ -195,6 +196,7 @@ where
     F: OutboundFactory + ?Sized,
     S: Future<Output = ()>,
 {
+    tracing::info!("bridge runtime starting");
     let policy = AccessPolicy::from_config(&config).map_err(|_| AppError::Config)?;
     let router_settings = RouterSettings::from_config(&config);
     let process_config = config.codex.process_config();
@@ -209,6 +211,7 @@ where
     let store = StoreHandle::open(&database_path)
         .await
         .map_err(|_| AppError::Store)?;
+    tracing::debug!("durable store opened");
     let attachment_store = store.clone();
     let attachment_downloader = Arc::new(LarkResourceDownloader::new(api.clone()));
     let opened_attachment_cache = tokio::task::spawn_blocking(move || {
@@ -273,8 +276,15 @@ where
         stop_store_after_error(store).await;
         return Err(AppError::Router);
     };
+    tracing::info!("bridge runtime ready");
 
     let summary = drive_inbound(&router, inbound, shutdown).await;
+    tracing::info!(
+        exit = ?summary.exit,
+        routed_events = summary.routed,
+        route_failures = summary.route_failures,
+        "bridge shutdown started"
+    );
 
     // Stop producers first, then settle scope actors and their durable
     // projections before stopping the delivery pump and store writer.
@@ -290,6 +300,12 @@ where
     if store_result.is_err() {
         return Err(AppError::Store);
     }
+    tracing::info!(
+        exit = ?summary.exit,
+        routed_events = summary.routed,
+        route_failures = summary.route_failures,
+        "bridge runtime stopped"
+    );
     match summary.exit {
         DriveExit::Shutdown => Ok(summary),
         DriveExit::InboundClosed => Err(AppError::InboundClosed),
