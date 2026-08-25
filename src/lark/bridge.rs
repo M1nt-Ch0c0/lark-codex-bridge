@@ -31,7 +31,9 @@ use super::credentials::LarkCredentials;
 use super::error::LarkError;
 use super::frame::MessageType;
 use super::http::LarkHttp;
-use super::normalize::{InboundEvent, NormalizeOutcome, Normalizer, ShortId};
+use super::normalize::{
+    InboundEvent, LiveTranscriptHandoff, NormalizeOutcome, Normalizer, ShortId,
+};
 use super::token::TenantTokenProvider;
 use super::transport::{InboundFrameHandler, LarkTransport, TransportConfig, TransportHandle};
 use crate::channel::ChatMessageQuery;
@@ -111,9 +113,52 @@ pub struct QueuedInboundEvent {
     /// Byte-budget permit sized by raw wire bytes in legacy mode and exact
     /// persisted payload bytes in durable-runtime mode; held until drop.
     pub permit: OwnedSemaphorePermit,
+    live_transcripts: LiveTranscriptHandoff,
 }
 
 impl QueuedInboundEvent {
+    /// Builds a recovery/synthetic queued event without live-only recognition
+    /// data.
+    #[must_use]
+    pub fn new(event: InboundEvent, permit: OwnedSemaphorePermit) -> Self {
+        Self {
+            event,
+            permit,
+            live_transcripts: LiveTranscriptHandoff::empty(),
+        }
+    }
+
+    /// Builds a queued event from recognition text supplied by an already
+    /// authenticated transport adapter. Every entry is rebound to the event's
+    /// exact audio part index and resource key; non-audio/mismatched entries
+    /// are discarded.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn from_authenticated_event(
+        event: InboundEvent,
+        permit: OwnedSemaphorePermit,
+        live_transcripts: Vec<(usize, String)>,
+    ) -> Self {
+        let live_transcripts = LiveTranscriptHandoff::bound(&event, live_transcripts);
+        Self::with_live_transcripts(event, permit, live_transcripts)
+    }
+
+    fn with_live_transcripts(
+        event: InboundEvent,
+        permit: OwnedSemaphorePermit,
+        live_transcripts: LiveTranscriptHandoff,
+    ) -> Self {
+        Self {
+            event,
+            permit,
+            live_transcripts,
+        }
+    }
+
+    pub(crate) fn take_live_transcripts(&mut self) -> LiveTranscriptHandoff {
+        std::mem::take(&mut self.live_transcripts)
+    }
+
     /// Consumes the wrapper, releasing the byte permit, and returns the event.
     #[must_use]
     pub fn into_event(self) -> InboundEvent {
@@ -227,7 +272,11 @@ impl LarkBridge {
                         );
                         Ok(None)
                     }
-                    NormalizeOutcome::Event { event, degradation } => {
+                    NormalizeOutcome::Event {
+                        event,
+                        live_transcripts,
+                        degradation,
+                    } => {
                         if let Some(degradation) = degradation {
                             tracing::warn!(
                                 ?degradation,
@@ -242,10 +291,11 @@ impl LarkBridge {
                                 config.event_byte_budget as u64,
                             )
                         })?;
-                        tx.try_send(QueuedInboundEvent {
-                            event: *event,
+                        tx.try_send(QueuedInboundEvent::with_live_transcripts(
+                            *event,
                             permit,
-                        })
+                            live_transcripts,
+                        ))
                         .map_err(|_| {
                             LarkError::exhausted(
                                 "the inbound event channel is full",
@@ -393,10 +443,7 @@ impl LarkBridge {
             preload.push((reserve, retained, permit));
         }
         for (reserve, retained, permit) in preload {
-            reserve.send(QueuedInboundEvent {
-                event: *retained.into_event(),
-                permit,
-            });
+            reserve.send(QueuedInboundEvent::new(*retained.into_event(), permit));
         }
 
         let handler: InboundEventHandler = Arc::new(move |payload: Bytes| {
@@ -406,7 +453,12 @@ impl LarkBridge {
             let budget = Arc::clone(&budget);
             Box::pin(async move {
                 let outcome = normalizer.normalize(&payload).await?;
-                let NormalizeOutcome::Event { event, degradation } = outcome else {
+                let NormalizeOutcome::Event {
+                    event,
+                    live_transcripts,
+                    degradation,
+                } = outcome
+                else {
                     return Ok(None);
                 };
                 if let Some(degradation) = degradation {
@@ -434,10 +486,12 @@ impl LarkBridge {
                         u64::try_from(config.event_byte_budget).unwrap_or(u64::MAX),
                     )
                 })?;
-                reserve.send(QueuedInboundEvent {
-                    event: *retained.into_event(),
+                let live_transcripts = live_transcripts.retain_if_bound(retained.event());
+                reserve.send(QueuedInboundEvent::with_live_transcripts(
+                    *retained.into_event(),
                     permit,
-                });
+                    live_transcripts,
+                ));
                 Ok(None)
             })
         });

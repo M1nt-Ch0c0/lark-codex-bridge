@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 
 use lark_codex_bridge::codex::types::{ApprovalPolicy, GranularApprovalPolicy, SandboxMode};
 use lark_codex_bridge::config::{
-    BridgeConfig, ChannelTransport, CodexSection, ConcurrencyConfig, PathsSection, WorkspacePolicy,
+    AsrSection, BridgeConfig, ChannelTransport, CodexSection, ConcurrencyConfig, PathsSection,
+    WorkspacePolicy,
 };
 use lark_codex_bridge::lark::api::ChatMode;
 use lark_codex_bridge::lark::normalize::{InboundEvent, ScopeKey};
@@ -89,6 +90,7 @@ fn policy_config(allow_root: PathBuf) -> BridgeConfig {
         codex: CodexSection::default(),
         channel: lark_codex_bridge::config::ChannelSection::default(),
         paths: PathsSection::default(),
+        asr: AsrSection::default(),
     }
 }
 
@@ -191,6 +193,12 @@ fn full_config_round_trips_and_resolves_only_runtime_relative_paths() {
         temp.path().join("cache/attachments")
     );
     assert_eq!(config.codex.binary, PathBuf::from("/opt/codex/bin/codex"));
+    assert_eq!(
+        config.asr.command.as_deref(),
+        Some(std::path::Path::new("sherpa-onnx-offline"))
+    );
+    assert_eq!(config.asr.ffmpeg, PathBuf::from("ffmpeg"));
+    assert_eq!(config.asr.max_duration_ms, 120_000);
 
     let encoded = toml::to_string(&config).expect("full config should serialize");
     let reparsed = toml::from_str::<BridgeConfig>(&encoded).expect("full config should reparse");
@@ -210,6 +218,7 @@ fn config_rejects_unknown_keys_at_every_schema_level() {
         "owners = [\"ou_owner_123456\"]\n[codex]\nunexpected = true",
         "owners = [\"ou_owner_123456\"]\n[channel]\nunexpected = true",
         "owners = [\"ou_owner_123456\"]\n[paths]\nunexpected = true",
+        "owners = [\"ou_owner_123456\"]\n[asr]\nunexpected = true",
     ] {
         assert!(toml::from_str::<BridgeConfig>(source).is_err());
     }
@@ -247,6 +256,18 @@ fallback_to_native = false
         )
         .is_err()
     );
+}
+
+#[test]
+fn config_rejects_asr_duration_above_the_absolute_runtime_cap() {
+    let temp = scratch();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        "owners = [\"ou_owner_123456\"]\n[asr]\nmax_duration_ms = 600001\n",
+    )
+    .expect("write config");
+    assert!(BridgeConfig::load(Some(&config_path)).is_err());
 }
 
 #[test]
