@@ -251,6 +251,15 @@ pub enum OutboundRequest {
         /// Card JSON (redacted from `Debug`).
         card: Value,
     },
+    /// Reply with a standalone Markdown post.
+    ReplyMarkdownPost {
+        /// Parent message.
+        message_id: String,
+        /// Whether to keep the reply inside its topic.
+        in_thread: bool,
+        /// Markdown content (redacted from `Debug`).
+        markdown: String,
+    },
     /// Update an existing interactive card.
     UpdateCard {
         /// Existing message identifier.
@@ -281,6 +290,16 @@ impl fmt::Debug for OutboundRequest {
                 .debug_struct("ReplyCard")
                 .field("message_id_len", &message_id.len())
                 .field("in_thread", in_thread)
+                .finish(),
+            Self::ReplyMarkdownPost {
+                message_id,
+                in_thread,
+                markdown,
+            } => formatter
+                .debug_struct("ReplyMarkdownPost")
+                .field("message_id_len", &message_id.len())
+                .field("in_thread", in_thread)
+                .field("markdown_len", &markdown.len())
                 .finish(),
             Self::UpdateCard {
                 message_id,
@@ -325,19 +344,37 @@ pub enum DeliveryFailureClass {
 pub struct DeliveryError {
     class: DeliveryFailureClass,
     context: &'static str,
+    patch_retryable: bool,
 }
 
 impl DeliveryError {
     /// Creates a classified outbound failure.
     #[must_use]
     pub const fn new(class: DeliveryFailureClass, context: &'static str) -> Self {
-        Self { class, context }
+        Self {
+            class,
+            context,
+            patch_retryable: false,
+        }
+    }
+
+    /// Marks whether an idempotent card PATCH may retry the same body.
+    #[must_use]
+    pub const fn with_patch_retryable(mut self, patch_retryable: bool) -> Self {
+        self.patch_retryable = patch_retryable;
+        self
     }
 
     /// Returns the receipt classification.
     #[must_use]
     pub const fn class(self) -> DeliveryFailureClass {
         self.class
+    }
+
+    /// Returns whether the failure is safe to retry as an idempotent PATCH.
+    #[must_use]
+    pub const fn patch_retryable(self) -> bool {
+        self.patch_retryable
     }
 }
 

@@ -148,18 +148,25 @@ fn apply_pragmas(connection: &Connection) -> Result<(), StoreError> {
 }
 
 fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
-    validate_migrations()?;
+    migrate_through(connection, MIGRATIONS)
+}
+
+fn migrate_through(
+    connection: &mut Connection,
+    migrations: &[super::schema::Migration],
+) -> Result<(), StoreError> {
+    validate_migrations(migrations)?;
     let current: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| sqlite_error("reading the schema version", &error))?;
-    let latest = MIGRATIONS.last().map_or(0, |migration| migration.version);
+    let latest = migrations.last().map_or(0, |migration| migration.version);
     if current > latest {
         return Err(StoreError::Migration {
             version: current,
             name: "database schema is newer than this binary",
         });
     }
-    for migration in MIGRATIONS
+    for migration in migrations
         .iter()
         .filter(|migration| migration.version > current)
     {
@@ -221,8 +228,8 @@ fn prepare_migration(
     Ok(())
 }
 
-fn validate_migrations() -> Result<(), StoreError> {
-    for (index, migration) in MIGRATIONS.iter().enumerate() {
+fn validate_migrations(migrations: &[super::schema::Migration]) -> Result<(), StoreError> {
+    for (index, migration) in migrations.iter().enumerate() {
         let expected = u32::try_from(index + 1).unwrap_or(u32::MAX);
         if migration.version != expected {
             return Err(StoreError::Migration {
@@ -237,6 +244,7 @@ fn validate_migrations() -> Result<(), StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn full_channel_maps_to_queue_full() {
@@ -248,5 +256,53 @@ mod tests {
             .try_send(StoreRequest::Shutdown)
             .expect_err("bounded channel rejects overflow");
         assert!(matches!(error, mpsc::error::TrySendError::Full(_)));
+    }
+
+    #[test]
+    fn file_upgrade_sets_v2_outbox_fence_and_v1_binary_refuses_downgrade() {
+        let temp = tempdir().expect("tempdir");
+        let path = temp.path().join("upgrade.sqlite");
+        {
+            let mut connection = Connection::open(&path).expect("open legacy file");
+            apply_pragmas(&connection).expect("legacy pragmas");
+            migrate_through(&mut connection, &MIGRATIONS[..5]).expect("seed schema v5");
+            connection
+                .execute(
+                    "INSERT INTO outbox
+                     (idempotency_key, scope_key, kind, payload_json, payload_bytes,
+                      state, attempts, next_retry_ms, created_ms, updated_ms)
+                     VALUES ('legacy', 'im:scope', 'final', ?1, length(?1),
+                             'pending', 0, 0, 1, 1)",
+                    [r#"{"version":1,"op":"reply_text","message_id":"om_old","text":"**literal**"}"#],
+                )
+                .expect("seed legacy payload");
+        }
+
+        {
+            let mut connection = Connection::open(&path).expect("reopen for upgrade");
+            migrate(&mut connection).expect("upgrade to schema v7");
+            let version: u32 = connection
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .expect("read upgraded version");
+            assert_eq!(version, 7);
+            let count: u32 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM outbox WHERE idempotency_key = 'legacy'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("legacy row survives upgrade");
+            assert_eq!(count, 1);
+        }
+
+        let mut legacy = Connection::open(&path).expect("legacy reopen");
+        assert!(matches!(
+            migrate_through(&mut legacy, &MIGRATIONS[..5]),
+            Err(StoreError::Migration { version: 7, .. })
+        ));
+        let version: u32 = legacy
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("downgrade fence stays intact");
+        assert_eq!(version, 7);
     }
 }

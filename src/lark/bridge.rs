@@ -256,20 +256,13 @@ impl LarkBridge {
             let budget = Arc::clone(&budget);
             Box::pin(async move {
                 if matches!(headers.ty(), Some(MessageType::Card)) {
-                    tracing::info!(
-                        message_id = headers.message_id().unwrap_or(""),
-                        "lark card action is unsupported in this milestone; acknowledging"
-                    );
+                    tracing::info!("lark card action is unsupported; acknowledging");
                     return Ok(Some(json!({ "status": "unsupported" })));
                 }
                 let outcome = normalizer.normalize(&payload).await?;
                 match outcome {
                     NormalizeOutcome::Ignored { reason } => {
-                        tracing::debug!(
-                            reason,
-                            message_id = headers.message_id().unwrap_or(""),
-                            "lark event ignored by the normalizer"
-                        );
+                        tracing::debug!(reason, "lark event ignored by the normalizer");
                         Ok(None)
                     }
                     NormalizeOutcome::Event {
@@ -278,11 +271,7 @@ impl LarkBridge {
                         degradation,
                     } => {
                         if let Some(degradation) = degradation {
-                            tracing::warn!(
-                                ?degradation,
-                                message_id = %event.message_id,
-                                "lark event normalized with degradation"
-                            );
+                            tracing::warn!(?degradation, "lark event normalized with degradation");
                         }
                         let size = u32::try_from(payload.len()).unwrap_or(u32::MAX);
                         let permit = budget.clone().try_acquire_many_owned(size).map_err(|_| {
@@ -427,6 +416,11 @@ impl LarkBridge {
                 u64::try_from(config.event_byte_budget).unwrap_or(u64::MAX),
             ));
         }
+        tracing::info!(
+            recovered_events = recovery_count,
+            recovered_bytes = recovery_bytes,
+            "durable inbound recovery scan complete"
+        );
 
         let (tx, rx) = mpsc::channel(config.event_capacity);
         let budget = Arc::new(Semaphore::new(config.event_byte_budget));
@@ -462,11 +456,7 @@ impl LarkBridge {
                     return Ok(None);
                 };
                 if let Some(degradation) = degradation {
-                    tracing::warn!(
-                        ?degradation,
-                        message_id = %event.message_id,
-                        "lark event normalized with degradation"
-                    );
+                    tracing::warn!(?degradation, "lark event normalized with degradation");
                 }
                 let retained = match hook(event).await? {
                     IntakeVerdict::DropDuplicate => return Ok(None),
@@ -492,6 +482,7 @@ impl LarkBridge {
                     permit,
                     live_transcripts,
                 ));
+                tracing::debug!(payload_bytes = size, "durable inbound event queued");
                 Ok(None)
             })
         });

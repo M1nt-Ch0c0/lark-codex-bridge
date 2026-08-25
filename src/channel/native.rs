@@ -12,6 +12,7 @@ use super::{
 use crate::lark::api::{ChatMode, LarkApi, ResourceKind};
 use crate::lark::error::LarkError;
 use crate::lark::transport::TransportHandle;
+use crate::outbox::pump::{is_documented_transient, is_http_server_error};
 
 /// Native `OpenAPI` implementation of query, media, and outbound capabilities.
 #[derive(Clone)]
@@ -141,6 +142,22 @@ impl OutboundDelivery for NativeChannel {
                     .reply_card(&message_id, card)
                     .await
                     .map(|receipt| receipt.message_id),
+                OutboundRequest::ReplyMarkdownPost {
+                    message_id,
+                    in_thread: true,
+                    markdown,
+                } => api
+                    .reply_post_markdown_in_thread(&message_id, &markdown)
+                    .await
+                    .map(|receipt| receipt.message_id),
+                OutboundRequest::ReplyMarkdownPost {
+                    message_id,
+                    in_thread: false,
+                    markdown,
+                } => api
+                    .reply_post_markdown(&message_id, &markdown)
+                    .await
+                    .map(|receipt| receipt.message_id),
                 OutboundRequest::UpdateCard { message_id, card } => api
                     .update_card(&message_id, card)
                     .await
@@ -166,23 +183,42 @@ fn channel_error(error: &LarkError, context: &'static str) -> ChannelError {
     let kind = match error {
         LarkError::PermanentAuth { .. } => ChannelErrorKind::PermanentAuth,
         LarkError::Retryable { .. } => ChannelErrorKind::Retryable,
-        LarkError::ProtocolViolation { .. } => ChannelErrorKind::Protocol,
+        LarkError::InvalidRequest { .. } | LarkError::ProtocolViolation { .. } => {
+            ChannelErrorKind::Protocol
+        }
         LarkError::Exhausted { .. } => ChannelErrorKind::Exhausted,
     };
     ChannelError::new(kind, context)
 }
 
 fn delivery_error(error: &LarkError) -> DeliveryError {
-    let class = match error {
-        LarkError::PermanentAuth { .. } | LarkError::Exhausted { .. } => {
-            DeliveryFailureClass::Definitive
+    const CONTEXT: &str = "delivering an outbound operation";
+    match error {
+        LarkError::InvalidRequest { .. }
+        | LarkError::PermanentAuth { .. }
+        | LarkError::Exhausted { .. } => {
+            DeliveryError::new(DeliveryFailureClass::Definitive, CONTEXT)
         }
-        LarkError::Retryable { code: Some(_), .. }
-        | LarkError::ProtocolViolation { code: Some(_), .. } => DeliveryFailureClass::Retryable,
+        LarkError::Retryable { code: Some(code), .. }
+        | LarkError::ProtocolViolation { code: Some(code), .. } => {
+            // Mirrors `delivery_decision` in the outbox pump: an explicit 5xx
+            // cannot prove a POST was not applied, so it stays uncertain, but
+            // an idempotent PATCH may retry it with the same body.
+            if is_http_server_error(*code) {
+                DeliveryError::new(DeliveryFailureClass::Uncertain, CONTEXT)
+                    .with_patch_retryable(true)
+            } else if is_documented_transient(*code) {
+                DeliveryError::new(DeliveryFailureClass::Retryable, CONTEXT)
+                    .with_patch_retryable(true)
+            } else {
+                DeliveryError::new(DeliveryFailureClass::Definitive, CONTEXT)
+            }
+        }
         LarkError::Retryable { code: None, .. }
-        | LarkError::ProtocolViolation { code: None, .. } => DeliveryFailureClass::Uncertain,
-    };
-    DeliveryError::new(class, "delivering an outbound operation")
+        | LarkError::ProtocolViolation { code: None, .. } => {
+            DeliveryError::new(DeliveryFailureClass::Uncertain, CONTEXT)
+        }
+    }
 }
 
 /// Inbound-source adapter retaining the native transport as the fallback.
