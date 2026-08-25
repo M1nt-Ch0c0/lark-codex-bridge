@@ -23,13 +23,21 @@
 //! transport down on every path. Because it requires a human, it is
 //! `#[ignore]`d and gated on `LARK_E2E=1`; it is never a CI test.
 
+mod bridgews;
+mod fakecodex;
+mod larkstub;
+
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
+use futures_util::future::BoxFuture;
+use lark_codex_bridge::codex::process::{CodexProcessConfig, ProcessError};
+use lark_codex_bridge::codex::supervisor::AppServerSupervisor;
+use lark_codex_bridge::config::{BridgeConfig, WorkspacePolicy};
 use lark_codex_bridge::lark::api::LarkApi;
 use lark_codex_bridge::lark::bridge::{LarkBridge, QueuedInboundEvent};
 use lark_codex_bridge::lark::config::{LarkEndpoints, TenantBrand};
@@ -40,19 +48,6 @@ use lark_codex_bridge::lark::token::TenantTokenProvider;
 use lark_codex_bridge::lark::transport::{
     InboundFrameHandler, LarkTransport, TransportEvent, TransportHandle, TransportState,
 };
-use secrecy::SecretString;
-use tokio::sync::mpsc;
-use tokio::time::timeout;
-use url::Url;
-
-mod fakecodex;
-
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-use futures_util::future::BoxFuture;
-use lark_codex_bridge::codex::process::{CodexProcessConfig, ProcessError};
-use lark_codex_bridge::codex::supervisor::AppServerSupervisor;
-use lark_codex_bridge::config::{BridgeConfig, WorkspacePolicy};
 use lark_codex_bridge::runtime::attachments::{
     AttachmentCache, AttachmentLimits, LarkResourceDownloader,
 };
@@ -69,12 +64,14 @@ use lark_codex_bridge::store::{
     DedupOutcome, InboundEventState, InboundRejectionKind, NewOutboxRow, NewTurnRow, StoreHandle,
     TurnState,
 };
+use secrecy::SecretString;
 use semver::Version;
 use tempfile::tempdir;
-use fakecodex::{FakeFactory, FakeOutcome};
+use tokio::sync::mpsc;
+use tokio::time::timeout;
+use url::Url;
 
-mod bridgews;
-mod larkstub;
+use fakecodex::{FakeFactory, FakeOutcome};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const OPERATOR_TIMEOUT: Duration = Duration::from_secs(300);
@@ -102,7 +99,7 @@ async fn real_lark_round_trips_an_operator_message() {
 fn required_env(name: &str) -> String {
     match std::env::var(name) {
         Ok(value) if !value.is_empty() => value,
-        _ => panic!("{name} is required for the real Lark smoke; set LARK_E2E_CHAT_ID"),
+        _ => panic!("{name} is required for the real Lark smoke"),
     }
 }
 
