@@ -1,7 +1,7 @@
 use std::{fmt, path::PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use secrecy::SecretString;
 use serde::Serialize;
 use tokio::time::{sleep, timeout};
@@ -22,13 +22,39 @@ use crate::{
         transport::LarkTransport,
     },
     limits::PROBE_TIMEOUT,
+    runtime::adoption::{ThreadAdoptionAvailability, ThreadAdoptionGate},
 };
 
 #[derive(Debug, Parser)]
 #[command(name = "lark-codex-bridge", version, about)]
 pub struct Cli {
+    /// Increase terminal diagnostics: -v for info, -vv for debug.
+    #[arg(short = 'v', long, action = ArgAction::Count, global = true)]
+    pub verbose: u8,
+    /// Terminal log encoding (always written to stderr).
+    #[arg(long, value_enum, default_value_t, global = true)]
+    pub log_format: LogFormat,
     #[command(subcommand)]
     pub command: Command,
+}
+
+/// Terminal tracing output encoding.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum LogFormat {
+    /// Compact human-readable lines.
+    #[default]
+    Human,
+    /// One JSON object per tracing event.
+    Json,
+}
+
+impl From<LogFormat> for crate::telemetry::OutputFormat {
+    fn from(format: LogFormat) -> Self {
+        match format {
+            LogFormat::Human => Self::Human,
+            LogFormat::Json => Self::Json,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -78,6 +104,8 @@ pub enum CodexCommand {
         #[arg(long, default_value = "codex")]
         binary: PathBuf,
     },
+    /// Print the fail-closed persisted-thread adoption capability as JSON.
+    AdoptionStatus,
 }
 
 impl fmt::Debug for CodexCommand {
@@ -87,6 +115,7 @@ impl fmt::Debug for CodexCommand {
                 .debug_struct("Probe")
                 .field("binary_bytes", &binary.as_os_str().len())
                 .finish(),
+            Self::AdoptionStatus => formatter.write_str("AdoptionStatus"),
         }
     }
 }
@@ -166,7 +195,10 @@ impl From<TenantArg> for TenantBrand {
 ///
 /// Returns an error when the selected command cannot complete successfully.
 pub async fn run() -> Result<()> {
-    run_with(Cli::parse()).await
+    let cli = Cli::parse();
+    crate::telemetry::init(cli.verbose, cli.log_format.into())
+        .context("unable to initialize terminal tracing")?;
+    run_with(cli).await
 }
 
 /// Executes an already parsed command.
@@ -175,11 +207,15 @@ pub async fn run() -> Result<()> {
 ///
 /// Returns an error when the selected command cannot complete successfully.
 pub async fn run_with(cli: Cli) -> Result<()> {
+    tracing::info!(command = cli.command.kind(), "CLI command started");
     match cli.command {
         Command::Run { config } => run_bridge(config).await,
         Command::Codex {
             command: CodexCommand::Probe { binary },
         } => probe_codex(binary).await,
+        Command::Codex {
+            command: CodexCommand::AdoptionStatus,
+        } => report_thread_adoption_status(),
         Command::Lark {
             command:
                 LarkCommand::Auth {
@@ -201,6 +237,41 @@ pub async fn run_with(cli: Cli) -> Result<()> {
             command: LarkCommand::Probe,
         } => lark_probe().await,
     }
+}
+
+impl Command {
+    const fn kind(&self) -> &'static str {
+        match self {
+            Self::Run { .. } => "run",
+            Self::Codex { .. } => "codex",
+            Self::Lark { .. } => "lark",
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadAdoptionReport {
+    available: bool,
+    classification: ThreadAdoptionAvailability,
+    guidance: &'static str,
+    requires_explicit_handoff: bool,
+    shared_endpoint_issue: u8,
+}
+
+fn report_thread_adoption_status() -> Result<()> {
+    let availability = ThreadAdoptionGate.availability();
+    let report = ThreadAdoptionReport {
+        available: availability.is_available(),
+        classification: availability,
+        guidance: availability.guidance(),
+        requires_explicit_handoff: true,
+        shared_endpoint_issue: 8,
+    };
+    let line =
+        serde_json::to_string(&report).context("unable to encode thread-adoption status report")?;
+    println!("{line}");
+    Ok(())
 }
 
 async fn run_bridge(config: Option<PathBuf>) -> Result<()> {

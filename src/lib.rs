@@ -1,4 +1,5 @@
 pub mod app;
+pub mod channel;
 pub mod cli;
 pub mod codex;
 pub mod config;
@@ -9,3 +10,4 @@ pub mod outbox;
 pub mod render;
 pub mod runtime;
 pub mod store;
+pub mod telemetry;

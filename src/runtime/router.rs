@@ -9,14 +9,17 @@ use std::time::Duration;
 use futures_util::future::join_all;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
-use tokio::time::{MissedTickBehavior, interval};
+use tokio::time::{MissedTickBehavior, interval, timeout};
+use tokio_util::sync::CancellationToken;
 
 use crate::codex::client::ControlEvent;
 use crate::codex::supervisor::{SupervisorError, SupervisorHandle, SupervisorState};
 use crate::codex::types::{ApprovalPolicy, SandboxMode};
-use crate::config::BridgeConfig;
+use crate::config::{AsrSection, BridgeConfig};
+use crate::lark::api::ChatMode;
 use crate::lark::bridge::QueuedInboundEvent;
 use crate::limits::{
+    PENDING_MEDIA_MAX_COUNT, PENDING_MEDIA_MAX_METADATA_BYTES, PENDING_MEDIA_TTL,
     ROUTER_ACTIVE_TURN_HARD_LIMIT, ROUTER_COMMAND_BYTE_BUDGET, ROUTER_COMMAND_CAPACITY,
     ROUTER_CONTROL_BYTE_BUDGET, ROUTER_CONTROL_CAPACITY, ROUTER_RETRY_BYTE_BUDGET,
     ROUTER_RETRY_CAPACITY, ROUTER_SCOPE_ACTOR_HARD_LIMIT, STORE_INBOUND_SCOPE_MAX_BYTES,
@@ -25,6 +28,7 @@ use crate::runtime::attachments::AttachmentCache;
 use crate::runtime::context::ContextRegistry;
 use crate::runtime::intake::TenantNamespace;
 use crate::runtime::policy::AccessPolicy;
+use crate::runtime::quote::QuoteResolver;
 use crate::runtime::scope::{
     ActorRouteError, DurableReplySink, InterruptOutcome, ReplySinkError, ScopeActorHandle,
     ScopeSnapshot, SupervisorAccess,
@@ -46,6 +50,10 @@ pub struct RouterSettings {
     pub(crate) message_max_age: Duration,
     pub(crate) finalization_retry: Duration,
     pub(crate) shutdown_cleanup_timeout: Duration,
+    pub(crate) asr: AsrSection,
+    pub(crate) pending_media_ttl: Duration,
+    pub(crate) pending_media_max_count: usize,
+    pub(crate) pending_media_max_metadata_bytes: usize,
 }
 
 impl RouterSettings {
@@ -64,6 +72,10 @@ impl RouterSettings {
             message_max_age: Duration::from_secs(15 * 60),
             finalization_retry: Duration::from_secs(1),
             shutdown_cleanup_timeout: Duration::from_secs(5),
+            asr: config.asr.clone(),
+            pending_media_ttl: PENDING_MEDIA_TTL,
+            pending_media_max_count: PENDING_MEDIA_MAX_COUNT,
+            pending_media_max_metadata_bytes: PENDING_MEDIA_MAX_METADATA_BYTES,
         }
     }
 
@@ -94,6 +106,21 @@ impl RouterSettings {
         self
     }
 
+    /// Overrides P2P pending-media bounds for deterministic tests.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_test_pending_media_limits(
+        mut self,
+        ttl: Duration,
+        max_count: usize,
+        max_metadata_bytes: usize,
+    ) -> Self {
+        self.pending_media_ttl = ttl;
+        self.pending_media_max_count = max_count;
+        self.pending_media_max_metadata_bytes = max_metadata_bytes;
+        self
+    }
+
     fn validate(&self) -> Result<(), RouteError> {
         if self.active_turn_permits == 0
             || self.active_turn_permits > ROUTER_ACTIVE_TURN_HARD_LIMIT
@@ -103,6 +130,11 @@ impl RouterSettings {
             || self.message_max_age.is_zero()
             || self.finalization_retry.is_zero()
             || self.shutdown_cleanup_timeout.is_zero()
+            || self.pending_media_ttl.is_zero()
+            || self.pending_media_max_count == 0
+            || self.pending_media_max_count > PENDING_MEDIA_MAX_COUNT
+            || self.pending_media_max_metadata_bytes == 0
+            || self.pending_media_max_metadata_bytes > PENDING_MEDIA_MAX_METADATA_BYTES
         {
             return Err(RouteError::InvalidSettings);
         }
@@ -132,6 +164,13 @@ impl fmt::Debug for RouterSettings {
             .field("message_max_age", &self.message_max_age)
             .field("finalization_retry", &self.finalization_retry)
             .field("shutdown_cleanup_timeout", &self.shutdown_cleanup_timeout)
+            .field("asr", &self.asr)
+            .field("pending_media_ttl", &self.pending_media_ttl)
+            .field("pending_media_max_count", &self.pending_media_max_count)
+            .field(
+                "pending_media_max_metadata_bytes",
+                &self.pending_media_max_metadata_bytes,
+            )
             .finish()
     }
 }
@@ -225,7 +264,7 @@ impl Router {
         sink: Arc<dyn DurableReplySink>,
     ) -> Result<RouterHandle, RouteError> {
         Self::start_inner(
-            store, tenant, policy, settings, supervisor, sink, None, None,
+            store, tenant, policy, settings, supervisor, sink, None, None, None,
         )
         .await
     }
@@ -255,6 +294,7 @@ impl Router {
             sink,
             Some(attachments),
             None,
+            None,
         )
         .await
     }
@@ -265,10 +305,7 @@ impl Router {
     /// # Errors
     ///
     /// Returns the same static classifications as [`Self::start`].
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "production startup keeps its independently owned dependencies explicit"
-    )]
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_with_contexts(
         store: StoreHandle,
         tenant: TenantNamespace,
@@ -288,14 +325,44 @@ impl Router {
             sink,
             Some(attachments),
             Some(contexts),
+            None,
         )
         .await
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the shared startup path accepts the same explicit dependency set"
-    )]
+    /// Starts the production router with lazy contexts and authorized,
+    /// one-hop quote resolution.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same static classifications as [`Self::start`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_with_contexts_and_quotes(
+        store: StoreHandle,
+        tenant: TenantNamespace,
+        policy: AccessPolicy,
+        settings: RouterSettings,
+        supervisor: SupervisorHandle,
+        sink: Arc<dyn DurableReplySink>,
+        attachments: Arc<AttachmentCache>,
+        contexts: Arc<ContextRegistry>,
+        quote_resolver: Arc<dyn QuoteResolver>,
+    ) -> Result<RouterHandle, RouteError> {
+        Self::start_inner(
+            store,
+            tenant,
+            policy,
+            settings,
+            supervisor,
+            sink,
+            Some(attachments),
+            Some(contexts),
+            Some(quote_resolver),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn start_inner(
         store: StoreHandle,
         tenant: TenantNamespace,
@@ -305,6 +372,7 @@ impl Router {
         sink: Arc<dyn DurableReplySink>,
         attachments: Option<Arc<AttachmentCache>>,
         contexts: Option<Arc<ContextRegistry>>,
+        quote_resolver: Option<Arc<dyn QuoteResolver>>,
     ) -> Result<RouterHandle, RouteError> {
         if let Err(error) = settings.validate() {
             supervisor.shutdown().await?;
@@ -328,6 +396,7 @@ impl Router {
             sink,
             attachments,
             contexts,
+            quote_resolver,
             task_snapshot,
         ));
         Ok(RouterHandle {
@@ -537,6 +606,29 @@ struct RouterRetry {
     _queue_permit: OwnedSemaphorePermit,
 }
 
+struct ContextToolTask {
+    epoch: crate::codex::rpc::ConnectionEpoch,
+    shutdown: CancellationToken,
+    task: JoinHandle<()>,
+}
+
+impl ContextToolTask {
+    async fn stop(mut self, cleanup_timeout: Duration) {
+        self.shutdown.cancel();
+        if timeout(cleanup_timeout, &mut self.task).await.is_err() {
+            self.task.abort();
+            let _ = (&mut self.task).await;
+        }
+    }
+}
+
+impl Drop for ContextToolTask {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+        self.task.abort();
+    }
+}
+
 struct RouteFailure {
     error: RouteError,
     event: QueuedInboundEvent,
@@ -556,6 +648,7 @@ async fn run_router(
     sink: Arc<dyn DurableReplySink>,
     attachments: Option<Arc<AttachmentCache>>,
     contexts: Option<Arc<ContextRegistry>>,
+    quote_resolver: Option<Arc<dyn QuoteResolver>>,
     snapshot: Arc<RwLock<RouterSnapshot>>,
 ) -> Result<(), RouteError> {
     let (supervisor_tx, supervisor_rx) = watch::channel(supervisor_access(&supervisor));
@@ -564,9 +657,23 @@ async fn run_router(
     let mut retries = VecDeque::<RouterRetry>::new();
     let mut retry_tick = interval(Duration::from_millis(250));
     retry_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let asr_configured = settings.asr.is_configured();
+    let mut stale_sweep_task = Some(run_stale_sweep(
+        crate::runtime::asr::StaleWorkspaceSweeper::for_private_root(),
+        asr_configured,
+    ));
+    let mut stale_sweeper = crate::runtime::asr::StaleWorkspaceSweeper::for_private_root();
+    let mut stale_sweep = interval(crate::runtime::asr::ASR_STALE_SWEEP_INTERVAL);
+    stale_sweep.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // The startup round above replaces the interval's immediate first tick.
+    stale_sweep.tick().await;
     let mut supervisor_open = true;
-    let mut tool_task =
-        start_context_tool_task(&supervisor, attachments.as_ref(), contexts.as_ref());
+    let mut tool_task = start_context_tool_task(
+        &supervisor,
+        attachments.as_ref(),
+        contexts.as_ref(),
+        settings.asr.clone(),
+    );
     loop {
         tokio::select! {
             biased;
@@ -590,19 +697,20 @@ async fn run_router(
                 if state.is_ok() {
                     supervisor_tx.send_replace(supervisor_access(&supervisor));
                     let current_epoch = supervisor.client().ok().map(|client| client.epoch());
-                    if tool_task.as_ref().map(|(epoch, _)| *epoch) != current_epoch {
-                        if let Some((_, task)) = tool_task.take() {
-                            task.abort();
+                    if tool_task.as_ref().map(|task| task.epoch) != current_epoch {
+                        if let Some(task) = tool_task.take() {
+                            task.stop(settings.shutdown_cleanup_timeout).await;
                         }
                         tool_task = start_context_tool_task(
                             &supervisor,
                             attachments.as_ref(),
                             contexts.as_ref(),
+                            settings.asr.clone(),
                         );
                     }
                 } else {
-                    if let Some((_, task)) = tool_task.take() {
-                        task.abort();
+                    if let Some(task) = tool_task.take() {
+                        task.stop(settings.shutdown_cleanup_timeout).await;
                     }
                     supervisor_open = false;
                     supervisor_tx.send_replace(SupervisorAccess { epoch: 0, client: None });
@@ -620,11 +728,33 @@ async fn run_router(
                     Arc::clone(&sink),
                     attachments.as_ref(),
                     contexts.as_ref(),
+                    quote_resolver.as_ref(),
                     &mut actors,
                 ).await;
                 update_runtime_snapshot(
                     &snapshot, &actors, &receiver, &retries, &active_turns, &settings,
                 );
+            }
+            completed = async {
+                stale_sweep_task
+                    .as_mut()
+                    .expect("stale sweep task exists behind select guard")
+                    .await
+            }, if stale_sweep_task.is_some() => {
+                stale_sweep_task = None;
+                if let Ok((sweeper, result)) = completed {
+                    stale_sweeper = sweeper;
+                    if result.is_err() {
+                        tracing::warn!("private ASR stale workspace sweep failed");
+                    }
+                } else {
+                    tracing::warn!("private ASR stale workspace sweep task failed");
+                    stale_sweeper = crate::runtime::asr::StaleWorkspaceSweeper::for_private_root();
+                }
+            }
+            _ = stale_sweep.tick(), if stale_sweep_task.is_none() => {
+                stale_sweep_task = Some(run_stale_sweep(stale_sweeper, asr_configured));
+                stale_sweeper = crate::runtime::asr::StaleWorkspaceSweeper::for_private_root();
             }
             command = receiver.recv() => {
                 let Some(command) = command else { break };
@@ -640,6 +770,7 @@ async fn run_router(
                             Arc::clone(&sink),
                             attachments.as_ref(),
                             contexts.as_ref(),
+                            quote_resolver.as_ref(),
                             &mut actors,
                             *event,
                         ).await {
@@ -664,9 +795,10 @@ async fn run_router(
                     }
                     RouterCommand::Shutdown { respond } => {
                         shutdown_actors(actors).await;
-                        if let Some((_, task)) = tool_task.take() {
-                            task.abort();
+                        if let Some(task) = tool_task.take() {
+                            task.stop(settings.shutdown_cleanup_timeout).await;
                         }
+                        finish_stale_sweep(stale_sweep_task).await;
                         supervisor.shutdown().await?;
                         reconcile_terminal_attachments(attachments.as_deref()).await?;
                         let _ = respond.send(());
@@ -677,44 +809,90 @@ async fn run_router(
         }
     }
     shutdown_actors(actors).await;
-    if let Some((_, task)) = tool_task.take() {
-        task.abort();
+    if let Some(task) = tool_task.take() {
+        task.stop(settings.shutdown_cleanup_timeout).await;
     }
+    finish_stale_sweep(stale_sweep_task).await;
     supervisor.shutdown().await?;
     reconcile_terminal_attachments(attachments.as_deref()).await?;
     Ok(())
 }
 
+type StaleSweepTask = JoinHandle<(
+    crate::runtime::asr::StaleWorkspaceSweeper,
+    Result<(), crate::runtime::asr::AsrError>,
+)>;
+
+fn run_stale_sweep(
+    mut sweeper: crate::runtime::asr::StaleWorkspaceSweeper,
+    asr_configured: bool,
+) -> StaleSweepTask {
+    tokio::task::spawn_blocking(move || {
+        let result = if asr_configured {
+            sweeper.sweep_once()
+        } else {
+            sweeper.sweep_existing_once()
+        };
+        (sweeper, result)
+    })
+}
+
+async fn finish_stale_sweep(task: Option<StaleSweepTask>) {
+    let Some(task) = task else { return };
+    match task.await {
+        Ok((_, Ok(()))) => {}
+        Ok((_, Err(_))) => tracing::warn!("private ASR stale workspace sweep failed"),
+        Err(_) => tracing::warn!("private ASR stale workspace sweep task failed"),
+    }
+}
+
+#[allow(clippy::ref_option, clippy::too_many_arguments)]
 fn start_context_tool_task(
     supervisor: &SupervisorHandle,
     attachments: Option<&Arc<AttachmentCache>>,
     contexts: Option<&Arc<ContextRegistry>>,
-) -> Option<(crate::codex::rpc::ConnectionEpoch, JoinHandle<()>)> {
+    asr: AsrSection,
+) -> Option<ContextToolTask> {
     let attachments = attachments.map(Arc::clone)?;
     let contexts = contexts.map(Arc::clone)?;
     let client = supervisor.client().ok()?;
     let epoch = client.epoch();
     let mut events = client.take_control_events().ok()?;
+    let shutdown = CancellationToken::new();
+    let task_shutdown = shutdown.clone();
     let task = tokio::spawn(async move {
-        while let Some(event) = events.recv().await {
-            match event {
-                ControlEvent::ServerRequest(request) => {
-                    handle_server_request(
-                        client.as_ref(),
-                        request,
-                        contexts.as_ref(),
-                        attachments.as_ref(),
-                    )
-                    .await;
+        loop {
+            tokio::select! {
+                biased;
+                () = task_shutdown.cancelled() => break,
+                event = events.recv() => {
+                    let Some(event) = event else { break };
+                    match event {
+                        ControlEvent::ServerRequest(request) => {
+                            handle_server_request(
+                                client.as_ref(),
+                                request,
+                                contexts.as_ref(),
+                                attachments.as_ref(),
+                                &asr,
+                                &task_shutdown,
+                            )
+                            .await;
+                        }
+                        ControlEvent::ConnectionClosed(_) => break,
+                        ControlEvent::ProtocolDrift
+                        | ControlEvent::UnknownNotification { .. }
+                        | ControlEvent::InvalidNotification { .. } => {}
+                    }
                 }
-                ControlEvent::ConnectionClosed(_) => break,
-                ControlEvent::ProtocolDrift
-                | ControlEvent::UnknownNotification { .. }
-                | ControlEvent::InvalidNotification { .. } => {}
             }
         }
     });
-    Some((epoch, task))
+    Some(ContextToolTask {
+        epoch,
+        shutdown,
+        task,
+    })
 }
 
 async fn reconcile_terminal_attachments(
@@ -742,6 +920,7 @@ async fn retry_one(
     sink: Arc<dyn DurableReplySink>,
     attachments: Option<&Arc<AttachmentCache>>,
     contexts: Option<&Arc<ContextRegistry>>,
+    quote_resolver: Option<&Arc<dyn QuoteResolver>>,
     actors: &mut HashMap<String, ScopeActorHandle>,
 ) {
     let Some(mut retry) = retries.pop_front() else {
@@ -757,6 +936,7 @@ async fn retry_one(
         sink,
         attachments,
         contexts,
+        quote_resolver,
         actors,
         retry.event,
     )
@@ -770,7 +950,11 @@ async fn retry_one(
     }
 }
 
-#[allow(clippy::too_many_arguments, clippy::result_large_err)]
+#[allow(
+    clippy::result_large_err,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
 async fn route_one(
     store: &StoreHandle,
     tenant: &TenantNamespace,
@@ -781,18 +965,35 @@ async fn route_one(
     sink: Arc<dyn DurableReplySink>,
     attachments: Option<&Arc<AttachmentCache>>,
     contexts: Option<&Arc<ContextRegistry>>,
+    quote_resolver: Option<&Arc<dyn QuoteResolver>>,
     actors: &mut HashMap<String, ScopeActorHandle>,
     queued: QueuedInboundEvent,
-) -> Result<(), RouteFailure> {
-    let decision = policy.decide(&queued.event);
+) -> Result<(), Box<RouteFailure>> {
     let key = InboundKey::new(tenant.clone(), queued.event.event_id.clone());
+    if queued.event.chat_type != ChatMode::P2p && is_conversation_media(&queued.event.message_type)
+    {
+        return store
+            .complete_received_without_turn(&key)
+            .await
+            .map(|_| ())
+            .map_err(|_| {
+                Box::new(RouteFailure {
+                    error: RouteError::Store,
+                    event: queued,
+                    retryable: true,
+                })
+            });
+    }
+    let decision = policy.decide(&queued.event);
     if let Some(kind) = decision.rejection_kind() {
         return reject_with_notice(store, sink.as_ref(), &key, &queued.event, kind)
             .await
-            .map_err(|error| RouteFailure {
-                error,
-                event: queued,
-                retryable: true,
+            .map_err(|error| {
+                Box::new(RouteFailure {
+                    error,
+                    event: queued,
+                    retryable: true,
+                })
             });
     }
     let scope_key = queued.event.scope.to_string();
@@ -814,10 +1015,12 @@ async fn route_one(
                     InboundRejectionKind::Overloaded,
                 )
                 .await
-                .map_err(|error| RouteFailure {
-                    error,
-                    event: queued,
-                    retryable: true,
+                .map_err(|error| {
+                    Box::new(RouteFailure {
+                        error,
+                        event: queued,
+                        retryable: true,
+                    })
                 });
             }
         }
@@ -833,19 +1036,26 @@ async fn route_one(
                 Arc::clone(&sink),
                 attachments.map(Arc::clone),
                 contexts.map(Arc::clone),
+                quote_resolver.map(Arc::clone),
             ),
         );
     }
     let Some(actor) = actors.get(&scope_key) else {
-        return Err(RouteFailure {
+        return Err(Box::new(RouteFailure {
             error: RouteError::ActorUnavailable,
             event: queued,
             retryable: false,
-        });
+        }));
     };
     let route = actor.try_route(key.clone(), queued);
     match route {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            tracing::debug!(
+                queued_messages = actor.snapshot().queued_messages,
+                "inbound event queued for scope"
+            );
+            Ok(())
+        }
         Err(ActorRouteError::Capacity(queued)) => {
             let queued = *queued;
             reject_with_notice(
@@ -856,18 +1066,24 @@ async fn route_one(
                 InboundRejectionKind::Overloaded,
             )
             .await
-            .map_err(|error| RouteFailure {
-                error,
-                event: queued,
-                retryable: true,
+            .map_err(|error| {
+                Box::new(RouteFailure {
+                    error,
+                    event: queued,
+                    retryable: true,
+                })
             })
         }
-        Err(ActorRouteError::Closed(queued)) => Err(RouteFailure {
+        Err(ActorRouteError::Closed(queued)) => Err(Box::new(RouteFailure {
             error: RouteError::ActorUnavailable,
             event: *queued,
             retryable: false,
-        }),
+        })),
     }
+}
+
+fn is_conversation_media(message_type: &str) -> bool {
+    matches!(message_type, "image" | "video" | "media" | "file" | "audio")
 }
 
 fn enqueue_retry(
@@ -901,6 +1117,7 @@ async fn reject_with_notice(
     store
         .reject_received_and_enqueue_notice(key, reason, notice)
         .await?;
+    tracing::info!(reason = reason.as_str(), "inbound event rejected by policy");
     Ok(())
 }
 
@@ -979,8 +1196,8 @@ mod tests {
             .acquire_owned()
             .await
             .expect("permit");
-        QueuedInboundEvent {
-            event: InboundEvent {
+        QueuedInboundEvent::new(
+            InboundEvent {
                 event_id: event_id.to_owned(),
                 message_id: format!("message-{event_id}"),
                 chat_id: "chat-router-attempt".to_owned(),
@@ -1001,7 +1218,7 @@ mod tests {
                 scope: ScopeKey::Chat("chat-router-attempt".to_owned()),
             },
             permit,
-        }
+        )
     }
 
     #[tokio::test]

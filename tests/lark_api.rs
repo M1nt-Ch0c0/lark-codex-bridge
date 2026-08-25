@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use lark_codex_bridge::lark::api::{ChatMode, LarkApi, ResourceKind};
+use lark_codex_bridge::lark::api::{ChatMode, LarkApi, ResourceKind, post_markdown_reply_body_len};
 use lark_codex_bridge::lark::config::{LarkEndpoints, TenantBrand};
 use lark_codex_bridge::lark::credentials::LarkCredentials;
 use lark_codex_bridge::lark::error::{LarkError, LarkErrorKind};
@@ -151,6 +151,97 @@ async fn reply_text_in_thread_sets_the_flag() {
         serde_json::json!({
             "msg_type": "text",
             "content": "{\"text\":\"thread pong\"}",
+            "reply_in_thread": true,
+        })
+    );
+}
+
+#[tokio::test]
+async fn reply_markdown_post_uses_the_exact_lark_post_shape() {
+    let server = StubServer::start(token_plus(|_| ok_message("om_post"))).await;
+    let api = api_for(&server);
+    let markdown = "**Result**\n\n- one\n- two";
+
+    api.reply_post_markdown("om_parent", markdown)
+        .await
+        .expect("Markdown post should succeed");
+    api.reply_post_markdown_in_thread("om_parent", markdown)
+        .await
+        .expect("thread Markdown post should succeed");
+
+    let requests = requests_to(&server, MESSAGES_PATH);
+    let plain: serde_json::Value =
+        serde_json::from_str(&requests[0].body_text()).expect("post body should be JSON");
+    assert_eq!(
+        requests[0].body.len(),
+        post_markdown_reply_body_len(markdown, false),
+        "the splitter's size function must match the actual HTTP body"
+    );
+    assert_eq!(
+        plain,
+        serde_json::json!({
+            "msg_type": "post",
+            "content": serde_json::to_string(&serde_json::json!({
+                "zh_cn": {"content": [[{"tag": "md", "text": markdown}]]},
+            }))
+            .expect("post content"),
+        })
+    );
+    let plain_content: serde_json::Value = serde_json::from_str(
+        plain["content"]
+            .as_str()
+            .expect("post content should be a JSON string"),
+    )
+    .expect("post content should be JSON");
+    assert_eq!(
+        plain_content,
+        serde_json::json!({
+            "zh_cn": {
+                "content": [[{"tag": "md", "text": markdown}]],
+            },
+        })
+    );
+
+    let threaded: serde_json::Value =
+        serde_json::from_str(&requests[1].body_text()).expect("post body should be JSON");
+    assert_eq!(
+        requests[1].body.len(),
+        post_markdown_reply_body_len(markdown, true)
+    );
+    assert_eq!(
+        threaded,
+        serde_json::json!({
+            "msg_type": "post",
+            "content": serde_json::to_string(&serde_json::json!({
+                "zh_cn": {"content": [[{"tag": "md", "text": markdown}]]},
+            }))
+            .expect("post content"),
+            "reply_in_thread": true,
+        })
+    );
+}
+
+#[tokio::test]
+async fn topic_card2_reply_uses_the_exact_interactive_contract() {
+    let server = StubServer::start(token_plus(|_| ok_message("om_topic_card"))).await;
+    let api = api_for(&server);
+    let card = serde_json::json!({
+        "schema": "2.0",
+        "body": {"elements": [{"tag": "markdown", "content": "**working**"}]},
+    });
+    api.reply_card_in_thread("om_parent", card.clone())
+        .await
+        .expect("topic card reply");
+
+    let request = &requests_to(&server, MESSAGES_PATH)[0];
+    assert_eq!(request.method, "POST");
+    assert_eq!(request.path, "/open-apis/im/v1/messages/om_parent/reply");
+    let body: serde_json::Value = serde_json::from_slice(&request.body).expect("topic card body");
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "msg_type": "interactive",
+            "content": serde_json::to_string(&card).expect("card content"),
             "reply_in_thread": true,
         })
     );
@@ -336,7 +427,7 @@ async fn non_token_permanent_code_is_not_retried() {
 }
 
 #[tokio::test]
-async fn other_nonzero_codes_are_retryable() {
+async fn known_not_in_chat_code_is_a_permanent_business_rejection() {
     let server = StubServer::start(token_plus(|_| {
         StubResponse::json(200, r#"{"code":230001,"msg":"bot not in chat"}"#)
     }))
@@ -349,12 +440,34 @@ async fn other_nonzero_codes_are_retryable() {
         .expect_err("a nonzero code must fail");
     assert!(matches!(
         error,
-        LarkError::Retryable {
+        LarkError::ProtocolViolation {
             code: Some(230_001),
             ..
         }
     ));
     assert_eq!(requests_to(&server, MESSAGES_PATH).len(), 1);
+}
+
+#[tokio::test]
+async fn documented_frequency_limit_code_is_retryable() {
+    let server = StubServer::start(token_plus(|_| {
+        // Lark documents this application-frequency code with HTTP 400.
+        StubResponse::json(400, r#"{"code":99991400,"msg":"limited"}"#)
+    }))
+    .await;
+    let api = api_for(&server);
+
+    let error = api
+        .send_text("oc_chat", "hello")
+        .await
+        .expect_err("a rate limit must fail this call");
+    assert!(matches!(
+        error,
+        LarkError::Retryable {
+            code: Some(99_991_400),
+            ..
+        }
+    ));
 }
 
 #[tokio::test]
@@ -390,6 +503,11 @@ async fn get_message_preserves_the_thread_id() {
     assert_eq!(message.chat_type, "group");
     assert_eq!(message.message_type, "text");
     assert_eq!(
+        message.sender_id.as_deref(),
+        Some("ou_155184d1e73cb1458973df8d9e3000a")
+    );
+    assert_eq!(message.sender_type.as_deref(), Some("user"));
+    assert_eq!(
         message.root_id.as_deref(),
         Some("om_x100b5496d4b93cc0c73c1df0dc00001")
     );
@@ -398,6 +516,13 @@ async fn get_message_preserves_the_thread_id() {
         Some("om_x100b5496d4b93cc0c73c1df0dc00002")
     );
     assert_eq!(message.thread_id.as_deref(), Some("omt_1a9c1d74fd104000"));
+    assert_eq!(
+        message.content.as_deref(),
+        Some(r#"{"text":"scrubbed content"}"#)
+    );
+    assert!(!message.deleted);
+    let debug = format!("{message:?}");
+    assert!(!debug.contains("scrubbed content"));
 
     let request = &requests_to(&server, MESSAGES_PATH)[0];
     assert_eq!(request.method, "GET");

@@ -7,9 +7,13 @@
 //! attachment. Leases cascade when their attachment row is deleted.
 
 use rusqlite::params;
+use uuid::Uuid;
 
 use super::{StoreError, StoreHandle, now_ms, query_optional, request_bytes, sqlite_error};
-use crate::limits::{STORE_ATTACHMENT_MAX_BYTES, STORE_ATTACHMENT_MAX_ROWS};
+use crate::limits::{
+    STORE_ATTACHMENT_LEASE_MAX_ROWS, STORE_ATTACHMENT_LEASE_TOKEN_MAX_BYTES,
+    STORE_ATTACHMENT_MAX_BYTES, STORE_ATTACHMENT_MAX_ROWS,
+};
 
 /// One row of the `attachments` table.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +33,9 @@ pub struct AttachmentRow {
 /// One row of the `attachment_leases` table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachmentLeaseRow {
+    /// Unique acquisition token. Two reads by one turn intentionally have
+    /// different tokens so either caller can release only its own lease.
+    pub lease_token: String,
     /// Content hash of the leased attachment.
     pub sha256: String,
     /// Turn row holding the lease.
@@ -101,10 +108,9 @@ impl StoreHandle {
     /// atomicity: a failure (for example, a missing `turn_row_id` violating
     /// the lease foreign key) rolls the attachment row back too.
     ///
-    /// The capacity check, the upsert, and the lease insert all share one
-    /// transaction. The lease insert is `INSERT OR IGNORE` so re-leasing an
-    /// already-leased pair stays idempotent; foreign-key violations are not
-    /// suppressed by `OR IGNORE` and abort the transaction as errors.
+    /// The capacity check, the upsert, and the uniquely-tokened lease insert all
+    /// share one transaction. Every call is an independent acquisition even
+    /// for the same attachment and turn.
     ///
     /// # Errors
     ///
@@ -116,11 +122,13 @@ impl StoreHandle {
         bytes: u64,
         kind: &str,
         turn_row_id: i64,
-    ) -> Result<(), StoreError> {
+    ) -> Result<String, StoreError> {
         let sha256 = sha256.to_owned();
         let kind = kind.to_owned();
+        let lease_token = new_attachment_lease_token();
+        let returned_token = lease_token.clone();
         let bytes = i64::try_from(bytes).unwrap_or(i64::MAX);
-        let request_size = request_bytes(&[&sha256, &kind]);
+        let request_size = request_bytes(&[&sha256, &kind, &lease_token]);
         self.run_sized(request_size, move |connection| {
             let transaction = connection
                 .transaction()
@@ -159,16 +167,28 @@ impl StoreHandle {
                     params![sha256, bytes, kind, now_ms()],
                 )
                 .map_err(|error| sqlite_error("recording an attachment", &error))?;
+            let lease_count: i64 = transaction
+                .query_row("SELECT COUNT(*) FROM attachment_leases", [], |row| {
+                    row.get(0)
+                })
+                .map_err(|error| sqlite_error("checking attachment lease capacity", &error))?;
+            if u64::try_from(lease_count).unwrap_or(u64::MAX) >= STORE_ATTACHMENT_LEASE_MAX_ROWS {
+                return Err(StoreError::CapacityExceeded {
+                    context: "adding an attachment lease",
+                });
+            }
             transaction
                 .execute(
-                    "INSERT OR IGNORE INTO attachment_leases (sha256, turn_row_id, created_ms)
-                     VALUES (?1, ?2, ?3)",
-                    params![sha256, turn_row_id, now_ms()],
+                    "INSERT INTO attachment_leases
+                         (lease_token, sha256, turn_row_id, created_ms)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![lease_token, sha256, turn_row_id, now_ms()],
                 )
                 .map_err(|error| sqlite_error("adding an attachment lease", &error))?;
             transaction
                 .commit()
-                .map_err(|error| sqlite_error("committing an attachment transaction", &error))
+                .map_err(|error| sqlite_error("committing an attachment transaction", &error))?;
+            Ok(returned_token)
         })
         .await
     }
@@ -201,7 +221,7 @@ impl StoreHandle {
         .await
     }
 
-    /// Leases an attachment for one turn (idempotent per pair). Both foreign
+    /// Acquires an independent lease for one attachment and turn. Both foreign
     /// keys require the attachment and the turn row to exist.
     ///
     /// # Errors
@@ -211,18 +231,57 @@ impl StoreHandle {
         &self,
         sha256: &str,
         turn_row_id: i64,
-    ) -> Result<(), StoreError> {
+    ) -> Result<String, StoreError> {
         let sha256 = sha256.to_owned();
-        let request_size = request_bytes(&[&sha256]);
+        let lease_token = new_attachment_lease_token();
+        let returned_token = lease_token.clone();
+        let request_size = request_bytes(&[&sha256, &lease_token]);
+        self.run_sized(request_size, move |connection| {
+            let lease_count: i64 = connection
+                .query_row("SELECT COUNT(*) FROM attachment_leases", [], |row| {
+                    row.get(0)
+                })
+                .map_err(|error| sqlite_error("checking attachment lease capacity", &error))?;
+            if u64::try_from(lease_count).unwrap_or(u64::MAX) >= STORE_ATTACHMENT_LEASE_MAX_ROWS {
+                return Err(StoreError::CapacityExceeded {
+                    context: "adding an attachment lease",
+                });
+            }
+            connection
+                .execute(
+                    "INSERT INTO attachment_leases
+                         (lease_token, sha256, turn_row_id, created_ms)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![lease_token, sha256, turn_row_id, now_ms()],
+                )
+                .map_err(|error| sqlite_error("adding an attachment lease", &error))?;
+            Ok(returned_token)
+        })
+        .await
+    }
+
+    /// Releases one exact acquisition token.
+    ///
+    /// This is the cancellation compensation boundary for a dynamic media
+    /// fetch that may be dropped after its writer request was admitted. The
+    /// operation is idempotent and never affects another simultaneous read,
+    /// including one for the same attachment and turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the writer task or SQLite fails.
+    pub async fn release_attachment_lease(&self, lease_token: &str) -> Result<bool, StoreError> {
+        validate_attachment_lease_token(lease_token)?;
+        let lease_token = lease_token.to_owned();
+        let request_size = request_bytes(&[&lease_token]);
         self.run_sized(request_size, move |connection| {
             connection
                 .execute(
-                    "INSERT OR IGNORE INTO attachment_leases (sha256, turn_row_id, created_ms)
-                     VALUES (?1, ?2, ?3)",
-                    params![sha256, turn_row_id, now_ms()],
+                    "DELETE FROM attachment_leases WHERE lease_token = ?1",
+                    params![lease_token],
                 )
-                .map_err(|error| sqlite_error("adding an attachment lease", &error))?;
-            Ok(())
+                .map(|deleted| deleted > 0)
+                .map_err(|error| sqlite_error("releasing an attachment lease", &error))
         })
         .await
     }
@@ -241,16 +300,18 @@ impl StoreHandle {
         self.run_sized(request_size, move |connection| {
             let mut statement = connection
                 .prepare(
-                    "SELECT sha256, turn_row_id, created_ms
-                     FROM attachment_leases WHERE sha256 = ?1 ORDER BY turn_row_id",
+                    "SELECT lease_token, sha256, turn_row_id, created_ms
+                     FROM attachment_leases
+                     WHERE sha256 = ?1 ORDER BY turn_row_id, lease_token",
                 )
                 .map_err(|error| sqlite_error("listing attachment leases", &error))?;
             let rows = statement
                 .query_map(params![sha256], |row| {
                     Ok(AttachmentLeaseRow {
-                        sha256: row.get(0)?,
-                        turn_row_id: row.get(1)?,
-                        created_ms: row.get(2)?,
+                        lease_token: row.get(0)?,
+                        sha256: row.get(1)?,
+                        turn_row_id: row.get(2)?,
+                        created_ms: row.get(3)?,
                     })
                 })
                 .map_err(|error| sqlite_error("listing attachment leases", &error))?
@@ -421,4 +482,18 @@ impl StoreHandle {
         })
         .await
     }
+}
+
+fn new_attachment_lease_token() -> String {
+    format!("alease_{}", Uuid::new_v4().simple())
+}
+
+fn validate_attachment_lease_token(token: &str) -> Result<(), StoreError> {
+    if token.is_empty() || token.len() > STORE_ATTACHMENT_LEASE_TOKEN_MAX_BYTES {
+        return Err(StoreError::PayloadTooLarge {
+            context: "validating an attachment lease token",
+            limit: u64::try_from(STORE_ATTACHMENT_LEASE_TOKEN_MAX_BYTES).unwrap_or(u64::MAX),
+        });
+    }
+    Ok(())
 }
