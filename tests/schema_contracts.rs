@@ -1,6 +1,6 @@
 use lark_codex_bridge::codex::{
     client::{CONSUMED_NOTIFICATION_METHODS, ClientError, NORMAL_NOTIFICATION_ORDER},
-    compat::{self, WireAdapter},
+    compat::{self, SharedWireProfile, WireAdapter},
     protocol::{InboundMessage, OutboundMessage, RequestId, decode_line, encode_line},
     rpc::{ConnectionEpoch, RpcError},
     types, wire,
@@ -395,6 +395,75 @@ fn supported_adapter_serializes_every_outgoing_contract_exactly() {
 }
 
 #[test]
+fn promoted_adapter_serializes_every_base_outgoing_contract_exactly() {
+    let fixture = contract("0.149.0");
+    let adapter = WireAdapter::V0_149_0;
+
+    assert_outgoing_adapter_params!(
+        &fixture,
+        adapter,
+        "initialize",
+        types::InitializeParams,
+        initialize_params
+    );
+    assert_outgoing_adapter_params!(
+        &fixture,
+        adapter,
+        "thread/start",
+        types::ThreadStartParams,
+        thread_start_params
+    );
+    assert_outgoing_adapter_params!(
+        &fixture,
+        adapter,
+        "thread/list",
+        types::ThreadListParams,
+        thread_list_params
+    );
+    assert_outgoing_adapter_params!(
+        &fixture,
+        adapter,
+        "thread/read",
+        types::ThreadReadParams,
+        thread_read_params
+    );
+    assert_outgoing_adapter_params!(
+        &fixture,
+        adapter,
+        "thread/resume",
+        types::ThreadResumeParams,
+        thread_resume_params
+    );
+    assert_outgoing_adapter_params!(
+        &fixture,
+        adapter,
+        "turn/start",
+        types::TurnStartParams,
+        turn_start_params
+    );
+    assert_outgoing_adapter_params!(
+        &fixture,
+        adapter,
+        "turn/interrupt",
+        types::TurnInterruptParams,
+        turn_interrupt_params
+    );
+
+    let reverse = fixture["reverseRequests"]
+        .as_array()
+        .expect("reverse requests")
+        .iter()
+        .find(|entry| entry["method"] == "item/tool/call")
+        .expect("dynamic tool fixture");
+    let stable: types::DynamicToolCallResponse = serde_json::from_value(reverse["result"].clone())
+        .expect("contract result should decode into the stable tool response");
+    let mapped = adapter
+        .dynamic_tool_call_response(&stable)
+        .expect("promoted adapter should encode the dynamic-tool response");
+    assert_eq!(mapped, reverse["result"]);
+}
+
+#[test]
 fn supported_adapter_maps_every_incoming_notification_and_reverse_request() {
     let fixture = contract("0.146.0");
     let adapter = WireAdapter::V0_146_0;
@@ -494,11 +563,17 @@ fn fixture_notification_order_is_the_production_router_order() {
             .iter()
             .map(|entry| entry["method"].as_str().expect("method should be a string"))
             .collect();
-        assert_eq!(
-            fixture_methods,
-            CONSUMED_NOTIFICATION_METHODS.iter().copied().collect(),
-            "{version}"
-        );
+        let mut expected_methods: std::collections::BTreeSet<&str> =
+            CONSUMED_NOTIFICATION_METHODS.iter().copied().collect();
+        if version == "0.149.0" {
+            expected_methods.extend(
+                SharedWireProfile::QueueShared
+                    .required_notifications()
+                    .iter()
+                    .copied(),
+            );
+        }
+        assert_eq!(fixture_methods, expected_methods, "{version}");
     }
 }
 
@@ -554,7 +629,7 @@ fn turn_start_failure_contract_drives_client_retry_classification() {
 }
 
 #[test]
-fn candidate_only_section_position_remains_unknown_in_the_stable_domain() {
+fn promoted_section_position_remains_rejected_by_the_older_adapter() {
     let supported_schema: Value = serde_json::from_str(include_str!(
         "../protocol/codex/schemas/0.146.0/selected.schema.json"
     ))
@@ -565,24 +640,22 @@ fn candidate_only_section_position_remains_unknown_in_the_stable_domain() {
             .expect("supported ThreadSortKey should be an enum");
     assert!(!supported_sort_keys.contains(&json!("section_position")));
 
-    let stable: types::ThreadSortKey = serde_json::from_value(json!("section_position"))
-        .expect("stable open enum should retain candidate-only values");
-    assert_eq!(
-        stable,
-        types::ThreadSortKey::Unknown("section_position".to_owned())
-    );
+    let stable: types::ThreadSortKey =
+        serde_json::from_value(json!("section_position")).expect("promoted sort key should decode");
+    assert_eq!(stable, types::ThreadSortKey::SectionPosition);
     assert_eq!(
         serde_json::to_value(stable).expect("unknown sort key should remain serializable"),
         json!("section_position")
     );
     let params = types::ThreadListParams {
-        sort_key: Some(types::ThreadSortKey::Unknown("section_position".to_owned())),
+        sort_key: Some(types::ThreadSortKey::SectionPosition),
         ..types::ThreadListParams::default()
     };
     assert!(
         WireAdapter::V0_146_0.thread_list_params(&params).is_err(),
         "candidate-only sort keys must not leak onto the supported 0.146 wire"
     );
+    assert!(WireAdapter::V0_149_0.thread_list_params(&params).is_ok());
 }
 
 #[test]
@@ -593,6 +666,18 @@ fn supported_adapter_rejects_outgoing_values_outside_the_0_146_schema() {
         ..types::ThreadStartParams::default()
     };
     assert!(adapter.thread_start_params(&start).is_err());
+
+    let start = types::ThreadStartParams {
+        project_id: Some("project-contract-1".to_owned()),
+        ..types::ThreadStartParams::default()
+    };
+    assert!(adapter.thread_start_params(&start).is_err());
+    assert_eq!(
+        WireAdapter::V0_149_0
+            .thread_start_params(&start)
+            .expect("0.149 should retain its promoted project id")["projectId"],
+        "project-contract-1"
+    );
 
     let mut turn = types::TurnStartParams::new("thread-contract-1", vec![]);
     turn.summary = Some("future-summary".to_owned());
@@ -663,15 +748,390 @@ fn compatibility_errors_never_echo_wire_payloads() {
 
 #[test]
 fn only_reviewed_versions_are_enabled_at_runtime() {
-    assert_eq!(wire::SUPPORTED_CODEX_VERSIONS, ["0.146.0"]);
-    let supported = semver::Version::parse("0.146.0").unwrap();
-    let candidate = semver::Version::parse("0.149.0").unwrap();
-    assert!(wire::is_supported_codex_version(&supported));
-    assert!(!wire::is_supported_codex_version(&candidate));
+    assert_eq!(wire::SUPPORTED_CODEX_VERSIONS, ["0.146.0", "0.149.0"]);
+    let baseline = semver::Version::parse("0.146.0").unwrap();
+    let promoted = semver::Version::parse("0.149.0").unwrap();
+    let unreviewed = semver::Version::parse("0.150.0").unwrap();
+    assert!(wire::is_supported_codex_version(&baseline));
+    assert!(wire::is_supported_codex_version(&promoted));
+    assert!(!wire::is_supported_codex_version(&unreviewed));
     assert_eq!(
-        WireAdapter::for_version(&supported),
+        WireAdapter::for_version(&baseline),
         Some(WireAdapter::V0_146_0)
     );
     assert_eq!(WireAdapter::V0_146_0.codex_version(), "0.146.0");
-    assert_eq!(WireAdapter::for_version(&candidate), None);
+    assert_eq!(
+        WireAdapter::for_version(&promoted),
+        Some(WireAdapter::V0_149_0)
+    );
+    assert_eq!(WireAdapter::V0_149_0.codex_version(), "0.149.0");
+    assert_eq!(WireAdapter::for_version(&unreviewed), None);
+    for profile in [
+        SharedWireProfile::ObserveShared,
+        SharedWireProfile::ResumeShared,
+        SharedWireProfile::MutateShared,
+        SharedWireProfile::QueueShared,
+    ] {
+        assert!(WireAdapter::V0_149_0.supports_shared_profile(profile));
+        assert!(!WireAdapter::V0_146_0.supports_shared_profile(profile));
+        assert!(!profile.required_methods().is_empty());
+    }
+}
+
+#[test]
+fn promoted_shared_surface_maps_every_selected_exchange() {
+    let fixture = contract("0.149.0");
+    let adapter = WireAdapter::V0_149_0;
+
+    macro_rules! outgoing {
+        ($method:literal, $stable:ty, $mapper:ident) => {{
+            let exchange = exchange(&fixture, $method);
+            let stable: $stable = serde_json::from_value(exchange["params"].clone())
+                .expect("shared contract params should decode into the stable type");
+            assert_eq!(
+                adapter.$mapper(&stable).expect("promoted shared mapper"),
+                exchange["params"],
+                "shared outgoing drift for {}",
+                $method
+            );
+        }};
+    }
+
+    macro_rules! incoming {
+        ($method:literal, $mapper:ident) => {{
+            let exchange = exchange(&fixture, $method);
+            let stable = adapter
+                .$mapper(exchange["result"].clone())
+                .expect("promoted shared response mapper");
+            serde_json::to_value(&stable).expect("stable shared response should encode");
+            stable
+        }};
+    }
+
+    outgoing!(
+        "thread/unsubscribe",
+        types::ThreadUnsubscribeParams,
+        thread_unsubscribe_params
+    );
+    incoming!("thread/unsubscribe", thread_unsubscribe_response);
+    outgoing!("turn/steer", types::TurnSteerParams, turn_steer_params);
+    incoming!("turn/steer", turn_steer_response);
+    outgoing!(
+        "thread/queue/add",
+        types::ThreadQueueAddParams,
+        thread_queue_add_params
+    );
+    incoming!("thread/queue/add", thread_queue_add_response);
+    outgoing!(
+        "thread/queue/list",
+        types::ThreadQueueListParams,
+        thread_queue_list_params
+    );
+    incoming!("thread/queue/list", thread_queue_list_response);
+    outgoing!(
+        "thread/queue/start",
+        types::ThreadQueueStartParams,
+        thread_queue_start_params
+    );
+    incoming!("thread/queue/start", thread_queue_start_response);
+    outgoing!(
+        "thread/turns/list",
+        types::ThreadTurnsListParams,
+        thread_turns_list_params
+    );
+    incoming!("thread/turns/list", thread_turns_list_response);
+    outgoing!(
+        "thread/items/list",
+        types::ThreadItemsListParams,
+        thread_items_list_params
+    );
+    let items = incoming!("thread/items/list", thread_items_list_response);
+    assert_eq!(items.data.len(), 1);
+    assert_eq!(items.data[0].turn_id, "turn-contract-1");
+    assert_eq!(items.data[0].item.kind(), "agentMessage");
+}
+
+#[test]
+fn promoted_shared_notifications_and_approvals_cross_the_stable_boundary() {
+    let fixture = contract("0.149.0");
+    let adapter = WireAdapter::V0_149_0;
+
+    let status = notification(&fixture, "thread/status/changed");
+    assert_eq!(
+        adapter
+            .thread_status_changed_notification(status["params"].clone())
+            .expect("status notification")
+            .thread_id,
+        "thread-contract-1"
+    );
+    let queue = notification(&fixture, "thread/queue/changed");
+    assert_eq!(
+        adapter
+            .thread_queue_changed_notification(queue["params"].clone())
+            .expect("queue notification")
+            .thread_id,
+        "thread-contract-1"
+    );
+    let resolved = notification(&fixture, "serverRequest/resolved");
+    assert_eq!(
+        adapter
+            .server_request_resolved_notification(resolved["params"].clone())
+            .expect("resolved notification")
+            .request_id,
+        json!("approval-contract-1")
+    );
+
+    let reverse = fixture["reverseRequests"]
+        .as_array()
+        .expect("reverse requests");
+    let command = reverse
+        .iter()
+        .find(|entry| entry["method"] == "item/commandExecution/requestApproval")
+        .expect("command approval fixture");
+    assert_eq!(
+        adapter
+            .command_execution_request_approval_params(command["params"].clone())
+            .expect("command approval params")
+            .item_id,
+        "command-contract-1"
+    );
+    let command_result: types::CommandExecutionRequestApprovalResult =
+        serde_json::from_value(command["result"].clone()).expect("command decision");
+    assert_eq!(
+        adapter
+            .command_execution_request_approval_response(&command_result)
+            .expect("command approval response"),
+        command["result"]
+    );
+
+    let file = reverse
+        .iter()
+        .find(|entry| entry["method"] == "item/fileChange/requestApproval")
+        .expect("file approval fixture");
+    assert_eq!(
+        adapter
+            .file_change_request_approval_params(file["params"].clone())
+            .expect("file approval params")
+            .item_id,
+        "file-change-contract-1"
+    );
+    let file_result: types::FileChangeRequestApprovalResult =
+        serde_json::from_value(file["result"].clone()).expect("file decision");
+    assert_eq!(
+        adapter
+            .file_change_request_approval_response(&file_result)
+            .expect("file approval response"),
+        file["result"]
+    );
+
+    let permissions = reverse
+        .iter()
+        .find(|entry| entry["method"] == "item/permissions/requestApproval")
+        .expect("permissions approval fixture");
+    assert_eq!(
+        adapter
+            .permissions_request_approval_params(permissions["params"].clone())
+            .expect("permissions approval params")
+            .item_id,
+        "permissions-contract-1"
+    );
+    let permissions_result: types::PermissionsRequestApprovalResult =
+        serde_json::from_value(permissions["result"].clone()).expect("permission grant");
+    assert_eq!(
+        adapter
+            .permissions_request_approval_response(&permissions_result)
+            .expect("permissions approval response"),
+        permissions["result"]
+    );
+}
+
+#[test]
+fn promoted_approval_variants_encode_with_the_exact_schema_keys() {
+    let adapter = WireAdapter::V0_149_0;
+    let execpolicy = types::CommandExecutionRequestApprovalResult {
+        decision: types::CommandExecutionApprovalDecision::AcceptWithExecpolicyAmendment {
+            amendment: types::ExecpolicyAmendment {
+                execpolicy_amendment: vec!["allow prefix".to_owned()],
+            },
+        },
+    };
+    assert_eq!(
+        adapter
+            .command_execution_request_approval_response(&execpolicy)
+            .expect("execpolicy amendment should encode"),
+        json!({
+            "decision": {
+                "acceptWithExecpolicyAmendment": {
+                    "execpolicy_amendment": ["allow prefix"]
+                }
+            }
+        })
+    );
+
+    let network = types::CommandExecutionRequestApprovalResult {
+        decision: types::CommandExecutionApprovalDecision::ApplyNetworkPolicyAmendment {
+            amendment: types::NetworkPolicyAmendmentEnvelope {
+                network_policy_amendment: types::NetworkPolicyAmendment {
+                    action: types::NetworkPolicyAction::Allow,
+                    host: "example.invalid".to_owned(),
+                },
+            },
+        },
+    };
+    assert_eq!(
+        adapter
+            .command_execution_request_approval_response(&network)
+            .expect("network amendment should encode"),
+        json!({
+            "decision": {
+                "applyNetworkPolicyAmendment": {
+                    "network_policy_amendment": {
+                        "action": "allow",
+                        "host": "example.invalid"
+                    }
+                }
+            }
+        })
+    );
+}
+
+#[test]
+fn promoted_shared_unknown_values_are_preserved_or_rejected_by_policy() {
+    let adapter = WireAdapter::V0_149_0;
+    let unsubscribe = adapter
+        .thread_unsubscribe_response(json!({"status": "futureUnsubscribeState"}))
+        .expect("open unsubscribe state should map");
+    assert_eq!(
+        unsubscribe.status,
+        types::ThreadUnsubscribeStatus::Unknown("futureUnsubscribeState".to_owned())
+    );
+
+    let status = adapter
+        .thread_status_changed_notification(json!({
+            "threadId": "thread-contract-1",
+            "status": {"type": "futureActiveState", "opaque": true}
+        }))
+        .expect("unknown thread state should remain opaque");
+    assert_eq!(status.status["type"], "futureActiveState");
+
+    assert!(
+        serde_json::from_value::<types::CommandExecutionRequestApprovalResult>(
+            json!({"decision": "futureDecision"})
+        )
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<types::FileChangeRequestApprovalResult>(
+            json!({"decision": "futureDecision"})
+        )
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<types::PermissionsRequestApprovalResult>(json!({
+            "permissions": {},
+            "scope": "futureScope"
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<types::PermissionsRequestApprovalResult>(json!({
+            "permissions": "not-an-object"
+        }))
+        .is_err()
+    );
+
+    for params in [
+        json!({"threadId": "thread-contract-1", "sortDirection": "sideways"}),
+        json!({
+            "threadId": "thread-contract-1",
+            "turnId": "turn-contract-1",
+            "sortDirection": "sideways"
+        }),
+    ] {
+        if params.get("turnId").is_some() {
+            let stable: types::ThreadItemsListParams =
+                serde_json::from_value(params).expect("stable open sort direction");
+            assert!(adapter.thread_items_list_params(&stable).is_err());
+        } else {
+            let stable: types::ThreadTurnsListParams =
+                serde_json::from_value(params).expect("stable open sort direction");
+            assert!(adapter.thread_turns_list_params(&stable).is_err());
+        }
+    }
+
+    assert!(
+        serde_json::from_value::<types::TurnSteerParams>(json!({
+            "threadId": "thread-contract-1",
+            "expectedTurnId": "turn-contract-1",
+            "input": [],
+            "additionalContext": {
+                "source": {"kind": "futureKind", "value": "opaque"}
+            }
+        }))
+        .is_err()
+    );
+
+    assert!(
+        serde_json::from_value::<wire::v0_149_0::TurnSteerParams>(json!({
+            "threadId": "thread-contract-1",
+            "input": []
+        }))
+        .is_err(),
+        "the exact expectedTurnId precondition is required"
+    );
+    assert!(
+        WireAdapter::V0_146_0
+            .thread_unsubscribe_response(json!({"status": "unsubscribed"}))
+            .is_err(),
+        "the baseline adapter must reject a shape it never promoted"
+    );
+}
+
+#[test]
+fn shared_profile_catalogs_are_covered_by_the_promoted_contract() {
+    let fixture = contract("0.149.0");
+    let methods: std::collections::BTreeSet<&str> = fixture["exchanges"]
+        .as_array()
+        .expect("exchanges")
+        .iter()
+        .filter_map(|entry| entry["method"].as_str())
+        .collect();
+    let notifications: std::collections::BTreeSet<&str> = fixture["notifications"]
+        .as_array()
+        .expect("notifications")
+        .iter()
+        .filter_map(|entry| entry["method"].as_str())
+        .collect();
+    let reverse: std::collections::BTreeSet<&str> = fixture["reverseRequests"]
+        .as_array()
+        .expect("reverse requests")
+        .iter()
+        .filter_map(|entry| entry["method"].as_str())
+        .collect();
+
+    for profile in [
+        SharedWireProfile::ObserveShared,
+        SharedWireProfile::ResumeShared,
+        SharedWireProfile::MutateShared,
+        SharedWireProfile::QueueShared,
+    ] {
+        assert!(
+            profile
+                .required_methods()
+                .iter()
+                .all(|method| methods.contains(method))
+        );
+        assert!(
+            profile
+                .required_notifications()
+                .iter()
+                .all(|method| notifications.contains(method))
+        );
+        assert!(
+            profile
+                .required_reverse_requests()
+                .iter()
+                .all(|method| reverse.contains(method))
+        );
+    }
 }

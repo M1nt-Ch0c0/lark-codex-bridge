@@ -13,13 +13,13 @@ use tokio::time::{Instant, sleep, sleep_until, timeout};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::channel::MediaKind as ResourceKind;
 use crate::codex::client::{AppServerClient, AppServerEvent, ThreadId, TurnId, TurnOutcome};
 use crate::codex::types::{
     SandboxMode, ThreadResumeParams, ThreadStartParams, TurnSandboxPolicy, TurnStartParams,
     TurnStatus, UserInput,
 };
 use crate::lark::api::ChatMode;
-use crate::lark::api::ResourceKind;
 use crate::lark::bridge::QueuedInboundEvent;
 use crate::lark::normalize::{InboundEvent, MessagePart, ScopeKey};
 use crate::limits::{

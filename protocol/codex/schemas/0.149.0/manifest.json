@@ -1,8 +1,8 @@
 {
   "artifactSha256": {
-    "incomingAudit": "22d00f3562295af85a02aa319d80a47ee4e6df1defc95208635442dcf96e0a51",
-    "normalizedSchema": "c777729937b8e39317f60be35374fccc2250a5169c936a7b0ef080ce89dd81a3",
-    "rustWire": "a65f587d664c8ff7c5841a6d5add02b284e9010deb6da430a833a637684d3418"
+    "incomingAudit": "1cecb2a5a6c709a3513fd385cb739355653fb60d55a0c493beccf03ff5eeee66",
+    "normalizedSchema": "b4da974f1e701e919fd647ebff780463970314e81b2e7676dbfe0acf4140f3a6",
+    "rustWire": "d1f254644600232ade927c2ad7b02ed47701443bb1f57223f924c116324eb511"
   },
   "artifacts": {
     "incomingAudit": "protocol/codex/schemas/0.149.0/incoming-audit.json",
@@ -20,12 +20,12 @@
   ],
   "generator": {
     "name": "lark-codex-bridge/codex-schema",
-    "templateSha256": "4d07c5c97841b0c9fb14aa525e611026543e785347c293ff70498c36051de19e",
-    "version": "1.1.0"
+    "templateSha256": "16be5a6a164d5df4b0eeec06be42c0cfc4a000d3a78dd358acd60b8e8e8d3994",
+    "version": "1.2.1"
   },
-  "lifecycle": "candidate",
+  "lifecycle": "supported",
   "protocolFamily": "codex-app-server-jsonrpc/v1+v2-experimental",
-  "schemaSha256": "c777729937b8e39317f60be35374fccc2250a5169c936a7b0ef080ce89dd81a3",
+  "schemaSha256": "b4da974f1e701e919fd647ebff780463970314e81b2e7676dbfe0acf4140f3a6",
   "selectedRoots": [
     "initialize.params",
     "initialize.response",
@@ -37,10 +37,24 @@
     "thread.read.response",
     "thread.resume.params",
     "thread.resume.response",
+    "thread.unsubscribe.params",
+    "thread.unsubscribe.response",
+    "thread.turns.list.params",
+    "thread.turns.list.response",
+    "thread.items.list.params",
+    "thread.items.list.response",
+    "thread.queue.add.params",
+    "thread.queue.add.response",
+    "thread.queue.list.params",
+    "thread.queue.list.response",
+    "thread.queue.start.params",
+    "thread.queue.start.response",
     "turn.start.params",
     "turn.start.response",
     "turn.interrupt.params",
     "turn.interrupt.response",
+    "turn.steer.params",
+    "turn.steer.response",
     "notification.thread.started",
     "notification.turn.started",
     "notification.item.started",
@@ -50,7 +64,16 @@
     "notification.thread.token_usage.updated",
     "notification.error",
     "notification.turn.completed",
+    "notification.thread.status.changed",
+    "notification.thread.queue.changed",
+    "notification.server_request.resolved",
     "server_request.dynamic_tool_call.params",
-    "server_request.dynamic_tool_call.response"
+    "server_request.dynamic_tool_call.response",
+    "server_request.command_execution.request_approval.params",
+    "server_request.command_execution.request_approval.response",
+    "server_request.file_change.request_approval.params",
+    "server_request.file_change.request_approval.response",
+    "server_request.permissions.request_approval.params",
+    "server_request.permissions.request_approval.response"
   ]
 }

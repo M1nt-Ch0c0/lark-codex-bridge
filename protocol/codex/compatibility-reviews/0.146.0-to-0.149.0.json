@@ -1,0 +1,14 @@
+{
+  "baselineVersion": "0.146.0",
+  "breakingChangeCount": 61,
+  "candidateVersion": "0.149.0",
+  "decision": "supported",
+  "evidence": [
+    "exact_schema_sync_reproduces",
+    "shared_contract_matrix_covers_selected_roots",
+    "incoming_open_values_are_preserved_or_rejected",
+    "outgoing_adapter_rejects_unrepresentable_values"
+  ],
+  "formatVersion": 1,
+  "reportSha256": "a55c6e61cb992c28f2cff9f779c877cb4f3ec62c66d29c68f4a865169c7640eb"
+}

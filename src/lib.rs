@@ -1,4 +1,5 @@
 pub mod app;
+pub mod channel;
 pub mod cli;
 pub mod codex;
 pub mod config;

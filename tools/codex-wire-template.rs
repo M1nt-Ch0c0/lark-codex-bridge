@@ -105,7 +105,7 @@ pub struct ThreadStartParams {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_provider: Option<String>,
-}
+@THREAD_START_VERSION_FIELDS@}
 
 #[derive(Clone, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -412,7 +412,7 @@ pub struct DynamicToolCallParams {
     pub arguments: Value,
 }
 
-#[derive(Clone, Deserialize, PartialEq, Serialize)]
+@SHARED_WIRE_TYPES@#[derive(Clone, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DynamicToolCallResponse {
     pub content_items: Vec<Value>,

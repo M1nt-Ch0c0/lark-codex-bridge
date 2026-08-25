@@ -14,9 +14,9 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::channel::ConversationMode as ChatMode;
 use crate::codex::types::{ApprovalPolicy, SandboxMode};
 use crate::config::{BridgeConfig, ConfigError};
-use crate::lark::api::ChatMode;
 use crate::lark::normalize::InboundEvent;
 use crate::limits::{
     MAX_CONFIG_ALLOW_ROOT_BYTES, MAX_CONFIG_ALLOW_ROOTS, MAX_PLATFORM_PROTECTED_ROOT_BYTES,

@@ -28,6 +28,7 @@ use serde_json::Value;
 use super::error::{LarkError, check_code};
 use super::http::LarkHttp;
 use super::token::TenantTokenProvider;
+pub use crate::channel::{ConversationMode as ChatMode, MediaKind as ResourceKind};
 use crate::limits::{LARK_MAX_RESOURCE_BYTES, LARK_MAX_SEND_BODY_BYTES, LARK_MAX_UPLOAD_BYTES};
 
 const MESSAGES_PATH: &str = "/open-apis/im/v1/messages";
@@ -55,36 +56,6 @@ pub struct BotInfo {
     pub app_name: Option<String>,
     /// Bot `open_id`.
     pub open_id: Option<String>,
-}
-
-/// Conversation mode of a chat, from `GET /open-apis/im/v1/chats/{chat_id}`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChatMode {
-    /// Direct one-to-one chat (`p2p`).
-    P2p,
-    /// Plain group chat (`group`).
-    Group,
-    /// Topic (thread) group (`topic`).
-    Topic,
-}
-
-/// Kind of a message resource, selecting the `type` query parameter on
-/// download.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResourceKind {
-    /// An image resource (`type=image`).
-    Image,
-    /// A file resource (`type=file`).
-    File,
-}
-
-impl ResourceKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Image => "image",
-            Self::File => "file",
-        }
-    }
 }
 
 /// A downloaded message resource.
@@ -456,7 +427,7 @@ impl LarkApi {
         check_path_segment(file_key)?;
         let path = format!(
             "{MESSAGES_PATH}/{message_id}/resources/{file_key}?type={}",
-            kind.as_str()
+            kind.as_provider_str()
         );
         self.with_auth_retry(|token| {
             let path = path.clone();

@@ -23,7 +23,8 @@
       "method": "thread/start",
       "params": {
         "cwd": "/contract/workspace",
-        "ephemeral": true
+        "ephemeral": true,
+        "projectId": "project-contract-1"
       },
       "result": {
         "approvalPolicy": "on-request",
@@ -69,6 +70,7 @@
         ]
       },
       "result": {
+        "backwardsCursor": null,
         "data": [
           {
             "cliVersion": "0.149.0",
@@ -157,6 +159,126 @@
       }
     },
     {
+      "method": "thread/unsubscribe",
+      "params": {
+        "threadId": "thread-contract-1"
+      },
+      "result": {
+        "status": "unsubscribed"
+      }
+    },
+    {
+      "method": "thread/turns/list",
+      "params": {
+        "limit": 20,
+        "sortDirection": "asc",
+        "threadId": "thread-contract-1"
+      },
+      "result": {
+        "backwardsCursor": null,
+        "data": [
+          {
+            "completedAt": null,
+            "durationMs": null,
+            "error": null,
+            "id": "turn-contract-1",
+            "items": [],
+            "startedAt": 1786478401,
+            "status": "inProgress"
+          }
+        ],
+        "nextCursor": null
+      }
+    },
+    {
+      "method": "thread/items/list",
+      "params": {
+        "limit": 20,
+        "sortDirection": "asc",
+        "threadId": "thread-contract-1",
+        "turnId": "turn-contract-1"
+      },
+      "result": {
+        "backwardsCursor": null,
+        "data": [
+          {
+            "item": {
+              "id": "item-contract-1",
+              "text": "contract response",
+              "type": "agentMessage"
+            },
+            "turnId": "turn-contract-1"
+          }
+        ],
+        "nextCursor": null
+      }
+    },
+    {
+      "method": "thread/queue/add",
+      "params": {
+        "clientUserMessageId": "client-message-contract-1",
+        "input": [
+          {
+            "text": "queued contract input",
+            "type": "text"
+          }
+        ],
+        "threadId": "thread-contract-1"
+      },
+      "result": {
+        "queuedSubmission": {
+          "clientUserMessageId": "client-message-contract-1",
+          "id": "queued-contract-1",
+          "input": [
+            {
+              "text": "queued contract input",
+              "type": "text"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "method": "thread/queue/list",
+      "params": {
+        "limit": 20,
+        "threadId": "thread-contract-1"
+      },
+      "result": {
+        "data": [
+          {
+            "clientUserMessageId": "client-message-contract-1",
+            "id": "queued-contract-1",
+            "input": [
+              {
+                "text": "queued contract input",
+                "type": "text"
+              }
+            ]
+          }
+        ],
+        "nextCursor": null
+      }
+    },
+    {
+      "method": "thread/queue/start",
+      "params": {
+        "queuedSubmissionId": "queued-contract-1",
+        "threadId": "thread-contract-1"
+      },
+      "result": {
+        "turn": {
+          "completedAt": null,
+          "durationMs": null,
+          "error": null,
+          "id": "turn-contract-1",
+          "items": [],
+          "startedAt": 1786478401,
+          "status": "inProgress"
+        }
+      }
+    },
+    {
       "method": "turn/start",
       "params": {
         "input": [
@@ -186,6 +308,23 @@
         "turnId": "turn-contract-1"
       },
       "result": {}
+    },
+    {
+      "method": "turn/steer",
+      "params": {
+        "clientUserMessageId": "client-message-contract-2",
+        "expectedTurnId": "turn-contract-1",
+        "input": [
+          {
+            "text": "steer contract input",
+            "type": "text"
+          }
+        ],
+        "threadId": "thread-contract-1"
+      },
+      "result": {
+        "turnId": "turn-contract-1"
+      }
     }
   ],
   "failureCases": [
@@ -219,6 +358,98 @@
     }
   ],
   "formatVersion": 1,
+  "mutationFailureCases": [
+    {
+      "expected": "definitely_not_applied",
+      "method": "turn/steer",
+      "source": "local_validation"
+    },
+    {
+      "expected": "definitely_rejected",
+      "method": "turn/steer",
+      "source": "server_rejection"
+    },
+    {
+      "expected": "uncertain",
+      "method": "turn/steer",
+      "source": "timeout"
+    },
+    {
+      "expected": "uncertain",
+      "method": "turn/steer",
+      "source": "connection_lost"
+    },
+    {
+      "expected": "uncertain",
+      "method": "turn/steer",
+      "source": "malformed_success"
+    },
+    {
+      "expected": "rejected_stale",
+      "method": "turn/steer",
+      "source": "stale_epoch_response"
+    },
+    {
+      "expected": "definitely_not_applied",
+      "method": "thread/queue/add",
+      "source": "local_validation"
+    },
+    {
+      "expected": "definitely_rejected",
+      "method": "thread/queue/add",
+      "source": "server_rejection"
+    },
+    {
+      "expected": "uncertain",
+      "method": "thread/queue/add",
+      "source": "timeout"
+    },
+    {
+      "expected": "uncertain",
+      "method": "thread/queue/add",
+      "source": "connection_lost"
+    },
+    {
+      "expected": "uncertain",
+      "method": "thread/queue/add",
+      "source": "malformed_success"
+    },
+    {
+      "expected": "rejected_stale",
+      "method": "thread/queue/add",
+      "source": "stale_epoch_response"
+    },
+    {
+      "expected": "definitely_not_applied",
+      "method": "thread/queue/start",
+      "source": "local_validation"
+    },
+    {
+      "expected": "definitely_rejected",
+      "method": "thread/queue/start",
+      "source": "server_rejection"
+    },
+    {
+      "expected": "uncertain",
+      "method": "thread/queue/start",
+      "source": "timeout"
+    },
+    {
+      "expected": "uncertain",
+      "method": "thread/queue/start",
+      "source": "connection_lost"
+    },
+    {
+      "expected": "uncertain",
+      "method": "thread/queue/start",
+      "source": "malformed_success"
+    },
+    {
+      "expected": "rejected_stale",
+      "method": "thread/queue/start",
+      "source": "stale_epoch_response"
+    }
+  ],
   "normalNotificationOrder": [
     "thread/started",
     "turn/started",
@@ -368,6 +599,28 @@
           "status": "completed"
         }
       }
+    },
+    {
+      "method": "thread/status/changed",
+      "params": {
+        "status": {
+          "type": "idle"
+        },
+        "threadId": "thread-contract-1"
+      }
+    },
+    {
+      "method": "thread/queue/changed",
+      "params": {
+        "threadId": "thread-contract-1"
+      }
+    },
+    {
+      "method": "serverRequest/resolved",
+      "params": {
+        "requestId": "approval-contract-1",
+        "threadId": "thread-contract-1"
+      }
     }
   ],
   "protocolFamily": "codex-app-server-jsonrpc/v1+v2-experimental",
@@ -393,6 +646,73 @@
         ],
         "success": true
       }
+    },
+    {
+      "method": "item/commandExecution/requestApproval",
+      "params": {
+        "command": "contract command",
+        "itemId": "command-contract-1",
+        "startedAtMs": 1786478401000,
+        "threadId": "thread-contract-1",
+        "turnId": "turn-contract-1"
+      },
+      "result": {
+        "decision": "decline"
+      }
+    },
+    {
+      "method": "item/fileChange/requestApproval",
+      "params": {
+        "itemId": "file-change-contract-1",
+        "startedAtMs": 1786478401000,
+        "threadId": "thread-contract-1",
+        "turnId": "turn-contract-1"
+      },
+      "result": {
+        "decision": "decline"
+      }
+    },
+    {
+      "method": "item/permissions/requestApproval",
+      "params": {
+        "cwd": "/contract/workspace",
+        "itemId": "permissions-contract-1",
+        "permissions": {},
+        "startedAtMs": 1786478401000,
+        "threadId": "thread-contract-1",
+        "turnId": "turn-contract-1"
+      },
+      "result": {
+        "permissions": {},
+        "scope": "turn",
+        "strictAutoReview": false
+      }
+    }
+  ],
+  "unknownValueCases": [
+    {
+      "expected": "preserved_unknown",
+      "surface": "thread/unsubscribe.status"
+    },
+    {
+      "expected": "preserved_unknown",
+      "surface": "thread/status/changed.status"
+    },
+    {
+      "expected": "rejected_unknown",
+      "surface": "item/commandExecution/requestApproval.result"
+    },
+    {
+      "expected": "rejected_unknown",
+      "surface": "item/fileChange/requestApproval.result"
+    },
+    {
+      "expected": "rejected_unknown",
+      "surface": "item/permissions/requestApproval.result"
+    },
+    {
+      "expected": "rejected_unknown",
+      "surface": "required.notification.method"
     }
   ]
 }
