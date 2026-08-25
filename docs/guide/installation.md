@@ -12,7 +12,10 @@
 
 ## 2. 校验
 
-如果 Release 同时提供 SHA-256 文件，应在安装前校验。
+安装前必须完成完整性校验。Release 需要提供 SHA-256 校验和文件或发布签名；两者都没有时
+停止安装，不要执行该二进制。
+
+SHA-256 校验：
 
 Linux：
 
@@ -60,7 +63,7 @@ lark-codex-bridge.exe --version
 ## 4. 运行依赖
 
 - Codex CLI 已安装并登录；
-- 当前 bridge 代码支持 `codex-cli 0.146.x`；
+- 当前 bridge 精确支持 `codex-cli 0.146.0` 和 `0.149.0`；
 - 能访问对应租户的飞书或 Lark OpenAPI 与 WebSocket endpoint；
 - 本地时钟和系统证书正常。
 

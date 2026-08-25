@@ -9,7 +9,7 @@ initialize、thread/turn 生命周期、事件订阅、中断和进程重启。
 
 ## 版本和启动
 
-当前默认分支支持 `codex-cli 0.146.x`。启动前严格执行 `codex --version`，输出必须符合：
+当前默认分支精确支持 `codex-cli 0.146.0` 和 `0.149.0`。启动前严格执行 `codex --version`，输出必须符合：
 
 ```text
 codex-cli X.Y.Z

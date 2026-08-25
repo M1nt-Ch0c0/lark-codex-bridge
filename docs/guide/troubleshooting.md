@@ -25,7 +25,7 @@ lark-codex-bridge codex probe
 codex --version
 ```
 
-当前支持 `codex-cli 0.146.x`。还应确认 Codex 已登录、`codex app-server` 可以启动、
+当前精确支持 `codex-cli 0.146.0` 和 `0.149.0`。还应确认 Codex 已登录、`codex app-server` 可以启动、
 `CODEX_HOME` 可访问。
 
 probe 超时或 app-server 退出时，先单独修复 Codex 环境，不要同时排查 Lark。
@@ -58,7 +58,8 @@ WebSocket ping/pong 问题。probe 只报告 endpoint host，不会输出完整�
 
 - 确认机器人已经加入会话；
 - 群聊/话题必须直接 @机器人；
-- sender 必须在 owners 中；
+- sender 必须是人类，且满足其一：在 `owners` 中、在 `allowed_senders` 中，或所在群聊命中
+  `allowed_groups`（P2P 不适用群白名单）；
 - `@all` 不算直接 mention；
 - 检查应用事件权限和长连接订阅；
 - 使用 `RUST_LOG=debug` 查看脱敏的忽略原因。
