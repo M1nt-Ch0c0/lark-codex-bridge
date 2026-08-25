@@ -12,14 +12,16 @@ use lark_codex_bridge::{
             ExternalAuthentication, ExternalCapabilityProfile, ExternalEndpointConfig,
             ExternalEndpointGate,
         },
-        external_recovery::{ExternalRecoveryCoordinator, ExternalRecoverySettings},
+        external_recovery::{
+            ExternalRecoveryCoordinator, ExternalRecoverySettings, ExternalRecoveryState,
+        },
         types::ThreadResumeParams,
     },
     limits::{EXTERNAL_RECONCILE_EVENT_CAPACITY, EXTERNAL_RECONCILE_PAGE_CAPACITY},
     store::{ExternalThreadState, ExternalUncertaintyReason, StoreHandle},
 };
 use serde_json::{Value, json};
-use tokio::{net::TcpListener, task::JoinHandle, time::timeout};
+use tokio::{net::TcpListener, sync::Notify, task::JoinHandle, time::timeout};
 use tokio_tungstenite::{
     WebSocketStream, accept_hdr_async,
     tungstenite::{
@@ -47,7 +49,7 @@ fn resume_snapshot_request_promotes_only_exact_exclude_turns_field() {
     assert!(WireAdapter::V0_146_0.thread_resume_params(&params).is_err());
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum SessionBehavior {
     DropAt(&'static str),
     HoldAt(&'static str),
@@ -55,6 +57,7 @@ enum SessionBehavior {
     Overflow,
     PageLimit,
     WrongThread,
+    RemoteControlStatus(Arc<Notify>),
 }
 
 struct FakeRecoveryServer {
@@ -203,6 +206,14 @@ async fn serve_session(
             }
         }
         send_result(socket, &request, result).await;
+        if let (SessionBehavior::RemoteControlStatus(signal), "thread/items/list") =
+            (&behavior, method)
+        {
+            signal.notified().await;
+            send_json(socket, remote_control_notification()).await;
+            let _ = timeout(TEST_TIMEOUT, socket.next()).await;
+            return;
+        }
     }
 }
 
@@ -469,6 +480,49 @@ async fn cross_thread_snapshot_is_fenced_as_protocol_uncertainty() {
     assert_read_only(server.finish().await);
 }
 
+#[tokio::test]
+async fn ready_state_ignores_remote_control_status_notifications() {
+    let signal = Arc::new(Notify::new());
+    let server = FakeRecoveryServer::start(vec![SessionBehavior::RemoteControlStatus(Arc::clone(
+        &signal,
+    ))])
+    .await;
+    let scratch = tempfile::tempdir().expect("scratch");
+    let token_path = scratch.path().join("bearer");
+    write_token(&token_path);
+    let (store, coordinator) = seeded_coordinator(&server.endpoint, &token_path).await;
+    let ready_epoch = coordinator
+        .wait_for_ready_after(0, TEST_TIMEOUT)
+        .await
+        .expect("ready");
+    let mut states = coordinator.subscribe_state();
+    signal.notify_one();
+    let churned = timeout(Duration::from_millis(500), async {
+        loop {
+            states.changed().await.expect("recovery state remains open");
+            let state = *states.borrow_and_update();
+            if !matches!(state, ExternalRecoveryState::Ready { epoch } if epoch == ready_epoch) {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        churned.is_err(),
+        "remoteControl/status/changed must not fence the ready epoch"
+    );
+    let snapshot = coordinator
+        .thread_snapshot(THREAD_ID)
+        .await
+        .expect("snapshot")
+        .expect("managed");
+    assert_eq!(snapshot.epoch, ready_epoch);
+    assert_eq!(snapshot.state, ExternalThreadState::Ready);
+    coordinator.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+    assert_read_only(server.finish().await);
+}
+
 #[test]
 fn recovery_source_has_no_process_or_write_ownership_surface() {
     let source = include_str!("../src/codex/external_recovery.rs");
@@ -533,6 +587,18 @@ fn contract_notification(method: &str) -> Value {
         .find(|notification| notification["method"] == method)
         .unwrap_or_else(|| panic!("contract notification {method}"))
         .clone()
+}
+
+fn remote_control_notification() -> Value {
+    json!({
+        "method": "remoteControl/status/changed",
+        "params": {
+            "environmentId": null,
+            "installationId": "installation-contract-1",
+            "serverName": "contract-server",
+            "status": "ready"
+        }
+    })
 }
 
 async fn recv_json(socket: &mut WebSocketStream<tokio::net::TcpStream>) -> Value {

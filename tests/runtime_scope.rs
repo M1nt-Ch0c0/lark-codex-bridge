@@ -7,16 +7,18 @@ use std::sync::{
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use fs2::FileExt;
 use futures_util::{FutureExt, future::BoxFuture};
 use lark_codex_bridge::codex::process::{CodexProcessConfig, ProcessError};
 use lark_codex_bridge::codex::supervisor::AppServerSupervisor;
-use lark_codex_bridge::config::{BridgeConfig, WorkspacePolicy};
+use lark_codex_bridge::config::{AsrSection, BridgeConfig, WorkspacePolicy};
 use lark_codex_bridge::lark::api::{ChatMode, ResourceKind};
 use lark_codex_bridge::lark::bridge::QueuedInboundEvent;
 use lark_codex_bridge::lark::config::TenantBrand;
 use lark_codex_bridge::lark::credentials::LarkCredentials;
 use lark_codex_bridge::lark::normalize::{
-    InboundEvent, MediaMetadata, MediaPart, MessagePart, PartStatus, ResourceDesc, ScopeKey,
+    InboundEvent, MediaMetadata, MediaPart, MentionIdentity, MessagePart, PartStatus, ResourceDesc,
+    ScopeKey, TranscriptFailure,
 };
 use lark_codex_bridge::limits::{
     ROUTER_ACTIVE_TURN_HARD_LIMIT, ROUTER_COMMAND_BYTE_BUDGET, ROUTER_RETRY_CAPACITY,
@@ -25,12 +27,16 @@ use lark_codex_bridge::limits::{
 use lark_codex_bridge::runtime::attachments::{
     AttachError, AttachmentCache, AttachmentLimits, ResourceDownloader,
 };
-use lark_codex_bridge::runtime::context::ContextRegistry;
+use lark_codex_bridge::runtime::context::{
+    ContextRegistry, ContextRegistryConfig, DraftPart, MediaKind,
+    MediaMetadata as ContextMediaMetadata, QuoteDraft, QuoteStatus,
+};
 use lark_codex_bridge::runtime::intake::TenantNamespace;
 use lark_codex_bridge::runtime::policy::AccessPolicy;
+use lark_codex_bridge::runtime::quote::{QuoteRequest, QuoteResolver};
 use lark_codex_bridge::runtime::router::{RouteError, Router, RouterSettings};
 use lark_codex_bridge::runtime::scope::{
-    DurableReplySink, InterruptOutcome, ReplySinkError, TurnFinalization, TurnProgress,
+    DurableReplySink, InterruptOutcome, ReplySinkError, ScopeState, TurnFinalization, TurnProgress,
 };
 use lark_codex_bridge::store::{
     BeginTurnOutcome, DedupOutcome, InboundEventState, InboundKey, InboundRejectionKind,
@@ -45,6 +51,24 @@ use tokio::time::{sleep, timeout};
 
 use fakecodex::{FakeFactory, FakeOutcome, test_settings};
 
+// Process-heavy ASR cases share the host process table and system temp root.
+// Serializing only those cases keeps their short fake-RPC deadlines
+// deterministic while the rest of this large integration suite stays parallel.
+static ASR_SUBPROCESS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn lock_asr_process_tests() -> std::fs::File {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(std::env::temp_dir().join("lark-codex-bridge-asr-process-tests.lock"))
+        .expect("open shared ASR process-test lock");
+    file.lock_exclusive()
+        .expect("lock shared ASR process-test file");
+    file
+}
+
 #[derive(Default)]
 struct RecordingSink {
     rejections: Mutex<Vec<InboundRejectionKind>>,
@@ -53,6 +77,26 @@ struct RecordingSink {
 }
 
 struct StaticAttachmentDownloader;
+
+#[derive(Default)]
+struct RecordingAttachmentDownloader {
+    calls: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+#[derive(Default)]
+struct MeteredAttachmentDownloader {
+    calls: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+#[derive(Default)]
+struct RecordingQuoteResolver {
+    calls: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+#[derive(Default)]
+struct RecordingAudioQuoteResolver {
+    calls: Arc<Mutex<Vec<(String, String)>>>,
+}
 
 struct PendingAttachmentDownloader {
     started: Arc<AtomicUsize>,
@@ -78,9 +122,105 @@ impl ResourceDownloader for StaticAttachmentDownloader {
         let bytes = match key {
             "img_key" => Bytes::from_static(b"fake-image-bytes"),
             "file_key" => Bytes::from_static(b"fake-file-bytes"),
+            "aud_key" => Bytes::from_static(b"fake-opus-bytes"),
             _ => Bytes::from_static(b"fallback-attachment"),
         };
         async move { Ok(bytes) }.boxed()
+    }
+}
+
+impl ResourceDownloader for RecordingAttachmentDownloader {
+    fn download(
+        &self,
+        message_id: &str,
+        key: &str,
+        _kind: ResourceKind,
+    ) -> BoxFuture<'static, Result<Bytes, AttachError>> {
+        self.calls
+            .lock()
+            .expect("download calls")
+            .push((message_id.to_owned(), key.to_owned()));
+        async { Ok(Bytes::from_static(b"quoted-or-pending-image")) }.boxed()
+    }
+}
+
+impl ResourceDownloader for MeteredAttachmentDownloader {
+    fn download(
+        &self,
+        message_id: &str,
+        key: &str,
+        _kind: ResourceKind,
+    ) -> BoxFuture<'static, Result<Bytes, AttachError>> {
+        self.calls
+            .lock()
+            .expect("download calls")
+            .push((message_id.to_owned(), key.to_owned()));
+        let bytes = match key {
+            "meter_key_0" => Bytes::from_static(b"0000"),
+            "meter_key_1" => Bytes::from_static(b"1111"),
+            _ => Bytes::from_static(b"2222"),
+        };
+        async move { Ok(bytes) }.boxed()
+    }
+}
+
+impl QuoteResolver for RecordingQuoteResolver {
+    fn resolve(&self, request: QuoteRequest) -> BoxFuture<'static, QuoteDraft> {
+        self.calls
+            .lock()
+            .expect("quote calls")
+            .push((request.parent_message_id.clone(), request.chat_id));
+        async move {
+            QuoteDraft {
+                message_id: request.parent_message_id,
+                message_type: Some("image".to_owned()),
+                status: QuoteStatus::Available,
+                parts: vec![DraftPart::Media {
+                    kind: MediaKind::Image,
+                    resource: ResourceDesc {
+                        kind: ResourceKind::Image,
+                        key: "quoted_key".to_owned(),
+                    },
+                    thumbnail: None,
+                    metadata: ContextMediaMetadata::default(),
+                    transcript_failure: None,
+                }],
+            }
+        }
+        .boxed()
+    }
+}
+
+impl QuoteResolver for RecordingAudioQuoteResolver {
+    fn resolve(&self, request: QuoteRequest) -> BoxFuture<'static, QuoteDraft> {
+        self.calls
+            .lock()
+            .expect("quote calls")
+            .push((request.parent_message_id.clone(), request.chat_id));
+        async move {
+            QuoteDraft {
+                message_id: request.parent_message_id,
+                message_type: Some("audio".to_owned()),
+                status: QuoteStatus::Available,
+                parts: vec![DraftPart::Media {
+                    kind: MediaKind::Audio,
+                    resource: ResourceDesc {
+                        kind: ResourceKind::File,
+                        key: "quoted_audio_key".to_owned(),
+                    },
+                    thumbnail: None,
+                    metadata: ContextMediaMetadata {
+                        duration_ms: Some(800),
+                        ..ContextMediaMetadata::default()
+                    },
+                    // Mirrors a fetched Lark parent carrying valid recognition:
+                    // the text is intentionally absent, while the live-only
+                    // marker must not block byte-backed quote ASR.
+                    transcript_failure: Some(TranscriptFailure::NotRetained),
+                }],
+            }
+        }
+        .boxed()
     }
 }
 
@@ -302,6 +442,32 @@ fn event_in_chat(event_id: &str, sender_id: &str, chat_id: &str) -> InboundEvent
     }
 }
 
+fn image_event(event_id: &str, key: &str) -> InboundEvent {
+    let mut inbound = event(event_id, "owner-runtime-scope");
+    inbound.text.clear();
+    "image".clone_into(&mut inbound.message_type);
+    inbound.parts = vec![MessagePart::Image(MediaPart {
+        key: Some(key.to_owned()),
+        thumbnail_key: None,
+        metadata: MediaMetadata::default(),
+        status: PartStatus::Available,
+    })];
+    inbound.resources = vec![ResourceDesc {
+        kind: ResourceKind::Image,
+        key: key.to_owned(),
+    }];
+    inbound
+}
+
+fn context_reference(input: &Value) -> Value {
+    let reference = input["text"].as_str().expect("context input text");
+    let payload = reference
+        .strip_prefix("<bridge_context>")
+        .and_then(|value| value.strip_suffix("</bridge_context>"))
+        .expect("context envelope");
+    serde_json::from_str(payload).expect("context reference JSON")
+}
+
 fn now_ms() -> i64 {
     i64::try_from(
         SystemTime::now()
@@ -325,6 +491,185 @@ fn validated_config() -> BridgeConfig {
     };
     config.validate().expect("valid runtime config");
     config
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DebounceInvalidator {
+    ExplicitQuote,
+    ResetCommand,
+    ControlInterrupt,
+}
+
+#[allow(clippy::too_many_lines)]
+async fn assert_debounce_invalidates_reserved_media(mode: DebounceInvalidator) {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config).with_test_timings(
+        Duration::from_millis(300),
+        Duration::from_secs(60),
+        Duration::from_millis(10),
+    );
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let temp = tempdir().expect("tempdir");
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &temp.path().join("debounce-invalidation-cache"),
+            store.clone(),
+            Arc::new(StaticAttachmentDownloader),
+            AttachmentLimits::default(),
+        )
+        .expect("cache"),
+    );
+    let contexts = Arc::new(ContextRegistry::default());
+    let resolver = Arc::new(RecordingQuoteResolver::default());
+    let quote_calls = Arc::clone(&resolver.calls);
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start_with_contexts_and_quotes(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        Arc::new(RecordingSink::default()),
+        Arc::clone(&cache),
+        contexts,
+        resolver,
+    )
+    .await
+    .expect("router");
+    let scope = ScopeKey::Chat("chat-runtime-scope".to_owned());
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                image_event("debounce-reserved-media", "debounce_reserved_key"),
+            )
+            .await,
+        )
+        .await
+        .expect("stage media");
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["debounce-reserved-media"],
+        InboundEventState::Completed,
+    )
+    .await;
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("debounce-reserving-trigger", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("route reserving trigger");
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if router
+                .scope_snapshot(&scope)
+                .await
+                .expect("snapshot")
+                .is_some_and(|snapshot| {
+                    snapshot.state == ScopeState::Debouncing && snapshot.pending_media == 0
+                })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("ordinary text holds the reservation during debounce");
+
+    let invalidator_id = match mode {
+        DebounceInvalidator::ExplicitQuote => {
+            let mut explicit = event("debounce-explicit-quote", "owner-runtime-scope");
+            "prefer this explicit quote".clone_into(&mut explicit.text);
+            explicit.reply_to_message_id = Some("om_parent".to_owned());
+            router
+                .route(queued_registered(&store, &namespace, explicit).await)
+                .await
+                .expect("route explicit quote");
+            Some("debounce-explicit-quote")
+        }
+        DebounceInvalidator::ResetCommand => {
+            let mut reset = event("debounce-reset-command", "owner-runtime-scope");
+            "/new".clone_into(&mut reset.text);
+            router
+                .route(queued_registered(&store, &namespace, reset).await)
+                .await
+                .expect("route reset");
+            Some("debounce-reset-command")
+        }
+        DebounceInvalidator::ControlInterrupt => {
+            assert_eq!(
+                router.interrupt(&scope).await.expect("interrupt"),
+                InterruptOutcome::NoActiveTurn
+            );
+            None
+        }
+    };
+
+    let start_thread = control.next_request().await;
+    control
+        .respond(
+            &start_thread,
+            thread_result("thread-debounce-invalidation", &workspace),
+        )
+        .await;
+    let start_turn = control.next_request().await;
+    let context_references = start_turn["params"]["input"]
+        .as_array()
+        .expect("inputs")
+        .iter()
+        .filter_map(|input| input["text"].as_str())
+        .filter_map(|text| {
+            text.strip_prefix("<bridge_context>")
+                .and_then(|value| value.strip_suffix("</bridge_context>"))
+        })
+        .map(|reference| serde_json::from_str::<Value>(reference).expect("context JSON"))
+        .collect::<Vec<_>>();
+    assert!(
+        context_references
+            .iter()
+            .all(|reference| reference["wake"] != "pending_media"),
+        "{mode:?} must invalidate the reservation already held by the batch"
+    );
+    assert_eq!(
+        quote_calls.lock().expect("quote calls").len(),
+        usize::from(matches!(mode, DebounceInvalidator::ExplicitQuote))
+    );
+    respond_turn_started(&control, &start_turn, "turn-debounce-invalidation").await;
+    send_turn_completed(
+        &control,
+        "thread-debounce-invalidation",
+        "turn-debounce-invalidation",
+        "completed",
+    )
+    .await;
+    let mut completed = vec!["debounce-reserving-trigger"];
+    if let Some(invalidator_id) = invalidator_id {
+        completed.push(invalidator_id);
+    }
+    wait_for_inbound_states(&store, &namespace, &completed, InboundEventState::Completed).await;
+    assert_eq!(
+        router
+            .scope_snapshot(&scope)
+            .await
+            .expect("snapshot")
+            .expect("actor")
+            .pending_media,
+        0
+    );
+    router.shutdown().await.expect("shutdown");
+    drop(cache);
+    store.shutdown().await.expect("store shutdown");
 }
 
 async fn degraded_supervisor() -> lark_codex_bridge::codex::supervisor::SupervisorHandle {
@@ -480,10 +825,35 @@ async fn queued_registered(
         .acquire_many_owned(u32::try_from(bytes).expect("retained bytes fit"))
         .await
         .expect("byte permit");
-    QueuedInboundEvent {
-        event: *retained.into_event(),
+    QueuedInboundEvent::new(*retained.into_event(), permit)
+}
+
+async fn queued_registered_with_live_transcript(
+    store: &StoreHandle,
+    namespace: &TenantNamespace,
+    event: InboundEvent,
+    transcript: &str,
+) -> QueuedInboundEvent {
+    let retained = match store
+        .register_inbound(namespace, &event)
+        .await
+        .expect("register")
+    {
+        DedupOutcome::New(retained) | DedupOutcome::ReplayReceived(retained) => retained,
+        duplicate @ DedupOutcome::Duplicate { .. } => {
+            panic!("expected retained event, got {duplicate:?}")
+        }
+    };
+    let bytes = retained.retained_bytes();
+    let permit = Arc::new(Semaphore::new(bytes))
+        .acquire_many_owned(u32::try_from(bytes).expect("retained bytes fit"))
+        .await
+        .expect("byte permit");
+    QueuedInboundEvent::from_authenticated_event(
+        *retained.into_event(),
         permit,
-    }
+        vec![(0, transcript.to_owned())],
+    )
 }
 
 async fn queued_synthetic(event: InboundEvent, retained_bytes: usize) -> QueuedInboundEvent {
@@ -491,7 +861,7 @@ async fn queued_synthetic(event: InboundEvent, retained_bytes: usize) -> QueuedI
         .acquire_many_owned(u32::try_from(retained_bytes).expect("retained bytes fit"))
         .await
         .expect("synthetic retained permit");
-    QueuedInboundEvent { event, permit }
+    QueuedInboundEvent::new(event, permit)
 }
 
 async fn wait_for_inbound_states(
@@ -1170,6 +1540,1636 @@ async fn lazy_context_resolves_metadata_and_fetches_media_only_on_tool_call() {
         &store,
         &namespace,
         &["event-lazy-context"],
+        InboundEventState::Completed,
+    )
+    .await;
+    router.shutdown().await.expect("shutdown");
+    drop(cache);
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn bridge_media_read_meters_distinct_and_repeated_handles_before_cache_or_lease() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let temp = tempdir().expect("tempdir");
+    let downloader = Arc::new(MeteredAttachmentDownloader::default());
+    let calls = Arc::clone(&downloader.calls);
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &temp.path().join("metered-media"),
+            store.clone(),
+            downloader,
+            AttachmentLimits {
+                max_attachment_bytes: 8,
+                ..AttachmentLimits::default()
+            },
+        )
+        .expect("cache"),
+    );
+    let contexts = Arc::new(
+        ContextRegistry::new(ContextRegistryConfig {
+            max_media_reads_per_turn: 5,
+            max_media_read_bytes_per_turn: 13,
+            // Deliberately smaller than the cache cap: the production tool
+            // path must reserve the downstream cache maximum, not trust this
+            // direct-authorization fallback.
+            max_media_read_bytes_per_item: 1,
+            ..ContextRegistryConfig::default()
+        })
+        .expect("metered registry"),
+    );
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start_with_contexts(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        Arc::new(RecordingSink::default()),
+        Arc::clone(&cache),
+        contexts,
+    )
+    .await
+    .expect("router");
+
+    let mut inbound = event("event-metered-media", "owner-runtime-scope");
+    inbound.parts = ["meter_key_0", "meter_key_1", "meter_key_2"]
+        .into_iter()
+        .map(|key| {
+            MessagePart::Image(MediaPart {
+                key: Some(key.to_owned()),
+                thumbnail_key: None,
+                metadata: MediaMetadata::default(),
+                status: PartStatus::Available,
+            })
+        })
+        .collect();
+    router
+        .route(queued_registered(&store, &namespace, inbound).await)
+        .await
+        .expect("route media event");
+    let start_thread = control.next_request().await;
+    control
+        .respond(
+            &start_thread,
+            thread_result("thread-metered-media", &workspace),
+        )
+        .await;
+    let start_turn = control.next_request().await;
+    let reference = start_turn["params"]["input"]
+        .as_array()
+        .expect("inputs")
+        .iter()
+        .filter_map(|input| input["text"].as_str())
+        .find_map(|text| {
+            text.strip_prefix("<bridge_context>")
+                .and_then(|value| value.strip_suffix("</bridge_context>"))
+        })
+        .expect("context reference");
+    let reference: Value = serde_json::from_str(reference).expect("context reference JSON");
+    let context_id = reference["id"].as_str().expect("context id").to_owned();
+    respond_turn_started(&control, &start_turn, "turn-metered-media").await;
+    control
+        .send_json(json!({
+            "id": "resolve-metered-media",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-metered-media",
+                "turnId": "turn-metered-media",
+                "callId": "resolve-metered-media",
+                "namespace": "bridge_context",
+                "tool": "resolve",
+                "arguments": {"id": context_id}
+            }
+        }))
+        .await;
+    let resolved = control.next_request().await;
+    let body: Value = serde_json::from_str(
+        resolved["result"]["contentItems"][0]["text"]
+            .as_str()
+            .expect("resolved context"),
+    )
+    .expect("resolved JSON");
+    let handles = body["parts"]
+        .as_array()
+        .expect("parts")
+        .iter()
+        .map(|part| part["handle"].as_str().expect("media handle").to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(handles.len(), 3);
+
+    for (request_id, handle) in [
+        ("read-meter-0", handles[0].as_str()),
+        ("read-meter-1", handles[1].as_str()),
+        ("read-meter-1-repeat", handles[1].as_str()),
+    ] {
+        let response = read_media(
+            &control,
+            "thread-metered-media",
+            "turn-metered-media",
+            request_id,
+            &context_id,
+            handle,
+        )
+        .await;
+        assert_eq!(response["result"]["success"], true, "{request_id}");
+    }
+    assert_eq!(
+        calls.lock().expect("calls").len(),
+        3,
+        "the repeated handle is independently materialized and charged"
+    );
+
+    for (request_id, handle) in [
+        ("read-meter-distinct-denied", handles[2].as_str()),
+        ("read-meter-repeat-denied", handles[0].as_str()),
+    ] {
+        let response = read_media(
+            &control,
+            "thread-metered-media",
+            "turn-metered-media",
+            request_id,
+            &context_id,
+            handle,
+        )
+        .await;
+        assert_eq!(response["result"]["success"], false, "{request_id}");
+        let error: Value = serde_json::from_str(
+            response["result"]["contentItems"][0]["text"]
+                .as_str()
+                .expect("error body"),
+        )
+        .expect("error JSON");
+        assert_eq!(error["error"]["code"], "capacity_exceeded");
+    }
+    assert_eq!(
+        calls.lock().expect("calls").len(),
+        3,
+        "over-budget reads fail before downloader I/O"
+    );
+    let attachments = store.list_attachments().await.expect("attachments");
+    assert_eq!(attachments.len(), 2, "denied handle creates no cache row");
+    let mut lease_counts = Vec::with_capacity(attachments.len());
+    for attachment in &attachments {
+        lease_counts.push(
+            store
+                .attachment_leases(&attachment.sha256)
+                .await
+                .expect("leases")
+                .len(),
+        );
+    }
+    lease_counts.sort_unstable();
+    assert_eq!(
+        lease_counts,
+        [1, 2],
+        "the repeated successful read owns an independent revocable lease"
+    );
+
+    send_turn_completed(
+        &control,
+        "thread-metered-media",
+        "turn-metered-media",
+        "completed",
+    )
+    .await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-metered-media"],
+        InboundEventState::Completed,
+    )
+    .await;
+    router.shutdown().await.expect("shutdown");
+    drop(cache);
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn p2p_media_stages_without_a_turn_and_next_text_consumes_it_once_lazily() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let temp = tempdir().expect("tempdir");
+    let downloader = Arc::new(RecordingAttachmentDownloader::default());
+    let calls = Arc::clone(&downloader.calls);
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &temp.path().join("pending-media-cache"),
+            store.clone(),
+            downloader,
+            AttachmentLimits::default(),
+        )
+        .expect("cache"),
+    );
+    let contexts = Arc::new(ContextRegistry::default());
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start_with_contexts(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        Arc::new(RecordingSink::default()),
+        Arc::clone(&cache),
+        contexts,
+    )
+    .await
+    .expect("router");
+
+    for (event_id, key) in [
+        ("pending-one", "pending_key_one"),
+        ("pending-two", "pending_key_two"),
+    ] {
+        router
+            .route(queued_registered(&store, &namespace, image_event(event_id, key)).await)
+            .await
+            .expect("stage image");
+    }
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["pending-one", "pending-two"],
+        InboundEventState::Completed,
+    )
+    .await;
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if router
+                .scope_snapshot(&ScopeKey::Chat("chat-runtime-scope".to_owned()))
+                .await
+                .expect("snapshot")
+                .is_some_and(|snapshot| snapshot.pending_media == 2)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("two pending descriptors");
+    assert!(calls.lock().expect("download calls").is_empty());
+    assert_eq!(router.snapshot().active_turns, 0);
+
+    let trigger = event("pending-trigger", "owner-runtime-scope");
+    router
+        .route(queued_registered(&store, &namespace, trigger).await)
+        .await
+        .expect("route trigger");
+    let start_thread = control.next_request().await;
+    control
+        .respond(
+            &start_thread,
+            thread_result("thread-pending-media", &workspace),
+        )
+        .await;
+    let start_turn = control.next_request().await;
+    let inputs = start_turn["params"]["input"].as_array().expect("inputs");
+    assert_eq!(inputs.len(), 4, "one text plus three context references");
+    assert_eq!(inputs[0]["text"], "hello");
+    let first_pending = context_reference(&inputs[1]);
+    assert_eq!(first_pending["wake"], "pending_media");
+    assert_eq!(context_reference(&inputs[2])["wake"], "pending_media");
+    assert_eq!(context_reference(&inputs[3])["wake"], "message");
+    let prompt = serde_json::to_string(inputs).expect("serialize prompt");
+    assert!(!prompt.contains("pending_key_one"));
+    assert!(!prompt.contains("pending_key_two"));
+    assert!(calls.lock().expect("download calls").is_empty());
+
+    respond_turn_started(&control, &start_turn, "turn-pending-media").await;
+    let context_id = first_pending["id"].as_str().expect("context ID");
+    control
+        .send_json(json!({
+            "id": "resolve-pending-media",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-pending-media",
+                "turnId": "turn-pending-media",
+                "callId": "call-resolve-pending-media",
+                "namespace": "bridge_context",
+                "tool": "resolve",
+                "arguments": {"id": context_id}
+            }
+        }))
+        .await;
+    let response = control.next_request().await;
+    let body: Value = serde_json::from_str(
+        response["result"]["contentItems"][0]["text"]
+            .as_str()
+            .expect("resolve text"),
+    )
+    .expect("resolve JSON");
+    let handle = body["parts"][0]["handle"].as_str().expect("media handle");
+    assert!(!body.to_string().contains("pending_key_one"));
+    let response = read_media(
+        &control,
+        "thread-pending-media",
+        "turn-pending-media",
+        "read-pending-media",
+        context_id,
+        handle,
+    )
+    .await;
+    assert_eq!(response["result"]["success"], true);
+    assert_eq!(
+        *calls.lock().expect("download calls"),
+        vec![(
+            "message-pending-one".to_owned(),
+            "pending_key_one".to_owned()
+        )]
+    );
+
+    send_turn_completed(
+        &control,
+        "thread-pending-media",
+        "turn-pending-media",
+        "completed",
+    )
+    .await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["pending-trigger"],
+        InboundEventState::Completed,
+    )
+    .await;
+    let snapshot = router
+        .scope_snapshot(&ScopeKey::Chat("chat-runtime-scope".to_owned()))
+        .await
+        .expect("snapshot")
+        .expect("actor");
+    assert_eq!(snapshot.pending_media, 0, "pending media is single-use");
+    router.shutdown().await.expect("shutdown");
+    drop(cache);
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn pending_media_is_restored_when_the_consuming_turn_is_not_started() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let temp = tempdir().expect("tempdir");
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &temp.path().join("pending-retry-cache"),
+            store.clone(),
+            Arc::new(RecordingAttachmentDownloader::default()),
+            AttachmentLimits::default(),
+        )
+        .expect("cache"),
+    );
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start_with_contexts(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        Arc::new(RecordingSink::default()),
+        cache,
+        Arc::new(ContextRegistry::default()),
+    )
+    .await
+    .expect("router");
+
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                image_event("pending-retry", "pending_retry_key"),
+            )
+            .await,
+        )
+        .await
+        .expect("stage image");
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["pending-retry"],
+        InboundEventState::Completed,
+    )
+    .await;
+
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("pending-failed-trigger", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("route failed trigger");
+    let start_thread = control.next_request().await;
+    control
+        .respond(
+            &start_thread,
+            thread_result("thread-pending-retry", &workspace),
+        )
+        .await;
+    let failed_start = control.next_request().await;
+    assert_eq!(failed_start["method"], "turn/start");
+    control
+        .send_json(json!({
+            "id": failed_start["id"],
+            "error": {"code": -32602, "message": "deliberate start rejection"}
+        }))
+        .await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["pending-failed-trigger"],
+        InboundEventState::Rejected,
+    )
+    .await;
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = router
+                .scope_snapshot(&ScopeKey::Chat("chat-runtime-scope".to_owned()))
+                .await
+                .expect("snapshot")
+                .expect("actor");
+            if snapshot.pending_media == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a definitely rejected start restores staged media");
+
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("pending-retry-trigger", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("route retry trigger");
+    let resume = control.next_request().await;
+    assert_eq!(resume["method"], "thread/resume");
+    control
+        .respond(&resume, thread_result("thread-pending-retry", &workspace))
+        .await;
+    let start_turn = control.next_request().await;
+    let inputs = start_turn["params"]["input"].as_array().expect("inputs");
+    assert_eq!(
+        inputs.len(),
+        3,
+        "text, restored pending context, trigger context"
+    );
+    assert_eq!(context_reference(&inputs[1])["wake"], "pending_media");
+    respond_turn_started(&control, &start_turn, "turn-pending-retry").await;
+    send_turn_completed(
+        &control,
+        "thread-pending-retry",
+        "turn-pending-retry",
+        "completed",
+    )
+    .await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["pending-retry-trigger"],
+        InboundEventState::Completed,
+    )
+    .await;
+    assert_eq!(
+        router
+            .scope_snapshot(&ScopeKey::Chat("chat-runtime-scope".to_owned()))
+            .await
+            .expect("snapshot")
+            .expect("actor")
+            .pending_media,
+        0
+    );
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn uncertain_turn_start_commits_pending_media_instead_of_restoring_it() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = Arc::new(RecordingSink::default());
+    let (supervisor, first_control, second_control) = restarting_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink.clone(),
+    )
+    .await
+    .expect("router");
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                image_event("pending-uncertain", "pending_uncertain_key"),
+            )
+            .await,
+        )
+        .await
+        .expect("stage image");
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["pending-uncertain"],
+        InboundEventState::Completed,
+    )
+    .await;
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("pending-uncertain-trigger", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("route uncertain trigger");
+    let start_thread = first_control.next_request().await;
+    first_control
+        .respond(
+            &start_thread,
+            thread_result("thread-pending-uncertain", &workspace),
+        )
+        .await;
+    let start_turn = first_control.next_request().await;
+    assert_eq!(start_turn["method"], "turn/start");
+    first_control.unexpected_exit();
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["pending-uncertain-trigger"],
+        InboundEventState::Rejected,
+    )
+    .await;
+    assert_eq!(
+        sink.finalizations.lock().expect("finalizations")[0].1,
+        TurnResolution::Uncertain
+    );
+    let scope = ScopeKey::Chat("chat-runtime-scope".to_owned());
+    assert_eq!(
+        router
+            .scope_snapshot(&scope)
+            .await
+            .expect("snapshot")
+            .expect("actor")
+            .pending_media,
+        0,
+        "an ambiguously applied association is never replayed"
+    );
+    second_control
+        .expect_no_request_for(Duration::from_millis(100))
+        .await;
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn p2p_audio_triggers_alone_without_consuming_pending_images() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let temp = tempdir().expect("tempdir");
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &temp.path().join("audio-does-not-consume"),
+            store.clone(),
+            Arc::new(StaticAttachmentDownloader),
+            AttachmentLimits::default(),
+        )
+        .expect("cache"),
+    );
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start_with_contexts(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        Arc::new(RecordingSink::default()),
+        Arc::clone(&cache),
+        Arc::new(ContextRegistry::default()),
+    )
+    .await
+    .expect("router");
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                image_event("audio-pending-image", "img_key"),
+            )
+            .await,
+        )
+        .await
+        .expect("stage image");
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["audio-pending-image"],
+        InboundEventState::Completed,
+    )
+    .await;
+
+    let mut audio = event("audio-direct-trigger", "owner-runtime-scope");
+    audio.text.clear();
+    audio.message_type = "audio".to_owned();
+    audio.parts = vec![audio_part(Some("audio is complete input"))];
+    router
+        .route(queued_registered(&store, &namespace, audio).await)
+        .await
+        .expect("route audio");
+    let start_thread = control.next_request().await;
+    control
+        .respond(
+            &start_thread,
+            thread_result("thread-audio-pending", &workspace),
+        )
+        .await;
+    let start_audio = control.next_request().await;
+    let audio_inputs = start_audio["params"]["input"]
+        .as_array()
+        .expect("audio inputs");
+    assert_eq!(audio_inputs.len(), 2, "audio has only its own context");
+    assert_eq!(context_reference(&audio_inputs[1])["wake"], "message");
+    respond_turn_started(&control, &start_audio, "turn-audio-pending").await;
+    let snapshot = router
+        .scope_snapshot(&ScopeKey::Chat("chat-runtime-scope".to_owned()))
+        .await
+        .expect("snapshot")
+        .expect("actor");
+    assert_eq!(snapshot.pending_media, 1);
+    send_turn_completed(
+        &control,
+        "thread-audio-pending",
+        "turn-audio-pending",
+        "completed",
+    )
+    .await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["audio-direct-trigger"],
+        InboundEventState::Completed,
+    )
+    .await;
+
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("audio-followup-text", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("route followup");
+    let resume = control.next_request().await;
+    assert_eq!(resume["method"], "thread/resume");
+    control
+        .respond(&resume, thread_result("thread-audio-pending", &workspace))
+        .await;
+    let start_followup = control.next_request().await;
+    let inputs = start_followup["params"]["input"]
+        .as_array()
+        .expect("followup inputs");
+    assert_eq!(
+        inputs.len(),
+        3,
+        "text consumes the image plus its own context"
+    );
+    assert_eq!(context_reference(&inputs[1])["wake"], "pending_media");
+    respond_turn_started(&control, &start_followup, "turn-audio-followup").await;
+    send_turn_completed(
+        &control,
+        "thread-audio-pending",
+        "turn-audio-followup",
+        "completed",
+    )
+    .await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["audio-followup-text"],
+        InboundEventState::Completed,
+    )
+    .await;
+    router.shutdown().await.expect("shutdown");
+    drop(cache);
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn group_media_flood_is_durably_ignored_without_actor_context_cache_or_asr_work() {
+    let mut config = validated_config();
+    config.allowed_groups.push("chat-group-media".to_owned());
+    config.validate().expect("group policy");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let temp = tempdir().expect("tempdir");
+    let downloader = Arc::new(RecordingAttachmentDownloader::default());
+    let download_calls = Arc::clone(&downloader.calls);
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &temp.path().join("ignored-group-media"),
+            store.clone(),
+            downloader,
+            AttachmentLimits::default(),
+        )
+        .expect("cache"),
+    );
+    let contexts = Arc::new(ContextRegistry::default());
+    let router = Router::start_with_contexts(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        degraded_supervisor().await,
+        Arc::new(RecordingSink::default()),
+        Arc::clone(&cache),
+        Arc::clone(&contexts),
+    )
+    .await
+    .expect("router");
+
+    let mut ids = Vec::new();
+    for index in 0..100 {
+        let event_id = format!("group-media-{index}");
+        let mut inbound = if index % 4 == 3 {
+            let mut audio = event_in_chat(&event_id, "owner-runtime-scope", "chat-group-media");
+            audio.text.clear();
+            audio.message_type = "audio".to_owned();
+            audio.parts = vec![audio_part(None)];
+            audio
+        } else {
+            let mut image = image_event(&event_id, &format!("group_key_{index}"));
+            image.chat_id = "chat-group-media".to_owned();
+            image.scope = ScopeKey::Chat("chat-group-media".to_owned());
+            image
+        };
+        inbound.chat_type = ChatMode::Group;
+        inbound.mentions_bot = false;
+        router
+            .route(queued_registered(&store, &namespace, inbound).await)
+            .await
+            .expect("ignore group media");
+        ids.push(event_id);
+    }
+    for event_id in &ids {
+        assert_eq!(
+            store
+                .inbound_state(&namespace, event_id)
+                .await
+                .expect("inbound state"),
+            Some(InboundEventState::Completed)
+        );
+    }
+    assert_eq!(router.snapshot().scope_count, 0);
+    assert!(download_calls.lock().expect("download calls").is_empty());
+    assert_eq!(contexts.stats().total, 0);
+    assert!(
+        store
+            .list_attachments()
+            .await
+            .expect("attachment rows")
+            .is_empty()
+    );
+    router.shutdown().await.expect("shutdown");
+    drop(cache);
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn pending_media_count_ttl_and_interrupt_bounds_clear_metadata() {
+    let config = validated_config();
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config).with_test_pending_media_limits(
+        Duration::from_millis(40),
+        2,
+        16 * 1024,
+    );
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        degraded_supervisor().await,
+        Arc::new(RecordingSink::default()),
+    )
+    .await
+    .expect("router");
+    for index in 0..3 {
+        let event_id = format!("bounded-pending-{index}");
+        router
+            .route(
+                queued_registered(
+                    &store,
+                    &namespace,
+                    image_event(&event_id, &format!("bounded_key_{index}")),
+                )
+                .await,
+            )
+            .await
+            .expect("stage bounded media");
+    }
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &[
+            "bounded-pending-0",
+            "bounded-pending-1",
+            "bounded-pending-2",
+        ],
+        InboundEventState::Completed,
+    )
+    .await;
+    let scope = ScopeKey::Chat("chat-runtime-scope".to_owned());
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if router
+                .scope_snapshot(&scope)
+                .await
+                .expect("snapshot")
+                .is_some_and(|snapshot| snapshot.pending_media == 2)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("count bound evicts oldest");
+    assert_eq!(
+        router.interrupt(&scope).await.expect("interrupt"),
+        InterruptOutcome::NoActiveTurn
+    );
+    let cleared = router
+        .scope_snapshot(&scope)
+        .await
+        .expect("snapshot")
+        .expect("actor");
+    assert_eq!((cleared.pending_media, cleared.pending_media_bytes), (0, 0));
+
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                image_event("bounded-pending-expiry", "bounded_expiry_key"),
+            )
+            .await,
+        )
+        .await
+        .expect("stage expiring media");
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["bounded-pending-expiry"],
+        InboundEventState::Completed,
+    )
+    .await;
+    sleep(Duration::from_millis(100)).await;
+    let expired = router
+        .scope_snapshot(&scope)
+        .await
+        .expect("snapshot")
+        .expect("actor");
+    assert_eq!((expired.pending_media, expired.pending_media_bytes), (0, 0));
+
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                image_event("bounded-pending-explicit", "bounded_explicit_key"),
+            )
+            .await,
+        )
+        .await
+        .expect("stage before explicit quote");
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["bounded-pending-explicit"],
+        InboundEventState::Completed,
+    )
+    .await;
+    let mut explicit = event("bounded-explicit-trigger", "owner-runtime-scope");
+    explicit.reply_to_message_id = Some("om_explicit_parent".to_owned());
+    router
+        .route(queued_registered(&store, &namespace, explicit).await)
+        .await
+        .expect("route explicit quote");
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if router
+                .scope_snapshot(&scope)
+                .await
+                .expect("snapshot")
+                .is_some_and(|snapshot| snapshot.pending_media == 0)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("explicit quote wins and clears pending media");
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn debounce_quote_reset_and_control_interrupt_invalidate_held_pending_reservations() {
+    for mode in [
+        DebounceInvalidator::ExplicitQuote,
+        DebounceInvalidator::ResetCommand,
+        DebounceInvalidator::ControlInterrupt,
+    ] {
+        assert_debounce_invalidates_reserved_media(mode).await;
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn debounce_prepare_failure_keeps_the_scope_actor_alive() {
+    let config = validated_config();
+    let workspace = config
+        .default_workspace
+        .clone()
+        .expect("validated default workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config).with_test_timings(
+        Duration::from_millis(300),
+        Duration::from_secs(60),
+        Duration::from_millis(10),
+    );
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        Arc::new(UnavailableRejectionSink),
+    )
+    .await
+    .expect("router");
+    let scope = ScopeKey::Chat("chat-runtime-scope".to_owned());
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("debounce-first", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("route first message");
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if router
+                .scope_snapshot(&scope)
+                .await
+                .expect("snapshot")
+                .is_some_and(|snapshot| snapshot.state == ScopeState::Debouncing)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first message opens the debounce window");
+
+    // A stale media event inside the debounce window fails `prepare_inbound`:
+    // its rejection notice cannot be projected through the sink.
+    let mut stale = image_event("debounce-stale-image", "debounce_stale_key");
+    stale.create_time_ms = 0;
+    router
+        .route(queued_registered(&store, &namespace, stale).await)
+        .await
+        .expect("route stale image");
+
+    // The already assembled batch must still be processed.
+    let start_thread = control.next_request().await;
+    assert_eq!(start_thread["method"], "thread/start");
+    control
+        .respond(
+            &start_thread,
+            thread_result("thread-debounce-failure", &workspace),
+        )
+        .await;
+    let start_turn = control.next_request().await;
+    assert_eq!(start_turn["method"], "turn/start");
+    assert_eq!(
+        start_turn["params"]["input"]
+            .as_array()
+            .expect("input array")
+            .len(),
+        1,
+        "the failed item is dropped while the first message keeps its turn"
+    );
+    respond_turn_started(&control, &start_turn, "turn-debounce-failure").await;
+    send_turn_completed(
+        &control,
+        "thread-debounce-failure",
+        "turn-debounce-failure",
+        "completed",
+    )
+    .await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["debounce-first"],
+        InboundEventState::Completed,
+    )
+    .await;
+
+    // The actor survives the transient prepare failure and still accepts work.
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("debounce-after-failure", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("actor still routes after a debounce prepare failure");
+    let resume = control.next_request().await;
+    assert_eq!(resume["method"], "thread/resume");
+    control
+        .respond(
+            &resume,
+            thread_result("thread-debounce-failure", &workspace),
+        )
+        .await;
+    let second_turn = control.next_request().await;
+    assert_eq!(second_turn["method"], "turn/start");
+    respond_turn_started(&control, &second_turn, "turn-debounce-recovered").await;
+    send_turn_completed(
+        &control,
+        "thread-debounce-failure",
+        "turn-debounce-recovered",
+        "completed",
+    )
+    .await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["debounce-after-failure"],
+        InboundEventState::Completed,
+    )
+    .await;
+
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn pending_media_ttl_remains_truthful_while_an_unrelated_turn_is_active() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config)
+        .with_test_timings(
+            Duration::from_millis(300),
+            Duration::from_secs(60),
+            Duration::from_millis(10),
+        )
+        .with_test_pending_media_limits(Duration::from_millis(400), 2, 16 * 1024);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        Arc::new(RecordingSink::default()),
+    )
+    .await
+    .expect("router");
+    let scope = ScopeKey::Chat("chat-runtime-scope".to_owned());
+
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                event("active-ttl-trigger", "owner-runtime-scope"),
+            )
+            .await,
+        )
+        .await
+        .expect("route trigger");
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if router
+                .scope_snapshot(&scope)
+                .await
+                .expect("snapshot")
+                .is_some_and(|snapshot| snapshot.state == ScopeState::Debouncing)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("trigger enters debounce");
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                image_event("active-ttl-media", "active_ttl_key"),
+            )
+            .await,
+        )
+        .await
+        .expect("stage during debounce");
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["active-ttl-media"],
+        InboundEventState::Completed,
+    )
+    .await;
+    let start_thread = control.next_request().await;
+    control
+        .respond(
+            &start_thread,
+            thread_result("thread-active-ttl", &workspace),
+        )
+        .await;
+    let start_turn = control.next_request().await;
+    respond_turn_started(&control, &start_turn, "turn-active-ttl").await;
+    assert_eq!(
+        router
+            .scope_snapshot(&scope)
+            .await
+            .expect("snapshot")
+            .expect("actor")
+            .pending_media,
+        1
+    );
+
+    sleep(Duration::from_millis(450)).await;
+    let expired = router
+        .scope_snapshot(&scope)
+        .await
+        .expect("snapshot")
+        .expect("actor");
+    assert_eq!((expired.pending_media, expired.pending_media_bytes), (0, 0));
+    assert!(matches!(expired.state, ScopeState::Running { .. }));
+
+    send_turn_completed(
+        &control,
+        "thread-active-ttl",
+        "turn-active-ttl",
+        "completed",
+    )
+    .await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["active-ttl-trigger"],
+        InboundEventState::Completed,
+    )
+    .await;
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn pending_media_metadata_byte_bound_drops_an_oversize_descriptor() {
+    let config = validated_config();
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config).with_test_pending_media_limits(
+        Duration::from_secs(60),
+        2,
+        128,
+    );
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        degraded_supervisor().await,
+        Arc::new(RecordingSink::default()),
+    )
+    .await
+    .expect("router");
+    router
+        .route(
+            queued_registered(
+                &store,
+                &namespace,
+                image_event("pending-metadata-oversize", &"k".repeat(256)),
+            )
+            .await,
+        )
+        .await
+        .expect("settle oversize descriptor");
+    let mut oversized_mention = image_event("pending-mention-oversize", "short_key");
+    oversized_mention.mentions = vec![MentionIdentity {
+        key: Some("@_user_1".to_owned()),
+        open_id: Some("ou_mentioned".to_owned()),
+        user_id: Some("user_mentioned".to_owned()),
+        union_id: Some("on_mentioned".to_owned()),
+        name: Some("m".repeat(256)),
+    }];
+    router
+        .route(queued_registered(&store, &namespace, oversized_mention).await)
+        .await
+        .expect("settle oversize retained mention");
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["pending-metadata-oversize", "pending-mention-oversize"],
+        InboundEventState::Completed,
+    )
+    .await;
+    sleep(Duration::from_millis(50)).await;
+    let snapshot = router
+        .scope_snapshot(&ScopeKey::Chat("chat-runtime-scope".to_owned()))
+        .await
+        .expect("snapshot")
+        .expect("actor");
+    assert_eq!(
+        (snapshot.pending_media, snapshot.pending_media_bytes),
+        (0, 0)
+    );
+    assert_eq!(router.snapshot().active_turns, 0);
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn authorized_group_quote_resolves_one_hop_and_reads_parent_media_lazily() {
+    let mut config = validated_config();
+    config.allowed_groups.push("chat-quoted-group".to_owned());
+    config.validate().expect("group policy");
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let temp = tempdir().expect("tempdir");
+    let downloader = Arc::new(RecordingAttachmentDownloader::default());
+    let download_calls = Arc::clone(&downloader.calls);
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &temp.path().join("quoted-group-cache"),
+            store.clone(),
+            downloader,
+            AttachmentLimits::default(),
+        )
+        .expect("cache"),
+    );
+    let resolver = Arc::new(RecordingQuoteResolver::default());
+    let quote_calls = Arc::clone(&resolver.calls);
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start_with_contexts_and_quotes(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        Arc::new(RecordingSink::default()),
+        Arc::clone(&cache),
+        Arc::new(ContextRegistry::default()),
+        resolver,
+    )
+    .await
+    .expect("router");
+
+    let mut unauthorized = event_in_chat(
+        "quote-unauthorized",
+        "intruder-runtime-scope",
+        "chat-not-allowed",
+    );
+    unauthorized.chat_type = ChatMode::Group;
+    unauthorized.mentions_bot = true;
+    unauthorized.reply_to_message_id = Some("om_forbidden_parent".to_owned());
+    router
+        .route(queued_registered(&store, &namespace, unauthorized).await)
+        .await
+        .expect("durable policy rejection");
+    assert!(quote_calls.lock().expect("quote calls").is_empty());
+
+    let mut inbound = event_in_chat(
+        "quote-authorized",
+        "owner-runtime-scope",
+        "chat-quoted-group",
+    );
+    inbound.chat_type = ChatMode::Group;
+    inbound.mentions_bot = true;
+    inbound.reply_to_message_id = Some("om_parent".to_owned());
+    inbound.text = "analyze the quoted image".to_owned();
+    inbound.parts = vec![MessagePart::Text {
+        text: inbound.text.clone(),
+    }];
+    router
+        .route(queued_registered(&store, &namespace, inbound).await)
+        .await
+        .expect("route authorized quote");
+    let start_thread = control.next_request().await;
+    control
+        .respond(
+            &start_thread,
+            thread_result("thread-quoted-group", &workspace),
+        )
+        .await;
+    let start_turn = control.next_request().await;
+    let inputs = start_turn["params"]["input"].as_array().expect("inputs");
+    assert_eq!(inputs.len(), 2);
+    assert_eq!(inputs[0]["text"], "analyze the quoted image");
+    assert!(
+        !serde_json::to_string(inputs)
+            .expect("prompt")
+            .contains("quoted_key")
+    );
+    assert!(download_calls.lock().expect("download calls").is_empty());
+    assert_eq!(
+        *quote_calls.lock().expect("quote calls"),
+        vec![("om_parent".to_owned(), "chat-quoted-group".to_owned())]
+    );
+
+    let context_id = context_reference(&inputs[1])["id"]
+        .as_str()
+        .expect("context ID")
+        .to_owned();
+    respond_turn_started(&control, &start_turn, "turn-quoted-group").await;
+    control
+        .send_json(json!({
+            "id": "resolve-quoted-group",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-quoted-group",
+                "turnId": "turn-quoted-group",
+                "callId": "call-resolve-quoted-group",
+                "namespace": "bridge_context",
+                "tool": "resolve",
+                "arguments": {"id": context_id}
+            }
+        }))
+        .await;
+    let response = control.next_request().await;
+    let context_text = response["result"]["contentItems"][0]["text"]
+        .as_str()
+        .expect("context text");
+    assert!(!context_text.contains("quoted_key"));
+    let context: Value = serde_json::from_str(context_text).expect("context JSON");
+    assert_eq!(context["quote"]["messageId"], "om_parent");
+    assert_eq!(context["quote"]["messageType"], "image");
+    assert_eq!(context["quote"]["status"], "available");
+    let handle = context["quote"]["parts"][0]["handle"]
+        .as_str()
+        .expect("quoted handle");
+    let response = read_media(
+        &control,
+        "thread-quoted-group",
+        "turn-quoted-group",
+        "read-quoted-group",
+        &context_id,
+        handle,
+    )
+    .await;
+    assert_eq!(response["result"]["success"], true);
+    assert_eq!(
+        *download_calls.lock().expect("download calls"),
+        vec![("om_parent".to_owned(), "quoted_key".to_owned())]
+    );
+    send_turn_completed(
+        &control,
+        "thread-quoted-group",
+        "turn-quoted-group",
+        "completed",
+    )
+    .await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["quote-authorized"],
+        InboundEventState::Completed,
+    )
+    .await;
+    router.shutdown().await.expect("shutdown");
+    drop(cache);
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn authorized_group_audio_quote_runs_lazy_asr_inside_the_instruction_turn() {
+    let _asr_subprocess_guard = ASR_SUBPROCESS_TEST_LOCK.lock().await;
+    let _asr_process_lock = lock_asr_process_tests();
+    let mut config = validated_config();
+    config.allowed_groups.push("chat-quoted-audio".to_owned());
+    let temp = tempdir().expect("tempdir");
+    let marker = temp.path().join("quoted-asr-invoked.txt");
+    let asr = stub_program(
+        temp.path(),
+        "quoted-asr",
+        r#"printf 'invoked\n' >> "$1"; printf 'QUOTED AUDIO TRANSCRIPT\n'"#,
+        "@echo off\r\necho invoked>>\"%~1\"\r\necho QUOTED AUDIO TRANSCRIPT\r\n",
+    );
+    config.asr = asr_config(
+        asr,
+        ffmpeg_stub(temp.path()),
+        vec![marker.to_string_lossy().into_owned()],
+    );
+    config.validate().expect("group audio policy");
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let downloader = Arc::new(RecordingAttachmentDownloader::default());
+    let download_calls = Arc::clone(&downloader.calls);
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &temp.path().join("quoted-audio-cache"),
+            store.clone(),
+            downloader,
+            AttachmentLimits::default(),
+        )
+        .expect("cache"),
+    );
+    let resolver = Arc::new(RecordingAudioQuoteResolver::default());
+    let quote_calls = Arc::clone(&resolver.calls);
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start_with_contexts_and_quotes(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        Arc::new(RecordingSink::default()),
+        Arc::clone(&cache),
+        Arc::new(ContextRegistry::default()),
+        resolver,
+    )
+    .await
+    .expect("router");
+
+    let mut inbound = event_in_chat(
+        "quote-authorized-audio",
+        "owner-runtime-scope",
+        "chat-quoted-audio",
+    );
+    inbound.chat_type = ChatMode::Group;
+    inbound.mentions_bot = true;
+    inbound.reply_to_message_id = Some("om_audio_parent".to_owned());
+    inbound.text = "summarize this voice note".to_owned();
+    inbound.parts = vec![MessagePart::Text {
+        text: inbound.text.clone(),
+    }];
+    router
+        .route(queued_registered(&store, &namespace, inbound).await)
+        .await
+        .expect("route quote");
+    let start_thread = control.next_request().await;
+    control
+        .respond(
+            &start_thread,
+            thread_result("thread-quoted-audio", &workspace),
+        )
+        .await;
+    let start_turn = control.next_request().await;
+    let inputs = start_turn["params"]["input"].as_array().expect("inputs");
+    assert_eq!(inputs.len(), 2, "instruction and quote form one turn");
+    assert_eq!(inputs[0]["text"], "summarize this voice note");
+    assert!(
+        !serde_json::to_string(inputs)
+            .expect("prompt")
+            .contains("quoted_audio_key")
+    );
+    assert!(download_calls.lock().expect("downloads").is_empty());
+    assert!(!marker.exists());
+    assert_eq!(
+        *quote_calls.lock().expect("quote calls"),
+        vec![("om_audio_parent".to_owned(), "chat-quoted-audio".to_owned())]
+    );
+
+    let context_id = context_reference(&inputs[1])["id"]
+        .as_str()
+        .expect("context ID")
+        .to_owned();
+    respond_turn_started(&control, &start_turn, "turn-quoted-audio").await;
+    control
+        .send_json(json!({
+            "id": "resolve-quoted-audio",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-quoted-audio",
+                "turnId": "turn-quoted-audio",
+                "callId": "call-resolve-quoted-audio",
+                "namespace": "bridge_context",
+                "tool": "resolve",
+                "arguments": {"id": context_id}
+            }
+        }))
+        .await;
+    let context_response = control.next_request().await;
+    let context_text = context_response["result"]["contentItems"][0]["text"]
+        .as_str()
+        .expect("context text");
+    assert!(!context_text.contains("quoted_audio_key"));
+    assert!(!context_text.contains("QUOTED AUDIO TRANSCRIPT"));
+    let context: Value = serde_json::from_str(context_text).expect("context JSON");
+    assert_eq!(context["quote"]["status"], "available");
+    assert_eq!(context["quote"]["parts"][0]["kind"], "audio");
+    let handle = context["quote"]["parts"][0]["handle"]
+        .as_str()
+        .expect("audio handle");
+
+    let response = read_media(
+        &control,
+        "thread-quoted-audio",
+        "turn-quoted-audio",
+        "read-quoted-audio",
+        &context_id,
+        handle,
+    )
+    .await;
+    assert_eq!(response["result"]["success"], true);
+    let text = response["result"]["contentItems"][0]["text"]
+        .as_str()
+        .expect("media response");
+    let media: Value = serde_json::from_str(text).expect("media JSON");
+    assert_eq!(media["media"]["transcript"], "QUOTED AUDIO TRANSCRIPT");
+    assert_eq!(media["media"]["source"], "sidecar");
+    assert_eq!(
+        *download_calls.lock().expect("downloads"),
+        vec![("om_audio_parent".to_owned(), "quoted_audio_key".to_owned())]
+    );
+    assert!(marker.exists());
+
+    send_turn_completed(
+        &control,
+        "thread-quoted-audio",
+        "turn-quoted-audio",
+        "completed",
+    )
+    .await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["quote-authorized-audio"],
         InboundEventState::Completed,
     )
     .await;
@@ -3334,4 +5334,1107 @@ async fn connection_loss_before_atomic_begin_leaves_the_event_received_for_repla
         .await;
     router.shutdown().await.expect("shutdown");
     store.shutdown().await.expect("store shutdown");
+}
+
+fn stub_program(
+    dir: &std::path::Path,
+    name: &str,
+    unix: &str,
+    #[allow(unused_variables)] windows: &str,
+) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let path = dir.join(format!("{name}.cmd"));
+        std::fs::write(&path, windows).expect("write windows stub");
+        path
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{unix}\n")).expect("write unix stub");
+        std::fs::set_permissions(&path, PermissionsExt::from_mode(0o755)).expect("chmod stub");
+        path
+    }
+}
+
+fn ffmpeg_stub(dir: &std::path::Path) -> std::path::PathBuf {
+    let fixture = dir.join("decoded-audio.pcm");
+    let samples = 160_u32;
+    let data_bytes = samples * 2;
+    std::fs::write(&fixture, vec![0_u8; data_bytes as usize]).expect("write decoded PCM fixture");
+    let source = fixture.to_string_lossy();
+    stub_program(
+        dir,
+        "ffmpeg",
+        &format!(r#"cat "{}""#, source.replace('"', r#"\""#)),
+        &format!("@echo off\r\ntype \"{source}\"\r\n"),
+    )
+}
+
+fn asr_config(
+    command: std::path::PathBuf,
+    ffmpeg: std::path::PathBuf,
+    args: Vec<String>,
+) -> AsrSection {
+    AsrSection {
+        command: Some(command),
+        args,
+        ffmpeg,
+        ..AsrSection::default()
+    }
+}
+
+fn audio_part(transcript: Option<&str>) -> MessagePart {
+    MessagePart::Audio(MediaPart {
+        key: Some("aud_key".to_owned()),
+        thumbnail_key: None,
+        metadata: MediaMetadata {
+            duration_ms: Some(800),
+            transcript_failure: transcript.map(|_| TranscriptFailure::NotRetained),
+            ..MediaMetadata::default()
+        },
+        status: PartStatus::Available,
+    })
+}
+
+fn rejected_audio_part(failure: TranscriptFailure) -> MessagePart {
+    MessagePart::Audio(MediaPart {
+        key: Some("aud_key".to_owned()),
+        thumbnail_key: None,
+        metadata: MediaMetadata {
+            duration_ms: Some(800),
+            transcript_failure: Some(failure),
+            ..MediaMetadata::default()
+        },
+        status: PartStatus::Available,
+    })
+}
+
+async fn start_audio_router(
+    config: BridgeConfig,
+    store: StoreHandle,
+    cache: Arc<AttachmentCache>,
+) -> (
+    lark_codex_bridge::runtime::router::RouterHandle,
+    fakecodex::FakeControl,
+    TenantNamespace,
+    std::path::PathBuf,
+) {
+    let workspace = config
+        .default_workspace
+        .clone()
+        .expect("validated default workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let sink = Arc::new(RecordingSink::default());
+    let contexts = Arc::new(ContextRegistry::default());
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start_with_contexts(
+        store,
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink,
+        cache,
+        contexts,
+    )
+    .await
+    .expect("router");
+    (router, control, namespace, workspace)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn route_audio_event(
+    router: &lark_codex_bridge::runtime::router::RouterHandle,
+    store: &StoreHandle,
+    namespace: &TenantNamespace,
+    control: &fakecodex::FakeControl,
+    workspace: &std::path::Path,
+    event_id: &str,
+    inbound: InboundEvent,
+    thread_id: &str,
+    turn_id: &str,
+) -> (String, String, Value) {
+    route_audio_event_inner(
+        router, store, namespace, control, workspace, event_id, inbound, None, thread_id, turn_id,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn route_audio_event_with_live_transcript(
+    router: &lark_codex_bridge::runtime::router::RouterHandle,
+    store: &StoreHandle,
+    namespace: &TenantNamespace,
+    control: &fakecodex::FakeControl,
+    workspace: &std::path::Path,
+    event_id: &str,
+    inbound: InboundEvent,
+    transcript: &str,
+    thread_id: &str,
+    turn_id: &str,
+) -> (String, String, Value) {
+    route_audio_event_inner(
+        router,
+        store,
+        namespace,
+        control,
+        workspace,
+        event_id,
+        inbound,
+        Some(transcript),
+        thread_id,
+        turn_id,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn route_audio_event_inner(
+    router: &lark_codex_bridge::runtime::router::RouterHandle,
+    store: &StoreHandle,
+    namespace: &TenantNamespace,
+    control: &fakecodex::FakeControl,
+    workspace: &std::path::Path,
+    event_id: &str,
+    inbound: InboundEvent,
+    live_transcript: Option<&str>,
+    thread_id: &str,
+    turn_id: &str,
+) -> (String, String, Value) {
+    router
+        .route(if let Some(transcript) = live_transcript {
+            queued_registered_with_live_transcript(store, namespace, inbound, transcript).await
+        } else {
+            queued_registered(store, namespace, inbound).await
+        })
+        .await
+        .expect("route audio event");
+    let start_thread = control.next_request().await;
+    assert_eq!(start_thread["method"], "thread/start");
+    control
+        .respond(&start_thread, thread_result(thread_id, workspace))
+        .await;
+    let start_turn = control.next_request().await;
+    let inputs = start_turn["params"]["input"]
+        .as_array()
+        .expect("turn input array");
+    assert!(
+        inputs
+            .iter()
+            .all(|input| input["type"] != "localAudio" && input["type"] != "audio"),
+        "audio must not be sent as Codex user input"
+    );
+    let reference = inputs
+        .iter()
+        .filter_map(|input| input["text"].as_str())
+        .find_map(|text| {
+            text.strip_prefix("<bridge_context>")
+                .and_then(|value| value.strip_suffix("</bridge_context>"))
+        })
+        .expect("compact context envelope");
+    let reference: Value = serde_json::from_str(reference).expect("context JSON");
+    let context_id = reference["id"]
+        .as_str()
+        .expect("opaque context id")
+        .to_owned();
+    respond_turn_started(control, &start_turn, turn_id).await;
+    control
+        .send_json(json!({
+            "id": format!("server-context-{event_id}"),
+            "method": "item/tool/call",
+            "params": {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "callId": format!("call-context-{event_id}"),
+                "namespace": "bridge_context",
+                "tool": "resolve",
+                "arguments": {"id": context_id}
+            }
+        }))
+        .await;
+    let context_response = control.next_request().await;
+    assert_eq!(context_response["result"]["success"], true);
+    let context_text = context_response["result"]["contentItems"][0]["text"]
+        .as_str()
+        .expect("context result text");
+    if let Some(transcript) = live_transcript {
+        assert!(
+            !context_text.contains(transcript),
+            "ContextSnapshot must not contain live recognition text"
+        );
+    }
+    let context_value: Value = serde_json::from_str(context_text).expect("context result JSON");
+    let handle = context_value["parts"]
+        .as_array()
+        .expect("parts")
+        .iter()
+        .find(|part| part["kind"] == "audio")
+        .and_then(|part| part["handle"].as_str())
+        .expect("audio handle")
+        .to_owned();
+    (context_id, handle, start_turn)
+}
+
+async fn read_media(
+    control: &fakecodex::FakeControl,
+    thread_id: &str,
+    turn_id: &str,
+    request_id: &str,
+    context_id: &str,
+    handle: &str,
+) -> Value {
+    control
+        .send_json(json!({
+            "id": request_id,
+            "method": "item/tool/call",
+            "params": {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "callId": request_id,
+                "namespace": "bridge_media",
+                "tool": "read",
+                "arguments": {"context_id": context_id, "handle": handle}
+            }
+        }))
+        .await;
+    // Local process startup is intentionally tested through the real Tokio
+    // process boundary and can be slower under a fully parallel CI suite.
+    control.next_request_within(Duration::from_secs(10)).await
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn audio_media_read_uses_stub_sidecar_and_leaves_image_path_reads_unchanged() {
+    let _asr_subprocess_guard = ASR_SUBPROCESS_TEST_LOCK.lock().await;
+    let _asr_process_lock = lock_asr_process_tests();
+    let mut config = validated_config();
+    let temp = tempdir().expect("tempdir");
+    let marker = temp.path().join("asr-invoked.txt");
+    let asr = stub_program(
+        temp.path(),
+        "asr",
+        r#"printf 'invoked\n' >> "$1"; printf 'KNOWN TRANSCRIPT\n'"#,
+        "@echo off\r\necho invoked>>\"%~1\"\r\necho KNOWN TRANSCRIPT\r\n",
+    );
+    config.asr = asr_config(
+        asr,
+        ffmpeg_stub(temp.path()),
+        vec![marker.to_string_lossy().into_owned()],
+    );
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &temp.path().join("attachments-live"),
+            store.clone(),
+            Arc::new(StaticAttachmentDownloader),
+            AttachmentLimits::default(),
+        )
+        .expect("attachment cache"),
+    );
+    let (router, control, namespace, workspace) =
+        start_audio_router(config, store.clone(), Arc::clone(&cache)).await;
+
+    let mut inbound = event("event-audio-sidecar", "owner-runtime-scope");
+    inbound.message_type = "audio".to_owned();
+    inbound.text = "hello".to_owned();
+    inbound.parts = vec![
+        MessagePart::Text {
+            text: "hello".to_owned(),
+        },
+        MessagePart::Image(MediaPart {
+            key: Some("img_key".to_owned()),
+            thumbnail_key: None,
+            metadata: MediaMetadata::default(),
+            status: PartStatus::Available,
+        }),
+        audio_part(None),
+    ];
+
+    router
+        .route(queued_registered(&store, &namespace, inbound).await)
+        .await
+        .expect("route");
+    let start_thread = control.next_request().await;
+    control
+        .respond(
+            &start_thread,
+            thread_result("thread-audio-sidecar", &workspace),
+        )
+        .await;
+    let start_turn = control.next_request().await;
+    let inputs = start_turn["params"]["input"]
+        .as_array()
+        .expect("turn inputs");
+    assert_eq!(inputs.len(), 2, "media must not be downloaded eagerly");
+    assert!(
+        inputs
+            .iter()
+            .all(|input| input["type"] != "localAudio" && input["type"] != "localImage"),
+        "audio and images stay lazy"
+    );
+    let reference = inputs[1]["text"].as_str().expect("context reference");
+    let payload = reference
+        .strip_prefix("<bridge_context>")
+        .and_then(|value| value.strip_suffix("</bridge_context>"))
+        .expect("compact context envelope");
+    let reference: Value = serde_json::from_str(payload).expect("context JSON");
+    let context_id = reference["id"].as_str().expect("opaque context id");
+    respond_turn_started(&control, &start_turn, "turn-audio-sidecar").await;
+
+    control
+        .send_json(json!({
+            "id": "server-context-audio",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-audio-sidecar",
+                "turnId": "turn-audio-sidecar",
+                "callId": "call-context-audio",
+                "namespace": "bridge_context",
+                "tool": "resolve",
+                "arguments": {"id": context_id}
+            }
+        }))
+        .await;
+    let context_response = control.next_request().await;
+    let context_text = context_response["result"]["contentItems"][0]["text"]
+        .as_str()
+        .expect("context result text");
+    let context_value: Value = serde_json::from_str(context_text).expect("context result JSON");
+    let image_handle = context_value["parts"][1]["handle"]
+        .as_str()
+        .expect("image handle");
+    let audio_handle = context_value["parts"][2]["handle"]
+        .as_str()
+        .expect("audio handle");
+
+    let image_response = read_media(
+        &control,
+        "thread-audio-sidecar",
+        "turn-audio-sidecar",
+        "server-image-read",
+        context_id,
+        image_handle,
+    )
+    .await;
+    assert_eq!(image_response["result"]["success"], true);
+    let image_text = image_response["result"]["contentItems"][0]["text"]
+        .as_str()
+        .expect("image result");
+    let image_value: Value = serde_json::from_str(image_text).expect("image JSON");
+    assert!(
+        std::path::Path::new(image_value["media"]["path"].as_str().expect("image path")).is_file()
+    );
+    assert_eq!(image_value["media"]["bytes"], 16);
+    assert!(image_value["media"]["transcript"].is_null());
+
+    let audio_response = read_media(
+        &control,
+        "thread-audio-sidecar",
+        "turn-audio-sidecar",
+        "server-audio-read",
+        context_id,
+        audio_handle,
+    )
+    .await;
+    assert_eq!(audio_response["result"]["success"], true);
+    let audio_text = audio_response["result"]["contentItems"][0]["text"]
+        .as_str()
+        .expect("audio result");
+    let audio_value: Value = serde_json::from_str(audio_text).expect("audio JSON");
+    assert_eq!(audio_value["media"]["transcript"], "KNOWN TRANSCRIPT");
+    assert_eq!(audio_value["media"]["source"], "sidecar");
+    assert!(audio_value["media"]["path"].is_null());
+    assert!(
+        std::fs::read_to_string(&marker)
+            .expect("marker")
+            .contains("invoked")
+    );
+
+    send_turn_completed(
+        &control,
+        "thread-audio-sidecar",
+        "turn-audio-sidecar",
+        "completed",
+    )
+    .await;
+    router.shutdown().await.expect("shutdown");
+    drop(cache);
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn inbound_audio_transcript_skips_sidecar() {
+    let mut config = validated_config();
+    let temp = tempdir().expect("tempdir");
+    let marker = temp.path().join("must-not-run.txt");
+    let exploding = stub_program(
+        temp.path(),
+        "asr-explode",
+        r#"printf 'invoked\n' >> "$1"; exit 99"#,
+        "@echo off\r\necho invoked>>\"%~1\"\r\nexit /b 99\r\n",
+    );
+    config.asr = asr_config(
+        exploding,
+        ffmpeg_stub(temp.path()),
+        vec![marker.to_string_lossy().into_owned()],
+    );
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &temp.path().join("attachments"),
+            store.clone(),
+            Arc::new(StaticAttachmentDownloader),
+            AttachmentLimits::default(),
+        )
+        .expect("attachment cache"),
+    );
+    let (router, control, namespace, workspace) =
+        start_audio_router(config, store.clone(), cache).await;
+    let mut inbound = event("event-audio-inbound", "owner-runtime-scope");
+    inbound.message_type = "audio".to_owned();
+    inbound.text.clear();
+    inbound.parts = vec![audio_part(Some("please review the patch"))];
+    let (context_id, handle, start_turn) = route_audio_event_with_live_transcript(
+        &router,
+        &store,
+        &namespace,
+        &control,
+        &workspace,
+        "inbound",
+        inbound,
+        "please review the patch",
+        "thread-audio-inbound",
+        "turn-audio-inbound",
+    )
+    .await;
+    assert!(
+        !start_turn.to_string().contains("please review the patch"),
+        "turn prompt must contain only the opaque context reference"
+    );
+    let response = read_media(
+        &control,
+        "thread-audio-inbound",
+        "turn-audio-inbound",
+        "server-audio-inbound",
+        &context_id,
+        &handle,
+    )
+    .await;
+    assert_eq!(response["result"]["success"], true);
+    let body: Value = serde_json::from_str(
+        response["result"]["contentItems"][0]["text"]
+            .as_str()
+            .expect("text"),
+    )
+    .expect("json");
+    assert_eq!(body["media"]["transcript"], "please review the patch");
+    assert_eq!(body["media"]["source"], "inbound");
+    assert!(!marker.exists(), "sidecar must not run for inbound text");
+    send_turn_completed(
+        &control,
+        "thread-audio-inbound",
+        "turn-audio-inbound",
+        "completed",
+    )
+    .await;
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn configured_inbound_transcript_limit_is_enforced_only_at_media_read() {
+    let mut config = validated_config();
+    let temp = tempdir().expect("tempdir");
+    let marker = temp.path().join("must-not-run-over-limit.txt");
+    let exploding = stub_program(
+        temp.path(),
+        "asr-over-limit",
+        r#"printf 'invoked\n' >> "$1"; exit 99"#,
+        "@echo off\r\necho invoked>>\"%~1\"\r\nexit /b 99\r\n",
+    );
+    config.asr = asr_config(
+        exploding,
+        ffmpeg_stub(temp.path()),
+        vec![marker.to_string_lossy().into_owned()],
+    );
+    config.asr.max_transcript_bytes = 4;
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let download_count = Arc::new(AtomicUsize::new(0));
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &temp.path().join("attachments-over-limit"),
+            store.clone(),
+            Arc::new(PendingAttachmentDownloader {
+                started: Arc::clone(&download_count),
+                started_notify: Arc::new(Notify::new()),
+            }),
+            AttachmentLimits::default(),
+        )
+        .expect("attachment cache"),
+    );
+    let (router, control, namespace, workspace) =
+        start_audio_router(config, store.clone(), cache).await;
+    let mut inbound = event("event-audio-over-limit", "owner-runtime-scope");
+    inbound.message_type = "audio".to_owned();
+    inbound.text.clear();
+    inbound.parts = vec![audio_part(Some("private transcript"))];
+    let (context_id, handle, start_turn) = route_audio_event_with_live_transcript(
+        &router,
+        &store,
+        &namespace,
+        &control,
+        &workspace,
+        "over-limit",
+        inbound,
+        "private transcript",
+        "thread-audio-over-limit",
+        "turn-audio-over-limit",
+    )
+    .await;
+    assert!(
+        !start_turn.to_string().contains("private transcript"),
+        "recognition text must remain behind the turn-scoped media capability"
+    );
+    let response = read_media(
+        &control,
+        "thread-audio-over-limit",
+        "turn-audio-over-limit",
+        "server-audio-over-limit",
+        &context_id,
+        &handle,
+    )
+    .await;
+    assert_eq!(response["result"]["success"], false);
+    let body: Value = serde_json::from_str(
+        response["result"]["contentItems"][0]["text"]
+            .as_str()
+            .expect("tool response text"),
+    )
+    .expect("tool response JSON");
+    assert_eq!(body["error"]["code"], "transcript_too_large");
+    assert_eq!(download_count.load(Ordering::SeqCst), 0);
+    assert!(!marker.exists(), "over-limit inbound text must not run ASR");
+    send_turn_completed(
+        &control,
+        "thread-audio-over-limit",
+        "turn-audio-over-limit",
+        "completed",
+    )
+    .await;
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn rejected_inbound_transcripts_never_download_or_fall_back_to_sidecar() {
+    for (suffix, failure, expected_code) in [
+        ("invalid", TranscriptFailure::Invalid, "invalid_transcript"),
+        (
+            "oversize",
+            TranscriptFailure::TooLarge,
+            "transcript_too_large",
+        ),
+        (
+            "recovered",
+            TranscriptFailure::NotRetained,
+            "transcript_unavailable",
+        ),
+    ] {
+        let mut config = validated_config();
+        let temp = tempdir().expect("tempdir");
+        let marker = temp.path().join(format!("must-not-run-{suffix}"));
+        config.asr = asr_config(
+            stub_program(
+                temp.path(),
+                &format!("asr-rejected-{suffix}"),
+                r#"printf 'invoked\n' >> "$1"; exit 99"#,
+                "@echo off\r\necho invoked>>\"%~1\"\r\nexit /b 99\r\n",
+            ),
+            ffmpeg_stub(temp.path()),
+            vec![marker.to_string_lossy().into_owned()],
+        );
+        let store = StoreHandle::open_in_memory().await.expect("store");
+        let download_count = Arc::new(AtomicUsize::new(0));
+        let cache = Arc::new(
+            AttachmentCache::open(
+                &temp.path().join(format!("attachments-{suffix}")),
+                store.clone(),
+                Arc::new(PendingAttachmentDownloader {
+                    started: Arc::clone(&download_count),
+                    started_notify: Arc::new(Notify::new()),
+                }),
+                AttachmentLimits::default(),
+            )
+            .expect("attachment cache"),
+        );
+        let (router, control, namespace, workspace) =
+            start_audio_router(config, store.clone(), cache).await;
+        let event_id = format!("event-audio-rejected-{suffix}");
+        let thread_id = format!("thread-audio-rejected-{suffix}");
+        let turn_id = format!("turn-audio-rejected-{suffix}");
+        let mut inbound = event(&event_id, "owner-runtime-scope");
+        inbound.message_type = "audio".to_owned();
+        inbound.text.clear();
+        inbound.parts = vec![rejected_audio_part(failure)];
+        let (context_id, handle, _) = route_audio_event(
+            &router, &store, &namespace, &control, &workspace, suffix, inbound, &thread_id,
+            &turn_id,
+        )
+        .await;
+        let response = read_media(
+            &control,
+            &thread_id,
+            &turn_id,
+            &format!("server-audio-rejected-{suffix}"),
+            &context_id,
+            &handle,
+        )
+        .await;
+        assert_eq!(response["result"]["success"], false);
+        let body: Value = serde_json::from_str(
+            response["result"]["contentItems"][0]["text"]
+                .as_str()
+                .expect("tool response text"),
+        )
+        .expect("tool response JSON");
+        assert_eq!(body["error"]["code"], expected_code);
+        assert_eq!(download_count.load(Ordering::SeqCst), 0);
+        assert!(!marker.exists());
+        send_turn_completed(&control, &thread_id, &turn_id, "completed").await;
+        router.shutdown().await.expect("shutdown");
+        store.shutdown().await.expect("store shutdown");
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn interrupt_cancels_an_active_audio_download_and_returns_a_tool_result() {
+    let mut config = validated_config();
+    let temp = tempdir().expect("tempdir");
+    config.asr = asr_config(
+        stub_program(
+            temp.path(),
+            "asr-unused-on-cancel",
+            "printf unexpected",
+            "@echo off\r\necho unexpected\r\n",
+        ),
+        ffmpeg_stub(temp.path()),
+        Vec::new(),
+    );
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let started = Arc::new(AtomicUsize::new(0));
+    let started_notify = Arc::new(Notify::new());
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &temp.path().join("attachments-cancelled-download"),
+            store.clone(),
+            Arc::new(PendingAttachmentDownloader {
+                started: Arc::clone(&started),
+                started_notify: Arc::clone(&started_notify),
+            }),
+            AttachmentLimits::default(),
+        )
+        .expect("attachment cache"),
+    );
+    let (router, control, namespace, workspace) =
+        start_audio_router(config, store.clone(), cache).await;
+    let mut inbound = event("event-audio-cancel-download", "owner-runtime-scope");
+    inbound.message_type = "audio".to_owned();
+    inbound.text.clear();
+    inbound.parts = vec![audio_part(None)];
+    let scope = inbound.scope.clone();
+    let (context_id, handle, _) = route_audio_event(
+        &router,
+        &store,
+        &namespace,
+        &control,
+        &workspace,
+        "cancel-download",
+        inbound,
+        "thread-audio-cancel-download",
+        "turn-audio-cancel-download",
+    )
+    .await;
+    control
+        .send_json(json!({
+            "id": "server-audio-cancel-download",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-audio-cancel-download",
+                "turnId": "turn-audio-cancel-download",
+                "callId": "server-audio-cancel-download",
+                "namespace": "bridge_media",
+                "tool": "read",
+                "arguments": {"context_id": context_id, "handle": handle}
+            }
+        }))
+        .await;
+    timeout(Duration::from_secs(2), async {
+        while started.load(Ordering::SeqCst) == 0 {
+            started_notify.notified().await;
+        }
+    })
+    .await
+    .expect("audio download starts");
+
+    let (interrupt, ()) = tokio::join!(router.interrupt(&scope), async {
+        let response = control.next_request().await;
+        assert_eq!(response["id"], "server-audio-cancel-download");
+        assert_eq!(response["result"]["success"], false);
+        let body: Value = serde_json::from_str(
+            response["result"]["contentItems"][0]["text"]
+                .as_str()
+                .expect("tool response text"),
+        )
+        .expect("tool response JSON");
+        assert_eq!(body["error"]["code"], "cancelled");
+        let request = control.next_request().await;
+        assert_eq!(request["method"], "turn/interrupt");
+        control.respond(&request, json!({})).await;
+    });
+    assert_eq!(
+        interrupt.expect("interrupt request"),
+        InterruptOutcome::Requested
+    );
+    assert!(
+        store
+            .list_attachments()
+            .await
+            .expect("attachments")
+            .is_empty()
+    );
+    send_turn_completed(
+        &control,
+        "thread-audio-cancel-download",
+        "turn-audio-cancel-download",
+        "interrupted",
+    )
+    .await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-audio-cancel-download"],
+        InboundEventState::Rejected,
+    )
+    .await;
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn interrupt_cancels_an_active_sidecar_and_releases_its_exact_lease() {
+    let _asr_subprocess_guard = ASR_SUBPROCESS_TEST_LOCK.lock().await;
+    let _asr_process_lock = lock_asr_process_tests();
+    let mut config = validated_config();
+    let temp = tempdir().expect("tempdir");
+    let marker = temp.path().join("active-sidecar.txt");
+    config.asr = asr_config(
+        stub_program(
+            temp.path(),
+            "asr-block-until-cancelled",
+            r#"sleep 60 & child=$!; printf '%s' "$child" > "$1"; wait "$child""#,
+            "@echo off\r\necho invoked>\"%~1\"\r\n:loop\r\ngoto loop\r\n",
+        ),
+        ffmpeg_stub(temp.path()),
+        vec![marker.to_string_lossy().into_owned()],
+    );
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &temp.path().join("attachments-cancelled-sidecar"),
+            store.clone(),
+            Arc::new(StaticAttachmentDownloader),
+            AttachmentLimits::default(),
+        )
+        .expect("attachment cache"),
+    );
+    let (router, control, namespace, workspace) =
+        start_audio_router(config, store.clone(), Arc::clone(&cache)).await;
+    let mut inbound = event("event-audio-cancel-sidecar", "owner-runtime-scope");
+    inbound.message_type = "audio".to_owned();
+    inbound.text.clear();
+    inbound.parts = vec![audio_part(None)];
+    let scope = inbound.scope.clone();
+    let (context_id, handle, _) = route_audio_event(
+        &router,
+        &store,
+        &namespace,
+        &control,
+        &workspace,
+        "cancel-sidecar",
+        inbound,
+        "thread-audio-cancel-sidecar",
+        "turn-audio-cancel-sidecar",
+    )
+    .await;
+    control
+        .send_json(json!({
+            "id": "server-audio-cancel-sidecar",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-audio-cancel-sidecar",
+                "turnId": "turn-audio-cancel-sidecar",
+                "callId": "server-audio-cancel-sidecar",
+                "namespace": "bridge_media",
+                "tool": "read",
+                "arguments": {"context_id": context_id, "handle": handle}
+            }
+        }))
+        .await;
+    // The marker is the child-process startup handshake. Keep the deadline
+    // generous because this integration case competes with the full suite for
+    // process-table and scheduler time.
+    timeout(Duration::from_secs(30), async {
+        while !marker.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("sidecar starts");
+    let rows = store.list_attachments().await.expect("attachments");
+    assert_eq!(rows.len(), 1);
+    let active = store
+        .attachment_leases(&rows[0].sha256)
+        .await
+        .expect("active ASR lease");
+    assert_eq!(active.len(), 1);
+    let sibling_token = store
+        .put_attachment_and_lease(
+            &rows[0].sha256,
+            rows[0].bytes,
+            &rows[0].kind,
+            active[0].turn_row_id,
+        )
+        .await
+        .expect("independent sibling acquisition");
+    assert_eq!(
+        store
+            .attachment_leases(&rows[0].sha256)
+            .await
+            .expect("two independent leases")
+            .len(),
+        2
+    );
+
+    let (interrupt, ()) = tokio::join!(router.interrupt(&scope), async {
+        let response = control.next_request().await;
+        assert_eq!(response["id"], "server-audio-cancel-sidecar");
+        assert_eq!(response["result"]["success"], false);
+        let body: Value = serde_json::from_str(
+            response["result"]["contentItems"][0]["text"]
+                .as_str()
+                .expect("tool response text"),
+        )
+        .expect("tool response JSON");
+        assert_eq!(body["error"]["code"], "cancelled");
+        let request = control.next_request().await;
+        assert_eq!(request["method"], "turn/interrupt");
+        control.respond(&request, json!({})).await;
+    });
+    assert_eq!(
+        interrupt.expect("interrupt request"),
+        InterruptOutcome::Requested
+    );
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let leases = store
+                .attachment_leases(&rows[0].sha256)
+                .await
+                .expect("cancelled ASR leases");
+            if leases.len() == 1 && leases[0].lease_token == sibling_token {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled ASR releases only its exact lease");
+    assert!(
+        store
+            .release_attachment_lease(&sibling_token)
+            .await
+            .expect("release test sibling")
+    );
+    #[cfg(unix)]
+    {
+        let pid = std::fs::read_to_string(&marker)
+            .expect("sidecar pid marker")
+            .parse::<u32>()
+            .expect("sidecar pid");
+        timeout(Duration::from_secs(30), async {
+            while std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("non-exec sidecar grandchild exits on cancellation");
+    }
+    send_turn_completed(
+        &control,
+        "thread-audio-cancel-sidecar",
+        "turn-audio-cancel-sidecar",
+        "interrupted",
+    )
+    .await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-audio-cancel-sidecar"],
+        InboundEventState::Rejected,
+    )
+    .await;
+    router.shutdown().await.expect("shutdown");
+    drop(cache);
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn missing_sidecar_returns_structured_audio_error() {
+    let config = validated_config();
+    let temp = tempdir().expect("tempdir");
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let download_count = Arc::new(AtomicUsize::new(0));
+    let cache = Arc::new(
+        AttachmentCache::open(
+            &temp.path().join("attachments"),
+            store.clone(),
+            Arc::new(PendingAttachmentDownloader {
+                started: Arc::clone(&download_count),
+                started_notify: Arc::new(Notify::new()),
+            }),
+            AttachmentLimits::default(),
+        )
+        .expect("attachment cache"),
+    );
+    let (router, control, namespace, workspace) =
+        start_audio_router(config, store.clone(), cache).await;
+    let mut inbound = event("event-audio-missing", "owner-runtime-scope");
+    inbound.message_type = "audio".to_owned();
+    inbound.text.clear();
+    inbound.parts = vec![audio_part(None)];
+    let (context_id, handle, _) = route_audio_event(
+        &router,
+        &store,
+        &namespace,
+        &control,
+        &workspace,
+        "missing",
+        inbound,
+        "thread-audio-missing",
+        "turn-audio-missing",
+    )
+    .await;
+    let response = read_media(
+        &control,
+        "thread-audio-missing",
+        "turn-audio-missing",
+        "server-audio-missing",
+        &context_id,
+        &handle,
+    )
+    .await;
+    assert_eq!(response["result"]["success"], false);
+    let body: Value = serde_json::from_str(
+        response["result"]["contentItems"][0]["text"]
+            .as_str()
+            .expect("text"),
+    )
+    .expect("json");
+    assert_eq!(body["error"]["code"], "sidecar_missing");
+    assert_eq!(
+        download_count.load(Ordering::SeqCst),
+        0,
+        "missing sidecar must fail before media download"
+    );
+    send_turn_completed(
+        &control,
+        "thread-audio-missing",
+        "turn-audio-missing",
+        "completed",
+    )
+    .await;
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn empty_and_failing_sidecar_return_structured_audio_errors() {
+    let _asr_subprocess_guard = ASR_SUBPROCESS_TEST_LOCK.lock().await;
+    let _asr_process_lock = lock_asr_process_tests();
+    for (name, unix, windows, code) in [
+        (
+            "empty",
+            "exit 0",
+            "@echo off\r\nexit /b 0\r\n",
+            "empty_transcript",
+        ),
+        (
+            "failing",
+            "exit 2",
+            "@echo off\r\nexit /b 2\r\n",
+            "sidecar_failed",
+        ),
+    ] {
+        let mut config = validated_config();
+        let temp = tempdir().expect("tempdir");
+        config.asr = asr_config(
+            stub_program(temp.path(), name, unix, windows),
+            ffmpeg_stub(temp.path()),
+            Vec::new(),
+        );
+        let store = StoreHandle::open_in_memory().await.expect("store");
+        let cache = Arc::new(
+            AttachmentCache::open(
+                &temp.path().join("attachments"),
+                store.clone(),
+                Arc::new(StaticAttachmentDownloader),
+                AttachmentLimits::default(),
+            )
+            .expect("attachment cache"),
+        );
+        let (router, control, namespace, workspace) =
+            start_audio_router(config, store.clone(), cache).await;
+        let event_id = format!("event-audio-{name}");
+        let thread_id = format!("thread-audio-{name}");
+        let turn_id = format!("turn-audio-{name}");
+        let mut inbound = event(&event_id, "owner-runtime-scope");
+        inbound.message_type = "audio".to_owned();
+        inbound.text.clear();
+        inbound.parts = vec![audio_part(None)];
+        let (context_id, handle, _) = route_audio_event(
+            &router, &store, &namespace, &control, &workspace, name, inbound, &thread_id, &turn_id,
+        )
+        .await;
+        let response = read_media(
+            &control,
+            &thread_id,
+            &turn_id,
+            &format!("server-audio-{name}"),
+            &context_id,
+            &handle,
+        )
+        .await;
+        assert_eq!(response["result"]["success"], false);
+        let body: Value = serde_json::from_str(
+            response["result"]["contentItems"][0]["text"]
+                .as_str()
+                .expect("text"),
+        )
+        .expect("json");
+        assert_eq!(body["error"]["code"], code);
+        send_turn_completed(&control, &thread_id, &turn_id, "completed").await;
+        router.shutdown().await.expect("shutdown");
+        store.shutdown().await.expect("store shutdown");
+    }
 }

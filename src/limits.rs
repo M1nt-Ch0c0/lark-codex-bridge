@@ -93,6 +93,10 @@ pub const TOKEN_REFRESH_SKEW: Duration = Duration::from_secs(3 * 60);
 /// Hard cap on one outbound Lark message/card request body (serialized JSON,
 /// envelope included). Oversize sends are refused before any request I/O.
 pub const LARK_MAX_SEND_BODY_BYTES: usize = 256 * 1024;
+/// Exact serialized-byte cap for one Card 2.0 Markdown element. Lark's Card
+/// 2.0 contract documents this as approximately 30 KiB; the bridge treats
+/// 30*1024 bytes as a hard element-object wire bound after JSON escaping.
+pub const LARK_CARD_MARKDOWN_ELEMENT_MAX_BYTES: usize = 30 * 1024;
 /// Hard cap on one downloaded Lark message resource (image/file). The
 /// download stream is aborted mid-body once the cap is exceeded instead of
 /// buffering an unbounded response.
@@ -177,6 +181,30 @@ pub const LARK_INBOUND_EVENT_CAPACITY: usize = 256;
 /// startup accounts raw wire payloads, while durable-runtime startup accounts
 /// exact persisted normalized payload bytes. Permits are held until drop.
 pub const LARK_INBOUND_EVENT_BYTE_BUDGET: usize = 8 * 1024 * 1024;
+
+/// Maximum bytes before the newline of one Rust↔Node sidecar frame. This is
+/// deliberately no larger than one native reassembled event.
+pub const CHANNEL_SIDECAR_FRAME_BYTES: usize = LARK_FRAGMENT_MESSAGE_BYTES;
+/// Events admitted by the Rust wire reader but not yet decided by the durable
+/// intake hook. Saturation returns an explicit negative ack.
+pub const CHANNEL_SIDECAR_EVENT_CAPACITY: usize = 64;
+/// Frames waiting for the child stdin writer.
+pub const CHANNEL_SIDECAR_WRITE_CAPACITY: usize = 128;
+/// Deadline for protocol/version/capability configuration.
+pub const CHANNEL_SIDECAR_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Deadline for the official SDK to report its first live connection after
+/// protocol configuration succeeds.
+pub const CHANNEL_SIDECAR_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// A process epoch must remain continuously connected for this long before a
+/// later crash starts a fresh restart-backoff sequence.
+pub const CHANNEL_SIDECAR_HEALTHY_UPTIME: Duration = Duration::from_secs(30);
+/// Deadline shared with the Node handler before upstream must receive failure.
+pub const CHANNEL_SIDECAR_HANDLER_TIMEOUT: Duration = LARK_HANDLER_TIMEOUT;
+/// Extra time for a negative handler-timeout ack to reach Node before Node
+/// independently rejects the pending SDK handler.
+pub const CHANNEL_SIDECAR_ACK_GRACE: Duration = Duration::from_secs(5);
+/// Grace for a correlated shutdown response and clean child exit.
+pub const CHANNEL_SIDECAR_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// Count bound of the single-writer store command channel. Every store
 /// request (reads included) travels this channel to the one blocking writer
@@ -281,6 +309,34 @@ pub const ATTACHMENT_CACHE_MARKER: &str = ".attachment-cache";
 /// advisory lock. Never a valid SHA-256 name, and the reconciliation scanner
 /// deliberately skips it.
 pub const ATTACHMENT_INSTANCE_LOCK: &str = ".attachment-instance.lock";
+/// Default maximum duration of one audio part that may be sent to the local
+/// ASR sidecar (10 minutes). Longer clips fail closed as `too_long`.
+pub const ASR_MAX_DURATION_MS: u64 = 10 * 60 * 1000;
+/// Non-configurable upper bound for local ASR work. Operator configuration may
+/// lower this limit but can never raise it.
+pub const ASR_ABSOLUTE_MAX_DURATION_MS: u64 = ASR_MAX_DURATION_MS;
+/// PCM byte rate produced by the fixed ffmpeg projection (16 kHz, mono, s16).
+pub const ASR_DECODED_PCM_BYTES_PER_SECOND: u64 = 16_000 * 2;
+/// Maximum decoded WAV bytes, including a conservative bounded header. This is
+/// enforced while ffmpeg is running and verified again before the sidecar.
+pub const ASR_DECODED_WAV_MAX_BYTES: u64 =
+    ASR_DECODED_PCM_BYTES_PER_SECOND * (ASR_ABSOLUTE_MAX_DURATION_MS / 1_000) + 64 * 1024;
+/// Maximum transcript bytes accepted from inbound recognition text or sidecar
+/// stdout.
+pub const ASR_TRANSCRIPT_MAX_BYTES: usize = 32 * 1024;
+/// Maximum extra arguments forwarded to the ASR sidecar.
+pub const ASR_MAX_ARGS: usize = 32;
+/// Maximum bytes of one ASR sidecar argument.
+pub const ASR_MAX_ARG_BYTES: usize = 4 * 1024;
+/// Deadline for one ffmpeg decode of inbound audio.
+pub const ASR_FFMPEG_TIMEOUT: Duration = Duration::from_secs(30);
+/// Deadline for one local ASR sidecar invocation.
+pub const ASR_SIDECAR_TIMEOUT: Duration = Duration::from_secs(60);
+/// Maximum live attachment acquisitions. Every fetch owns an independent token
+/// so overlapping reads cannot release one another's GC protection.
+pub const STORE_ATTACHMENT_LEASE_MAX_ROWS: u64 = 65_536;
+/// Maximum UTF-8 bytes in an internal attachment acquisition token.
+pub const STORE_ATTACHMENT_LEASE_TOKEN_MAX_BYTES: usize = 64;
 /// Maximum live (`starting`/`running`/`uncertain`) turns retained for crash
 /// recovery. Terminal turns are historical rows and do not occupy this set.
 pub const STORE_RECOVERY_TURN_MAX_ROWS: usize = 32;
@@ -352,6 +408,26 @@ pub const TURN_BATCH_MAX_MESSAGES: usize = 64;
 pub const TURN_BATCH_TEXT_BYTE_BUDGET: usize = 768 * 1024;
 /// Maximum bytes parsed as one recognized first-stage bridge command.
 pub const BRIDGE_COMMAND_MAX_BYTES: usize = 16 * 1024;
+/// Maximum opaque pagination cursor accepted by the persisted-thread command surface.
+pub const THREAD_DISCOVERY_CURSOR_MAX_BYTES: usize = 512;
+/// Maximum stable thread selector accepted by an explicit adoption request.
+pub const THREAD_ADOPTION_SELECTOR_MAX_BYTES: usize = 128;
+/// Maximum candidate summaries a future enabled discovery page may expose.
+pub const THREAD_DISCOVERY_MAX_RESULTS: usize = 20;
+/// Maximum encoded bytes a future enabled discovery page may expose.
+pub const THREAD_DISCOVERY_MAX_PAGE_BYTES: usize = 16 * 1024;
+
+/// Lifetime of attachment descriptors staged by one direct-message scope.
+/// Bytes are never downloaded while a descriptor is pending.
+pub const PENDING_MEDIA_TTL: Duration = Duration::from_secs(10 * 60);
+/// Maximum attachment messages staged by one direct-message scope.
+pub const PENDING_MEDIA_MAX_COUNT: usize = 16;
+/// Aggregate variable metadata bytes retained by one pending-media queue.
+pub const PENDING_MEDIA_MAX_METADATA_BYTES: usize = 256 * 1024;
+/// Maximum serialized content accepted from a directly quoted Lark message.
+pub const QUOTE_CONTENT_MAX_BYTES: usize = 256 * 1024;
+/// Maximum typed parts accepted from one directly quoted message.
+pub const QUOTE_MAX_PARTS: usize = 16;
 
 /// Maximum characters (Unicode scalar values) in one projected reply message
 /// before deterministic splitting. A part never exceeds this bound.

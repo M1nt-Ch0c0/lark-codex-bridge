@@ -23,3 +23,10 @@ codex_home = "/opt/codex/home"
 [paths]
 database = "state/bridge.sqlite3"
 attachment_cache = "cache/attachments"
+
+[asr]
+command = "sherpa-onnx-offline"
+args = ["--tokens", "/opt/asr/tokens.txt"]
+ffmpeg = "ffmpeg"
+max_duration_ms = 120000
+max_transcript_bytes = 4096
