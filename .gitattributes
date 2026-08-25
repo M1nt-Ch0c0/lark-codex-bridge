@@ -1,0 +1,8 @@
+# These artifacts are compared and hashed byte-for-byte. Keep their canonical
+# LF encoding even when Git checks the repository out on Windows.
+protocol/codex/** text eol=lf
+src/codex/wire/*.rs text eol=lf
+tools/codex-wire-template.rs text eol=lf
+
+protocol/codex/schemas/** linguist-generated=true
+src/codex/wire/v*.rs linguist-generated=true

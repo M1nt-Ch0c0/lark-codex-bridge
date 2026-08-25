@@ -1,0 +1,722 @@
+{
+  "codexVersion": "0.149.0",
+  "constructs": [
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/AgentMessageDelivery"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ApprovalsReviewer"
+    },
+    {
+      "construct": "oneOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/AskForApproval"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/AskForApproval/oneOf/0"
+    },
+    {
+      "construct": "oneOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/CodexErrorInfo"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/CodexErrorInfo/oneOf/0"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/CollabAgentStatus"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/CollabAgentTool"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/CollabAgentToolCallStatus"
+    },
+    {
+      "construct": "oneOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/CommandAction"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/CommandAction/oneOf/0/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/CommandAction/oneOf/1/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/CommandAction/oneOf/2/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/CommandAction/oneOf/3/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/CommandExecutionSource"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/CommandExecutionStatus"
+    },
+    {
+      "construct": "oneOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/DynamicToolCallOutputContentItem"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/DynamicToolCallOutputContentItem/oneOf/0/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/DynamicToolCallOutputContentItem/oneOf/1/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/DynamicToolCallOutputContentItem/oneOf/2/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/DynamicToolCallStatus"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ImageDetail"
+    },
+    {
+      "construct": "oneOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ImageGenerationFailure"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ImageGenerationFailure/oneOf/0/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/McpToolCallStatus"
+    },
+    {
+      "construct": "oneOf",
+      "evidence": "unknown_generated_enum_values_fail_soft_at_the_stable_boundary",
+      "handling": "open-string-fallback",
+      "schemaPath": "definitions/MessagePhase"
+    },
+    {
+      "construct": "enum",
+      "evidence": "unknown_generated_enum_values_fail_soft_at_the_stable_boundary",
+      "handling": "open-string-fallback",
+      "schemaPath": "definitions/MessagePhase/oneOf/0"
+    },
+    {
+      "construct": "enum",
+      "evidence": "unknown_generated_enum_values_fail_soft_at_the_stable_boundary",
+      "handling": "open-string-fallback",
+      "schemaPath": "definitions/MessagePhase/oneOf/1"
+    },
+    {
+      "construct": "oneOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/MultiAgentMode"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/MultiAgentMode/oneOf/0"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/NetworkAccess"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/NonSteerableTurnKind"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/PatchApplyStatus"
+    },
+    {
+      "construct": "oneOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/PatchChangeKind"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/PatchChangeKind/oneOf/0/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/PatchChangeKind/oneOf/1/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/PatchChangeKind/oneOf/2/properties/type"
+    },
+    {
+      "construct": "oneOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/SandboxPolicy"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/SandboxPolicy/oneOf/0/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/SandboxPolicy/oneOf/1/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/SandboxPolicy/oneOf/2/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/SandboxPolicy/oneOf/3/properties/type"
+    },
+    {
+      "construct": "oneOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/SessionSource"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/SessionSource/oneOf/0"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/SubAgentActivityKind"
+    },
+    {
+      "construct": "oneOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/SubAgentSource"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/SubAgentSource/oneOf/0"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/SubAgentSource/oneOf/1/properties/thread_spawn/properties/agent_path"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/Thread/properties/extra"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/Thread/properties/gitInfo"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/Thread/properties/section"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/Thread/properties/threadSource"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadActiveFlag"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadHistoryMode"
+    },
+    {
+      "construct": "oneOf",
+      "evidence": "unknown_thread_items_preserve_the_complete_raw_payload",
+      "handling": "open-tagged-fallback",
+      "schemaPath": "definitions/ThreadItem"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadItem/oneOf/0/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadItem/oneOf/1/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadItem/oneOf/10/properties/type"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadItem/oneOf/11/properties/action"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadItem/oneOf/11/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadItem/oneOf/12/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadItem/oneOf/13/properties/type"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadItem/oneOf/14/properties/failure"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadItem/oneOf/14/properties/savedPath"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadItem/oneOf/14/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadItem/oneOf/15/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadItem/oneOf/16/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadItem/oneOf/17/properties/type"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadItem/oneOf/2/properties/delivery"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadItem/oneOf/2/properties/memoryCitation"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadItem/oneOf/2/properties/phase"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadItem/oneOf/2/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadItem/oneOf/3/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadItem/oneOf/4/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadItem/oneOf/5/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadItem/oneOf/6/properties/type"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadItem/oneOf/7/properties/appContext"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadItem/oneOf/7/properties/error"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadItem/oneOf/7/properties/result"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadItem/oneOf/7/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadItem/oneOf/8/properties/type"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadItem/oneOf/9/properties/reasoningEffort"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadItem/oneOf/9/properties/type"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadSection/properties/appearance"
+    },
+    {
+      "construct": "oneOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadStatus"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadStatus/oneOf/0/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadStatus/oneOf/1/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadStatus/oneOf/2/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadStatus/oneOf/3/properties/type"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/Turn/properties/error"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/TurnError/properties/codexErrorInfo"
+    },
+    {
+      "construct": "oneOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/TurnItemsView"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/TurnItemsView/oneOf/0"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/TurnItemsView/oneOf/1"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/TurnItemsView/oneOf/2"
+    },
+    {
+      "construct": "enum",
+      "evidence": "unknown_generated_enum_values_fail_soft_at_the_stable_boundary",
+      "handling": "open-string-fallback",
+      "schemaPath": "definitions/TurnStatus"
+    },
+    {
+      "construct": "oneOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/UserInput"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/UserInput/oneOf/0/properties/type"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/UserInput/oneOf/1/properties/detail"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/UserInput/oneOf/1/properties/type"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/UserInput/oneOf/2/properties/detail"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/UserInput/oneOf/2/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/UserInput/oneOf/3/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/UserInput/oneOf/4/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/UserInput/oneOf/5/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/UserInput/oneOf/6/properties/type"
+    },
+    {
+      "construct": "oneOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/WebSearchAction"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/WebSearchAction/oneOf/0/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/WebSearchAction/oneOf/1/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/WebSearchAction/oneOf/2/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/WebSearchAction/oneOf/3/properties/type"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "roots/thread.resume.response/properties/activePermissionProfile"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "roots/thread.resume.response/properties/initialTurnsPage"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "roots/thread.resume.response/properties/reasoningEffort"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "roots/thread.start.response/properties/activePermissionProfile"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "roots/thread.start.response/properties/reasoningEffort"
+    }
+  ],
+  "formatVersion": 1,
+  "incomingRoots": [
+    "initialize.response",
+    "notification.error",
+    "notification.item.agent_message.delta",
+    "notification.item.command_execution.output_delta",
+    "notification.item.completed",
+    "notification.item.started",
+    "notification.thread.started",
+    "notification.thread.token_usage.updated",
+    "notification.turn.completed",
+    "notification.turn.started",
+    "server_request.dynamic_tool_call.params",
+    "server_request.dynamic_tool_call.response",
+    "thread.list.response",
+    "thread.read.response",
+    "thread.resume.response",
+    "thread.start.response",
+    "turn.interrupt.response",
+    "turn.start.response"
+  ]
+}
