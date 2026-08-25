@@ -164,7 +164,7 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
         .iter()
         .filter(|migration| migration.version > current)
     {
-        if migration.version == 6 {
+        if migration.name == "remove durable media capabilities and transcripts" {
             super::dedup::scrub_persisted_inbound_secrets(connection).map_err(
                 |error| match error {
                     StoreError::Sqlite { .. } => StoreError::Migration {
