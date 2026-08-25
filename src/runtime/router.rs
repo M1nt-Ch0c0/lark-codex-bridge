@@ -533,7 +533,7 @@ struct RouterRetry {
 
 struct RouteFailure {
     error: RouteError,
-    event: Box<QueuedInboundEvent>,
+    event: QueuedInboundEvent,
     retryable: bool,
 }
 
@@ -588,11 +588,7 @@ async fn run_router(
                         if let Some((_, task)) = tool_task.take() {
                             task.abort();
                         }
-                        tool_task = start_context_tool_task(
-                            &supervisor,
-                            attachments.as_ref(),
-                            contexts.as_ref(),
-                        );
+                        tool_task = start_context_tool_task(&supervisor, attachments.as_ref(), contexts.as_ref());
                     }
                 } else {
                     if let Some((_, task)) = tool_task.take() {
@@ -643,7 +639,7 @@ async fn run_router(
                                 match enqueue_retry(
                                     &mut retries,
                                     &retry_budget,
-                                    *failure.event,
+                                    failure.event,
                                 ) {
                                     Ok(()) => Ok(()),
                                     Err(()) => Err(error),
@@ -757,7 +753,7 @@ async fn retry_one(
     .await
     {
         Err(failure) if failure.retryable => {
-            retry.event = *failure.event;
+            retry.event = failure.event;
             retries.push_back(retry);
         }
         Ok(()) | Err(_) => {}
@@ -777,16 +773,18 @@ async fn route_one(
     contexts: Option<&Arc<ContextRegistry>>,
     actors: &mut HashMap<String, ScopeActorHandle>,
     queued: QueuedInboundEvent,
-) -> Result<(), RouteFailure> {
+) -> Result<(), Box<RouteFailure>> {
     let decision = policy.decide(&queued.event);
     let key = InboundKey::new(tenant.clone(), queued.event.event_id.clone());
     if let Some(kind) = decision.rejection_kind() {
         return reject_with_notice(store, sink.as_ref(), &key, &queued.event, kind)
             .await
-            .map_err(|error| RouteFailure {
-                error,
-                event: Box::new(queued),
-                retryable: true,
+            .map_err(|error| {
+                Box::new(RouteFailure {
+                    error,
+                    event: queued,
+                    retryable: true,
+                })
             });
     }
     let scope_key = queued.event.scope.to_string();
@@ -808,10 +806,12 @@ async fn route_one(
                     InboundRejectionKind::Overloaded,
                 )
                 .await
-                .map_err(|error| RouteFailure {
-                    error,
-                    event: Box::new(queued),
-                    retryable: true,
+                .map_err(|error| {
+                    Box::new(RouteFailure {
+                        error,
+                        event: queued,
+                        retryable: true,
+                    })
                 });
             }
         }
@@ -831,11 +831,11 @@ async fn route_one(
         );
     }
     let Some(actor) = actors.get(&scope_key) else {
-        return Err(RouteFailure {
+        return Err(Box::new(RouteFailure {
             error: RouteError::ActorUnavailable,
-            event: Box::new(queued),
+            event: queued,
             retryable: false,
-        });
+        }));
     };
     let route = actor.try_route(key.clone(), queued);
     match route {
@@ -846,24 +846,29 @@ async fn route_one(
             );
             Ok(())
         }
-        Err(ActorRouteError::Capacity(queued)) => reject_with_notice(
-            store,
-            sink.as_ref(),
-            &key,
-            &queued.event,
-            InboundRejectionKind::Overloaded,
-        )
-        .await
-        .map_err(|error| RouteFailure {
-            error,
-            event: queued,
-            retryable: true,
-        }),
-        Err(ActorRouteError::Closed(queued)) => Err(RouteFailure {
+        Err(ActorRouteError::Capacity(queued)) => {
+            let queued = *queued;
+            reject_with_notice(
+                store,
+                sink.as_ref(),
+                &key,
+                &queued.event,
+                InboundRejectionKind::Overloaded,
+            )
+            .await
+            .map_err(|error| {
+                Box::new(RouteFailure {
+                    error,
+                    event: queued,
+                    retryable: true,
+                })
+            })
+        }
+        Err(ActorRouteError::Closed(queued)) => Err(Box::new(RouteFailure {
             error: RouteError::ActorUnavailable,
-            event: queued,
+            event: *queued,
             retryable: false,
-        }),
+        })),
     }
 }
 
