@@ -114,6 +114,7 @@ pub struct BridgeConfig {
     pub workspace: WorkspacePolicy,
     pub concurrency: ConcurrencyConfig,
     pub codex: CodexSection,
+    pub channel: ChannelSection,
     pub paths: PathsSection,
     pub asr: AsrSection,
 }
@@ -132,6 +133,7 @@ impl fmt::Debug for BridgeConfig {
             .field("workspace", &self.workspace)
             .field("concurrency", &self.concurrency)
             .field("codex", &self.codex)
+            .field("channel", &self.channel)
             .field("paths", &self.paths)
             .field("asr", &self.asr)
             .finish()
@@ -228,6 +230,11 @@ impl BridgeConfig {
             return Err(ConfigError::AllowRootsTooLarge);
         }
         self.asr.validate()?;
+        if self.channel.node_binary.as_os_str().is_empty()
+            || self.channel.sidecar_entrypoint.as_os_str().is_empty()
+        {
+            return Err(ConfigError::InvalidRuntimePath);
+        }
         Ok(())
     }
 
@@ -246,6 +253,9 @@ impl BridgeConfig {
             self.asr.command = Some(resolve_command_path(&parent, &command)?);
         }
         self.asr.ffmpeg = resolve_command_path(&parent, &self.asr.ffmpeg)?;
+        self.channel.node_binary = resolve_command_path(&parent, &self.channel.node_binary)?;
+        self.channel.sidecar_entrypoint =
+            resolve_relative_path(&parent, &self.channel.sidecar_entrypoint)?;
         Ok(())
     }
 }
@@ -471,6 +481,44 @@ impl fmt::Debug for CodexSection {
     }
 }
 
+/// Inbound transport selected for production application assembly.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ChannelTransport {
+    /// Native Rust WebSocket transport (default and fallback).
+    #[default]
+    Native,
+    /// Official Node SDK sidecar for inbound WebSocket events.
+    NodeSidecar,
+}
+
+/// Channel transport configuration. Queue/frame/time bounds are fixed in the
+/// binary and are intentionally not operator-tunable.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ChannelSection {
+    /// Explicit inbound implementation.
+    pub transport: ChannelTransport,
+    /// Node executable used only for `node-sidecar`.
+    pub node_binary: PathBuf,
+    /// Checked-in/deployed sidecar entrypoint used only for `node-sidecar`.
+    pub sidecar_entrypoint: PathBuf,
+    /// If sidecar bootstrap fails before the first SDK connection is live,
+    /// retain the native transport.
+    pub fallback_to_native: bool,
+}
+
+impl Default for ChannelSection {
+    fn default() -> Self {
+        Self {
+            transport: ChannelTransport::Native,
+            node_binary: PathBuf::from("node"),
+            sidecar_entrypoint: PathBuf::from("sidecar/index.cjs"),
+            fallback_to_native: true,
+        }
+    }
+}
+
 /// Fail-closed operator configuration for the local ASR sidecar.
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -497,6 +545,18 @@ impl Default for AsrSection {
             max_duration_ms: ASR_MAX_DURATION_MS,
             max_transcript_bytes: ASR_TRANSCRIPT_MAX_BYTES,
         }
+    }
+}
+
+impl fmt::Debug for ChannelSection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ChannelSection")
+            .field("transport", &self.transport)
+            .field("node_binary", &"[configured]")
+            .field("sidecar_entrypoint", &"[configured]")
+            .field("fallback_to_native", &self.fallback_to_native)
+            .finish()
     }
 }
 

@@ -95,10 +95,25 @@ jobs:
       - uses: taiki-e/install-action@6cd13508893c0e7eab5f273c2575d3859bd7229a # v2
         with:
           tool: cargo-nextest
-      - run: cargo nextest run --all-targets --all-features --profile ci --locked
+      - run: cargo nextest run --all-targets --all-features --profile ci --locked -E 'not binary(channel_sidecar)'
+      - run: cargo test --test channel_sidecar --locked -- --test-threads=1
       - run: cargo test --doc --all-features --locked
         env:
           RUSTDOCFLAGS: -D warnings
+
+  sidecar:
+    name: Node sidecar lockfile
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: sidecar/package-lock.json
+      - run: npm ci --ignore-scripts --prefix sidecar
+      - run: npm run check --prefix sidecar
 
   docs:
     name: Docs (rustdoc)
@@ -254,5 +269,6 @@ jobs:
         run: python -m unittest discover -s tools/tests -p 'test_*.py'
       - name: Verify committed Codex schema artifacts offline
         run: python tools/codex_schema.py verify
-      - run: cargo nextest run --all-targets --all-features --profile ci --locked
+      - run: cargo nextest run --all-targets --all-features --profile ci --locked -E 'not binary(channel_sidecar)'
+      - run: cargo test --test channel_sidecar --locked -- --test-threads=1
       - run: cargo build --locked

@@ -1,0 +1,17 @@
+{
+  "name": "lark-codex-bridge-channel-sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pinned official Lark SDK inbound adapter for lark-codex-bridge",
+  "license": "MIT",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "check": "node --check index.cjs && node --check dispatcher.cjs && node --check sdk-contract-check.cjs && node sdk-contract-check.cjs"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "1.72.0"
+  }
+}

@@ -8,10 +8,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use lark_codex_bridge::channel::ChannelErrorKind;
 use lark_codex_bridge::lark::api::ResourceKind;
 use lark_codex_bridge::lark::config::{LarkEndpoints, TenantBrand};
 use lark_codex_bridge::lark::credentials::LarkCredentials;
-use lark_codex_bridge::lark::error::{LarkError, LarkErrorKind};
+use lark_codex_bridge::lark::error::LarkError;
 use lark_codex_bridge::lark::http::LarkHttp;
 use lark_codex_bridge::lark::normalize::{
     Degradation, InboundEvent, MessagePart, NormalizeOutcome, Normalizer, PartStatus, ScopeKey,
@@ -409,7 +410,7 @@ async fn backfill_failure_degrades_to_chat_scope() {
     assert_eq!(
         degradation,
         Some(Degradation::ThreadBackfillFailed {
-            kind: LarkErrorKind::Retryable,
+            kind: ChannelErrorKind::Retryable,
         })
     );
     assert_eq!(event.thread_id, None);

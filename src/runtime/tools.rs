@@ -4,6 +4,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
+use crate::channel::MediaKind as ResourceKind;
 use crate::codex::{
     client::{AppServerClient, DYNAMIC_TOOL_CALL_METHOD},
     rpc::ServerRequest,
@@ -14,7 +15,6 @@ use crate::codex::{
     },
 };
 use crate::config::AsrSection;
-use crate::lark::api::ResourceKind;
 use crate::runtime::{
     asr::{self, AsrError, TranscriptSource},
     attachments::{AttachError, AttachmentCache, DownloadKind},

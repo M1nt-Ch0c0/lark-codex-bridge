@@ -13,7 +13,7 @@ use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use super::{StoreError, StoreHandle, now_ms, query_optional, request_bytes, sqlite_error};
-use crate::lark::api::{ChatMode, ResourceKind};
+use crate::channel::{ConversationMode as ChatMode, MediaKind as ResourceKind};
 use crate::lark::bridge::RetainedInbound;
 use crate::lark::normalize::ShortId;
 use crate::lark::normalize::{

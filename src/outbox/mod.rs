@@ -8,7 +8,7 @@
 #![allow(clippy::doc_markdown)]
 
 mod payload;
-mod pump;
+pub(crate) mod pump;
 mod sink;
 
 pub use payload::{OUTBOX_PAYLOAD_VERSION, OutboxError, OutboxOperation};
