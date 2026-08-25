@@ -47,7 +47,11 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::lark::api::{LarkApi, ResourceKind};
+use crate::channel::{
+    ChannelError, ChannelErrorKind, ControlledMediaResolver, MediaKind as ResourceKind,
+    MediaRequest,
+};
+use crate::lark::api::LarkApi;
 use crate::lark::error::LarkError;
 use crate::lark::normalize::ResourceDesc;
 use crate::limits::{
@@ -364,8 +368,8 @@ pub trait ResourceDownloader: Send + Sync {
 }
 
 /// [`ResourceDownloader`] adapter over the real [`LarkApi`] download path.
-/// Wiring this into scope/turn input is Task 8 integration and intentionally
-/// out of scope here.
+/// The runtime invokes it only after a turn-scoped opaque handle passes
+/// context authorization and the per-turn read meter.
 pub struct LarkResourceDownloader {
     api: LarkApi,
 }
@@ -405,6 +409,46 @@ impl fmt::Debug for LarkResourceDownloader {
     }
 }
 
+/// [`ResourceDownloader`] adapter over the provider-neutral controlled-media
+/// boundary. Production assembly uses this type so cache policy never depends
+/// on a vendor SDK or concrete HTTP client.
+pub struct ChannelResourceDownloader {
+    resolver: Arc<dyn ControlledMediaResolver>,
+}
+
+impl ChannelResourceDownloader {
+    /// Creates an adapter around a shared resolver capability.
+    #[must_use]
+    pub fn new(resolver: Arc<dyn ControlledMediaResolver>) -> Self {
+        Self { resolver }
+    }
+}
+
+impl ResourceDownloader for ChannelResourceDownloader {
+    fn download(
+        &self,
+        message_id: &str,
+        key: &str,
+        kind: ResourceKind,
+    ) -> BoxFuture<'static, Result<Bytes, AttachError>> {
+        let resolver = Arc::clone(&self.resolver);
+        let request = MediaRequest {
+            message_id: message_id.to_owned(),
+            resource_key: key.to_owned(),
+            kind,
+        };
+        Box::pin(async move { resolver.resolve(request).await.map_err(map_channel_error) })
+    }
+}
+
+impl fmt::Debug for ChannelResourceDownloader {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ChannelResourceDownloader")
+            .finish_non_exhaustive()
+    }
+}
+
 // `map_err` requires the adapter to accept the error by value even though the
 // body only reads its classification.
 #[allow(clippy::needless_pass_by_value)]
@@ -412,8 +456,20 @@ fn map_lark_error(error: LarkError) -> AttachError {
     let kind = match error {
         LarkError::PermanentAuth { .. } => DownloadKind::PermanentAuth,
         LarkError::Retryable { .. } => DownloadKind::Retryable,
-        LarkError::ProtocolViolation { .. } => DownloadKind::Protocol,
+        LarkError::InvalidRequest { .. } | LarkError::ProtocolViolation { .. } => {
+            DownloadKind::Protocol
+        }
         LarkError::Exhausted { .. } => DownloadKind::Exhausted,
+    };
+    AttachError::Download { kind }
+}
+
+fn map_channel_error(error: ChannelError) -> AttachError {
+    let kind = match error.kind() {
+        ChannelErrorKind::PermanentAuth => DownloadKind::PermanentAuth,
+        ChannelErrorKind::Retryable => DownloadKind::Retryable,
+        ChannelErrorKind::Protocol => DownloadKind::Protocol,
+        ChannelErrorKind::Exhausted => DownloadKind::Exhausted,
     };
     AttachError::Download { kind }
 }
@@ -430,6 +486,9 @@ pub struct CachedAttachment {
     pub kind: ResourceKind,
     /// Object size in bytes.
     pub bytes: u64,
+    /// Unique acquisition token. It is intentionally omitted from `Debug` and
+    /// is used only to release this exact caller's GC protection.
+    pub lease_token: String,
 }
 
 impl fmt::Debug for CachedAttachment {
@@ -580,12 +639,13 @@ impl AttachmentCache {
     /// ([`AttachmentLimits::check_resource_key`]) and the single-object byte
     /// cap ([`AttachmentLimits::check_attachment_bytes`]). The per-message
     /// count ([`AttachmentLimits::check_resource_batch`]) and the per-turn
-    /// byte total ([`AttachmentLimits::check_turn_total`]) are turn-assembly
-    /// responsibilities (plan Task 8 / B8), not fetch's; the display file-name
-    /// and MIME checkers ([`AttachmentLimits::check_file_name`] and
+    /// byte total ([`AttachmentLimits::check_turn_total`]) are enforced by
+    /// turn assembly and the context-tool read meter, not by `fetch` itself;
+    /// the display file-name and MIME checkers
+    /// ([`AttachmentLimits::check_file_name`] and
     /// [`AttachmentLimits::check_mime`]) apply to metadata that
     /// [`ResourceDesc`] does not carry (only `kind` + `key`), so they remain
-    /// public for the scope-actor wiring point that does carry that metadata.
+    /// public for the lazy context-tool path that does carry that metadata.
     ///
     /// The install/commit/re-verify sequence runs under the per-cache lock so
     /// a concurrent same-process `gc`/`reconcile` cannot delete the file
@@ -685,10 +745,9 @@ impl AttachmentCache {
         }
         // Row and lease commit in one transaction (design §10, Task 7 Step 1),
         // so GC can never observe an unleased row and evict it mid-fetch.
-        self.store
-            .put_attachment_and_lease(&sha, size, resource_kind_str(desc.kind), turn_row_id)
-            .await
-            .map_err(|error| store_err("recording and leasing an attachment", error))?;
+        let lease_token = self
+            .commit_lease(&sha, size, desc.kind, turn_row_id, shutdown)
+            .await?;
         // Close the file race: a concurrent reconcile may have removed the
         // still-rowless file as an orphan before the transaction committed, so
         // re-establish it now that the row+lease exist (bytes are in hand).
@@ -709,6 +768,7 @@ impl AttachmentCache {
         )
         .await?;
         if shutdown.is_some_and(CancellationToken::is_cancelled) {
+            let _ = self.store.release_attachment_lease(&lease_token).await;
             return Err(AttachError::Cancelled {
                 context: "verifying an installed attachment",
             });
@@ -718,7 +778,44 @@ impl AttachmentCache {
             path: final_path,
             kind: desc.kind,
             bytes: size,
+            lease_token,
         })
+    }
+
+    async fn commit_lease(
+        &self,
+        sha256: &str,
+        bytes: u64,
+        kind: ResourceKind,
+        turn_row_id: i64,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<String, AttachError> {
+        let Some(cancellation) = cancellation.cloned() else {
+            return self
+                .store
+                .put_attachment_and_lease(sha256, bytes, resource_kind_str(kind), turn_row_id)
+                .await
+                .map_err(|error| store_err("recording and leasing an attachment", error));
+        };
+        // Keep the admitted store mutation alive if the reverse-tool future is
+        // dropped. Every transaction returns a unique acquisition token, so a
+        // cancelled caller can never release another simultaneous reader.
+        let store = self.store.clone();
+        let sha256 = sha256.to_owned();
+        tokio::spawn(async move {
+            let lease_token = store
+                .put_attachment_and_lease(&sha256, bytes, resource_kind_str(kind), turn_row_id)
+                .await?;
+            if cancellation.is_cancelled() {
+                store.release_attachment_lease(&lease_token).await?;
+            }
+            Ok::<String, StoreError>(lease_token)
+        })
+        .await
+        .map_err(|_| AttachError::Io {
+            context: "joining an attachment lease transaction",
+        })?
+        .map_err(|error| store_err("recording and leasing an attachment", error))
     }
 
     /// Releases every attachment lease held by a turn, returning the number
@@ -732,6 +829,17 @@ impl AttachmentCache {
             .release_turn_attachment_leases(turn_row_id)
             .await
             .map_err(|error| store_err("releasing turn attachment leases", error))
+    }
+
+    /// Releases only the lease created for one materialized attachment.
+    ///
+    /// Dynamic tool cancellation uses this narrower boundary so concurrent
+    /// reads owned by the same turn keep their independent leases.
+    pub(crate) async fn release_lease(&self, lease_token: &str) -> Result<bool, AttachError> {
+        self.store
+            .release_attachment_lease(lease_token)
+            .await
+            .map_err(|error| store_err("releasing an attachment lease", error))
     }
 
     /// Evicts unleased attachments, oldest (`last_used_ms`) first, until the
@@ -1641,6 +1749,7 @@ fn now_ms() -> i64 {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::store::{NewTurnRow, TurnState};
 
     struct EmptyDownloader;
 
@@ -1739,6 +1848,86 @@ mod tests {
         assert!(reopened.is_some(), "cache reopens after detached job exits");
         drop(reopened);
         let _ = store.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_behind_a_blocked_writer_compensates_the_late_exact_lease() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let database = temp.path().join("store.sqlite");
+        let store = StoreHandle::open(&database).await.expect("store");
+        let turn_row_id = store
+            .record_turn(NewTurnRow {
+                scope_key: "chat:late-lease".to_owned(),
+                client_message_id: "late-lease".to_owned(),
+                codex_thread_id: Some("thread-late-lease".to_owned()),
+                state: TurnState::Starting,
+            })
+            .await
+            .expect("turn");
+        let cache_root = temp.path().join("attachments");
+        let cache = Arc::new(
+            AttachmentCache::open(
+                &cache_root,
+                store.clone(),
+                Arc::new(EmptyDownloader),
+                AttachmentLimits::default(),
+            )
+            .expect("cache"),
+        );
+        let blocker = rusqlite::Connection::open(&database).expect("writer blocker");
+        blocker
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold SQLite writer");
+        let cancellation = CancellationToken::new();
+        let fetch = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            let cancellation = cancellation.clone();
+            async move {
+                cache
+                    .fetch_cancellable(
+                        "message-late-lease",
+                        &ResourceDesc {
+                            kind: ResourceKind::File,
+                            key: "resource-late-lease".to_owned(),
+                        },
+                        turn_row_id,
+                        &cancellation,
+                    )
+                    .await
+            }
+        });
+        let sha = sha256_hex(b"");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !cache_root.join(&sha).is_file() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("content installed before the blocked lease transaction");
+        cancellation.cancel();
+        blocker.execute_batch("ROLLBACK").expect("release writer");
+
+        assert!(matches!(
+            fetch.await.expect("fetch task"),
+            Err(AttachError::Cancelled { .. })
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if store
+                    .attachment_leases(&sha)
+                    .await
+                    .expect("leases")
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("late exact lease is compensated");
+        drop(cache);
+        store.shutdown().await.expect("shutdown");
     }
 
     /// The chmod failure path is hard to reach through `AttachmentCache::open`

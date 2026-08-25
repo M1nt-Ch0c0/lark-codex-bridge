@@ -9,13 +9,15 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
+use crate::codex::external::CodexBackendConfig;
 use crate::codex::process::CodexProcessConfig;
 use crate::codex::types::{ApprovalPolicy, SandboxMode};
 use crate::limits::{
-    DEFAULT_ACTIVE_TURN_PERMITS, DEFAULT_MAX_SCOPE_ACTORS, MAX_CONFIG_ALLOW_ROOT_BYTES,
-    MAX_CONFIG_ALLOW_ROOTS, MAX_CONFIG_ALLOWED_GROUP_BYTES, MAX_CONFIG_ALLOWED_GROUPS,
-    MAX_CONFIG_ALLOWED_SENDER_BYTES, MAX_CONFIG_ALLOWED_SENDERS, MAX_CONFIG_OWNER_BYTES,
-    MAX_CONFIG_OWNERS,
+    ASR_ABSOLUTE_MAX_DURATION_MS, ASR_MAX_ARG_BYTES, ASR_MAX_ARGS, ASR_MAX_DURATION_MS,
+    ASR_TRANSCRIPT_MAX_BYTES, DEFAULT_ACTIVE_TURN_PERMITS, DEFAULT_MAX_SCOPE_ACTORS,
+    MAX_CONFIG_ALLOW_ROOT_BYTES, MAX_CONFIG_ALLOW_ROOTS, MAX_CONFIG_ALLOWED_GROUP_BYTES,
+    MAX_CONFIG_ALLOWED_GROUPS, MAX_CONFIG_ALLOWED_SENDER_BYTES, MAX_CONFIG_ALLOWED_SENDERS,
+    MAX_CONFIG_OWNER_BYTES, MAX_CONFIG_OWNERS,
 };
 use crate::runtime::policy::{AccessPolicy, PlatformRoots};
 
@@ -61,6 +63,16 @@ pub enum ConfigError {
     InvalidDefaultWorkspace,
     #[error("unable to determine safe platform filesystem roots")]
     PlatformRoots,
+    #[error("bridge configuration contains an invalid Codex backend")]
+    InvalidCodexBackend,
+    #[error("bridge configuration contains an invalid ASR sidecar command")]
+    InvalidAsrCommand,
+    #[error("bridge configuration has too many ASR sidecar arguments")]
+    TooManyAsrArgs,
+    #[error("bridge configuration ASR sidecar arguments exceed the byte limit")]
+    AsrArgsTooLarge,
+    #[error("bridge configuration contains an invalid ASR limit")]
+    InvalidAsrLimit,
 }
 
 impl fmt::Debug for ConfigError {
@@ -85,6 +97,11 @@ impl fmt::Debug for ConfigError {
             Self::InvalidRuntimePath => "InvalidRuntimePath",
             Self::InvalidDefaultWorkspace => "InvalidDefaultWorkspace",
             Self::PlatformRoots => "PlatformRoots",
+            Self::InvalidCodexBackend => "InvalidCodexBackend",
+            Self::InvalidAsrCommand => "InvalidAsrCommand",
+            Self::TooManyAsrArgs => "TooManyAsrArgs",
+            Self::AsrArgsTooLarge => "AsrArgsTooLarge",
+            Self::InvalidAsrLimit => "InvalidAsrLimit",
         };
         formatter.write_str(category)
     }
@@ -101,7 +118,9 @@ pub struct BridgeConfig {
     pub workspace: WorkspacePolicy,
     pub concurrency: ConcurrencyConfig,
     pub codex: CodexSection,
+    pub channel: ChannelSection,
     pub paths: PathsSection,
+    pub asr: AsrSection,
 }
 
 impl fmt::Debug for BridgeConfig {
@@ -118,7 +137,9 @@ impl fmt::Debug for BridgeConfig {
             .field("workspace", &self.workspace)
             .field("concurrency", &self.concurrency)
             .field("codex", &self.codex)
+            .field("channel", &self.channel)
             .field("paths", &self.paths)
+            .field("asr", &self.asr)
             .finish()
     }
 }
@@ -212,6 +233,16 @@ impl BridgeConfig {
         {
             return Err(ConfigError::AllowRootsTooLarge);
         }
+        self.codex
+            .backend
+            .validate()
+            .map_err(|_| ConfigError::InvalidCodexBackend)?;
+        self.asr.validate()?;
+        if self.channel.node_binary.as_os_str().is_empty()
+            || self.channel.sidecar_entrypoint.as_os_str().is_empty()
+        {
+            return Err(ConfigError::InvalidRuntimePath);
+        }
         Ok(())
     }
 
@@ -226,6 +257,13 @@ impl BridgeConfig {
         };
         self.paths.database = resolve_relative_path(&parent, &self.paths.database)?;
         self.paths.attachment_cache = resolve_relative_path(&parent, &self.paths.attachment_cache)?;
+        if let Some(command) = self.asr.command.take() {
+            self.asr.command = Some(resolve_command_path(&parent, &command)?);
+        }
+        self.asr.ffmpeg = resolve_command_path(&parent, &self.asr.ffmpeg)?;
+        self.channel.node_binary = resolve_command_path(&parent, &self.channel.node_binary)?;
+        self.channel.sidecar_entrypoint =
+            resolve_relative_path(&parent, &self.channel.sidecar_entrypoint)?;
         Ok(())
     }
 }
@@ -305,8 +343,7 @@ impl Default for ConcurrencyConfig {
 /// Codex process and policy settings.
 #[derive(Clone, Serialize)]
 pub struct CodexSection {
-    pub binary: PathBuf,
-    pub codex_home: Option<PathBuf>,
+    pub backend: CodexBackendConfig,
     pub model: Option<String>,
     pub sandbox: SandboxMode,
     pub approval_policy: ApprovalPolicy,
@@ -319,8 +356,7 @@ impl<'de> Deserialize<'de> for CodexSection {
     {
         let config = CodexSectionConfig::deserialize(deserializer)?;
         Ok(Self {
-            binary: config.binary,
-            codex_home: config.codex_home,
+            backend: config.backend,
             model: config.model,
             sandbox: config.sandbox,
             approval_policy: config.approval_policy.into(),
@@ -331,8 +367,7 @@ impl<'de> Deserialize<'de> for CodexSection {
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct CodexSectionConfig {
-    binary: PathBuf,
-    codex_home: Option<PathBuf>,
+    backend: CodexBackendConfig,
     model: Option<String>,
     sandbox: SandboxMode,
     approval_policy: ConfigApprovalPolicy,
@@ -342,8 +377,7 @@ impl Default for CodexSectionConfig {
     fn default() -> Self {
         let defaults = CodexSection::default();
         Self {
-            binary: defaults.binary,
-            codex_home: defaults.codex_home,
+            backend: defaults.backend,
             model: defaults.model,
             sandbox: defaults.sandbox,
             approval_policy: ConfigApprovalPolicy::default(),
@@ -412,8 +446,7 @@ impl From<StrictGranularApprovalPolicy> for crate::codex::types::GranularApprova
 impl Default for CodexSection {
     fn default() -> Self {
         Self {
-            binary: PathBuf::from("codex"),
-            codex_home: None,
+            backend: CodexBackendConfig::default(),
             model: None,
             sandbox: SandboxMode::WorkspaceWrite,
             approval_policy: ApprovalPolicy::Named("never".to_owned()),
@@ -423,11 +456,8 @@ impl Default for CodexSection {
 
 impl CodexSection {
     #[must_use]
-    pub fn process_config(&self) -> CodexProcessConfig {
-        CodexProcessConfig {
-            binary: self.binary.clone(),
-            codex_home: self.codex_home.clone(),
-        }
+    pub fn process_config(&self) -> Option<CodexProcessConfig> {
+        self.backend.spawned_process_config()
     }
 }
 
@@ -439,14 +469,137 @@ impl fmt::Debug for CodexSection {
         };
         formatter
             .debug_struct("CodexSection")
-            .field("binary", &"[configured]")
-            .field(
-                "codex_home",
-                &self.codex_home.as_ref().map(|_| "[configured]"),
-            )
+            .field("backend", &self.backend)
             .field("model_configured", &self.model.is_some())
             .field("sandbox", &self.sandbox)
             .field("approval_policy_kind", &approval_policy_kind)
+            .finish()
+    }
+}
+
+/// Inbound transport selected for production application assembly.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ChannelTransport {
+    /// Native Rust WebSocket transport (default and fallback).
+    #[default]
+    Native,
+    /// Official Node SDK sidecar for inbound WebSocket events.
+    NodeSidecar,
+}
+
+/// Channel transport configuration. Queue/frame/time bounds are fixed in the
+/// binary and are intentionally not operator-tunable.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ChannelSection {
+    /// Explicit inbound implementation.
+    pub transport: ChannelTransport,
+    /// Node executable used only for `node-sidecar`.
+    pub node_binary: PathBuf,
+    /// Checked-in/deployed sidecar entrypoint used only for `node-sidecar`.
+    pub sidecar_entrypoint: PathBuf,
+    /// If sidecar bootstrap fails before the first SDK connection is live,
+    /// retain the native transport.
+    pub fallback_to_native: bool,
+}
+
+impl Default for ChannelSection {
+    fn default() -> Self {
+        Self {
+            transport: ChannelTransport::Native,
+            node_binary: PathBuf::from("node"),
+            sidecar_entrypoint: PathBuf::from("sidecar/index.cjs"),
+            fallback_to_native: true,
+        }
+    }
+}
+
+/// Fail-closed operator configuration for the local ASR sidecar.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AsrSection {
+    /// Optional sidecar executable. Absent means audio cannot be transcribed
+    /// unless the inbound payload already carries recognition text.
+    pub command: Option<PathBuf>,
+    /// Extra arguments inserted before the decoded WAV path.
+    pub args: Vec<String>,
+    /// ffmpeg executable used to decode inbound audio to 16 kHz PCM WAV.
+    pub ffmpeg: PathBuf,
+    /// Audio longer than this is refused without invoking the sidecar.
+    pub max_duration_ms: u64,
+    /// Maximum accepted transcript bytes from inbound text or sidecar stdout.
+    pub max_transcript_bytes: usize,
+}
+
+impl Default for AsrSection {
+    fn default() -> Self {
+        Self {
+            command: None,
+            args: Vec::new(),
+            ffmpeg: PathBuf::from("ffmpeg"),
+            max_duration_ms: ASR_MAX_DURATION_MS,
+            max_transcript_bytes: ASR_TRANSCRIPT_MAX_BYTES,
+        }
+    }
+}
+
+impl fmt::Debug for ChannelSection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ChannelSection")
+            .field("transport", &self.transport)
+            .field("node_binary", &"[configured]")
+            .field("sidecar_entrypoint", &"[configured]")
+            .field("fallback_to_native", &self.fallback_to_native)
+            .finish()
+    }
+}
+
+impl AsrSection {
+    pub(crate) fn validate(&mut self) -> Result<(), ConfigError> {
+        if let Some(command) = &self.command {
+            if command.as_os_str().is_empty() {
+                return Err(ConfigError::InvalidAsrCommand);
+            }
+        }
+        if self.ffmpeg.as_os_str().is_empty() {
+            return Err(ConfigError::InvalidAsrCommand);
+        }
+        if self.args.len() > ASR_MAX_ARGS {
+            return Err(ConfigError::TooManyAsrArgs);
+        }
+        if self.args.iter().any(|arg| arg.len() > ASR_MAX_ARG_BYTES) {
+            return Err(ConfigError::AsrArgsTooLarge);
+        }
+        if self.max_duration_ms == 0
+            || self.max_duration_ms > ASR_ABSOLUTE_MAX_DURATION_MS
+            || self.max_transcript_bytes == 0
+            || self.max_transcript_bytes > ASR_TRANSCRIPT_MAX_BYTES
+        {
+            return Err(ConfigError::InvalidAsrLimit);
+        }
+        Ok(())
+    }
+
+    /// Returns whether a sidecar executable is configured.
+    #[must_use]
+    pub fn is_configured(&self) -> bool {
+        self.command
+            .as_ref()
+            .is_some_and(|command| !command.as_os_str().is_empty())
+    }
+}
+
+impl fmt::Debug for AsrSection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AsrSection")
+            .field("command_configured", &self.command.is_some())
+            .field("arg_count", &self.args.len())
+            .field("ffmpeg_configured", &!self.ffmpeg.as_os_str().is_empty())
+            .field("max_duration_ms", &self.max_duration_ms)
+            .field("max_transcript_bytes", &self.max_transcript_bytes)
             .finish()
     }
 }
@@ -476,6 +629,23 @@ impl fmt::Debug for PathsSection {
             .field("attachment_cache", &"[configured]")
             .finish()
     }
+}
+
+fn resolve_command_path(parent: &Path, path: &Path) -> Result<PathBuf, ConfigError> {
+    if path.as_os_str().is_empty() {
+        return Err(ConfigError::InvalidAsrCommand);
+    }
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    #[cfg(windows)]
+    if path.has_root() || matches!(path.components().next(), Some(Component::Prefix(_))) {
+        return Err(ConfigError::InvalidAsrCommand);
+    }
+    if path.components().count() <= 1 {
+        return Ok(path.to_path_buf());
+    }
+    resolve_relative_path(parent, path)
 }
 
 fn resolve_relative_path(parent: &Path, path: &Path) -> Result<PathBuf, ConfigError> {
@@ -531,6 +701,13 @@ mod tests {
         assert_eq!(
             resolve_relative_path(parent, Path::new(r"state\bridge.sqlite3")).unwrap(),
             parent.join(r"state\bridge.sqlite3")
+        );
+        assert!(resolve_command_path(parent, Path::new(r"C:")).is_err());
+        assert!(resolve_command_path(parent, Path::new(r"C:ffmpeg.exe")).is_err());
+        assert!(resolve_command_path(parent, Path::new(r"\ffmpeg.exe")).is_err());
+        assert_eq!(
+            resolve_command_path(parent, Path::new("ffmpeg.exe")).unwrap(),
+            PathBuf::from("ffmpeg.exe")
         );
     }
 }

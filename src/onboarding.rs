@@ -31,6 +31,7 @@ use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
 
+use crate::codex::external::CodexBackendConfig;
 use crate::config::{BridgeConfig, PathsSection, WorkspacePolicy, default_config_path};
 use crate::lark::api::LarkApi;
 use crate::lark::config::{LarkEndpoints, TenantBrand};
@@ -345,19 +346,25 @@ fn build_config(paths: &OnboardingPaths, owner: &str) -> BridgeConfig {
     }
 }
 
-/// Minimal on-disk representation of a generated config. Everything else
-/// (concurrency, codex, network access) is left to the validated defaults.
+/// Minimal on-disk representation of a generated config. The backend tag is emitted explicitly;
+/// concurrency, Codex policy, and network access retain their validated defaults.
 #[derive(Serialize)]
 struct GeneratedConfig {
     owners: Vec<String>,
     default_workspace: PathBuf,
     workspace: GeneratedWorkspace,
+    codex: GeneratedCodex,
     paths: GeneratedPaths,
 }
 
 #[derive(Serialize)]
 struct GeneratedWorkspace {
     allow_roots: Vec<PathBuf>,
+}
+
+#[derive(Serialize)]
+struct GeneratedCodex {
+    backend: CodexBackendConfig,
 }
 
 #[derive(Serialize)]
@@ -374,6 +381,9 @@ fn write_config_atomic(paths: &OnboardingPaths, config: &BridgeConfig) -> Result
         })?,
         workspace: GeneratedWorkspace {
             allow_roots: config.workspace.allow_roots.clone(),
+        },
+        codex: GeneratedCodex {
+            backend: config.codex.backend.clone(),
         },
         paths: GeneratedPaths {
             database: config.paths.database.clone(),

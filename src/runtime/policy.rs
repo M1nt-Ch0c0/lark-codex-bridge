@@ -14,9 +14,9 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::channel::ConversationMode as ChatMode;
 use crate::codex::types::{ApprovalPolicy, SandboxMode};
 use crate::config::{BridgeConfig, ConfigError};
-use crate::lark::api::ChatMode;
 use crate::lark::normalize::InboundEvent;
 use crate::limits::{
     MAX_CONFIG_ALLOW_ROOT_BYTES, MAX_CONFIG_ALLOW_ROOTS, MAX_PLATFORM_PROTECTED_ROOT_BYTES,
@@ -317,6 +317,24 @@ impl AccessPolicy {
             return AccessDecision::DenyOwnerCommandRequired;
         }
         Self::mention_gate(event)
+    }
+
+    /// Authorizes the sender of a directly quoted parent after Lark has
+    /// returned its identity. Parent messages do not need to mention the bot,
+    /// but they must independently satisfy the human sender/owner/group
+    /// policy; authorization of the quoting child is not transitive.
+    #[must_use]
+    pub(crate) fn allows_quoted_parent(
+        &self,
+        sender_id: &str,
+        sender_is_human: bool,
+        chat_id: &str,
+        chat_type: ChatMode,
+    ) -> bool {
+        sender_is_human
+            && (self.is_owner(sender_id)
+                || self.is_allowed_sender(sender_id)
+                || (chat_type != ChatMode::P2p && self.is_allowed_group(chat_id)))
     }
 
     fn is_owner(&self, sender_id: &str) -> bool {

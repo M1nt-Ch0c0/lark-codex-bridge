@@ -2,6 +2,18 @@
   "codexVersion": "0.149.0",
   "constructs": [
     {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/AdditionalPermissionProfile/properties/fileSystem"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/AdditionalPermissionProfile/properties/network"
+    },
+    {
       "construct": "enum",
       "evidence": "incoming_closed_union_additions_are_breaking",
       "handling": "promotion-blocking",
@@ -86,6 +98,36 @@
       "schemaPath": "definitions/CommandAction/oneOf/3/properties/type"
     },
     {
+      "construct": "oneOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/CommandExecutionApprovalDecision"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/CommandExecutionApprovalDecision/oneOf/0"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/CommandExecutionApprovalDecision/oneOf/1"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/CommandExecutionApprovalDecision/oneOf/4"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/CommandExecutionApprovalDecision/oneOf/5"
+    },
+    {
       "construct": "enum",
       "evidence": "incoming_closed_union_additions_are_breaking",
       "handling": "promotion-blocking",
@@ -126,6 +168,132 @@
       "evidence": "incoming_closed_union_additions_are_breaking",
       "handling": "promotion-blocking",
       "schemaPath": "definitions/DynamicToolCallStatus"
+    },
+    {
+      "construct": "oneOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/FileChangeApprovalDecision"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/FileChangeApprovalDecision/oneOf/0"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/FileChangeApprovalDecision/oneOf/1"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/FileChangeApprovalDecision/oneOf/2"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/FileChangeApprovalDecision/oneOf/3"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/FileSystemAccessMode"
+    },
+    {
+      "construct": "oneOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/FileSystemPath"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/FileSystemPath/oneOf/0/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/FileSystemPath/oneOf/1/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/FileSystemPath/oneOf/2/properties/type"
+    },
+    {
+      "construct": "oneOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/FileSystemSpecialPath"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/FileSystemSpecialPath/oneOf/0/properties/kind"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/FileSystemSpecialPath/oneOf/1/properties/kind"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/FileSystemSpecialPath/oneOf/2/properties/kind"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/FileSystemSpecialPath/oneOf/2/properties/subpath"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/FileSystemSpecialPath/oneOf/3/properties/kind"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/FileSystemSpecialPath/oneOf/4/properties/kind"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/FileSystemSpecialPath/oneOf/5/properties/kind"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/FileSystemSpecialPath/oneOf/5/properties/subpath"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/GrantedPermissionProfile/properties/fileSystem"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/GrantedPermissionProfile/properties/network"
     },
     {
       "construct": "enum",
@@ -191,6 +359,18 @@
       "construct": "enum",
       "evidence": "incoming_closed_union_additions_are_breaking",
       "handling": "promotion-blocking",
+      "schemaPath": "definitions/NetworkApprovalProtocol"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/NetworkPolicyRuleAction"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
       "schemaPath": "definitions/NonSteerableTurnKind"
     },
     {
@@ -222,6 +402,30 @@
       "evidence": "incoming_closed_union_additions_are_breaking",
       "handling": "promotion-blocking",
       "schemaPath": "definitions/PatchChangeKind/oneOf/2/properties/type"
+    },
+    {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/PermissionGrantScope"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/RequestId"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/RequestPermissionProfile/properties/fileSystem"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/RequestPermissionProfile/properties/network"
     },
     {
       "construct": "oneOf",
@@ -536,6 +740,12 @@
       "schemaPath": "definitions/ThreadStatus/oneOf/3/properties/type"
     },
     {
+      "construct": "enum",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "definitions/ThreadUnsubscribeStatus"
+    },
+    {
       "construct": "anyOf",
       "evidence": "incoming_closed_union_additions_are_breaking",
       "handling": "promotion-blocking",
@@ -671,6 +881,24 @@
       "construct": "anyOf",
       "evidence": "incoming_closed_union_additions_are_breaking",
       "handling": "promotion-blocking",
+      "schemaPath": "roots/server_request.command_execution.request_approval.params/properties/additionalPermissions"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "roots/server_request.command_execution.request_approval.params/properties/cwd"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "schemaPath": "roots/server_request.command_execution.request_approval.params/properties/networkApprovalContext"
+    },
+    {
+      "construct": "anyOf",
+      "evidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
       "schemaPath": "roots/thread.resume.response/properties/activePermissionProfile"
     },
     {
@@ -706,17 +934,33 @@
     "notification.item.command_execution.output_delta",
     "notification.item.completed",
     "notification.item.started",
+    "notification.server_request.resolved",
+    "notification.thread.queue.changed",
     "notification.thread.started",
+    "notification.thread.status.changed",
     "notification.thread.token_usage.updated",
     "notification.turn.completed",
     "notification.turn.started",
+    "server_request.command_execution.request_approval.params",
+    "server_request.command_execution.request_approval.response",
     "server_request.dynamic_tool_call.params",
     "server_request.dynamic_tool_call.response",
+    "server_request.file_change.request_approval.params",
+    "server_request.file_change.request_approval.response",
+    "server_request.permissions.request_approval.params",
+    "server_request.permissions.request_approval.response",
+    "thread.items.list.response",
     "thread.list.response",
+    "thread.queue.add.response",
+    "thread.queue.list.response",
+    "thread.queue.start.response",
     "thread.read.response",
     "thread.resume.response",
     "thread.start.response",
+    "thread.turns.list.response",
+    "thread.unsubscribe.response",
     "turn.interrupt.response",
-    "turn.start.response"
+    "turn.start.response",
+    "turn.steer.response"
   ]
 }

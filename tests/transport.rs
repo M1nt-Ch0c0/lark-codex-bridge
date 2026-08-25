@@ -534,56 +534,80 @@ async fn full_event_queue_and_broken_stdin_do_not_deadlock_terminal_delivery() {
 }
 
 #[cfg(unix)]
-fn fake_codex(version_output: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+fn install_executable_fixture(
+    directory: &std::path::Path,
+    name: &str,
+    script: &str,
+) -> std::path::PathBuf {
+    use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt;
 
+    let staging = directory.join(".executable-fixture-staging");
+    let binary = directory.join(name);
+    let mut staged = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staging)
+        .expect("executable fixture should be staged");
+    staged
+        .write_all(script.as_bytes())
+        .expect("executable fixture should be written");
+    staged
+        .sync_all()
+        .expect("executable fixture should be flushed");
+    drop(staged);
+    let mut permissions = std::fs::metadata(&staging)
+        .expect("executable fixture metadata should be readable")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&staging, permissions)
+        .expect("executable fixture should be executable");
+    // Install only after the writer has explicitly flushed and closed.
+    // Executing an inode with a live write handle fails with ETXTBSY on Linux.
+    std::fs::rename(staging, &binary).expect("executable fixture should install atomically");
+    binary
+}
+
+#[cfg(unix)]
+fn fake_codex(version_output: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     let directory = tempfile::tempdir().expect("temporary directory should be created");
-    let binary = directory.path().join("codex binary with spaces");
     let script = format!(
         "#!/bin/sh\n[ \"$1\" = \"--version\" ] || exit 91\nprintf '%s\\n' '{version_output}'\n"
     );
-    std::fs::write(&binary, script).expect("fake Codex binary should be written");
-    let mut permissions = std::fs::metadata(&binary)
-        .expect("fake Codex metadata should be readable")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&binary, permissions).expect("fake Codex binary should be executable");
+    let binary = install_executable_fixture(directory.path(), "codex binary with spaces", &script);
     (directory, binary)
 }
 
 #[cfg(unix)]
 fn fake_app_server() -> (tempfile::TempDir, std::path::PathBuf) {
-    use std::os::unix::fs::PermissionsExt;
-
     let directory = tempfile::tempdir().expect("temporary directory should be created");
-    let binary = directory.path().join("codex app server fixture");
     let script = "#!/bin/sh\n\
         if [ \"$1\" = \"--version\" ]; then printf '%s\\n' 'codex-cli 0.146.0'; exit 0; fi\n\
         [ \"$1\" = \"app-server\" ] || exit 91\n\
         [ \"$2\" = \"--listen\" ] || exit 92\n\
         [ \"$3\" = \"stdio://\" ] || exit 93\n\
         while IFS= read -r line; do :; done\n";
-    std::fs::write(&binary, script).expect("fake app-server should be written");
-    let mut permissions = std::fs::metadata(&binary)
-        .expect("fake app-server metadata should be readable")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&binary, permissions).expect("fake app-server should be executable");
+    let binary = install_executable_fixture(directory.path(), "codex app server fixture", script);
     (directory, binary)
 }
 
 #[cfg(unix)]
 #[tokio::test]
-async fn version_probe_executes_the_binary_directly_with_version_argument() {
-    let (_directory, binary) = fake_codex("codex-cli 0.146.0");
-    let version = probe_version(&CodexProcessConfig {
-        binary,
-        codex_home: None,
-    })
-    .await
-    .expect("supported version should be accepted");
+async fn version_probe_executes_the_binary_directly_for_each_supported_version() {
+    for (output, expected) in [
+        ("codex-cli 0.146.0", semver::Version::new(0, 146, 0)),
+        ("codex-cli 0.149.0", semver::Version::new(0, 149, 0)),
+    ] {
+        let (_directory, binary) = fake_codex(output);
+        let version = probe_version(&CodexProcessConfig {
+            binary,
+            codex_home: None,
+        })
+        .await
+        .expect("supported version should be accepted");
 
-    assert_eq!(version, semver::Version::new(0, 146, 0));
+        assert_eq!(version, expected);
+    }
 }
 
 #[cfg(unix)]
@@ -593,7 +617,7 @@ async fn version_probe_rejects_malformed_and_unsupported_versions() {
         "codex 0.146.0",
         "codex-cli 0.145.9",
         "codex-cli 0.147.0",
-        "codex-cli 0.149.0",
+        "codex-cli 0.150.0",
         "codex-cli 0.146.0-rc.1",
         "codex-cli 0.146.0+build.1",
     ] {

@@ -1,5 +1,5 @@
 {
-  "formatVersion": 1,
+  "formatVersion": 2,
   "protocolFamily": "codex-app-server-jsonrpc/v1+v2-experimental",
   "generatorArguments": [
     "app-server",
@@ -50,6 +50,66 @@
       "path": "v2/ThreadResumeResponse.json"
     },
     {
+      "name": "thread.unsubscribe.params",
+      "path": "v2/ThreadUnsubscribeParams.json",
+      "sinceVersion": "0.149.0"
+    },
+    {
+      "name": "thread.unsubscribe.response",
+      "path": "v2/ThreadUnsubscribeResponse.json",
+      "sinceVersion": "0.149.0"
+    },
+    {
+      "name": "thread.turns.list.params",
+      "path": "v2/ThreadTurnsListParams.json",
+      "sinceVersion": "0.149.0"
+    },
+    {
+      "name": "thread.turns.list.response",
+      "path": "v2/ThreadTurnsListResponse.json",
+      "sinceVersion": "0.149.0"
+    },
+    {
+      "name": "thread.items.list.params",
+      "path": "v2/ThreadItemsListParams.json",
+      "sinceVersion": "0.149.0"
+    },
+    {
+      "name": "thread.items.list.response",
+      "path": "v2/ThreadItemsListResponse.json",
+      "sinceVersion": "0.149.0"
+    },
+    {
+      "name": "thread.queue.add.params",
+      "path": "v2/ThreadQueueAddParams.json",
+      "sinceVersion": "0.149.0"
+    },
+    {
+      "name": "thread.queue.add.response",
+      "path": "v2/ThreadQueueAddResponse.json",
+      "sinceVersion": "0.149.0"
+    },
+    {
+      "name": "thread.queue.list.params",
+      "path": "v2/ThreadQueueListParams.json",
+      "sinceVersion": "0.149.0"
+    },
+    {
+      "name": "thread.queue.list.response",
+      "path": "v2/ThreadQueueListResponse.json",
+      "sinceVersion": "0.149.0"
+    },
+    {
+      "name": "thread.queue.start.params",
+      "path": "v2/ThreadQueueStartParams.json",
+      "sinceVersion": "0.149.0"
+    },
+    {
+      "name": "thread.queue.start.response",
+      "path": "v2/ThreadQueueStartResponse.json",
+      "sinceVersion": "0.149.0"
+    },
+    {
       "name": "turn.start.params",
       "path": "v2/TurnStartParams.json"
     },
@@ -64,6 +124,16 @@
     {
       "name": "turn.interrupt.response",
       "path": "v2/TurnInterruptResponse.json"
+    },
+    {
+      "name": "turn.steer.params",
+      "path": "v2/TurnSteerParams.json",
+      "sinceVersion": "0.149.0"
+    },
+    {
+      "name": "turn.steer.response",
+      "path": "v2/TurnSteerResponse.json",
+      "sinceVersion": "0.149.0"
     },
     {
       "name": "notification.thread.started",
@@ -102,12 +172,57 @@
       "path": "v2/TurnCompletedNotification.json"
     },
     {
+      "name": "notification.thread.status.changed",
+      "path": "v2/ThreadStatusChangedNotification.json",
+      "sinceVersion": "0.149.0"
+    },
+    {
+      "name": "notification.thread.queue.changed",
+      "path": "v2/ThreadQueueChangedNotification.json",
+      "sinceVersion": "0.149.0"
+    },
+    {
+      "name": "notification.server_request.resolved",
+      "path": "v2/ServerRequestResolvedNotification.json",
+      "sinceVersion": "0.149.0"
+    },
+    {
       "name": "server_request.dynamic_tool_call.params",
       "path": "DynamicToolCallParams.json"
     },
     {
       "name": "server_request.dynamic_tool_call.response",
       "path": "DynamicToolCallResponse.json"
+    },
+    {
+      "name": "server_request.command_execution.request_approval.params",
+      "path": "CommandExecutionRequestApprovalParams.json",
+      "sinceVersion": "0.149.0"
+    },
+    {
+      "name": "server_request.command_execution.request_approval.response",
+      "path": "CommandExecutionRequestApprovalResponse.json",
+      "sinceVersion": "0.149.0"
+    },
+    {
+      "name": "server_request.file_change.request_approval.params",
+      "path": "FileChangeRequestApprovalParams.json",
+      "sinceVersion": "0.149.0"
+    },
+    {
+      "name": "server_request.file_change.request_approval.response",
+      "path": "FileChangeRequestApprovalResponse.json",
+      "sinceVersion": "0.149.0"
+    },
+    {
+      "name": "server_request.permissions.request_approval.params",
+      "path": "PermissionsRequestApprovalParams.json",
+      "sinceVersion": "0.149.0"
+    },
+    {
+      "name": "server_request.permissions.request_approval.response",
+      "path": "PermissionsRequestApprovalResponse.json",
+      "sinceVersion": "0.149.0"
     }
   ],
   "notificationCatalog": "ServerNotification.json"

@@ -9,21 +9,28 @@ use std::time::Duration;
 use futures_util::{FutureExt, future::BoxFuture};
 use tokio::sync::{mpsc, watch};
 
+use crate::channel::native::{NativeChannel, NativeInboundSource};
+use crate::channel::sidecar::{NodeSidecar, NodeSidecarConfig};
+use crate::channel::{
+    ChatMessageQuery, ConnectionState, ControlledMediaResolver, InboundRuntime, InboundSource,
+    OutboundDelivery,
+};
+use crate::config::{ChannelSection, ChannelTransport};
 use crate::lark::api::LarkApi;
 use crate::lark::bridge::{BridgeConfig as LarkBridgeConfig, LarkBridge, QueuedInboundEvent};
 use crate::lark::config::LarkEndpoints;
 use crate::lark::credentials::{LarkCredentials, load_credentials};
 use crate::lark::http::LarkHttp;
 use crate::lark::token::TenantTokenProvider;
-use crate::lark::transport::TransportState;
 use crate::outbox::{OutboxPump, OutboxPumpConfig, OutboxReplySink};
-use crate::runtime::attachments::{AttachmentCache, AttachmentLimits, LarkResourceDownloader};
+use crate::runtime::attachments::{AttachmentCache, AttachmentLimits, ChannelResourceDownloader};
 use crate::runtime::context::ContextRegistry;
 use crate::runtime::intake::{DurableIntake, TenantNamespace};
 use crate::runtime::policy::AccessPolicy;
+use crate::runtime::quote::LarkQuoteResolver;
 use crate::runtime::router::{RouteAttemptError, RouteError, Router, RouterHandle, RouterSettings};
 use crate::runtime::scope::DurableReplySink;
-use crate::store::StoreHandle;
+use crate::store::{StoreError, StoreHandle};
 use crate::{codex::supervisor::AppServerSupervisor, config::BridgeConfig};
 
 /// Static application startup, runtime, and shutdown failure categories.
@@ -73,8 +80,8 @@ pub trait OutboundFactory: Send + Sync {
     fn start(
         &self,
         store: StoreHandle,
-        api: LarkApi,
-        transport: watch::Receiver<TransportState>,
+        delivery: Arc<dyn OutboundDelivery>,
+        transport: watch::Receiver<ConnectionState>,
     ) -> Result<OutboundRuntime, OutboundStartError>;
 }
 
@@ -86,11 +93,12 @@ impl OutboundFactory for ProductionOutboundFactory {
     fn start(
         &self,
         store: StoreHandle,
-        api: LarkApi,
-        transport: watch::Receiver<TransportState>,
+        delivery: Arc<dyn OutboundDelivery>,
+        transport: watch::Receiver<ConnectionState>,
     ) -> Result<OutboundRuntime, OutboundStartError> {
         let sink: Arc<dyn DurableReplySink> = Arc::new(OutboxReplySink::new(store.clone()));
-        let pump = OutboxPump::spawn(store, api, transport, OutboxPumpConfig::default());
+        let pump =
+            OutboxPump::spawn_shared(store, delivery, transport, OutboxPumpConfig::default());
         Ok(OutboundRuntime::new(sink, async move {
             pump.shutdown().await;
         }))
@@ -184,6 +192,7 @@ where
 ///
 /// Returns only content-free classifications. Components started before a
 /// later startup failure are stopped before the error is returned.
+#[allow(clippy::too_many_lines)]
 pub async fn run_config_with_outbound_until<F, S>(
     config: BridgeConfig,
     credentials: LarkCredentials,
@@ -194,22 +203,28 @@ where
     F: OutboundFactory + ?Sized,
     S: Future<Output = ()>,
 {
+    tracing::info!("bridge runtime starting");
     let policy = AccessPolicy::from_config(&config).map_err(|_| AppError::Config)?;
     let router_settings = RouterSettings::from_config(&config);
-    let process_config = config.codex.process_config();
+    // The long-running external WebSocket transport is intentionally not part of the endpoint
+    // admission-gate change. An explicitly external backend can never fall back to spawning.
+    let process_config = config.codex.process_config().ok_or(AppError::Supervisor)?;
     let database_path = config.paths.database.clone();
     let attachment_cache_path = config.paths.attachment_cache.clone();
     let tenant = TenantNamespace::from_credentials(&credentials);
     let endpoints = LarkEndpoints::for_tenant(credentials.tenant);
     let http = LarkHttp::new(endpoints.clone()).map_err(|_| AppError::Lark)?;
     let tokens = TenantTokenProvider::new(http.clone(), credentials.clone());
-    let api = LarkApi::new(http, tokens);
+    let api = LarkApi::new(http.clone(), tokens);
+    let native = Arc::new(NativeChannel::new(api.clone()));
 
     let store = StoreHandle::open(&database_path)
         .await
         .map_err(|_| AppError::Store)?;
+    tracing::debug!("durable store opened");
     let attachment_store = store.clone();
-    let attachment_downloader = Arc::new(LarkResourceDownloader::new(api.clone()));
+    let media: Arc<dyn ControlledMediaResolver> = native.clone();
+    let attachment_downloader = Arc::new(ChannelResourceDownloader::new(media));
     let opened_attachment_cache = tokio::task::spawn_blocking(move || {
         AttachmentCache::open(
             &attachment_cache_path,
@@ -230,30 +245,37 @@ where
         return Err(AppError::Attachments);
     }
     let context_registry = Arc::new(ContextRegistry::default());
-    let Ok(intake) = DurableIntake::prepare(store.clone(), &credentials).await else {
-        stop_store_after_error(store).await;
-        return Err(AppError::Lark);
-    };
-    let Ok((transport, inbound)) =
-        LarkBridge::start_with_runtime(endpoints, credentials, LarkBridgeConfig::default(), intake)
-            .await
+    let quote_resolver = Arc::new(LarkQuoteResolver::new(api.clone(), policy.clone()));
+    let Ok(InboundRuntime {
+        source,
+        events: inbound,
+    }) = start_inbound(
+        &config.channel,
+        &credentials,
+        &http,
+        &api,
+        Arc::clone(&native),
+        &store,
+    )
+    .await
     else {
         stop_store_after_error(store).await;
         return Err(AppError::Lark);
     };
     let Ok(supervisor) = AppServerSupervisor::start(process_config).await else {
-        transport.shutdown().await;
+        source.shutdown().await;
         stop_store_after_error(store).await;
         return Err(AppError::Supervisor);
     };
-    let Ok(outbound) = outbound_factory.start(store.clone(), api, transport.subscribe_state())
+    let delivery: Arc<dyn OutboundDelivery> = native;
+    let Ok(outbound) = outbound_factory.start(store.clone(), delivery, source.subscribe_state())
     else {
-        transport.shutdown().await;
+        source.shutdown().await;
         stop_supervisor_after_error(supervisor).await;
         stop_store_after_error(store).await;
         return Err(AppError::Outbound);
     };
-    let Ok(router) = Router::start_with_contexts(
+    let Ok(router) = Router::start_with_contexts_and_quotes(
         store.clone(),
         tenant,
         policy,
@@ -262,36 +284,120 @@ where
         outbound.sink(),
         Arc::clone(&attachment_cache),
         context_registry,
+        quote_resolver,
     )
     .await
     else {
-        transport.shutdown().await;
+        source.shutdown().await;
         outbound.shutdown().await;
         stop_store_after_error(store).await;
         return Err(AppError::Router);
     };
+    tracing::info!("bridge runtime ready");
 
     let summary = drive_inbound(&router, inbound, shutdown).await;
+    tracing::info!(
+        exit = ?summary.exit,
+        routed_events = summary.routed,
+        route_failures = summary.route_failures,
+        "bridge shutdown started"
+    );
 
     // Stop producers first, then settle scope actors and their durable
     // projections before stopping the delivery pump and store writer.
-    transport.shutdown().await;
+    source.shutdown().await;
     let router_result = router.shutdown().await;
     outbound.shutdown().await;
     drop(attachment_cache);
     let store_result = store.shutdown().await;
 
-    if router_result.is_err() {
-        return Err(AppError::Router);
-    }
-    if store_result.is_err() {
-        return Err(AppError::Store);
-    }
+    finish_run(summary, router_result, store_result)
+}
+
+fn finish_run(
+    summary: DriveSummary,
+    router_result: Result<(), RouteError>,
+    store_result: Result<(), StoreError>,
+) -> Result<DriveSummary, AppError> {
+    router_result.map_err(|_| AppError::Router)?;
+    store_result.map_err(|_| AppError::Store)?;
+    tracing::info!(
+        exit = ?summary.exit,
+        routed_events = summary.routed,
+        route_failures = summary.route_failures,
+        "bridge runtime stopped"
+    );
     match summary.exit {
         DriveExit::Shutdown => Ok(summary),
         DriveExit::InboundClosed => Err(AppError::InboundClosed),
         DriveExit::RouterFailed => Err(AppError::Router),
     }
+}
+
+async fn start_inbound(
+    channel: &ChannelSection,
+    credentials: &LarkCredentials,
+    http: &LarkHttp,
+    api: &LarkApi,
+    native: Arc<NativeChannel>,
+    store: &StoreHandle,
+) -> Result<InboundRuntime, AppError> {
+    let intake = DurableIntake::prepare(store.clone(), credentials)
+        .await
+        .map_err(|_| AppError::Lark)?;
+    let bot_open_id = api
+        .bot_info()
+        .await
+        .map_err(|_| AppError::Lark)?
+        .open_id
+        .filter(|open_id| !open_id.is_empty())
+        .ok_or(AppError::Lark)?;
+    let query: Arc<dyn ChatMessageQuery> = native;
+    let normalizer = Arc::new(crate::lark::normalize::Normalizer::with_query(
+        query,
+        bot_open_id,
+    ));
+    let bridge_config = LarkBridgeConfig::default();
+    let (event_handler, events) =
+        LarkBridge::prepare_durable(credentials, bridge_config, intake, normalizer)
+            .map_err(|_| AppError::Lark)?;
+    let source: Box<dyn InboundSource> = match channel.transport {
+        ChannelTransport::Native => {
+            Box::new(NativeInboundSource::new(LarkBridge::start_prepared_native(
+                http.clone(),
+                credentials.clone(),
+                bridge_config,
+                event_handler,
+            )))
+        }
+        ChannelTransport::NodeSidecar => {
+            let sidecar_config = NodeSidecarConfig {
+                node_binary: channel.node_binary.clone(),
+                entrypoint: channel.sidecar_entrypoint.clone(),
+                ..NodeSidecarConfig::default()
+            };
+            match NodeSidecar::start(
+                sidecar_config,
+                credentials.clone(),
+                Arc::clone(&event_handler),
+            )
+            .await
+            {
+                Ok(sidecar) => Box::new(sidecar),
+                Err(_) if channel.fallback_to_native => {
+                    tracing::warn!("node sidecar startup failed; using configured native fallback");
+                    Box::new(NativeInboundSource::new(LarkBridge::start_prepared_native(
+                        http.clone(),
+                        credentials.clone(),
+                        bridge_config,
+                        event_handler,
+                    )))
+                }
+                Err(_) => return Err(AppError::Lark),
+            }
+        }
+    };
+    Ok(InboundRuntime { source, events })
 }
 
 async fn stop_supervisor_after_error(supervisor: crate::codex::supervisor::SupervisorHandle) {
@@ -452,6 +558,8 @@ mod tests {
         DriveExit, EventRouteError, EventRouter, OutboundFactory, OutboundRuntime,
         ProductionOutboundFactory, drive_inbound,
     };
+    use crate::channel::OutboundDelivery;
+    use crate::channel::native::NativeChannel;
     use crate::lark::api::{ChatMode, LarkApi};
     use crate::lark::bridge::QueuedInboundEvent;
     use crate::lark::config::{LarkEndpoints, TenantBrand};
@@ -492,8 +600,8 @@ mod tests {
             .acquire_owned()
             .await
             .expect("permit");
-        QueuedInboundEvent {
-            event: InboundEvent {
+        QueuedInboundEvent::new(
+            InboundEvent {
                 event_id: event_id.to_owned(),
                 message_id: format!("message-{event_id}"),
                 chat_id: "chat-app-driver".to_owned(),
@@ -514,7 +622,7 @@ mod tests {
                 scope: ScopeKey::Chat("chat-app-driver".to_owned()),
             },
             permit,
-        }
+        )
     }
 
     #[tokio::test]
@@ -641,8 +749,9 @@ mod tests {
         let api = LarkApi::new(http, tokens);
         let (_transport, state) = watch::channel(TransportState::Connecting { attempt: 1 });
 
+        let delivery: Arc<dyn OutboundDelivery> = Arc::new(NativeChannel::new(api));
         let runtime = ProductionOutboundFactory
-            .start(store.clone(), api, state)
+            .start(store.clone(), delivery, state)
             .expect("factory start");
         let event = queued("factory").await;
         let row = runtime
