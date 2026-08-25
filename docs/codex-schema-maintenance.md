@@ -5,8 +5,10 @@ compatibility mapping, and contract fixture have been reviewed. The authoritativ
 policy is [`protocol/codex/support-policy.json`](../protocol/codex/support-policy.json).
 The established baseline and every promoted version are also pinned in the
 append-only [`protocol/codex/support-history.json`](../protocol/codex/support-history.json).
-At present 0.146.0 is supported; 0.149.0 is a recorded candidate and is deliberately
-blocked because its compatibility report contains breaking changes.
+At present 0.146.0 and 0.149.0 are supported. Version 0.146.0 remains the established
+baseline, while 0.149.0 is the first promoted shared-endpoint contract. Promotion is
+exact-version only; a later Codex release remains unsupported until it completes the
+same review and contract process.
 
 Normal Cargo builds are offline with respect to Codex. They compile committed Rust
 wire DTOs and never install, locate, or execute a `codex` binary. Only the explicit
@@ -74,6 +76,12 @@ Promotion requires adding an append-only support-history record, moving the vers
 to `supportedVersions`, adding its explicit `WireAdapter` branch, and passing offline
 `verify`. CI compares the history to the trusted pull-request base so deleting or
 rewriting an earlier supported release cannot make a candidate trust itself.
+When a promoted version has breaking changes, it also requires a canonical
+`protocol/codex/compatibility-reviews/BASE-to-VERSION.json`. That record binds the
+exact report SHA-256, breaking-change count, and required stable-adapter evidence;
+its own SHA-256 is pinned in support history. Report or evidence drift therefore
+fails closed. Candidates continue to require reports against every historically
+supported version, even after another version is promoted.
 `verify` re-renders Rust and the incoming audit from canonical schema bytes, compares
 them byte-for-byte, and validates the complete manifest. Do not edit generated Rust
 or schema artifacts by hand, and do not put schema export in `build.rs`.
@@ -81,6 +89,12 @@ or schema artifacts by hand, and do not put schema export in `build.rs`.
 Contract fixtures cover initialize, thread start/list/read/resume, turn
 start/interrupt, the dynamic-tool reverse request, all notifications consumed by
 the bridge, normal notification order, and retry/uncertain failure classification.
+The 0.149.0 contract additionally covers unsubscribe, turn steering, queued input,
+turn/item pagination, active-thread and queue state notifications, resolved server
+requests, and command/file/permission approval request/result shapes. Each shared
+mutation fixture records local rejection, server rejection, timeout, connection-loss,
+malformed-success, and stale-epoch outcomes. Missing required fields and explicit
+open/closed unknown-value cases are validated automatically.
 Rust tests drive those records through the production wire adapter, JSONL
 encoder/decoder bounds, notification mapping, and actual retry classifier; the
 Python validator checks the records against their selected schemas. Tool errors
@@ -94,7 +108,8 @@ At runtime the supervisor probes the exact binary version before initialization 
 selects only a promoted adapter. Every outgoing request and reverse response is
 serialized through that generated version, while every response, consumed
 notification, and reverse request is decoded through it before reaching stable
-domain types. Candidate 0.149.0 therefore cannot enter production paths.
+domain types. Shared-endpoint profiles are exposed only by the exact promoted
+0.149.0 adapter; the historical 0.146.0 adapter rejects those unpromoted shapes.
 
 The scheduled `Codex Schema Upgrade Report` workflow discovers a newer npm release,
 generates the normalized candidate report as a workflow artifact, and opens an

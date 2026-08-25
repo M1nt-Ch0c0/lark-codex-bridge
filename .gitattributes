@@ -3,6 +3,7 @@
 protocol/codex/** text eol=lf
 src/codex/wire/*.rs text eol=lf
 tools/codex-wire-template.rs text eol=lf
+tools/codex-shared-wire-template.rs text eol=lf
 
 protocol/codex/schemas/** linguist-generated=true
 src/codex/wire/v*.rs linguist-generated=true

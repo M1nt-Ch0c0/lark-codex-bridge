@@ -422,10 +422,11 @@ mod tests {
     #[test]
     fn enforces_the_exact_reviewed_schema_versions() {
         assert!(ensure_supported(Version::new(0, 146, 0)).is_ok());
+        assert!(ensure_supported(Version::new(0, 149, 0)).is_ok());
         for version in [
             Version::new(0, 145, 9),
             Version::new(0, 147, 0),
-            Version::new(0, 149, 0),
+            Version::new(0, 150, 0),
             Version::new(1, 0, 0),
         ] {
             assert!(matches!(
