@@ -457,6 +457,7 @@ async fn process_row(
 const fn operation_kind(operation: &OutboxOperation) -> &'static str {
     match operation {
         OutboxOperation::ReplyText { .. } => "reply_text",
+        OutboxOperation::ReplyMarkdownPost { .. } => "reply_markdown_post",
         OutboxOperation::ReplyProgressCard { .. } => "reply_progress_card",
         OutboxOperation::UpdateProgressCard { .. } => "update_progress_card",
         OutboxOperation::FinalizeProgressCard { .. } => "finalize_progress_card",
