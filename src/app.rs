@@ -314,12 +314,8 @@ fn finish_run(
     router_result: Result<(), RouteError>,
     store_result: Result<(), StoreError>,
 ) -> Result<DriveSummary, AppError> {
-    if router_result.is_err() {
-        return Err(AppError::Router);
-    }
-    if store_result.is_err() {
-        return Err(AppError::Store);
-    }
+    router_result.map_err(|_| AppError::Router)?;
+    store_result.map_err(|_| AppError::Store)?;
     tracing::info!(
         exit = ?summary.exit,
         routed_events = summary.routed,

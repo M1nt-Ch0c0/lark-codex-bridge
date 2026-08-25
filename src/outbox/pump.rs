@@ -483,6 +483,7 @@ const fn operation_kind(operation: &OutboxOperation) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn send(
     store: &StoreHandle,
     delivery: &dyn OutboundDelivery,
@@ -883,7 +884,7 @@ async fn record_failure(
             // mark it explicitly uncertain, so a transient store failure can
             // never silently drop an attempted send.
             tracing::warn!(
-                error_kind = ?error.kind(),
+                error = %error,
                 store_error = %store_error,
                 class = ?class,
                 "outbox send failed and the receipt could not be recorded"
@@ -897,7 +898,7 @@ async fn record_failure(
         0
     };
     tracing::warn!(
-        error_kind = ?error.kind(),
+        error = %error,
         class = ?class,
         attempts,
         retry_delay_ms = retry_delay,

@@ -199,8 +199,12 @@ fn delivery_error(error: &LarkError) -> DeliveryError {
         | LarkError::Exhausted { .. } => {
             DeliveryError::new(DeliveryFailureClass::Definitive, CONTEXT)
         }
-        LarkError::Retryable { code: Some(code), .. }
-        | LarkError::ProtocolViolation { code: Some(code), .. } => {
+        LarkError::Retryable {
+            code: Some(code), ..
+        }
+        | LarkError::ProtocolViolation {
+            code: Some(code), ..
+        } => {
             // Mirrors `delivery_decision` in the outbox pump: an explicit 5xx
             // cannot prove a POST was not applied, so it stays uncertain, but
             // an idempotent PATCH may retry it with the same body.
