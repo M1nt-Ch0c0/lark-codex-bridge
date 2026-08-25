@@ -138,7 +138,8 @@ fn open_and_migrate(location: &StoreLocation) -> Result<Connection, StoreError> 
 fn apply_pragmas(connection: &Connection) -> Result<(), StoreError> {
     connection
         .execute_batch(
-            "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL;",
+            "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL;
+             PRAGMA secure_delete = ON;",
         )
         .map_err(|error| sqlite_error("applying store pragmas", &error))?;
     let busy_timeout_ms = i64::try_from(STORE_BUSY_TIMEOUT.as_millis()).unwrap_or(i64::MAX);
@@ -170,11 +171,35 @@ fn migrate_through(
         .iter()
         .filter(|migration| migration.version > current)
     {
+        if migration.name == "remove durable media capabilities and transcripts" {
+            super::dedup::scrub_persisted_inbound_secrets(connection).map_err(
+                |error| match error {
+                    StoreError::Sqlite { .. } => StoreError::Migration {
+                        version: migration.version,
+                        name: migration.name,
+                    },
+                    other => other,
+                },
+            )?;
+            // Updating a row is insufficient: old bytes can remain in free
+            // pages or WAL frames. Compact before advancing `user_version`;
+            // a failure therefore retries this cleanup on the next open.
+            connection
+                .execute_batch(
+                    "PRAGMA wal_checkpoint(TRUNCATE);
+                     VACUUM;
+                     PRAGMA wal_checkpoint(TRUNCATE);",
+                )
+                .map_err(|_| StoreError::Migration {
+                    version: migration.version,
+                    name: migration.name,
+                })?;
+        }
         let apply = |connection: &mut Connection| -> Result<(), StoreError> {
             let transaction = connection
                 .transaction()
                 .map_err(|error| sqlite_error("starting a migration transaction", &error))?;
-            prepare_migration(&transaction, migration.version)?;
+            prepare_migration(&transaction, migration.name)?;
             transaction
                 .execute_batch(migration.sql)
                 .map_err(|error| sqlite_error("applying a migration", &error))?;
@@ -200,9 +225,9 @@ fn migrate_through(
 
 fn prepare_migration(
     transaction: &rusqlite::Transaction<'_>,
-    version: u32,
+    migration_name: &str,
 ) -> Result<(), StoreError> {
-    if version != 6 {
+    if migration_name != "tokenize attachment lease acquisitions" {
         return Ok(());
     }
     transaction
@@ -280,11 +305,11 @@ mod tests {
 
         {
             let mut connection = Connection::open(&path).expect("reopen for upgrade");
-            migrate(&mut connection).expect("upgrade to schema v7");
+            migrate(&mut connection).expect("upgrade to schema v8");
             let version: u32 = connection
                 .pragma_query_value(None, "user_version", |row| row.get(0))
                 .expect("read upgraded version");
-            assert_eq!(version, 7);
+            assert_eq!(version, 8);
             let count: u32 = connection
                 .query_row(
                     "SELECT COUNT(*) FROM outbox WHERE idempotency_key = 'legacy'",
@@ -298,11 +323,11 @@ mod tests {
         let mut legacy = Connection::open(&path).expect("legacy reopen");
         assert!(matches!(
             migrate_through(&mut legacy, &MIGRATIONS[..5]),
-            Err(StoreError::Migration { version: 7, .. })
+            Err(StoreError::Migration { version: 8, .. })
         ));
         let version: u32 = legacy
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("downgrade fence stays intact");
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
     }
 }

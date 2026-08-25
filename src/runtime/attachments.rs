@@ -368,8 +368,8 @@ pub trait ResourceDownloader: Send + Sync {
 }
 
 /// [`ResourceDownloader`] adapter over the real [`LarkApi`] download path.
-/// Wiring this into scope/turn input is Task 8 integration and intentionally
-/// out of scope here.
+/// The runtime invokes it only after a turn-scoped opaque handle passes
+/// context authorization and the per-turn read meter.
 pub struct LarkResourceDownloader {
     api: LarkApi,
 }
@@ -639,12 +639,13 @@ impl AttachmentCache {
     /// ([`AttachmentLimits::check_resource_key`]) and the single-object byte
     /// cap ([`AttachmentLimits::check_attachment_bytes`]). The per-message
     /// count ([`AttachmentLimits::check_resource_batch`]) and the per-turn
-    /// byte total ([`AttachmentLimits::check_turn_total`]) are turn-assembly
-    /// responsibilities (plan Task 8 / B8), not fetch's; the display file-name
-    /// and MIME checkers ([`AttachmentLimits::check_file_name`] and
+    /// byte total ([`AttachmentLimits::check_turn_total`]) are enforced by
+    /// turn assembly and the context-tool read meter, not by `fetch` itself;
+    /// the display file-name and MIME checkers
+    /// ([`AttachmentLimits::check_file_name`] and
     /// [`AttachmentLimits::check_mime`]) apply to metadata that
     /// [`ResourceDesc`] does not carry (only `kind` + `key`), so they remain
-    /// public for the scope-actor wiring point that does carry that metadata.
+    /// public for the lazy context-tool path that does carry that metadata.
     ///
     /// The install/commit/re-verify sequence runs under the per-cache lock so
     /// a concurrent same-process `gc`/`reconcile` cannot delete the file
