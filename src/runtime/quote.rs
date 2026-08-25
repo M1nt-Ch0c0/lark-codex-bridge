@@ -176,9 +176,9 @@ fn status_for_error(error: &LarkError) -> QuoteStatus {
         | LarkError::ProtocolViolation {
             code: Some(404), ..
         } => QuoteStatus::Deleted,
-        LarkError::Retryable { .. } | LarkError::ProtocolViolation { .. } => {
-            QuoteStatus::Unavailable
-        }
+        LarkError::Retryable { .. }
+        | LarkError::ProtocolViolation { .. }
+        | LarkError::InvalidRequest { .. } => QuoteStatus::Unavailable,
     }
 }
 
