@@ -615,7 +615,7 @@ async fn run_recovery_actor(
 }
 
 #[derive(Clone, Copy, Debug)]
-enum EpochFailure {
+pub(crate) enum EpochFailure {
     ConnectionLost,
     RequestTimeout,
     ProtocolViolation,
@@ -623,7 +623,7 @@ enum EpochFailure {
 }
 
 impl EpochFailure {
-    const fn reason(self) -> ExternalUncertaintyReason {
+    pub(crate) const fn reason(self) -> ExternalUncertaintyReason {
         match self {
             Self::ConnectionLost => ExternalUncertaintyReason::SocketDisconnect,
             Self::RequestTimeout => ExternalUncertaintyReason::RequestTimeout,
@@ -632,7 +632,7 @@ impl EpochFailure {
     }
 }
 
-async fn reconcile_epoch(
+pub(crate) async fn reconcile_epoch(
     connection: &mut ExternalReadOnlyConnection,
     store: &StoreHandle,
     endpoint_label: &str,
@@ -959,7 +959,11 @@ async fn route_reconcile_event(
     ready: &HashSet<String>,
     mailboxes: &mut ReconcileMailboxes,
 ) -> Result<(), EpochFailure> {
-    if matches!(event, ExternalReadEvent::RemoteControlStatusChanged(_)) {
+    if matches!(
+        event,
+        ExternalReadEvent::AccountRateLimitsUpdated(_)
+            | ExternalReadEvent::RemoteControlStatusChanged(_)
+    ) {
         return Ok(());
     }
     let thread_id = event_thread_id(&event)
@@ -1008,9 +1012,20 @@ fn terminal_from_event(
     event: ExternalReadEvent,
 ) -> Result<(Option<ExternalTurnTerminal>, Option<ExternalItemTerminal>), EpochFailure> {
     match event {
-        ExternalReadEvent::RemoteControlStatusChanged(_)
+        ExternalReadEvent::AccountRateLimitsUpdated(_)
+        | ExternalReadEvent::RemoteControlStatusChanged(_)
         | ExternalReadEvent::ThreadGoalCleared(_)
-        | ExternalReadEvent::ThreadStatusChanged(_) => Ok((None, None)),
+        | ExternalReadEvent::ThreadSettingsUpdated(_)
+        | ExternalReadEvent::ThreadStatusChanged(_)
+        | ExternalReadEvent::TurnStarted(_)
+        | ExternalReadEvent::ItemStarted(_)
+        | ExternalReadEvent::AgentMessageDelta(_)
+        | ExternalReadEvent::CommandOutputDelta(_)
+        | ExternalReadEvent::TokenUsageUpdated(_)
+        | ExternalReadEvent::Error(_) => Ok((None, None)),
+        ExternalReadEvent::ThreadQueueChanged(_)
+        | ExternalReadEvent::ServerRequestResolved(_)
+        | ExternalReadEvent::Approval(_) => Err(EpochFailure::ProtocolViolation),
         ExternalReadEvent::ItemCompleted(notification) => {
             let item_id = notification
                 .item
@@ -1038,10 +1053,22 @@ fn terminal_from_event(
 
 fn event_thread_id(event: &ExternalReadEvent) -> Option<&str> {
     match event {
-        ExternalReadEvent::RemoteControlStatusChanged(_) | ExternalReadEvent::Closed(_) => None,
+        ExternalReadEvent::AccountRateLimitsUpdated(_)
+        | ExternalReadEvent::RemoteControlStatusChanged(_)
+        | ExternalReadEvent::Closed(_) => None,
         ExternalReadEvent::ThreadGoalCleared(notification) => Some(&notification.thread_id),
+        ExternalReadEvent::ThreadSettingsUpdated(notification) => Some(&notification.thread_id),
         ExternalReadEvent::ThreadStatusChanged(notification) => Some(&notification.thread_id),
+        ExternalReadEvent::ThreadQueueChanged(notification) => Some(&notification.thread_id),
+        ExternalReadEvent::ServerRequestResolved(notification) => Some(&notification.thread_id),
+        ExternalReadEvent::Approval(request) => Some(request.thread_id()),
+        ExternalReadEvent::TurnStarted(notification) => Some(&notification.thread_id),
+        ExternalReadEvent::ItemStarted(notification) => Some(&notification.thread_id),
+        ExternalReadEvent::AgentMessageDelta(notification) => Some(&notification.thread_id),
+        ExternalReadEvent::CommandOutputDelta(notification) => Some(&notification.thread_id),
         ExternalReadEvent::ItemCompleted(notification) => Some(&notification.thread_id),
+        ExternalReadEvent::TokenUsageUpdated(notification) => Some(&notification.thread_id),
+        ExternalReadEvent::Error(notification) => Some(&notification.thread_id),
         ExternalReadEvent::TurnCompleted(notification) => Some(&notification.thread_id),
     }
 }
@@ -1096,12 +1123,24 @@ impl Serialize for EventWeight<'_> {
         S: serde::Serializer,
     {
         match self.0 {
+            ExternalReadEvent::AccountRateLimitsUpdated(value) => value.serialize(serializer),
             ExternalReadEvent::RemoteControlStatusChanged(value) => value.serialize(serializer),
             ExternalReadEvent::ThreadGoalCleared(value) => value.serialize(serializer),
+            ExternalReadEvent::ThreadSettingsUpdated(value) => value.serialize(serializer),
             ExternalReadEvent::ThreadStatusChanged(value) => value.serialize(serializer),
+            ExternalReadEvent::ThreadQueueChanged(value) => value.serialize(serializer),
+            ExternalReadEvent::ServerRequestResolved(value) => value.serialize(serializer),
+            ExternalReadEvent::Approval(_) | ExternalReadEvent::Closed(_) => {
+                ().serialize(serializer)
+            }
+            ExternalReadEvent::TurnStarted(value) => value.serialize(serializer),
+            ExternalReadEvent::ItemStarted(value) => value.serialize(serializer),
+            ExternalReadEvent::AgentMessageDelta(value) => value.serialize(serializer),
+            ExternalReadEvent::CommandOutputDelta(value) => value.serialize(serializer),
             ExternalReadEvent::ItemCompleted(value) => value.serialize(serializer),
+            ExternalReadEvent::TokenUsageUpdated(value) => value.serialize(serializer),
+            ExternalReadEvent::Error(value) => value.serialize(serializer),
             ExternalReadEvent::TurnCompleted(value) => value.serialize(serializer),
-            ExternalReadEvent::Closed(_) => ().serialize(serializer),
         }
     }
 }

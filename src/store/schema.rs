@@ -300,4 +300,76 @@ CREATE INDEX IF NOT EXISTS external_managed_threads_state
     ON external_managed_threads(endpoint_label, state, thread_id);
 ",
     },
+    Migration {
+        version: 10,
+        name: "external Codex write and approval fences",
+        sql: "
+CREATE TABLE IF NOT EXISTS external_write_fences (
+    endpoint_label TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    epoch INTEGER NOT NULL CHECK (epoch > 0),
+    state TEXT NOT NULL CHECK (state IN ('open', 'active', 'uncertain')),
+    active_intent_id TEXT,
+    approval_actor TEXT NOT NULL,
+    updated_ms INTEGER NOT NULL,
+    PRIMARY KEY (endpoint_label, thread_id),
+    FOREIGN KEY (endpoint_label, thread_id)
+        REFERENCES external_managed_threads(endpoint_label, thread_id) ON DELETE CASCADE,
+    CHECK ((state = 'active') = (active_intent_id IS NOT NULL))
+);
+
+CREATE TABLE IF NOT EXISTS external_mutation_intents (
+    endpoint_label TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    intent_id TEXT NOT NULL,
+    epoch INTEGER NOT NULL CHECK (epoch > 0),
+    kind TEXT NOT NULL CHECK (kind IN (
+        'turn_start', 'turn_steer', 'turn_interrupt', 'queue_add', 'queue_start'
+    )),
+    expected_turn_id TEXT,
+    client_message_id TEXT,
+    source_actor TEXT NOT NULL,
+    client_actor TEXT NOT NULL,
+    approval_actor TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN (
+        'prepared', 'sent', 'applied', 'rejected', 'uncertain'
+    )),
+    result_id TEXT,
+    created_ms INTEGER NOT NULL,
+    updated_ms INTEGER NOT NULL,
+    PRIMARY KEY (endpoint_label, thread_id, intent_id),
+    FOREIGN KEY (endpoint_label, thread_id)
+        REFERENCES external_managed_threads(endpoint_label, thread_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS external_mutation_intents_state
+    ON external_mutation_intents(endpoint_label, thread_id, state, updated_ms);
+
+CREATE TABLE IF NOT EXISTS external_approval_claims (
+    endpoint_label TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    approval_id TEXT NOT NULL,
+    request_key TEXT NOT NULL,
+    epoch INTEGER NOT NULL CHECK (epoch > 0),
+    turn_id TEXT NOT NULL,
+    item_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('command', 'file_change', 'permissions')),
+    source_actor TEXT NOT NULL,
+    client_actor TEXT NOT NULL,
+    approval_actor TEXT NOT NULL,
+    recipient_actor TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN (
+        'received', 'claimed', 'responding', 'resolved', 'denied', 'uncertain'
+    )),
+    deadline_ms INTEGER NOT NULL,
+    created_ms INTEGER NOT NULL,
+    updated_ms INTEGER NOT NULL,
+    PRIMARY KEY (endpoint_label, thread_id, approval_id),
+    UNIQUE (endpoint_label, epoch, request_key),
+    FOREIGN KEY (endpoint_label, thread_id)
+        REFERENCES external_managed_threads(endpoint_label, thread_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS external_approval_claims_state
+    ON external_approval_claims(endpoint_label, thread_id, state, deadline_ms);
+",
+    },
 ];

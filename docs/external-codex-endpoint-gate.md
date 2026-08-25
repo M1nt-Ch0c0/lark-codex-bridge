@@ -3,10 +3,11 @@
 Issue [#28](https://github.com/M1nt-Ch0c0/lark-codex-bridge/issues/28) adds the
 fail-closed configuration and admission boundary required before an external
 Codex app-server can be used. Issue #29 builds the bounded read-only WebSocket
-transport on this gate, and #30 adds socket-only reconciliation. External
-mutation support remains in #31. Selecting `external_endpoint` in the normal
-mutation-driven `run` path still fails closed and never falls back to a spawned
-child.
+transport on this gate, #30 adds socket-only reconciliation, and #31 adds the
+explicit shared-write coordinator documented in
+[external-codex-write-coordination.md](external-codex-write-coordination.md).
+Selecting `external_endpoint` in the normal mutation-driven `run` path still
+fails closed and never falls back to a spawned child.
 
 ## Tagged backend configuration
 
@@ -42,8 +43,9 @@ is no `auto` mode and no external-to-spawn fallback.
 surface. Exact 0.149.0 also promotes `resume_shared` for #30's socket-only
 recovery actor; that profile enables the experimental API bit during
 `initialize` and admits only resume/read/pagination plus a strict notification
-allowlist. Neither profile admits mutations. Later write profiles remain
-disabled until their policy issues land.
+allowlist. Neither profile admits mutations. Exact 0.149.0 additionally admits
+the explicit `mutate_shared` and `queue_shared` profiles only through #31's
+durable coordinator; selecting the external backend alone does not enable them.
 
 ## Endpoint and credential policy
 

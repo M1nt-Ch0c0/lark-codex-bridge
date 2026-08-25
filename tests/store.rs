@@ -281,7 +281,7 @@ async fn migration_two_persists_strict_inbound_payload_columns() {
     let temp = tempdir().expect("tempdir");
     let path = temp.path().join("store.sqlite");
     let store = StoreHandle::open(&path).await.expect("open");
-    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 9);
+    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 10);
     store.shutdown().await.expect("shutdown");
 
     let connection = rusqlite::Connection::open(&path).expect("inspect");
@@ -584,7 +584,7 @@ async fn v5_upgrade_scrubs_historical_plaintext_from_database_and_wal_pages() {
     }
 
     let store = StoreHandle::open(&path).await.expect("privacy migration");
-    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 9);
+    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 10);
     let recovered = store.recover_received(&tenant).await.expect("recover");
     assert!(matches!(
         recovered[0].event().parts.as_slice(),
@@ -611,7 +611,7 @@ async fn v5_upgrade_scrubs_historical_plaintext_from_database_and_wal_pages() {
     let store = StoreHandle::open(&path)
         .await
         .expect("retry idempotent privacy migration");
-    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 9);
+    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 10);
     let recovered = store
         .recover_received(&tenant)
         .await
@@ -798,7 +798,7 @@ async fn file_store_applies_pragmas_and_persists_every_typed_table() {
     assert!(pragmas.foreign_keys);
     assert_eq!(pragmas.busy_timeout_ms, 5_000);
     assert_eq!(pragmas.synchronous, 1);
-    assert_eq!(pragmas.user_version, 9);
+    assert_eq!(pragmas.user_version, 10);
     store
         .upsert_scope(&scope, temp.path(), "fp")
         .await
@@ -834,7 +834,7 @@ async fn file_store_applies_pragmas_and_persists_every_typed_table() {
     store.shutdown().await.expect("shutdown");
 
     let store = StoreHandle::open(&path).await.expect("reopen");
-    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 9);
+    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 10);
     assert!(store.scope_row(&scope).await.expect("scope").is_some());
     assert_eq!(
         store
@@ -897,7 +897,7 @@ async fn migration_seven_preserves_legacy_lease_as_one_unique_acquisition() {
     let store = StoreHandle::open(&path)
         .await
         .expect("migrate v5 through v8");
-    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 9);
+    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 10);
     let leases = store
         .attachment_leases("legacy-hash")
         .await
@@ -1045,7 +1045,7 @@ async fn rejects_future_schema_versions_without_mutating_the_database() {
     {
         let connection = rusqlite::Connection::open(&path).expect("seed");
         connection
-            .pragma_update(None, "user_version", 10_u32)
+            .pragma_update(None, "user_version", 11_u32)
             .expect("version");
     }
     assert!(matches!(
@@ -1056,7 +1056,7 @@ async fn rejects_future_schema_versions_without_mutating_the_database() {
     let version: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .expect("version");
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
 }
 
 #[tokio::test]

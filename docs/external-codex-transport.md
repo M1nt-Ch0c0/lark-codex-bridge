@@ -7,7 +7,8 @@ socket-only owner with the promoted read/resume operations needed by
 `resume_shared`; the durable coordinator is documented in
 [external-codex-reconciliation.md](external-codex-reconciliation.md). The
 ordinary bridge `run` path remains mutation-driven and therefore continues to
-reject external mode until the shared-write policy lands in #31.
+reject external mode. The separately configured #31 write surface is documented
+in [external-codex-write-coordination.md](external-codex-write-coordination.md).
 
 ## Ownership boundary
 

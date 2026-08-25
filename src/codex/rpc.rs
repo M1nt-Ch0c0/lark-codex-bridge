@@ -923,13 +923,22 @@ pub enum RpcProtocolPolicy {
     /// External resume/reconciliation connections accept only the promoted thread status and
     /// terminal item/turn notifications. Reverse requests and every other message still fault.
     FailClosedExternalResume,
+    /// External mutation connections additionally admit the three exact approval reverse-request
+    /// methods and their durable resolution notification.
+    FailClosedExternalMutate,
+    /// External queue connections add the reviewed queue-change notification to the mutation
+    /// surface.
+    FailClosedExternalQueue,
 }
 
 impl RpcProtocolPolicy {
     const fn is_fail_closed_external(self) -> bool {
         matches!(
             self,
-            Self::FailClosedExternalObserve | Self::FailClosedExternalResume
+            Self::FailClosedExternalObserve
+                | Self::FailClosedExternalResume
+                | Self::FailClosedExternalMutate
+                | Self::FailClosedExternalQueue
         )
     }
 
@@ -944,6 +953,54 @@ impl RpcProtocolPolicy {
                     | "thread/goal/cleared"
                     | "item/completed"
                     | "turn/completed"
+            ),
+            Self::FailClosedExternalMutate => matches!(
+                method,
+                "account/rateLimits/updated"
+                    | "remoteControl/status/changed"
+                    | "thread/status/changed"
+                    | "thread/goal/cleared"
+                    | "thread/settings/updated"
+                    | "turn/started"
+                    | "item/started"
+                    | "item/agentMessage/delta"
+                    | "item/commandExecution/outputDelta"
+                    | "item/completed"
+                    | "thread/tokenUsage/updated"
+                    | "error"
+                    | "turn/completed"
+                    | "serverRequest/resolved"
+            ),
+            Self::FailClosedExternalQueue => matches!(
+                method,
+                "account/rateLimits/updated"
+                    | "remoteControl/status/changed"
+                    | "thread/status/changed"
+                    | "thread/goal/cleared"
+                    | "thread/settings/updated"
+                    | "turn/started"
+                    | "item/started"
+                    | "item/agentMessage/delta"
+                    | "item/commandExecution/outputDelta"
+                    | "item/completed"
+                    | "thread/tokenUsage/updated"
+                    | "error"
+                    | "turn/completed"
+                    | "thread/queue/changed"
+                    | "serverRequest/resolved"
+            ),
+        }
+    }
+
+    fn allows_server_request(self, method: &str) -> bool {
+        match self {
+            Self::Permissive => true,
+            Self::FailClosedExternalObserve | Self::FailClosedExternalResume => false,
+            Self::FailClosedExternalMutate | Self::FailClosedExternalQueue => matches!(
+                method,
+                "item/commandExecution/requestApproval"
+                    | "item/fileChange/requestApproval"
+                    | "item/permissions/requestApproval"
             ),
         }
     }
@@ -1256,7 +1313,7 @@ async fn handle_inbound(
             }
         }
         InboundMessage::Request { id, method, params } => {
-            if policy.is_fail_closed_external() {
+            if !policy.allows_server_request(&method) {
                 return false;
             }
             if server_pending.len() >= RPC_SERVER_REQUEST_CAPACITY
@@ -1777,7 +1834,13 @@ impl io::Write for LimitedCounter {
 fn is_authoritative_notification(method: &str) -> bool {
     matches!(
         method,
-        "thread/status/changed" | "item/completed" | "turn/completed" | "error"
+        "thread/status/changed"
+            | "thread/settings/updated"
+            | "thread/queue/changed"
+            | "serverRequest/resolved"
+            | "item/completed"
+            | "turn/completed"
+            | "error"
     )
 }
 

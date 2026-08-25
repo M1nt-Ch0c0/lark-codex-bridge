@@ -305,11 +305,11 @@ mod tests {
 
         {
             let mut connection = Connection::open(&path).expect("reopen for upgrade");
-            migrate(&mut connection).expect("upgrade to schema v9");
+            migrate(&mut connection).expect("upgrade to schema v10");
             let version: u32 = connection
                 .pragma_query_value(None, "user_version", |row| row.get(0))
                 .expect("read upgraded version");
-            assert_eq!(version, 9);
+            assert_eq!(version, 10);
             let count: u32 = connection
                 .query_row(
                     "SELECT COUNT(*) FROM outbox WHERE idempotency_key = 'legacy'",
@@ -323,11 +323,11 @@ mod tests {
         let mut legacy = Connection::open(&path).expect("legacy reopen");
         assert!(matches!(
             migrate_through(&mut legacy, &MIGRATIONS[..5]),
-            Err(StoreError::Migration { version: 9, .. })
+            Err(StoreError::Migration { version: 10, .. })
         ));
         let version: u32 = legacy
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("downgrade fence stays intact");
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
     }
 }

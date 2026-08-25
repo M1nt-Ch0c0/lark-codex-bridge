@@ -685,6 +685,35 @@ fn command_path_never_authorizes_via_sender_or_group_allowlists() {
 }
 
 #[test]
+fn external_actor_tokens_preserve_lark_source_and_owner_only_approval_authorization() {
+    let temp = scratch();
+    let allowed = temp.path().join("safe");
+    fs::create_dir_all(&allowed).expect("safe root should be created");
+    let policy = policy_with(allowed, vec!["ou_sender".to_owned()], vec![]);
+
+    let source = policy
+        .authorize_external_source(&event("ou_sender", ChatMode::P2p, false))
+        .expect("allowed sender should mint a source actor");
+    let source_again = policy
+        .authorize_external_source(&event("ou_sender", ChatMode::P2p, false))
+        .expect("same source should mint a stable actor");
+    assert_eq!(source, source_again);
+    assert_eq!(format!("{source:?}"), "AuthorizedLarkActor([redacted])");
+    assert_eq!(
+        policy.authorize_external_source(&event("ou_stranger", ChatMode::P2p, false)),
+        Err(AccessDecision::DenyNotOwner)
+    );
+    assert_eq!(
+        policy.authorize_external_approval_recipient(&event("ou_sender", ChatMode::P2p, false,)),
+        Err(AccessDecision::DenyOwnerCommandRequired)
+    );
+    let recipient = policy
+        .authorize_external_approval_recipient(&event("ou_owner_123456", ChatMode::P2p, false))
+        .expect("owner should mint the sole approval recipient");
+    assert_ne!(source, recipient);
+}
+
+#[test]
 fn config_deduplicates_sender_and_group_allowlists_idempotently() {
     let temp = scratch();
     let safe = temp.path().join("safe");
