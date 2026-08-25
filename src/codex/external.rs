@@ -1,9 +1,9 @@
 //! Fail-closed configuration and one-shot admission gate for external app-server endpoints.
 //!
-//! This module deliberately does not provide the long-running WebSocket RPC transport. It
-//! authenticates one bounded connection, validates initialize metadata against an exact promoted
-//! wire adapter, and runs the read-only `thread/list` capability canary. No thread identifier or
-//! raw RPC value leaves the gate.
+//! It authenticates one bounded connection, validates initialize metadata against an exact
+//! promoted wire adapter, and runs the read-only `thread/list` capability canary. No thread
+//! identifier or raw RPC value leaves the gate. The separately owned long-running socket transport
+//! can take over only this same admitted connection, so it cannot bypass the per-connection gate.
 
 use std::{
     fmt,
@@ -19,9 +19,9 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tokio::time::timeout;
+use tokio::{net::TcpStream, time::timeout};
 use tokio_tungstenite::{
-    connect_async_with_config,
+    MaybeTlsStream, WebSocketStream, connect_async_with_config,
     tungstenite::{
         Error as WebSocketError, Message,
         client::IntoClientRequest,
@@ -40,8 +40,8 @@ use crate::{
     },
     limits::{
         EXTERNAL_GATE_MAX_MESSAGES, EXTERNAL_GATE_MESSAGE_BYTES, EXTERNAL_GATE_TIMEOUT,
-        EXTERNAL_GATE_TOTAL_BYTES, MAX_EXTERNAL_AUTH_TOKEN_BYTES, MAX_EXTERNAL_ENDPOINT_BYTES,
-        MAX_EXTERNAL_SECRET_PATH_BYTES,
+        EXTERNAL_GATE_TOTAL_BYTES, EXTERNAL_WS_CLOSE_TIMEOUT, EXTERNAL_WS_MESSAGE_BYTES,
+        MAX_EXTERNAL_AUTH_TOKEN_BYTES, MAX_EXTERNAL_ENDPOINT_BYTES, MAX_EXTERNAL_SECRET_PATH_BYTES,
     },
 };
 
@@ -275,6 +275,14 @@ pub struct ExternalEndpointGate {
     endpoint_label: EndpointLabel,
 }
 
+pub(crate) type ExternalSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+pub(crate) struct AdmittedExternalSocket {
+    pub socket: ExternalSocket,
+    pub report: ExternalGateReport,
+    pub wire: WireAdapter,
+}
+
 impl fmt::Debug for ExternalEndpointGate {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -331,18 +339,29 @@ impl ExternalEndpointGate {
     /// Fails closed with a static, redacted classification for every configuration, credential,
     /// connection, authentication, version, or protocol failure.
     pub async fn check(&self) -> Result<ExternalGateReport, ExternalGateError> {
+        let admitted = self.admit_socket().await?;
+        let mut socket = admitted.socket;
+        let _ = timeout(EXTERNAL_WS_CLOSE_TIMEOUT, socket.close(None)).await;
+        Ok(admitted.report)
+    }
+
+    pub(crate) async fn admit_socket(&self) -> Result<AdmittedExternalSocket, ExternalGateError> {
         let token = load_authentication(&self.authentication)?;
-        timeout(EXTERNAL_GATE_TIMEOUT, self.check_inner(&token))
+        let socket = timeout(EXTERNAL_GATE_TIMEOUT, self.admit_inner(&token))
             .await
             .map_err(|_| ExternalGateError::Timeout)??;
-        Ok(ExternalGateReport {
-            endpoint_label: self.endpoint_label.clone(),
-            codex_version: self.expected_version.clone(),
-            capability_profile: self.capability_profile,
+        Ok(AdmittedExternalSocket {
+            socket,
+            report: ExternalGateReport {
+                endpoint_label: self.endpoint_label.clone(),
+                codex_version: self.expected_version.clone(),
+                capability_profile: self.capability_profile,
+            },
+            wire: self.wire,
         })
     }
 
-    async fn check_inner(&self, token: &SecretString) -> Result<(), ExternalGateError> {
+    async fn admit_inner(&self, token: &SecretString) -> Result<ExternalSocket, ExternalGateError> {
         let mut request = self
             .endpoint
             .as_str()
@@ -357,9 +376,9 @@ impl ExternalEndpointGate {
         let ws_config = WebSocketConfig::default()
             .read_buffer_size(16 * 1024)
             .write_buffer_size(16 * 1024)
-            .max_write_buffer_size(EXTERNAL_GATE_MESSAGE_BYTES.saturating_mul(2))
-            .max_message_size(Some(EXTERNAL_GATE_MESSAGE_BYTES))
-            .max_frame_size(Some(EXTERNAL_GATE_MESSAGE_BYTES));
+            .max_write_buffer_size(EXTERNAL_WS_MESSAGE_BYTES.saturating_mul(2))
+            .max_message_size(Some(EXTERNAL_WS_MESSAGE_BYTES))
+            .max_frame_size(Some(EXTERNAL_WS_MESSAGE_BYTES));
         let (mut socket, _) = connect_async_with_config(request, Some(ws_config), true)
             .await
             .map_err(classify_connect_error)?;
@@ -430,8 +449,7 @@ impl ExternalEndpointGate {
         }
         drop(list);
 
-        let _ = socket.close(None).await;
-        Ok(())
+        Ok(socket)
     }
 }
 

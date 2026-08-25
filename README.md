@@ -13,7 +13,8 @@
 
 - Codex app-server 的有界 stdio transport、RPC broker、typed thread/turn client、
   长驻 supervisor、thread 复用、`codex probe` 和门控的真实 Codex smoke；另含显式
-  spawned/external backend 配置及外部端点认证/精确版本/只读能力准入门禁；
+  spawned/external backend 配置、外部端点认证/精确版本/只读能力准入门禁，以及不拥有
+  服务端进程的有界只读 WebSocket transport；
 - Rust 原生飞书/Lark 凭证登记、OpenAPI、WebSocket transport、事件归一化，
   以及可灰度启用、受 Rust 监督的官方 Node SDK 入站 sidecar；
   `lark probe` 和门控的真实 Lark smoke；
@@ -24,9 +25,10 @@
 - 完整应用装配和 `run --config`：飞书消息 → Codex turn → 飞书进度/终答。
 
 尚未接线的是 slash command handler、Codex 审批卡、服务管理和完整故障注入/恢复。
-外部端点目前也只有 fail-closed 准入门禁；长连接 WebSocket RPC、重连和共享写入仍未接线，
-选择 external mode 不会回退为新起一个 stdio child。配置与验收说明见
-[`docs/external-codex-endpoint-gate.md`](docs/external-codex-endpoint-gate.md)。
+外部端点已有 fail-closed 准入和只读长连接 transport，但重连、订阅恢复和共享写入仍未
+接入普通 `run` 链路；选择 external mode 不会回退为新起一个 stdio child。配置与验收说明见
+[`docs/external-codex-endpoint-gate.md`](docs/external-codex-endpoint-gate.md) 和
+[`docs/external-codex-transport.md`](docs/external-codex-transport.md)。
 `/stop`、`/status` 按当前最小试用范围明确暂缓；`/new`、`/cd`、`/help` 目前也只有
 解析与 help 元数据，还未进入运行时。启动时会预装有界的 `Received` 行，但尚无周期性
 重扫。首次启动 onboarding 已恢复参考实现的一命令体验：扫码注册后自动携带创建者身份、
@@ -126,6 +128,8 @@ CODEX_E2E=1 cargo test --test codex_smoke --locked -- --ignored --nocapture
 外部端点门禁另有精确 0.149 binary + bearer 的真实 smoke；它要求显式环境配置，缺项会
 直接失败，完整命令见
 [`docs/external-codex-endpoint-gate.md`](docs/external-codex-endpoint-gate.md#verification)。
+外部只读 transport 另有双客户端、shutdown/abort、health 和新连接复用的真实生命周期
+smoke，见 [`docs/external-codex-transport.md`](docs/external-codex-transport.md#verification)。
 
 ### Persisted thread adoption（当前禁用）
 

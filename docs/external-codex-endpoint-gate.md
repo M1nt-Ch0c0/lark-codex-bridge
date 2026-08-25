@@ -2,10 +2,10 @@
 
 Issue [#28](https://github.com/M1nt-Ch0c0/lark-codex-bridge/issues/28) adds the
 fail-closed configuration and admission boundary required before an external
-Codex app-server can be used. It does **not** add the long-running WebSocket RPC
-transport, reconnect, or external mutation support; those remain in #29-#31.
-Consequently, selecting `external_endpoint` in the normal `run` path never
-falls back to a spawned child and currently stops before a runtime is created.
+Codex app-server can be used. Issue #29 builds the bounded read-only WebSocket
+transport on this gate; reconnect and external mutation support remain in
+#30-#31. Selecting `external_endpoint` in the normal mutation-driven `run` path
+still fails closed and never falls back to a spawned child.
 
 ## Tagged backend configuration
 

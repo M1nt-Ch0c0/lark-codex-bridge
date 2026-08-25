@@ -43,6 +43,13 @@ pub const EXTERNAL_GATE_MESSAGE_BYTES: usize = 256 * 1024;
 pub const EXTERNAL_GATE_TOTAL_BYTES: usize = 1024 * 1024;
 /// Inbound frames accepted while waiting for one external-gate response.
 pub const EXTERNAL_GATE_MAX_MESSAGES: usize = 64;
+/// Maximum assembled text message and individual frame size on a long-running external Codex
+/// WebSocket connection. This matches the existing JSONL protocol record limit.
+pub const EXTERNAL_WS_MESSAGE_BYTES: usize = MAX_JSONL_LINE_BYTES;
+/// Deadline for one WebSocket write or control-frame flush.
+pub const EXTERNAL_WS_IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// Maximum time spent waiting for the peer half of a WebSocket close handshake.
+pub const EXTERNAL_WS_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 pub const HIGH_PRIORITY_BURST: usize = 8;
 pub const TRANSPORT_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 pub const TRANSPORT_HIGH_BYTE_BUDGET: usize = TRANSPORT_BYTE_BUDGET;
