@@ -666,15 +666,6 @@ fn resolve_relative_path(parent: &Path, path: &Path) -> Result<PathBuf, ConfigEr
     Ok(lexical_normalize(&parent.join(path)))
 }
 
-fn resolve_command_path(parent: &Path, path: &Path) -> Result<PathBuf, ConfigError> {
-    if path.components().count() == 1
-        && matches!(path.components().next(), Some(Component::Normal(_)))
-    {
-        return Ok(path.to_path_buf());
-    }
-    resolve_relative_path(parent, path)
-}
-
 /// Validates one identity/chat ID collection against its count and byte caps,
 /// rejects malformed IDs, and deduplicates idempotently in place.
 fn normalize_id_collection(
