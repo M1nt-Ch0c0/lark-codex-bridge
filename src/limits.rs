@@ -238,6 +238,34 @@ pub const ATTACHMENT_CACHE_MARKER: &str = ".attachment-cache";
 /// advisory lock. Never a valid SHA-256 name, and the reconciliation scanner
 /// deliberately skips it.
 pub const ATTACHMENT_INSTANCE_LOCK: &str = ".attachment-instance.lock";
+/// Default maximum duration of one audio part that may be sent to the local
+/// ASR sidecar (10 minutes). Longer clips fail closed as `too_long`.
+pub const ASR_MAX_DURATION_MS: u64 = 10 * 60 * 1000;
+/// Non-configurable upper bound for local ASR work. Operator configuration may
+/// lower this limit but can never raise it.
+pub const ASR_ABSOLUTE_MAX_DURATION_MS: u64 = ASR_MAX_DURATION_MS;
+/// PCM byte rate produced by the fixed ffmpeg projection (16 kHz, mono, s16).
+pub const ASR_DECODED_PCM_BYTES_PER_SECOND: u64 = 16_000 * 2;
+/// Maximum decoded WAV bytes, including a conservative bounded header. This is
+/// enforced while ffmpeg is running and verified again before the sidecar.
+pub const ASR_DECODED_WAV_MAX_BYTES: u64 =
+    ASR_DECODED_PCM_BYTES_PER_SECOND * (ASR_ABSOLUTE_MAX_DURATION_MS / 1_000) + 64 * 1024;
+/// Maximum transcript bytes accepted from inbound recognition text or sidecar
+/// stdout.
+pub const ASR_TRANSCRIPT_MAX_BYTES: usize = 32 * 1024;
+/// Maximum extra arguments forwarded to the ASR sidecar.
+pub const ASR_MAX_ARGS: usize = 32;
+/// Maximum bytes of one ASR sidecar argument.
+pub const ASR_MAX_ARG_BYTES: usize = 4 * 1024;
+/// Deadline for one ffmpeg decode of inbound audio.
+pub const ASR_FFMPEG_TIMEOUT: Duration = Duration::from_secs(30);
+/// Deadline for one local ASR sidecar invocation.
+pub const ASR_SIDECAR_TIMEOUT: Duration = Duration::from_secs(60);
+/// Maximum live attachment acquisitions. Every fetch owns an independent token
+/// so overlapping reads cannot release one another's GC protection.
+pub const STORE_ATTACHMENT_LEASE_MAX_ROWS: u64 = 65_536;
+/// Maximum UTF-8 bytes in an internal attachment acquisition token.
+pub const STORE_ATTACHMENT_LEASE_TOKEN_MAX_BYTES: usize = 64;
 /// Maximum live (`starting`/`running`/`uncertain`) turns retained for crash
 /// recovery. Terminal turns are historical rows and do not occupy this set.
 pub const STORE_RECOVERY_TURN_MAX_ROWS: usize = 32;

@@ -492,8 +492,8 @@ mod tests {
             .acquire_owned()
             .await
             .expect("permit");
-        QueuedInboundEvent {
-            event: InboundEvent {
+        QueuedInboundEvent::new(
+            InboundEvent {
                 event_id: event_id.to_owned(),
                 message_id: format!("message-{event_id}"),
                 chat_id: "chat-app-driver".to_owned(),
@@ -514,7 +514,7 @@ mod tests {
                 scope: ScopeKey::Chat("chat-app-driver".to_owned()),
             },
             permit,
-        }
+        )
     }
 
     #[tokio::test]

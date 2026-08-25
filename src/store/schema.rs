@@ -207,6 +207,32 @@ ALTER TABLE threads ADD COLUMN context_tools_version INTEGER NOT NULL DEFAULT 0
     },
     Migration {
         version: 6,
+        name: "tokenize attachment lease acquisitions",
+        sql: "
+ALTER TABLE attachment_leases RENAME TO attachment_leases_v1;
+
+CREATE TABLE attachment_leases (
+    lease_token TEXT PRIMARY KEY CHECK (
+        length(lease_token) BETWEEN 1 AND 64
+    ),
+    sha256 TEXT NOT NULL,
+    turn_row_id INTEGER NOT NULL,
+    created_ms INTEGER NOT NULL,
+    FOREIGN KEY (sha256) REFERENCES attachments (sha256) ON DELETE CASCADE,
+    FOREIGN KEY (turn_row_id) REFERENCES turns (id) ON DELETE CASCADE
+);
+CREATE INDEX attachment_leases_sha256 ON attachment_leases (sha256);
+CREATE INDEX attachment_leases_turn ON attachment_leases (turn_row_id);
+
+INSERT INTO attachment_leases (lease_token, sha256, turn_row_id, created_ms)
+SELECT printf('legacy-%016x', rowid), sha256, turn_row_id, created_ms
+FROM attachment_leases_v1;
+
+DROP TABLE attachment_leases_v1;
+",
+    },
+    Migration {
+        version: 7,
         name: "fence versioned Markdown outbox payloads",
         // No table shape changes are needed: outbox payloads are deliberately
         // opaque JSON. Advancing `user_version` is nevertheless required so a
