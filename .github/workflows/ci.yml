@@ -78,11 +78,24 @@ jobs:
       - run: cargo fetch --locked
       - run: cargo build --offline --locked
       - run: cargo test --offline --locked --test schema_contracts
+      - name: Resolve exact native Codex executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          native_name=codex
+          if [[ "$RUNNER_OS" == "Windows" ]]; then native_name=codex.exe; fi
+          codex_binary="$(find "$GITHUB_WORKSPACE/.codex-ci/0.149.0/node_modules/@openai" \
+            -type f -path "*/vendor/*/bin/$native_name" -print)"
+          if [[ -z "$codex_binary" || "$codex_binary" == *$'\n'* || ! -f "$codex_binary" ]]; then
+            echo "expected exactly one native Codex executable" >&2
+            exit 1
+          fi
+          printf 'CODEX_0_149_NATIVE=%s\n' "$codex_binary" >> "$GITHUB_ENV"
       - name: Run exact authenticated external endpoint gate smoke
         shell: bash
         run: |
           set -euo pipefail
-          codex_binary="$GITHUB_WORKSPACE/.codex-ci/0.149.0/node_modules/.bin/codex"
+          codex_binary="$CODEX_0_149_NATIVE"
           CODEX_EXTERNAL_GATE_E2E=1 \
           CODEX_EXTERNAL_GATE_BINARY="$codex_binary" \
           CODEX_EXTERNAL_GATE_EXPECTED_VERSION=0.149.0 \
@@ -93,12 +106,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          codex_binary="$GITHUB_WORKSPACE/.codex-ci/0.149.0/node_modules/.bin/codex"
+          codex_binary="$CODEX_0_149_NATIVE"
           CODEX_EXTERNAL_TRANSPORT_E2E=1 \
           CODEX_EXTERNAL_TRANSPORT_BINARY="$codex_binary" \
           CODEX_EXTERNAL_TRANSPORT_EXPECTED_VERSION=0.149.0 \
             cargo test --locked --test external_transport_smoke \
               real_exact_binary_transport_preserves_external_server_across_two_clients_and_fresh_reuse \
+              -- --ignored --exact --nocapture
+      - name: Run exact external reconciliation restart smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          codex_binary="$CODEX_0_149_NATIVE"
+          CODEX_EXTERNAL_RECONCILIATION_E2E=1 \
+          CODEX_EXTERNAL_RECONCILIATION_BINARY="$codex_binary" \
+          CODEX_EXTERNAL_RECONCILIATION_EXPECTED_VERSION=0.149.0 \
+            cargo test --locked --test external_recovery_smoke \
+              real_exact_binary_reconciles_across_socket_and_operator_server_restarts_without_write_replay \
               -- --ignored --exact --nocapture
 
   fmt:
@@ -334,12 +358,24 @@ jobs:
             python tools/codex_schema.py sync \
               --binary "$codex_binary" --check
           done
+      - name: Resolve exact native Codex executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          native_name=codex
+          if [[ "$RUNNER_OS" == "Windows" ]]; then native_name=codex.exe; fi
+          codex_binary="$(find "$GITHUB_WORKSPACE/.codex-ci/0.149.0/node_modules/@openai" \
+            -type f -path "*/vendor/*/bin/$native_name" -print)"
+          if [[ -z "$codex_binary" || "$codex_binary" == *$'\n'* || ! -f "$codex_binary" ]]; then
+            echo "expected exactly one native Codex executable" >&2
+            exit 1
+          fi
+          printf 'CODEX_0_149_NATIVE=%s\n' "$codex_binary" >> "$GITHUB_ENV"
       - name: Run exact authenticated external endpoint gate smoke
         shell: bash
         run: |
           set -euo pipefail
-          codex_binary="$GITHUB_WORKSPACE/.codex-ci/0.149.0/node_modules/.bin/codex"
-          if [[ "$RUNNER_OS" == "Windows" ]]; then codex_binary="$codex_binary.cmd"; fi
+          codex_binary="$CODEX_0_149_NATIVE"
           CODEX_EXTERNAL_GATE_E2E=1 \
           CODEX_EXTERNAL_GATE_BINARY="$codex_binary" \
           CODEX_EXTERNAL_GATE_EXPECTED_VERSION=0.149.0 \
@@ -350,13 +386,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          codex_binary="$GITHUB_WORKSPACE/.codex-ci/0.149.0/node_modules/.bin/codex"
-          if [[ "$RUNNER_OS" == "Windows" ]]; then codex_binary="$codex_binary.cmd"; fi
+          codex_binary="$CODEX_0_149_NATIVE"
           CODEX_EXTERNAL_TRANSPORT_E2E=1 \
           CODEX_EXTERNAL_TRANSPORT_BINARY="$codex_binary" \
           CODEX_EXTERNAL_TRANSPORT_EXPECTED_VERSION=0.149.0 \
             cargo test --locked --test external_transport_smoke \
               real_exact_binary_transport_preserves_external_server_across_two_clients_and_fresh_reuse \
+              -- --ignored --exact --nocapture
+      - name: Run exact external reconciliation restart smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          codex_binary="$CODEX_0_149_NATIVE"
+          CODEX_EXTERNAL_RECONCILIATION_E2E=1 \
+          CODEX_EXTERNAL_RECONCILIATION_BINARY="$codex_binary" \
+          CODEX_EXTERNAL_RECONCILIATION_EXPECTED_VERSION=0.149.0 \
+            cargo test --locked --test external_recovery_smoke \
+              real_exact_binary_reconciles_across_socket_and_operator_server_restarts_without_write_replay \
               -- --ignored --exact --nocapture
       - run: cargo nextest run --all-targets --all-features --profile ci --locked -E 'not binary(channel_sidecar)'
       - run: cargo test --test channel_sidecar --locked -- --test-threads=1

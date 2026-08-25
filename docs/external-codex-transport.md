@@ -1,10 +1,13 @@
 # Bounded external Codex WebSocket transport
 
 Issue [#29](https://github.com/M1nt-Ch0c0/lark-codex-bridge/issues/29) adds the
-long-running transport immediately above the authenticated endpoint gate. It is
-an opt-in, exact-version `observe_shared` building block. The ordinary bridge
-`run` path remains mutation-driven and therefore continues to reject external
-mode until reconnect/reconciliation and shared-write policy land in #30-#31.
+long-running transport immediately above the authenticated endpoint gate. It
+supports the exact-version `observe_shared` surface. Issue #30 extends the same
+socket-only owner with the promoted read/resume operations needed by
+`resume_shared`; the durable coordinator is documented in
+[external-codex-reconciliation.md](external-codex-reconciliation.md). The
+ordinary bridge `run` path remains mutation-driven and therefore continues to
+reject external mode until the shared-write policy lands in #31.
 
 ## Ownership boundary
 
@@ -36,15 +39,18 @@ The transport accepts one JSON-RPC object per assembled text message. It:
 
 - rejects binary/raw frames, malformed JSON, oversized messages, excessive JSON
   structure, stale/unknown/duplicate responses, server requests, and unexpected
-  notifications in `observe_shared` mode;
+  notifications; `observe_shared` accepts no notifications, while
+  `resume_shared` accepts only exact promoted status/terminal lifecycle traffic;
 - bounds WebSocket frame/message size, outbound count and byte queues, inbound
   retained bytes, RPC pending requests, notification/reliable queues, write
   deadlines, request deadlines, incomplete-fragment shutdown, and close grace;
 - retains separate high and normal queues with an eight-message high-priority
   burst limit, so control traffic can overtake backlog without starving normal
   traffic;
-- exposes only typed `thread/list` on the external read-only wrapper. It exposes
-  no start, resume, steer, interrupt, queue, approval, or generic mutation API.
+- exposes typed `thread/list` for `observe_shared`; `resume_shared` additionally
+  exposes typed `thread/resume`, `thread/read`, `thread/turns/list`, and
+  `thread/items/list`. It exposes no start, steer, interrupt, queue, approval,
+  generic mutation, process, or reconnect API.
 
 Endpoint URLs, hosts, bearer values, token paths, authorization headers, raw
 payloads, server error text/data, close reasons, `codexHome`, and thread records

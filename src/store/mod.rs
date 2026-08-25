@@ -20,6 +20,7 @@
 
 mod attachments;
 mod dedup;
+mod external;
 mod outbox;
 pub mod schema;
 mod sessions;
@@ -41,6 +42,11 @@ pub use dedup::{
     BeginTurnOutcome, ClaimedInbound, DedupOutcome, InboundDisposition, InboundEventState,
     InboundKey, InboundRejectionKind, InboundTerminal, ResolveTurnOutcome, SkippedInbound,
     TurnResolution,
+};
+pub use external::{
+    ExternalApplyOutcome, ExternalEndpointState, ExternalEpochReservation, ExternalFenceOutcome,
+    ExternalItemTerminal, ExternalTerminalStatus, ExternalThreadSnapshot, ExternalThreadState,
+    ExternalTurnTerminal, ExternalUncertaintyReason,
 };
 pub use outbox::{NewOutboxRow, OutboxDepth, OutboxEnqueue, OutboxRow, OutboxState};
 pub use sessions::{NewTurnRow, ScopeRow, ThreadRow, ThreadStatus, TurnRow, TurnState};

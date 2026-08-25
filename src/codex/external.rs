@@ -151,17 +151,19 @@ impl CodexBackendConfig {
     }
 }
 
-/// The only shared capability profile admitted before the long-running external transport lands.
+/// Explicitly promoted external shared-endpoint capability profiles.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExternalCapabilityProfile {
     ObserveShared,
+    ResumeShared,
 }
 
 impl ExternalCapabilityProfile {
     const fn shared_wire_profile(self) -> SharedWireProfile {
         match self {
             Self::ObserveShared => SharedWireProfile::ObserveShared,
+            Self::ResumeShared => SharedWireProfile::ResumeShared,
         }
     }
 }
@@ -329,6 +331,11 @@ impl ExternalEndpointGate {
         &self.endpoint_label
     }
 
+    #[must_use]
+    pub const fn capability_profile(&self) -> ExternalCapabilityProfile {
+        self.capability_profile
+    }
+
     /// Authenticates and runs initialize, exact-version, and read-only capability gates.
     ///
     /// Credentials are read immediately before the new connection. The result never exposes a
@@ -387,7 +394,11 @@ impl ExternalEndpointGate {
             ClientInfo::new("lark_codex_bridge_external_gate", env!("CARGO_PKG_VERSION"));
         client_info.title = Some("Lark Codex Bridge external endpoint gate".to_owned());
         let mut initialize = InitializeParams::new(client_info);
-        initialize.capabilities = Some(InitializeCapabilities::default());
+        initialize.capabilities = Some(InitializeCapabilities {
+            experimental_api: (self.capability_profile == ExternalCapabilityProfile::ResumeShared)
+                .then_some(true),
+            ..InitializeCapabilities::default()
+        });
         let initialize = self
             .wire
             .initialize_params(&initialize)
@@ -735,6 +746,7 @@ fn endpoint_label(
     hasher.update([0]);
     hasher.update(match profile {
         ExternalCapabilityProfile::ObserveShared => b"observe_shared".as_slice(),
+        ExternalCapabilityProfile::ResumeShared => b"resume_shared".as_slice(),
     });
     let digest = hasher.finalize();
     let mut encoded = String::with_capacity(68);

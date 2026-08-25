@@ -50,6 +50,26 @@ pub const EXTERNAL_WS_MESSAGE_BYTES: usize = MAX_JSONL_LINE_BYTES;
 pub const EXTERNAL_WS_IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum time spent waiting for the peer half of a WebSocket close handshake.
 pub const EXTERNAL_WS_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Maximum number of persisted thread subscriptions managed by one external endpoint.
+pub const EXTERNAL_MANAGED_THREAD_CAPACITY: usize = 64;
+/// Maximum terminal/status events buffered for one thread while its authoritative snapshot is
+/// being reconciled.
+pub const EXTERNAL_RECONCILE_EVENT_CAPACITY: usize = THREAD_EVENT_CAPACITY;
+/// Maximum retained bytes in one thread's reconciliation mailbox.
+pub const EXTERNAL_RECONCILE_MAILBOX_BYTES: usize = THREAD_MAILBOX_BYTE_BUDGET;
+/// Maximum turn pages and item pages read for one thread in a reconciliation pass.
+pub const EXTERNAL_RECONCILE_PAGE_CAPACITY: usize = 32;
+/// Page size requested from the exact promoted turn/item list APIs.
+pub const EXTERNAL_RECONCILE_PAGE_SIZE: u32 = 100;
+/// Maximum number of turns or items materialized for one thread in a reconciliation pass.
+pub const EXTERNAL_RECONCILE_ENTRY_CAPACITY: usize = 3_200;
+/// Maximum typed response bytes materialized while reconciling one thread.
+pub const EXTERNAL_RECONCILE_THREAD_BYTES: usize = 32 * 1024 * 1024;
+/// Maximum typed response bytes materialized across one endpoint reconciliation pass.
+pub const EXTERNAL_RECONCILE_ENDPOINT_BYTES: usize = 64 * 1024 * 1024;
+/// Initial and maximum reconnect delays for an unavailable external endpoint.
+pub const EXTERNAL_RECONNECT_INITIAL_DELAY: Duration = Duration::from_millis(500);
+pub const EXTERNAL_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 pub const HIGH_PRIORITY_BURST: usize = 8;
 pub const TRANSPORT_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 pub const TRANSPORT_HIGH_BYTE_BUDGET: usize = TRANSPORT_BYTE_BUDGET;

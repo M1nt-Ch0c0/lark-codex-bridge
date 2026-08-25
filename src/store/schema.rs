@@ -248,4 +248,56 @@ DROP TABLE attachment_leases_v1;
         // versioned application payload rather than mutate JSON in SQL.
         sql: "SELECT 1;",
     },
+    Migration {
+        version: 9,
+        name: "external Codex reconciliation epochs",
+        sql: "
+CREATE TABLE IF NOT EXISTS external_endpoint_epochs (
+    endpoint_label TEXT PRIMARY KEY,
+    current_epoch INTEGER NOT NULL CHECK (current_epoch > 0),
+    state TEXT NOT NULL CHECK (state IN ('connecting', 'reconciling', 'ready', 'unavailable', 'stopped')),
+    updated_ms INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS external_managed_threads (
+    endpoint_label TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    epoch INTEGER NOT NULL CHECK (epoch >= 0),
+    state TEXT NOT NULL CHECK (state IN ('unavailable', 'reconciling', 'ready', 'uncertain')),
+    reason TEXT CHECK (reason IS NULL OR reason IN (
+        'bridge_restart', 'socket_disconnect', 'request_timeout', 'buffer_overflow',
+        'page_limit', 'server_restart', 'protocol_violation', 'conflicting_terminal'
+    )),
+    updated_ms INTEGER NOT NULL,
+    PRIMARY KEY (endpoint_label, thread_id),
+    FOREIGN KEY (endpoint_label) REFERENCES external_endpoint_epochs(endpoint_label)
+        ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS external_turn_terminals (
+    endpoint_label TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('completed', 'failed', 'interrupted')),
+    observed_epoch INTEGER NOT NULL CHECK (observed_epoch > 0),
+    PRIMARY KEY (endpoint_label, thread_id, turn_id),
+    FOREIGN KEY (endpoint_label, thread_id)
+        REFERENCES external_managed_threads(endpoint_label, thread_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS external_item_terminals (
+    endpoint_label TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    item_id TEXT NOT NULL,
+    observed_epoch INTEGER NOT NULL CHECK (observed_epoch > 0),
+    PRIMARY KEY (endpoint_label, thread_id, turn_id, item_id),
+    FOREIGN KEY (endpoint_label, thread_id)
+        REFERENCES external_managed_threads(endpoint_label, thread_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS external_managed_threads_state
+    ON external_managed_threads(endpoint_label, state, thread_id);
+",
+    },
 ];
