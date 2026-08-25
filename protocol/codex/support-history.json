@@ -1,0 +1,14 @@
+{
+  "establishedBaselineVersion": "0.146.0",
+  "formatVersion": 1,
+  "protocolFamily": "codex-app-server-jsonrpc/v1+v2-experimental",
+  "releases": [
+    {
+      "contractSha256": "747bfb797bd56362c40b8639962e622306da3a85ac21e916e5fcf8e395bf2ca1",
+      "decision": "supported",
+      "rustWireSha256": "293b8dfe76516be9cb1e848ea54d5bfa1a4e80d09c5d87f091e672a0c335797a",
+      "schemaSha256": "8f949f41d0de731f26d264db686a90469a817837f83050c47487045745a3b3a6",
+      "version": "0.146.0"
+    }
+  ]
+}

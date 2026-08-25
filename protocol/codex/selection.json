@@ -1,0 +1,114 @@
+{
+  "formatVersion": 1,
+  "protocolFamily": "codex-app-server-jsonrpc/v1+v2-experimental",
+  "generatorArguments": [
+    "app-server",
+    "generate-json-schema",
+    "--experimental",
+    "--out",
+    "<temporary-directory>"
+  ],
+  "roots": [
+    {
+      "name": "initialize.params",
+      "path": "v1/InitializeParams.json"
+    },
+    {
+      "name": "initialize.response",
+      "path": "v1/InitializeResponse.json"
+    },
+    {
+      "name": "thread.start.params",
+      "path": "v2/ThreadStartParams.json"
+    },
+    {
+      "name": "thread.start.response",
+      "path": "v2/ThreadStartResponse.json"
+    },
+    {
+      "name": "thread.list.params",
+      "path": "v2/ThreadListParams.json"
+    },
+    {
+      "name": "thread.list.response",
+      "path": "v2/ThreadListResponse.json"
+    },
+    {
+      "name": "thread.read.params",
+      "path": "v2/ThreadReadParams.json"
+    },
+    {
+      "name": "thread.read.response",
+      "path": "v2/ThreadReadResponse.json"
+    },
+    {
+      "name": "thread.resume.params",
+      "path": "v2/ThreadResumeParams.json"
+    },
+    {
+      "name": "thread.resume.response",
+      "path": "v2/ThreadResumeResponse.json"
+    },
+    {
+      "name": "turn.start.params",
+      "path": "v2/TurnStartParams.json"
+    },
+    {
+      "name": "turn.start.response",
+      "path": "v2/TurnStartResponse.json"
+    },
+    {
+      "name": "turn.interrupt.params",
+      "path": "v2/TurnInterruptParams.json"
+    },
+    {
+      "name": "turn.interrupt.response",
+      "path": "v2/TurnInterruptResponse.json"
+    },
+    {
+      "name": "notification.thread.started",
+      "path": "v2/ThreadStartedNotification.json"
+    },
+    {
+      "name": "notification.turn.started",
+      "path": "v2/TurnStartedNotification.json"
+    },
+    {
+      "name": "notification.item.started",
+      "path": "v2/ItemStartedNotification.json"
+    },
+    {
+      "name": "notification.item.agent_message.delta",
+      "path": "v2/AgentMessageDeltaNotification.json"
+    },
+    {
+      "name": "notification.item.command_execution.output_delta",
+      "path": "v2/CommandExecutionOutputDeltaNotification.json"
+    },
+    {
+      "name": "notification.item.completed",
+      "path": "v2/ItemCompletedNotification.json"
+    },
+    {
+      "name": "notification.thread.token_usage.updated",
+      "path": "v2/ThreadTokenUsageUpdatedNotification.json"
+    },
+    {
+      "name": "notification.error",
+      "path": "v2/ErrorNotification.json"
+    },
+    {
+      "name": "notification.turn.completed",
+      "path": "v2/TurnCompletedNotification.json"
+    },
+    {
+      "name": "server_request.dynamic_tool_call.params",
+      "path": "DynamicToolCallParams.json"
+    },
+    {
+      "name": "server_request.dynamic_tool_call.response",
+      "path": "DynamicToolCallResponse.json"
+    }
+  ],
+  "notificationCatalog": "ServerNotification.json"
+}

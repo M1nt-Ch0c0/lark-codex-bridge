@@ -1,0 +1,398 @@
+{
+  "codexVersion": "0.149.0",
+  "exchanges": [
+    {
+      "method": "initialize",
+      "params": {
+        "capabilities": {
+          "experimentalApi": true
+        },
+        "clientInfo": {
+          "name": "lark-codex-bridge",
+          "version": "0.1.0-alpha.1"
+        }
+      },
+      "result": {
+        "codexHome": "/contract/codex-home",
+        "platformFamily": "unix",
+        "platformOs": "linux",
+        "userAgent": "codex_cli_rs/0.149.0"
+      }
+    },
+    {
+      "method": "thread/start",
+      "params": {
+        "cwd": "/contract/workspace",
+        "ephemeral": true
+      },
+      "result": {
+        "approvalPolicy": "on-request",
+        "approvalsReviewer": "user",
+        "cwd": "/contract/workspace",
+        "model": "gpt-5.6",
+        "modelProvider": "openai",
+        "sandbox": {
+          "excludeSlashTmp": false,
+          "excludeTmpdirEnvVar": false,
+          "networkAccess": false,
+          "type": "workspaceWrite",
+          "writableRoots": [
+            "/contract/workspace"
+          ]
+        },
+        "thread": {
+          "cliVersion": "0.149.0",
+          "createdAt": 1786478400,
+          "cwd": "/contract/workspace",
+          "ephemeral": true,
+          "id": "thread-contract-1",
+          "modelProvider": "openai",
+          "preview": "",
+          "projectId": "project-contract-1",
+          "sessionId": "session-contract-1",
+          "source": "appServer",
+          "status": {
+            "type": "idle"
+          },
+          "turns": [],
+          "updatedAt": 1786478400
+        }
+      }
+    },
+    {
+      "method": "thread/list",
+      "params": {
+        "limit": 20,
+        "sectionId": "section-contract-1",
+        "sourceKinds": [
+          "appServer"
+        ]
+      },
+      "result": {
+        "data": [
+          {
+            "cliVersion": "0.149.0",
+            "createdAt": 1786478400,
+            "cwd": "/contract/workspace",
+            "ephemeral": true,
+            "id": "thread-contract-1",
+            "modelProvider": "openai",
+            "preview": "",
+            "projectId": "project-contract-1",
+            "sessionId": "session-contract-1",
+            "source": "appServer",
+            "status": {
+              "type": "idle"
+            },
+            "turns": [],
+            "updatedAt": 1786478400
+          }
+        ],
+        "nextCursor": null
+      }
+    },
+    {
+      "method": "thread/read",
+      "params": {
+        "includeTurns": true,
+        "threadId": "thread-contract-1"
+      },
+      "result": {
+        "thread": {
+          "cliVersion": "0.149.0",
+          "createdAt": 1786478400,
+          "cwd": "/contract/workspace",
+          "ephemeral": true,
+          "id": "thread-contract-1",
+          "modelProvider": "openai",
+          "preview": "",
+          "projectId": "project-contract-1",
+          "sessionId": "session-contract-1",
+          "source": "appServer",
+          "status": {
+            "type": "idle"
+          },
+          "turns": [],
+          "updatedAt": 1786478400
+        }
+      }
+    },
+    {
+      "method": "thread/resume",
+      "params": {
+        "threadId": "thread-contract-1"
+      },
+      "result": {
+        "approvalPolicy": "on-request",
+        "approvalsReviewer": "user",
+        "cwd": "/contract/workspace",
+        "model": "gpt-5.6",
+        "modelProvider": "openai",
+        "sandbox": {
+          "excludeSlashTmp": false,
+          "excludeTmpdirEnvVar": false,
+          "networkAccess": false,
+          "type": "workspaceWrite",
+          "writableRoots": [
+            "/contract/workspace"
+          ]
+        },
+        "thread": {
+          "cliVersion": "0.149.0",
+          "createdAt": 1786478400,
+          "cwd": "/contract/workspace",
+          "ephemeral": true,
+          "id": "thread-contract-1",
+          "modelProvider": "openai",
+          "preview": "",
+          "projectId": "project-contract-1",
+          "sessionId": "session-contract-1",
+          "source": "appServer",
+          "status": {
+            "type": "idle"
+          },
+          "turns": [],
+          "updatedAt": 1786478400
+        }
+      }
+    },
+    {
+      "method": "turn/start",
+      "params": {
+        "input": [
+          {
+            "text": "contract input",
+            "type": "text"
+          }
+        ],
+        "threadId": "thread-contract-1"
+      },
+      "result": {
+        "turn": {
+          "completedAt": null,
+          "durationMs": null,
+          "error": null,
+          "id": "turn-contract-1",
+          "items": [],
+          "startedAt": 1786478401,
+          "status": "inProgress"
+        }
+      }
+    },
+    {
+      "method": "turn/interrupt",
+      "params": {
+        "threadId": "thread-contract-1",
+        "turnId": "turn-contract-1"
+      },
+      "result": {}
+    }
+  ],
+  "failureCases": [
+    {
+      "expected": "definitely_not_applied",
+      "source": "serialize"
+    },
+    {
+      "expected": "definitely_not_applied",
+      "source": "payload_too_large"
+    },
+    {
+      "expected": "definitely_not_applied",
+      "source": "request_id_exhausted"
+    },
+    {
+      "expected": "definitely_not_applied",
+      "source": "server_error"
+    },
+    {
+      "expected": "uncertain",
+      "source": "timeout"
+    },
+    {
+      "expected": "uncertain",
+      "source": "connection_lost"
+    },
+    {
+      "expected": "uncertain",
+      "source": "confirmed_untracked"
+    }
+  ],
+  "formatVersion": 1,
+  "normalNotificationOrder": [
+    "thread/started",
+    "turn/started",
+    "item/started",
+    "item/agentMessage/delta",
+    "item/commandExecution/outputDelta",
+    "item/completed",
+    "thread/tokenUsage/updated",
+    "turn/completed"
+  ],
+  "notifications": [
+    {
+      "method": "thread/started",
+      "params": {
+        "thread": {
+          "cliVersion": "0.149.0",
+          "createdAt": 1786478400,
+          "cwd": "/contract/workspace",
+          "ephemeral": true,
+          "id": "thread-contract-1",
+          "modelProvider": "openai",
+          "preview": "",
+          "projectId": "project-contract-1",
+          "sessionId": "session-contract-1",
+          "source": "appServer",
+          "status": {
+            "type": "idle"
+          },
+          "turns": [],
+          "updatedAt": 1786478400
+        }
+      }
+    },
+    {
+      "method": "turn/started",
+      "params": {
+        "threadId": "thread-contract-1",
+        "turn": {
+          "completedAt": null,
+          "durationMs": null,
+          "error": null,
+          "id": "turn-contract-1",
+          "items": [],
+          "startedAt": 1786478401,
+          "status": "inProgress"
+        }
+      }
+    },
+    {
+      "method": "item/started",
+      "params": {
+        "item": {
+          "id": "item-contract-1",
+          "text": "",
+          "type": "agentMessage"
+        },
+        "startedAtMs": 1786478401000,
+        "threadId": "thread-contract-1",
+        "turnId": "turn-contract-1"
+      }
+    },
+    {
+      "method": "item/agentMessage/delta",
+      "params": {
+        "delta": "contract delta",
+        "itemId": "item-contract-1",
+        "threadId": "thread-contract-1",
+        "turnId": "turn-contract-1"
+      }
+    },
+    {
+      "method": "item/commandExecution/outputDelta",
+      "params": {
+        "delta": "bounded output",
+        "itemId": "command-contract-1",
+        "threadId": "thread-contract-1",
+        "turnId": "turn-contract-1"
+      }
+    },
+    {
+      "method": "item/completed",
+      "params": {
+        "completedAtMs": 1786478402000,
+        "item": {
+          "id": "item-contract-1",
+          "phase": "final_answer",
+          "text": "contract output",
+          "type": "agentMessage"
+        },
+        "threadId": "thread-contract-1",
+        "turnId": "turn-contract-1"
+      }
+    },
+    {
+      "method": "thread/tokenUsage/updated",
+      "params": {
+        "threadId": "thread-contract-1",
+        "tokenUsage": {
+          "last": {
+            "cachedInputTokens": 0,
+            "inputTokens": 10,
+            "outputTokens": 5,
+            "reasoningOutputTokens": 1,
+            "totalTokens": 16
+          },
+          "modelContextWindow": 100000,
+          "total": {
+            "cachedInputTokens": 0,
+            "inputTokens": 10,
+            "outputTokens": 5,
+            "reasoningOutputTokens": 1,
+            "totalTokens": 16
+          }
+        },
+        "turnId": "turn-contract-1"
+      }
+    },
+    {
+      "method": "error",
+      "params": {
+        "error": {
+          "message": "synthetic contract failure"
+        },
+        "threadId": "thread-contract-1",
+        "turnId": "turn-contract-1",
+        "willRetry": false
+      }
+    },
+    {
+      "method": "turn/completed",
+      "params": {
+        "threadId": "thread-contract-1",
+        "turn": {
+          "completedAt": 1786478402,
+          "durationMs": 1000,
+          "error": null,
+          "id": "turn-contract-1",
+          "items": [
+            {
+              "id": "item-contract-1",
+              "phase": "final_answer",
+              "text": "contract output",
+              "type": "agentMessage"
+            }
+          ],
+          "startedAt": 1786478401,
+          "status": "completed"
+        }
+      }
+    }
+  ],
+  "protocolFamily": "codex-app-server-jsonrpc/v1+v2-experimental",
+  "reverseRequests": [
+    {
+      "method": "item/tool/call",
+      "params": {
+        "arguments": {
+          "key": "value"
+        },
+        "callId": "call-contract-1",
+        "namespace": null,
+        "threadId": "thread-contract-1",
+        "tool": "contract_tool",
+        "turnId": "turn-contract-1"
+      },
+      "result": {
+        "contentItems": [
+          {
+            "text": "contract tool result",
+            "type": "inputText"
+          }
+        ],
+        "success": true
+      }
+    }
+  ]
+}

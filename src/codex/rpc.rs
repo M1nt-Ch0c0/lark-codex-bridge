@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     codex::{
+        compat::WireAdapter,
         protocol::{
             InboundMessage, OutboundMessage, RequestId, RpcErrorObject, request_id_memory_weight,
             value_memory_weight,
@@ -241,6 +242,21 @@ impl<T> BudgetedResponse<T> {
 
     pub fn into_parts(self) -> (T, OwnedSemaphorePermit) {
         (self.value, self.transport_budget)
+    }
+
+    /// Maps a decoded response while retaining its inbound memory permit.
+    ///
+    /// # Errors
+    ///
+    /// Returns the mapping closure's error without discarding it or exposing the response.
+    pub fn try_map<U, E>(
+        self,
+        map: impl FnOnce(T) -> Result<U, E>,
+    ) -> Result<BudgetedResponse<U>, E> {
+        Ok(BudgetedResponse {
+            value: map(self.value)?,
+            transport_budget: self.transport_budget,
+        })
     }
 }
 
@@ -1694,7 +1710,19 @@ fn request_id_kind(id: &RequestId) -> &'static str {
 /// Returns [`RpcError::AlreadyInitialized`] after any prior attempt on the same
 /// epoch, or another safe RPC failure if the handshake cannot complete.
 pub async fn initialize_connection(handle: &RpcHandle) -> Result<InitializeResult, RpcError> {
-    initialize_connection_with_capabilities(handle, false).await
+    initialize_connection_for_wire(handle, WireAdapter::V0_146_0).await
+}
+
+/// Performs the initialize handshake using an explicitly selected wire contract.
+///
+/// # Errors
+///
+/// Returns the same redacted failures as [`initialize_connection`].
+pub async fn initialize_connection_for_wire(
+    handle: &RpcHandle,
+    wire: WireAdapter,
+) -> Result<InitializeResult, RpcError> {
+    initialize_connection_with_capabilities(handle, wire, false).await
 }
 
 /// Performs the initialize handshake while opting into app-server dynamic
@@ -1708,12 +1736,14 @@ pub async fn initialize_connection(handle: &RpcHandle) -> Result<InitializeResul
 /// Returns the same failures as [`initialize_connection`].
 pub async fn initialize_connection_with_dynamic_tools(
     handle: &RpcHandle,
+    wire: WireAdapter,
 ) -> Result<InitializeResult, RpcError> {
-    initialize_connection_with_capabilities(handle, true).await
+    initialize_connection_with_capabilities(handle, wire, true).await
 }
 
 async fn initialize_connection_with_capabilities(
     handle: &RpcHandle,
+    wire: WireAdapter,
     dynamic_tools: bool,
 ) -> Result<InitializeResult, RpcError> {
     handle
@@ -1730,9 +1760,23 @@ async fn initialize_connection_with_capabilities(
             ..InitializeCapabilities::default()
         });
     }
+    let Ok(params) = wire.initialize_params(&params) else {
+        handle
+            .initialize_state
+            .store(INIT_FAILED, Ordering::Release);
+        return Err(RpcError::Serialize {
+            method: "initialize",
+        });
+    };
     let result = handle
-        .request_high::<_, InitializeResult>("initialize", &params, INITIALIZE_TIMEOUT)
-        .await;
+        .request_high::<_, Value>("initialize", &params, INITIALIZE_TIMEOUT)
+        .await
+        .and_then(|value| {
+            wire.initialize_response(value)
+                .map_err(|_| RpcError::Deserialize {
+                    method: "initialize",
+                })
+        });
     let result = match result {
         Ok(result) => result,
         Err(error) => {

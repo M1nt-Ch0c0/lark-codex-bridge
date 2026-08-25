@@ -1,0 +1,56 @@
+{
+  "artifactSha256": {
+    "incomingAudit": "3355aad62534ab5d3f2c20be3a596f2cc47f3e52cb01e809137c5944b3e9476d",
+    "normalizedSchema": "8f949f41d0de731f26d264db686a90469a817837f83050c47487045745a3b3a6",
+    "rustWire": "293b8dfe76516be9cb1e848ea54d5bfa1a4e80d09c5d87f091e672a0c335797a"
+  },
+  "artifacts": {
+    "incomingAudit": "protocol/codex/schemas/0.146.0/incoming-audit.json",
+    "normalizedSchema": "protocol/codex/schemas/0.146.0/selected.schema.json",
+    "rustWire": "src/codex/wire/v0_146_0.rs"
+  },
+  "codexVersion": "0.146.0",
+  "formatVersion": 1,
+  "generationArguments": [
+    "app-server",
+    "generate-json-schema",
+    "--experimental",
+    "--out",
+    "<temporary-directory>"
+  ],
+  "generator": {
+    "name": "lark-codex-bridge/codex-schema",
+    "templateSha256": "4d07c5c97841b0c9fb14aa525e611026543e785347c293ff70498c36051de19e",
+    "version": "1.1.0"
+  },
+  "lifecycle": "supported",
+  "protocolFamily": "codex-app-server-jsonrpc/v1+v2-experimental",
+  "schemaSha256": "8f949f41d0de731f26d264db686a90469a817837f83050c47487045745a3b3a6",
+  "selectedRoots": [
+    "initialize.params",
+    "initialize.response",
+    "thread.start.params",
+    "thread.start.response",
+    "thread.list.params",
+    "thread.list.response",
+    "thread.read.params",
+    "thread.read.response",
+    "thread.resume.params",
+    "thread.resume.response",
+    "turn.start.params",
+    "turn.start.response",
+    "turn.interrupt.params",
+    "turn.interrupt.response",
+    "notification.thread.started",
+    "notification.turn.started",
+    "notification.item.started",
+    "notification.item.agent_message.delta",
+    "notification.item.command_execution.output_delta",
+    "notification.item.completed",
+    "notification.thread.token_usage.updated",
+    "notification.error",
+    "notification.turn.completed",
+    "server_request.dynamic_tool_call.params",
+    "server_request.dynamic_tool_call.response"
+  ]
+}

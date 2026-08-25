@@ -32,7 +32,7 @@
 
 ## 最小试用
 
-前提：本机已安装并登录受支持的 `codex-cli 0.146.0` 或更高版本，飞书/Lark 应用机器人已创建并
+前提：本机已安装并登录当前精确支持的 `codex-cli 0.146.0`，飞书/Lark 应用机器人已创建并
 加入目标会话。首次运行不再需要手写 TOML、手动查询 `open_id` 或预先创建工作区。
 
 直接启动常驻桥接器，按提示完成扫码授权即可：
@@ -95,6 +95,11 @@ cargo run --locked -- lark probe
 ```
 
 ## Codex 环境检查
+
+Codex app-server 协议采用精确版本的 Schema/契约门控；候选版本不会因“版本更高”而自动进入
+支持范围。同步、兼容性报告和升级流程见
+[`docs/codex-schema-maintenance.md`](docs/codex-schema-maintenance.md)。普通构建不会安装或运行
+Codex，也不依赖本机存在 Codex binary。
 
 ```bash
 cargo run --locked -- codex probe
