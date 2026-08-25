@@ -11,7 +11,7 @@ use futures_util::future::BoxFuture;
 
 use super::payload::OutboxOperation;
 use crate::lark::normalize::InboundEvent;
-use crate::render::{ProjectedReply, ReplyProjector};
+use crate::render::{ProjectedReply, ReplyProjector, render_lark_markdown};
 use crate::runtime::scope::{
     DurableReplySink, ReplySinkError, TurnFinalization, TurnProgress, TurnSource,
 };
@@ -187,6 +187,7 @@ fn progress_final_rows(
         message_id: source.message_id.clone(),
         thread_id: source.thread_id.clone(),
         text: text.to_owned(),
+        fallback_markdown: nonempty_fallback_markdown(text),
     };
     Ok(vec![NewOutboxRow {
         idempotency_key: format!("{anchor_key}:final"),
@@ -220,7 +221,7 @@ fn final_rows(
             idempotency_key: key,
             scope_key: turn.scope_key.clone(),
             kind: "final".to_owned(),
-            payload_json: encode_reply(source, text)?,
+            payload_json: encode_markdown_reply(source, text)?,
             next_retry_ms: 0,
         });
     }
@@ -239,12 +240,12 @@ fn notice_rows(
         idempotency_key: format!("{}:notice", turn.turn_row_id),
         scope_key: turn.scope_key.clone(),
         kind: "notice".to_owned(),
-        payload_json: encode_reply(source, text)?,
+        payload_json: encode_text_reply(source, text)?,
         next_retry_ms: 0,
     }])
 }
 
-fn encode_reply(source: &TurnSource, text: &str) -> Result<String, ReplySinkError> {
+fn encode_text_reply(source: &TurnSource, text: &str) -> Result<String, ReplySinkError> {
     OutboxOperation::ReplyText {
         message_id: source.message_id.clone(),
         thread_id: source.thread_id.clone(),
@@ -252,6 +253,25 @@ fn encode_reply(source: &TurnSource, text: &str) -> Result<String, ReplySinkErro
     }
     .encode()
     .map_err(|_| ReplySinkError::Invariant)
+}
+
+fn encode_markdown_reply(source: &TurnSource, markdown: &str) -> Result<String, ReplySinkError> {
+    OutboxOperation::ReplyMarkdownPost {
+        message_id: source.message_id.clone(),
+        thread_id: source.thread_id.clone(),
+        markdown: markdown.to_owned(),
+    }
+    .encode()
+    .map_err(|_| ReplySinkError::Invariant)
+}
+
+fn nonempty_fallback_markdown(text: &str) -> String {
+    let rendered = render_lark_markdown(text);
+    if rendered.is_empty() {
+        "（回复不包含可显示文本）".to_owned()
+    } else {
+        rendered
+    }
 }
 
 fn map_store_error(error: &StoreError) -> ReplySinkError {

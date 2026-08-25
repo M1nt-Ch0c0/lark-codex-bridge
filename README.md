@@ -56,6 +56,35 @@ cargo run --locked -- run
 私聊可直接发消息；群聊和话题需要直接 @机器人。按 `Ctrl-C` 结束。当前真实飞书的
 “发消息 → Codex 回答 → 飞书收到回复”验收由操作者手动执行。
 
+### 终端日志与排障
+
+日志默认只显示错误和必要告警；全局 `-v` 打开 info 级连接、turn、恢复与 outbox
+生命周期，`-vv` 再打开队列深度、批次和重试等 debug 状态。全局参数可写在子命令前后：
+
+```bash
+cargo run --locked -- run -v
+cargo run --locked -- -vv run
+```
+
+设置 `RUST_LOG` 时会覆盖上述 bridge 默认过滤器，并使用
+[`tracing-subscriber` EnvFilter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html)
+语法；无效值会在启动前报错并给出示例，不会被静默忽略：
+
+```bash
+RUST_LOG='warn,lark_codex_bridge=debug' cargo run --locked -- run
+cargo run --locked -- --log-format json run -v
+```
+
+为维持日志脱敏边界，终端 subscriber 只接收 `lark_codex_bridge` 自身经过审计的事件；
+即使设置 `RUST_LOG=trace` 或指定第三方 crate，也不会输出 HTTP/WebSocket 依赖库可能包含
+完整 endpoint、header 或 frame payload 的诊断日志。
+
+human 与 JSON 日志都只写入 stderr；`codex probe`、`lark probe` 和认证检查等命令的
+stdout JSON 契约保持独立。因此 launchd/systemd 可分别重定向 stdout 与 stderr，后者
+即可用于基本故障诊断。日志字段限于静态分类、计数、耗时、重试次数和 supervisor epoch；
+不会记录 App Secret、tenant token、完整 WebSocket endpoint、消息/prompt/模型/工具正文、
+媒体内容、完整本地路径、用户身份或原始事件 payload。
+
 已登记应用与诊断场景保持不变；如需分别检查两侧连接：
 
 ```bash
@@ -170,6 +199,123 @@ endpointHost、pingIntervalSecs、elapsedMs）；绝不输出 secret、token 或
 LARK_E2E=1 LARK_E2E_APP_ID=… LARK_E2E_APP_SECRET=… LARK_E2E_TENANT=feishu LARK_E2E_CHAT_ID=oc_… \
   cargo test --test lark_smoke --locked -- --ignored --nocapture
 ```
+
+## 回复显示与 Markdown 验收
+
+输出层显式保留语义载体，不会根据字符串中是否出现 Markdown 符号来猜消息类型：
+
+- 无进度卡的独立终答使用飞书/Lark `msg_type=post`，内容固定包装成
+  `zh_cn.content -> [[{tag: "md", text: …}]]`；
+- 流式中间态和终态始终是同一条 Card 2.0 `interactive` 消息，正文元素保持
+  `tag=markdown`。每次发送的快照会临时补齐未闭合代码围栏，后续增量仍基于未修改的原文；
+- 拒绝、过载、失败、中断等短通知继续使用 `msg_type=text`。
+
+`post/tag=md` 与 Card 2.0 `tag=markdown` 分别经过载体专用的净化入口。两者支持并保留
+段落、无序/有序列表、引用、行内代码、fenced code、粗体、斜体、删除线和行内链接；
+行内代码与链接字面量不会被 HTML/脚注规则误写。标题稳定降级为粗体段落，表格固定降级为
+`text` fenced code（不依赖客户端不一致的表格支持），任务列表变成 Unicode 复选框，脚注
+变成带标签的普通文本且绝不在代码 span 内替换。复杂嵌套会展开成单层可读结构，连续空行会
+压缩。引用/列表容器内的 fence 与表格会先剥离容器前缀再识别，输出时保留外层引用语义，
+因此嵌套的开闭 fence 不会被当作普通正文切断。
+
+不支持的图片会降级为 `Image: alt (target)`，reference link/image 会降级为带 reference 标签的
+可读文本，reference definition 会显示为普通文本。`~~~` fence 通常转成反引号 fence；若正文
+与 delimiter 冲突则选择更短的安全 marker 或做显式可读降级；
+畸形 info string 整体降级为 `text`，未闭合 fence 在每个发送快照中补齐。原始 HTML 标签/注释
+只在代码 span 外移除，畸形标签使用惰性的 Unicode 尖括号显示且不会跨行吞掉引用内容。
+可能触发真实提及的 `<at …>` 控制（包括 `&lt;at …&gt;`、十进制/十六进制实体编码）、
+双向/零宽 Unicode format controls（包括数字/命名实体）会在两个载体中净化；代码 span 内的
+对应字面量原样保留。代码外由实体解码得到的 ASCII 与空白会显示为惰性的全角字符或可见
+控制符号，不能在二次结构解析或客户端中重建粗体、fence、换行、列表、引用、链接或图片。
+链接目标按载体白名单处理：`post` 只保留 `https`、`http`、`mailto`，
+Card 2.0 只保留 `https`；`javascript`、`data`、`file`、带控制字符/实体的目标稳定降级为文本。
+畸形 link/image 只消费已确认的语法前缀，目标及其后的普通文字不会被吞掉。
+
+转换先于分片。每个 `post` 分片同时检查 4,000 个 Unicode 标量上限和最终 Lark
+reply JSON 的精确序列化字节数（包括内层 JSON 转义与话题回复标记），最多 8 片；在
+代码块内切分时会闭合当前片并在下一片重新打开相同围栏，超出总预算则显式附加
+`…[truncated]`。Card 2.0 的创建、更新和终态（包括 v1/v2 durable replay）也在净化后按
+单个 `{tag:"markdown",content:…}` 元素的精确 JSON wire 大小执行 `30 * 1024` 字节硬上限；
+JSON 转义、Unicode 与闭合 fence 开销均计入，超限时 fence-safe 截断。病态超长 fence delimiter
+会整体规范化/降级，不会在 delimiter 中间切分。
+
+持久 outbox 从本功能起只写 payload v2；升级后的 reader 同时严格读取 v1/v2。历史 v1
+`reply_text` 始终保持纯文本载体，不会因内容像 Markdown 而改型；历史终态 Card 的备用正文
+会先经过当前净化器再成为 `post`。数据库 `PRAGMA user_version=6` 是显式降级栅栏：升级前应
+停掉旧进程并备份数据库，升级后不得再用只认识 payload v1/schema v5 的旧二进制打开同一库。
+确定未生效的终态 Card PATCH 在永久拒绝（或同样确定未生效的限流重试耗尽）后，会把同一个
+确定性 outbox 行原子转换成 standalone Markdown post；响应丢失、畸形或其他
+`uncertain_delivery` 绝不会触发备用发送。非幂等 POST 收到 HTTP 5xx 时，即使服务器返回了
+响应，也可能已经写入，因此立即记为 uncertain 且绝不盲重放。Card PATCH 可按幂等操作对
+HTTP 429/5xx 和平台明确记录的限频码做有界重试；5xx 重试耗尽仍为 uncertain，绝不授权
+fallback POST。校验、卡片格式、机器人不在会话、消息已撤回等明确业务拒绝直接视为永久失败。
+
+真实桌面端/移动端 Markdown 验收是单独的显式门控测试。先在目标会话发送一条可供
+机器人回复的消息并取得其 `message_id`，准备三个不纳入 Git 的本地路径，然后运行：
+
+```bash
+LARK_MARKDOWN_E2E=1 \
+LARK_E2E_APP_ID=… LARK_E2E_APP_SECRET=… LARK_E2E_TENANT=feishu \
+LARK_MARKDOWN_E2E_PARENT_MESSAGE_ID=om_… \
+LARK_MARKDOWN_E2E_DESKTOP_SCREENSHOT=/tmp/lark-markdown-desktop.png \
+LARK_MARKDOWN_E2E_MOBILE_SCREENSHOT=/tmp/lark-markdown-mobile.png \
+LARK_MARKDOWN_E2E_ATTESTATION=/tmp/lark-markdown-attestation.json \
+LARK_MARKDOWN_E2E_REVIEWER='独立审核人标识' \
+  cargo test --test lark_markdown_smoke --locked -- --ignored --nocapture
+```
+
+审核信任锚不是运行时输入。`LARK_MARKDOWN_E2E_REVIEWER` 只能选择
+`tests/lark_markdown_smoke.rs` 中编译进测试二进制的审核人标识/Ed25519 公钥，环境变量不能新增
+或替换公钥。当前仓库的可信 allowlist 有意为空，因此真实桌面端/移动端证据仍然**缺失**；即使
+提供全部环境变量，smoke 也会在读取凭证和发送消息前以
+`no trusted review anchor configured` 失败关闭。只有通过独立渠道取得审核公钥，并通过受审查的
+仓库提交固定该身份/公钥后，才可执行并产生可采信的真实验收证据；私钥不得进入仓库。
+
+测试发出覆盖全部子集及表格降级的真实 `post`；正文末尾会显示本次唯一 `nonce` 与基础正文
+SHA-256，测试同时打印回复 `message_id`、marker/body/最终正文 hash，默认等待 5 分钟。在飞书
+桌面端和移动端分别打开该回复，确认排版可读、表格显示为 fenced text，且两张截图都完整显示
+本次 marker。保存两张新截图后，测试会打印文件 hash、按 `width || height || RGBA8` 计算的
+canonical pixel hash、尺寸与最终 `evidence_sha256`，把这些值写入新生成的强类型验收文件：
+
+```json
+{
+  "version": 3,
+  "nonce": "测试打印的一次性nonce",
+  "message_id": "om_测试打印的回复ID",
+  "body_sha256": "测试打印的基础正文hash",
+  "markdown_sha256": "测试打印的正文hash",
+  "marker": {"verdict": "visible_in_both", "sha256": "测试打印的marker hash"},
+  "desktop": {
+    "verdict": "pass", "file_sha256": "桌面文件hash",
+    "pixel_sha256": "桌面canonical pixel hash", "width": 1234, "height": 800
+  },
+  "mobile": {
+    "verdict": "pass", "file_sha256": "移动文件hash",
+    "pixel_sha256": "移动canonical pixel hash", "width": 800, "height": 1234
+  },
+  "review": {
+    "reviewer": "与环境变量完全一致的独立审核人标识",
+    "public_key_sha256": "测试打印的审核公钥hash",
+    "signature_ed25519": "审核人生成的128位Ed25519签名hex"
+  },
+  "evidence_sha256": "测试打印的全字段绑定hash",
+  "table": "fenced"
+}
+```
+
+测试在发送前记录三个证据文件的旧 hash，只接受发送完成后变更且能真实解码、像素数有界的
+PNG/JPEG/WebP；桌面与移动截图按解码后的 canonical RGBA 像素比较，因而“相同像素重新编码”
+不会伪装成两份证据。`evidence_sha256` 以无歧义长度前缀格式绑定本次 nonce、message ID、
+marker/body/最终正文 hash、两张文件及 pixel hash/尺寸、所有视觉 verdict、审核人和审核公钥。
+
+程序只验证文件、像素和字段绑定，**不会声称能从像素中识别 marker 或判断排版**。这两个视觉
+结论必须由独立审核人检查桌面端和移动端截图后签署。审核公钥必须先经独立渠道核验，再由受审查
+的仓库提交固定；对应私钥不得提供给 smoke 进程或截图操作者。审核人用 Ed25519 签署 UTF-8 字节串
+`lark-markdown-independent-review-signature-v3\n<evidence_sha256>\n`。因此任意两张不同图片加
+自填 verdict/attestation、错误审核密钥、陈旧、同像素或字段错配均不能通过；有效签名表示外部
+审核人对绑定图片作了人工确认，而不是程序完成了 OCR。显式运行 ignored smoke 却没有
+`LARK_MARKDOWN_E2E=1` 或任一配置会直接失败，不会以 skip 冒充证据。截图可能包含会话信息，
+因此只作为操作者保存的外部验收证据，不应提交仓库。
 
 仓库只跟踪稳定的产品说明；缺陷和遗留项通过 GitHub Issue 与对应 PR 跟踪。实施计划、
 实时进度、Agent 接管记录和临时测试证据属于本地开发材料，不发布到 Git。
