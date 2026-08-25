@@ -1188,7 +1188,7 @@ async fn release_thread_route(
     }
 }
 
-#[allow(clippy::too_many_arguments, clippy::if_not_else)]
+#[allow(clippy::too_many_arguments)]
 async fn ensure_thread(
     scope: &ScopeKey,
     store: &StoreHandle,
@@ -1209,15 +1209,7 @@ async fn ensure_thread(
         } else {
             0
         };
-        if active.context_tools_version != required_version {
-            store
-                .archive_active_thread(scope)
-                .await
-                .map_err(|_| ScopeFailureKind::Store)?;
-            let _ = client
-                .release_thread(&ThreadId::from(active.codex_thread_id.as_str()))
-                .await;
-        } else {
+        if active.context_tools_version == required_version {
             let rpc_cwd = revalidate_workspace(policy, cwd, fingerprint)?;
             let mut params = ThreadResumeParams::new(&active.codex_thread_id);
             params.overrides.cwd = Some(rpc_cwd);
@@ -1230,6 +1222,13 @@ async fn ensure_thread(
                 .map_err(|_| ScopeFailureKind::Client)?;
             return Ok(thread.id);
         }
+        store
+            .archive_active_thread(scope)
+            .await
+            .map_err(|_| ScopeFailureKind::Store)?;
+        let _ = client
+            .release_thread(&ThreadId::from(active.codex_thread_id.as_str()))
+            .await;
     }
     let rpc_cwd = revalidate_workspace(policy, cwd, fingerprint)?;
     let params = ThreadStartParams {

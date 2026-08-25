@@ -132,8 +132,8 @@ pub async fn handle_server_request(
                         Err(asr_error(AsrError::Cancelled))
                     };
                     let response = match result {
-                        Ok(value) => tool_response(value, true),
-                        Err(value) => tool_response(value, false),
+                        Ok(value) => tool_response(&value, true),
+                        Err(value) => tool_response(&value, false),
                     };
                     let _ = client.respond_request(&mut request, &response).await;
                     return;
@@ -149,8 +149,8 @@ pub async fn handle_server_request(
     };
 
     let response = match result {
-        Ok(value) => tool_response(value, true),
-        Err(value) => tool_response(value, false),
+        Ok(value) => tool_response(&value, true),
+        Err(value) => tool_response(&value, false),
     };
     let _ = client.respond_request(&mut request, &response).await;
 }
@@ -177,7 +177,7 @@ fn resolve_context(
                 retryable: false,
             })
         })
-        .map_err(context_error)
+        .map_err(|error| context_error(&error))
 }
 
 async fn read_media(
@@ -199,7 +199,7 @@ async fn read_media(
     let handle = MediaHandle::from_external(arguments.handle);
     let authorized = contexts
         .authorize_media_for_tool(&context_id, &handle, &params.thread_id, &params.turn_id)
-        .map_err(context_error)?;
+        .map_err(|error| context_error(&error))?;
     if authorized.media_kind == MediaKind::Audio {
         let (result, acquisition_token) = read_audio(attachments, asr, shutdown, &authorized).await;
         return Ok(MediaReadOutcome {
@@ -220,7 +220,7 @@ async fn read_media(
         Ok(cached) => cached,
         Err(error) => {
             return Ok(MediaReadOutcome {
-                result: Err(attachment_error(error)),
+                result: Err(attachment_error(&error)),
                 authorized,
                 acquisition_token: None,
             });
@@ -333,7 +333,7 @@ async fn read_audio(
                 Err(match error {
                     AttachError::TooLarge { .. } => asr_error(AsrError::Oversize),
                     AttachError::Cancelled { .. } => asr_error(AsrError::Cancelled),
-                    other => attachment_error(other),
+                    other => attachment_error(&other),
                 }),
                 None,
             );
@@ -400,13 +400,11 @@ fn resource_kind(kind: ResourceKind) -> &'static str {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
-fn context_error(error: ContextError) -> Value {
+fn context_error(error: &ContextError) -> Value {
     json!({"error": error})
 }
 
-#[allow(clippy::needless_pass_by_value)]
-fn attachment_error(error: AttachError) -> Value {
+fn attachment_error(error: &AttachError) -> Value {
     let retryable = matches!(
         error,
         AttachError::Cancelled { .. }
@@ -431,11 +429,10 @@ fn tool_error(code: &'static str, message: &'static str, retryable: bool) -> Val
     })
 }
 
-#[allow(clippy::needless_pass_by_value)]
-fn tool_response(value: Value, success: bool) -> DynamicToolCallResponse {
+fn tool_response(value: &Value, success: bool) -> DynamicToolCallResponse {
     DynamicToolCallResponse {
         content_items: vec![DynamicToolCallOutputContentItem::InputText {
-            text: serde_json::to_string(&value).unwrap_or_else(|_| {
+            text: serde_json::to_string(value).unwrap_or_else(|_| {
                 "{\"error\":{\"code\":\"serialization_failed\",\"message\":\"tool response serialization failed\",\"retryable\":false}}".to_owned()
             }),
         }],
@@ -444,6 +441,6 @@ fn tool_response(value: Value, success: bool) -> DynamicToolCallResponse {
 }
 
 async fn respond_tool_error(client: &AppServerClient, request: &mut ServerRequest, error: &Value) {
-    let response = tool_response(error.clone(), false);
+    let response = tool_response(error, false);
     let _ = client.respond_request(request, &response).await;
 }

@@ -1274,7 +1274,7 @@ struct EventMention {
 }
 
 #[derive(Default, Deserialize)]
-#[allow(clippy::struct_field_names)]
+#[allow(clippy::struct_field_names)] // Mirrors the Lark event mention wire schema exactly.
 struct EventMentionId {
     open_id: Option<String>,
     user_id: Option<String>,
