@@ -759,7 +759,7 @@ pub struct ThreadGoalClearedNotification {
 }
 
 /// Exact 0.149 operational status emitted to every initialized WebSocket. It carries no thread
-/// lifecycle data and is validated then ignored by external reconciliation.
+/// lifecycle data and is validated then ignored by external reconciliation and live recovery.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RemoteControlStatusChangedNotification {
