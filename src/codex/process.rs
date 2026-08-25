@@ -8,10 +8,8 @@ use tokio::{
     time::timeout,
 };
 
+use crate::codex::wire::is_supported_codex_version;
 use crate::limits::{MAX_VERSION_OUTPUT_BYTES, VERSION_PROBE_TIMEOUT};
-
-const MINIMUM_CODEX_VERSION: Version = Version::new(0, 146, 0);
-const MAXIMUM_CODEX_VERSION: Version = Version::new(0, 147, 0);
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct CodexProcessConfig {
@@ -71,7 +69,7 @@ pub enum ProcessError {
     },
     #[error("Codex version output must exactly match `codex-cli X.Y.Z`")]
     InvalidVersionOutput,
-    #[error("Codex {found} is unsupported; expected >=0.146.0,<0.147.0")]
+    #[error("Codex {found} is unsupported; expected an exact reviewed version")]
     UnsupportedVersion { found: Version },
     #[error("Codex app-server stdio was already transferred")]
     StdioAlreadyTaken,
@@ -118,7 +116,8 @@ impl CodexProcess {
     ///
     /// # Errors
     ///
-    /// Returns [`ProcessError::MissingStdio`] if the pipes were already taken.
+    /// Returns [`ProcessError::StdioAlreadyTaken`] if the pipes were transferred,
+    /// or [`ProcessError::StdioUnavailable`] for an incomplete pipe set.
     pub fn take_stdio(&mut self) -> Result<(ChildStdout, ChildStdin, ChildStderr), ProcessError> {
         if self.stdout.is_none() && self.stdin.is_none() && self.stderr.is_none() {
             return Err(ProcessError::StdioAlreadyTaken);
@@ -363,7 +362,7 @@ fn parse_version(bytes: &[u8]) -> Result<Version, ProcessError> {
 }
 
 fn ensure_supported(version: Version) -> Result<Version, ProcessError> {
-    if (MINIMUM_CODEX_VERSION..MAXIMUM_CODEX_VERSION).contains(&version) {
+    if is_supported_codex_version(&version) {
         Ok(version)
     } else {
         Err(ProcessError::UnsupportedVersion { found: version })
@@ -421,15 +420,19 @@ mod tests {
     }
 
     #[test]
-    fn gates_the_supported_minor_line() {
+    fn enforces_the_exact_reviewed_schema_versions() {
         assert!(ensure_supported(Version::new(0, 146, 0)).is_ok());
-        assert!(matches!(
-            ensure_supported(Version::new(0, 145, 9)),
-            Err(ProcessError::UnsupportedVersion { .. })
-        ));
-        assert!(matches!(
-            ensure_supported(Version::new(0, 147, 0)),
-            Err(ProcessError::UnsupportedVersion { .. })
-        ));
+        assert!(ensure_supported(Version::new(0, 149, 0)).is_ok());
+        for version in [
+            Version::new(0, 145, 9),
+            Version::new(0, 147, 0),
+            Version::new(0, 150, 0),
+            Version::new(1, 0, 0),
+        ] {
+            assert!(matches!(
+                ensure_supported(version),
+                Err(ProcessError::UnsupportedVersion { .. })
+            ));
+        }
     }
 }

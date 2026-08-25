@@ -35,7 +35,7 @@
 //! bootstrap or a `handshake-autherrcode` header enters
 //! [`TransportState::Degraded`] without further retries; a `ProtocolViolation`
 //! from bootstrap (a malformed endpoint response) also fails closed into
-//! `Degraded`, since retrying an unparseable response cannot succeed.
+//! `Degraded`, since retrying an unparsable response cannot succeed.
 
 use std::fmt;
 use std::sync::Arc;
@@ -64,6 +64,7 @@ use super::error::{LarkError, LarkErrorKind};
 use super::fragments::{Reassembler, Reassembly};
 use super::frame::{Frame, FrameHeaders, FrameMethod, Header, MessageType, header_key};
 use super::http::LarkHttp;
+pub use crate::channel::ConnectionState as TransportState;
 use crate::codex::supervisor::AppServerSupervisor;
 use crate::limits::{
     LARK_DEFAULT_PING_INTERVAL, LARK_FRAGMENT_MESSAGE_BYTES, LARK_HANDLER_TIMEOUT,
@@ -110,34 +111,6 @@ impl fmt::Debug for WsEndpoint {
             .field("reconnect_nonce", &self.reconnect_nonce)
             .finish()
     }
-}
-
-/// Lifecycle states published by the transport actor.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TransportState {
-    /// A bootstrap + connect attempt is in progress (1-based consecutive
-    /// failure count plus one).
-    Connecting {
-        /// 1-based attempt number within the current outage.
-        attempt: u32,
-    },
-    /// The WebSocket is open and the ping loop is running.
-    Connected,
-    /// Waiting before the next attempt.
-    Backoff {
-        /// Number of consecutive failures so far.
-        attempt: u32,
-        /// The exact delay being slept (deterministic jittered backoff).
-        delay: Duration,
-    },
-    /// A permanent failure (bad credentials, connection limit, handshake
-    /// auth error, exhausted attempt cap); no further retries are made.
-    Degraded {
-        /// Static classified reason, never server-supplied text.
-        reason: String,
-    },
-    /// The actor shut down cleanly.
-    Stopped,
 }
 
 /// Observation events emitted by the transport actor.
@@ -665,14 +638,12 @@ impl Actor {
             });
             match self.connect_once().await {
                 Err(error) if is_fatal(&error) => {
-                    tracing::warn!(error = %error, "lark transport degraded");
                     self.publish_state(TransportState::Degraded {
                         reason: error.to_string(),
                     });
                     return;
                 }
-                Err(error) => {
-                    tracing::warn!(error = %error, "lark connect attempt failed");
+                Err(_error) => {
                     failures = failures.saturating_add(1);
                     if self.live.reconnect_count >= 0
                         && i64::from(failures) >= self.live.reconnect_count
@@ -892,27 +863,33 @@ impl Actor {
         )
         .await
         .unwrap_or_else(|_| {
-            tracing::warn!(
-                message_id = done.message_id,
-                "lark inbound handler timed out"
-            );
+            tracing::warn!("lark inbound handler timed out");
             Err(LarkError::retryable("the inbound frame handler timed out"))
         });
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let receipt = build_receipt(frame, result, elapsed_ms);
         let encoded = receipt.encode_to_vec();
-        if let Err(error) = sink.send(Message::Binary(encoded.into())).await {
+        if sink.send(Message::Binary(encoded.into())).await.is_err() {
             // A receipt failure on a closing socket is logged, never retried;
             // the read loop observes the dead socket on its own.
-            tracing::warn!(
-                message_id = done.message_id,
-                error = %error,
-                "lark receipt send failed"
-            );
+            tracing::warn!("lark receipt send failed");
         }
     }
 
     fn publish_state(&self, state: TransportState) {
+        match &state {
+            TransportState::Connecting { attempt } => {
+                tracing::debug!(attempt, "Lark transport connecting");
+            }
+            TransportState::Connected => tracing::info!("Lark transport connected"),
+            TransportState::Backoff { attempt, delay } => tracing::warn!(
+                attempt,
+                delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                "Lark transport reconnect backoff"
+            ),
+            TransportState::Degraded { .. } => tracing::warn!("Lark transport degraded"),
+            TransportState::Stopped => tracing::info!("Lark transport stopped"),
+        }
         let _ = self.state_tx.send(state.clone());
         self.push_event(TransportEvent::State(state));
     }
@@ -922,7 +899,7 @@ impl Actor {
         let permit = self.event_bytes.clone().try_acquire_many_owned(size).ok();
         if permit.is_none() {
             tracing::warn!(
-                message_id = done.message_id,
+                payload_bytes = size,
                 "lark transport observation byte budget exhausted; dropping message event"
             );
             return;
@@ -935,11 +912,7 @@ impl Actor {
     }
 
     fn anomaly(&self, kind: &'static str, message_id: Option<String>) {
-        tracing::warn!(
-            kind,
-            message_id = message_id.as_deref().unwrap_or(""),
-            "lark transport anomaly"
-        );
+        tracing::warn!(kind, "lark transport anomaly");
         self.push_event(TransportEvent::Anomaly { kind, message_id });
     }
 
@@ -952,7 +925,7 @@ impl Actor {
 
 /// Fail-closed classification for the connect phase: permanent auth and
 /// exhausted bounds cannot succeed on retry, and a protocol violation from
-/// bootstrap means the endpoint response is unparseable — retrying the same
+/// bootstrap means the endpoint response is unparsable — retrying the same
 /// parse cannot help either. All three degrade without further attempts.
 fn is_fatal(error: &LarkError) -> bool {
     matches!(

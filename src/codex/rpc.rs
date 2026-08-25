@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     codex::{
+        compat::WireAdapter,
         protocol::{
             InboundMessage, OutboundMessage, RequestId, RpcErrorObject, request_id_memory_weight,
             value_memory_weight,
@@ -26,7 +27,7 @@ use crate::{
         transport::{
             TransportEvent, TransportExit, TransportHandle, TransportSendError, TransportSender,
         },
-        types::{ClientInfo, InitializeParams, InitializeResult},
+        types::{ClientInfo, InitializeCapabilities, InitializeParams, InitializeResult},
     },
     limits::{
         CONTROL_RPC_TIMEOUT, EVENT_CAPACITY, HIGH_PRIORITY_BURST, INITIALIZE_TIMEOUT,
@@ -241,6 +242,21 @@ impl<T> BudgetedResponse<T> {
 
     pub fn into_parts(self) -> (T, OwnedSemaphorePermit) {
         (self.value, self.transport_budget)
+    }
+
+    /// Maps a decoded response while retaining its inbound memory permit.
+    ///
+    /// # Errors
+    ///
+    /// Returns the mapping closure's error without discarding it or exposing the response.
+    pub fn try_map<U, E>(
+        self,
+        map: impl FnOnce(T) -> Result<U, E>,
+    ) -> Result<BudgetedResponse<U>, E> {
+        Ok(BudgetedResponse {
+            value: map(self.value)?,
+            transport_budget: self.transport_budget,
+        })
     }
 }
 
@@ -858,6 +874,21 @@ impl RpcConnection {
         self.exit = Some(exit);
         exit
     }
+
+    /// Abruptly drops this connection epoch without waiting for an orderly transport close. This
+    /// is used for crash-path verification; it never reaches through the transport to a server
+    /// process.
+    pub fn abort(&mut self) -> TransportExit {
+        if let Some(exit) = self.exit {
+            return exit;
+        }
+        if let Some(actor) = self.actor.take() {
+            actor.abort();
+        }
+        self.cancellation.cancel();
+        self.exit = Some(TransportExit::Aborted);
+        TransportExit::Aborted
+    }
 }
 
 impl Drop for RpcConnection {
@@ -872,6 +903,116 @@ pub fn spawn_rpc(
     transport: TransportHandle,
     epoch: ConnectionEpoch,
     parent_cancellation: CancellationToken,
+) -> RpcConnection {
+    spawn_rpc_with_policy(
+        transport,
+        epoch,
+        parent_cancellation,
+        RpcProtocolPolicy::Permissive,
+    )
+}
+
+/// Inbound protocol policy selected by the connection owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RpcProtocolPolicy {
+    /// Preserve the existing spawned-stdio behavior: surface unknown traffic as protocol drift.
+    Permissive,
+    /// External observe-only connections fault on stale/duplicate responses, server requests,
+    /// notifications, and malformed transport records.
+    FailClosedExternalObserve,
+    /// External resume/reconciliation connections accept only the promoted thread status and
+    /// terminal item/turn notifications. Reverse requests and every other message still fault.
+    FailClosedExternalResume,
+    /// External mutation connections additionally admit the three exact approval reverse-request
+    /// methods and their durable resolution notification.
+    FailClosedExternalMutate,
+    /// External queue connections add the reviewed queue-change notification to the mutation
+    /// surface.
+    FailClosedExternalQueue,
+}
+
+impl RpcProtocolPolicy {
+    const fn is_fail_closed_external(self) -> bool {
+        matches!(
+            self,
+            Self::FailClosedExternalObserve
+                | Self::FailClosedExternalResume
+                | Self::FailClosedExternalMutate
+                | Self::FailClosedExternalQueue
+        )
+    }
+
+    fn allows_notification(self, method: &str) -> bool {
+        match self {
+            Self::Permissive => true,
+            Self::FailClosedExternalObserve => false,
+            Self::FailClosedExternalResume => matches!(
+                method,
+                "remoteControl/status/changed"
+                    | "thread/status/changed"
+                    | "thread/goal/cleared"
+                    | "item/completed"
+                    | "turn/completed"
+            ),
+            Self::FailClosedExternalMutate => matches!(
+                method,
+                "account/rateLimits/updated"
+                    | "remoteControl/status/changed"
+                    | "thread/status/changed"
+                    | "thread/goal/cleared"
+                    | "thread/settings/updated"
+                    | "turn/started"
+                    | "item/started"
+                    | "item/agentMessage/delta"
+                    | "item/commandExecution/outputDelta"
+                    | "item/completed"
+                    | "thread/tokenUsage/updated"
+                    | "error"
+                    | "turn/completed"
+                    | "serverRequest/resolved"
+            ),
+            Self::FailClosedExternalQueue => matches!(
+                method,
+                "account/rateLimits/updated"
+                    | "remoteControl/status/changed"
+                    | "thread/status/changed"
+                    | "thread/goal/cleared"
+                    | "thread/settings/updated"
+                    | "turn/started"
+                    | "item/started"
+                    | "item/agentMessage/delta"
+                    | "item/commandExecution/outputDelta"
+                    | "item/completed"
+                    | "thread/tokenUsage/updated"
+                    | "error"
+                    | "turn/completed"
+                    | "thread/queue/changed"
+                    | "serverRequest/resolved"
+            ),
+        }
+    }
+
+    fn allows_server_request(self, method: &str) -> bool {
+        match self {
+            Self::Permissive => true,
+            Self::FailClosedExternalObserve | Self::FailClosedExternalResume => false,
+            Self::FailClosedExternalMutate | Self::FailClosedExternalQueue => matches!(
+                method,
+                "item/commandExecution/requestApproval"
+                    | "item/fileChange/requestApproval"
+                    | "item/permissions/requestApproval"
+            ),
+        }
+    }
+}
+
+/// Starts the sole RPC owner with an explicit inbound protocol policy.
+#[must_use]
+pub fn spawn_rpc_with_policy(
+    transport: TransportHandle,
+    epoch: ConnectionEpoch,
+    parent_cancellation: CancellationToken,
+    policy: RpcProtocolPolicy,
 ) -> RpcConnection {
     let cancellation = parent_cancellation.child_token();
     drop(parent_cancellation);
@@ -922,6 +1063,7 @@ pub fn spawn_rpc(
             pending_count,
             protocol_drift_count,
             dropped_notification_count,
+            policy,
             actor_cancel,
         )
         .await
@@ -961,6 +1103,7 @@ async fn run_actor(
     pending_count: Arc<AtomicUsize>,
     protocol_drift_count: Arc<AtomicU64>,
     dropped_notification_count: Arc<AtomicU64>,
+    policy: RpcProtocolPolicy,
     cancellation: CancellationToken,
 ) -> TransportExit {
     let (pump_high_tx, pump_high_rx) = mpsc::channel(RPC_HIGH_CAPACITY);
@@ -1010,15 +1153,21 @@ async fn run_actor(
                             &pending_count,
                             &protocol_drift_count,
                             &dropped_notification_count,
+                            policy,
                         ).await {
                             break if cancellation.is_cancelled() {
                                 TransportExit::Cancelled
+                            } else if policy.is_fail_closed_external() {
+                                TransportExit::ProtocolViolation
                             } else {
                                 TransportExit::TaskFailed
                             };
                         }
                     }
                     Some(TransportEvent::ProtocolError(_)) => {
+                        if policy.is_fail_closed_external() {
+                            break TransportExit::ProtocolViolation;
+                        }
                         increment_saturating(&protocol_drift_count);
                         if !try_emit_small_event(
                             RpcEvent::ProtocolDrift,
@@ -1032,6 +1181,10 @@ async fn run_actor(
                     Some(TransportEvent::ReadError(error)) => break TransportExit::ReadError(error.kind),
                     Some(TransportEvent::WriteError(error)) => break TransportExit::WriteError(error.kind),
                     Some(TransportEvent::StdoutEof) => break TransportExit::StdoutEof,
+                    Some(TransportEvent::WebSocketClosed(report)) => {
+                        break TransportExit::WebSocketClosed(report);
+                    }
+                    Some(TransportEvent::ConnectionError) => break TransportExit::ConnectionFailed,
                     Some(TransportEvent::Cancelled) => break TransportExit::Cancelled,
                     Some(TransportEvent::StderrLine { .. }) => {}
                     None => break transport.shutdown().await,
@@ -1100,6 +1253,7 @@ async fn run_actor(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 async fn handle_inbound(
     message: InboundMessage,
     transport_budget: OwnedSemaphorePermit,
@@ -1115,6 +1269,7 @@ async fn handle_inbound(
     pending_count: &AtomicUsize,
     protocol_drift_count: &AtomicU64,
     dropped_notification_count: &AtomicU64,
+    policy: RpcProtocolPolicy,
 ) -> bool {
     match message {
         InboundMessage::Response { id, result } => {
@@ -1125,6 +1280,9 @@ async fn handle_inbound(
                 }));
             } else {
                 drop(transport_budget);
+                if policy.is_fail_closed_external() {
+                    return false;
+                }
                 increment_saturating(protocol_drift_count);
                 return try_emit_small_event(
                     RpcEvent::ProtocolDrift,
@@ -1142,6 +1300,9 @@ async fn handle_inbound(
                     code: error.code,
                 }));
             } else {
+                if policy.is_fail_closed_external() {
+                    return false;
+                }
                 increment_saturating(protocol_drift_count);
                 return try_emit_small_event(
                     RpcEvent::ProtocolDrift,
@@ -1152,6 +1313,9 @@ async fn handle_inbound(
             }
         }
         InboundMessage::Request { id, method, params } => {
+            if !policy.allows_server_request(&method) {
+                return false;
+            }
             if server_pending.len() >= RPC_SERVER_REQUEST_CAPACITY
                 || !server_pending.insert(id.clone())
             {
@@ -1176,6 +1340,9 @@ async fn handle_inbound(
             .await;
         }
         InboundMessage::Notification { method, params } => {
+            if !policy.allows_notification(&method) {
+                return false;
+            }
             let authoritative = is_authoritative_notification(&method);
             let event = RpcEvent::Notification { method, params };
             let emitted = if authoritative {
@@ -1665,7 +1832,16 @@ impl io::Write for LimitedCounter {
 }
 
 fn is_authoritative_notification(method: &str) -> bool {
-    matches!(method, "item/completed" | "turn/completed" | "error")
+    matches!(
+        method,
+        "thread/status/changed"
+            | "thread/settings/updated"
+            | "thread/queue/changed"
+            | "serverRequest/resolved"
+            | "item/completed"
+            | "turn/completed"
+            | "error"
+    )
 }
 
 fn deadline_after(timeout: Duration) -> Instant {
@@ -1694,6 +1870,42 @@ fn request_id_kind(id: &RequestId) -> &'static str {
 /// Returns [`RpcError::AlreadyInitialized`] after any prior attempt on the same
 /// epoch, or another safe RPC failure if the handshake cannot complete.
 pub async fn initialize_connection(handle: &RpcHandle) -> Result<InitializeResult, RpcError> {
+    initialize_connection_for_wire(handle, WireAdapter::V0_146_0).await
+}
+
+/// Performs the initialize handshake using an explicitly selected wire contract.
+///
+/// # Errors
+///
+/// Returns the same redacted failures as [`initialize_connection`].
+pub async fn initialize_connection_for_wire(
+    handle: &RpcHandle,
+    wire: WireAdapter,
+) -> Result<InitializeResult, RpcError> {
+    initialize_connection_with_capabilities(handle, wire, false).await
+}
+
+/// Performs the initialize handshake while opting into app-server dynamic
+/// tools for the long-running bridge runtime.
+///
+/// The opt-in is kept separate from [`initialize_connection`] so probes and
+/// protocol tests can continue exercising the stable handshake.
+///
+/// # Errors
+///
+/// Returns the same failures as [`initialize_connection`].
+pub async fn initialize_connection_with_dynamic_tools(
+    handle: &RpcHandle,
+    wire: WireAdapter,
+) -> Result<InitializeResult, RpcError> {
+    initialize_connection_with_capabilities(handle, wire, true).await
+}
+
+async fn initialize_connection_with_capabilities(
+    handle: &RpcHandle,
+    wire: WireAdapter,
+    dynamic_tools: bool,
+) -> Result<InitializeResult, RpcError> {
     handle
         .initialize_state
         .compare_exchange(INIT_NEW, INIT_RUNNING, Ordering::AcqRel, Ordering::Acquire)
@@ -1701,10 +1913,30 @@ pub async fn initialize_connection(handle: &RpcHandle) -> Result<InitializeResul
 
     let mut client_info = ClientInfo::new("lark_codex_bridge", env!("CARGO_PKG_VERSION"));
     client_info.title = Some("Lark Codex Bridge".to_owned());
-    let params = InitializeParams::new(client_info);
+    let mut params = InitializeParams::new(client_info);
+    if dynamic_tools {
+        params.capabilities = Some(InitializeCapabilities {
+            experimental_api: Some(true),
+            ..InitializeCapabilities::default()
+        });
+    }
+    let Ok(params) = wire.initialize_params(&params) else {
+        handle
+            .initialize_state
+            .store(INIT_FAILED, Ordering::Release);
+        return Err(RpcError::Serialize {
+            method: "initialize",
+        });
+    };
     let result = handle
-        .request_high::<_, InitializeResult>("initialize", &params, INITIALIZE_TIMEOUT)
-        .await;
+        .request_high::<_, Value>("initialize", &params, INITIALIZE_TIMEOUT)
+        .await
+        .and_then(|value| {
+            wire.initialize_response(value)
+                .map_err(|_| RpcError::Deserialize {
+                    method: "initialize",
+                })
+        });
     let result = match result {
         Ok(result) => result,
         Err(error) => {

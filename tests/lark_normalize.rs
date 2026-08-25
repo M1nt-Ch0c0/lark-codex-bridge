@@ -8,17 +8,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use lark_codex_bridge::channel::ChannelErrorKind;
 use lark_codex_bridge::lark::api::ResourceKind;
 use lark_codex_bridge::lark::config::{LarkEndpoints, TenantBrand};
 use lark_codex_bridge::lark::credentials::LarkCredentials;
-use lark_codex_bridge::lark::error::{LarkError, LarkErrorKind};
+use lark_codex_bridge::lark::error::LarkError;
 use lark_codex_bridge::lark::http::LarkHttp;
 use lark_codex_bridge::lark::normalize::{
-    Degradation, InboundEvent, NormalizeOutcome, Normalizer, ScopeKey,
+    Degradation, InboundEvent, MessagePart, NormalizeOutcome, Normalizer, PartStatus, ScopeKey,
+    TranscriptFailure,
 };
 use lark_codex_bridge::lark::token::TenantTokenProvider;
 use lark_codex_bridge::limits::{
-    LARK_CHAT_MODE_CACHE_CAPACITY, LARK_CHAT_MODE_CACHE_TTL, LARK_MAX_EVENT_PAYLOAD_BYTES,
+    ASR_TRANSCRIPT_MAX_BYTES, LARK_CHAT_MODE_CACHE_CAPACITY, LARK_CHAT_MODE_CACHE_TTL,
+    LARK_MAX_EVENT_PAYLOAD_BYTES,
 };
 use larkstub::{Handler, RecordedRequest, StubResponse, StubServer};
 use secrecy::SecretString;
@@ -159,7 +162,9 @@ fn text_event(chat_id: &str, message_id: &str, text: &str) -> String {
 
 fn unwrap_event(outcome: NormalizeOutcome) -> (InboundEvent, Option<Degradation>) {
     match outcome {
-        NormalizeOutcome::Event { event, degradation } => (*event, degradation),
+        NormalizeOutcome::Event {
+            event, degradation, ..
+        } => (*event, degradation),
         NormalizeOutcome::Ignored { reason } => {
             panic!("expected an event outcome, got Ignored: {reason}");
         }
@@ -189,6 +194,11 @@ async fn p2p_text_normalizes_to_chat_scope_without_chat_lookup() {
     assert_eq!(event.text, "hello bridge");
     assert!(!event.mentions_bot);
     assert!(!event.mention_all);
+    assert!(event.mentions.is_empty());
+    assert!(matches!(
+        event.parts.as_slice(),
+        [MessagePart::Text { text }] if text == "hello bridge"
+    ));
     assert!(event.resources.is_empty());
     assert_eq!(event.message_type, "text");
     assert_eq!(event.create_time_ms, 1_700_000_000_123);
@@ -212,6 +222,18 @@ async fn group_mention_strips_tags_and_flags_the_bot() {
     assert!(event.mentions_bot);
     assert!(!event.mention_all);
     assert_eq!(event.text, "status?");
+    assert_eq!(event.mentions.len(), 2);
+    assert_eq!(event.mentions[0].open_id.as_deref(), Some("ou_bot"));
+    assert_eq!(
+        event.mentions[0].user_id.as_deref(),
+        Some("user_scrubbed_bot")
+    );
+    assert_eq!(
+        event.mentions[0].union_id.as_deref(),
+        Some("on_scrubbed_bot")
+    );
+    assert_eq!(event.mentions[0].name.as_deref(), Some("Bridge Bot"));
+    assert_eq!(event.mentions[1].open_id.as_deref(), Some("ou_bob"));
     assert_eq!(
         event.chat_type,
         lark_codex_bridge::lark::api::ChatMode::Group
@@ -237,6 +259,81 @@ async fn group_message_without_mention_does_not_flag_the_bot() {
     assert!(!event.mentions_bot);
     assert!(!event.mention_all);
     assert_eq!(event.text, "plain message");
+}
+
+#[tokio::test]
+async fn app_sender_type_is_not_treated_as_a_human() {
+    let server = StubServer::start(im_stub(|_| chat_mode_ok("group"), failing)).await;
+    let normalizer = normalizer_for(&server);
+
+    let payload = serde_json::json!({
+        "schema": "2.0",
+        "header": {
+            "event_id": "evt_app_sender",
+            "event_type": "im.message.receive_v1",
+        },
+        "event": {
+            "sender": {
+                "sender_id": {"open_id": "ou_app_bot"},
+                "sender_type": "app",
+            },
+            "message": {
+                "message_id": "om_app_sender",
+                "chat_id": "oc_group_chat",
+                "chat_type": "group",
+                "message_type": "text",
+                "content": "{\"text\":\"plain\"}",
+                "create_time": "1700000004000",
+                "mentions": [],
+            },
+        },
+    })
+    .to_string();
+
+    let (event, _) = unwrap_event(
+        normalizer
+            .normalize(payload.as_bytes())
+            .await
+            .expect("app sender event should normalize"),
+    );
+    assert!(!event.sender_is_human);
+}
+
+#[tokio::test]
+async fn missing_sender_type_fails_closed_as_not_human() {
+    let server = StubServer::start(im_stub(|_| chat_mode_ok("group"), failing)).await;
+    let normalizer = normalizer_for(&server);
+
+    let payload = serde_json::json!({
+        "schema": "2.0",
+        "header": {
+            "event_id": "evt_no_sender_type",
+            "event_type": "im.message.receive_v1",
+        },
+        "event": {
+            "sender": {
+                "sender_id": {"open_id": "ou_no_type"},
+            },
+            "message": {
+                "message_id": "om_no_type",
+                "chat_id": "oc_group_chat",
+                "chat_type": "group",
+                "message_type": "text",
+                "content": "{\"text\":\"plain\"}",
+                "create_time": "1700000004000",
+                "mentions": [],
+            },
+        },
+    })
+    .to_string();
+
+    let (event, _) = unwrap_event(
+        normalizer
+            .normalize(payload.as_bytes())
+            .await
+            .expect("missing sender type should normalize"),
+    );
+    assert!(!event.sender_is_human);
 }
 
 #[tokio::test]
@@ -313,7 +410,7 @@ async fn backfill_failure_degrades_to_chat_scope() {
     assert_eq!(
         degradation,
         Some(Degradation::ThreadBackfillFailed {
-            kind: LarkErrorKind::Retryable,
+            kind: ChannelErrorKind::Retryable,
         })
     );
     assert_eq!(event.thread_id, None);
@@ -385,13 +482,24 @@ async fn image_and_file_messages_describe_resources_without_bytes() {
     assert_eq!(event.resources.len(), 1);
     assert_eq!(event.resources[0].kind, ResourceKind::Image);
     assert_eq!(event.resources[0].key, "img_scrubbed_key");
+    assert!(matches!(
+        event.parts.as_slice(),
+        [MessagePart::Image(media)]
+            if media.key.as_deref() == Some("img_scrubbed_key")
+                && media.status == PartStatus::Available
+    ));
 
     let file = make_event(
         "oc_group_chat",
         "group",
         "om_file",
         "file",
-        &serde_json::json!({"file_key": "file_scrubbed_key", "file_name": "secret plans.txt"}),
+        &serde_json::json!({
+            "file_key": "file_scrubbed_key",
+            "file_name": "secret plans.txt",
+            "mime_type": "text/plain",
+            "file_size": "42"
+        }),
         None,
         &serde_json::json!([]),
     );
@@ -404,13 +512,25 @@ async fn image_and_file_messages_describe_resources_without_bytes() {
     assert_eq!(event.resources.len(), 1);
     assert_eq!(event.resources[0].kind, ResourceKind::File);
     assert_eq!(event.resources[0].key, "file_scrubbed_key");
-    // The user-chosen file name is content: it must survive nowhere.
+    let [MessagePart::File(media)] = event.parts.as_slice() else {
+        panic!("file message should have one typed file part");
+    };
+    assert_eq!(
+        media.metadata.file_name.as_deref(),
+        Some("secret plans.txt")
+    );
+    assert_eq!(media.metadata.mime_type.as_deref(), Some("text/plain"));
+    assert_eq!(media.metadata.size_bytes, Some(42));
+    assert_eq!(media.status, PartStatus::Available);
+    // User-chosen metadata is retained for authorized resolution but remains
+    // redacted from diagnostic output.
     let debug = format!("{outcome:?}");
     assert!(!debug.contains("secret plans"));
+    assert!(!debug.contains("text/plain"));
 }
 
 #[tokio::test]
-async fn unknown_message_type_is_preserved_as_an_open_string() {
+async fn sticker_is_a_typed_part_and_unknown_types_are_explicitly_unsupported() {
     let server = StubServer::start(im_stub(|_| chat_mode_ok("group"), failing)).await;
     let normalizer = normalizer_for(&server);
 
@@ -434,6 +554,222 @@ async fn unknown_message_type_is_preserved_as_an_open_string() {
     assert_eq!(event.message_type, "sticker");
     assert!(event.text.is_empty());
     assert!(event.resources.is_empty());
+    assert!(matches!(
+        event.parts.as_slice(),
+        [MessagePart::Sticker(media)]
+            if media.key.as_deref() == Some("stk_scrubbed")
+                && media.status == PartStatus::Available
+    ));
+
+    let unknown = make_event(
+        "oc_group_chat",
+        "group",
+        "om_unknown",
+        "future_kind",
+        &serde_json::json!({"secret": "opaque"}),
+        None,
+        &serde_json::json!([]),
+    );
+    let (event, _) = unwrap_event(
+        normalizer
+            .normalize(unknown.as_bytes())
+            .await
+            .expect("unknown types should still normalize"),
+    );
+    assert!(matches!(
+        event.parts.as_slice(),
+        [MessagePart::Unsupported { message_type, status }]
+            if message_type == "future_kind" && *status == PartStatus::Unsupported
+    ));
+}
+
+#[tokio::test]
+async fn audio_video_card_and_forward_have_typed_availability() {
+    let server = StubServer::start(im_stub(|_| chat_mode_ok("group"), failing)).await;
+    let normalizer = normalizer_for(&server);
+
+    let cases = [
+        (
+            "audio",
+            serde_json::json!({"file_key":"aud_key","duration":1234}),
+        ),
+        (
+            "media",
+            serde_json::json!({"file_key":"vid_key","image_key":"thumb_key","duration_ms":"5678"}),
+        ),
+        ("interactive", serde_json::json!({"elements":[]})),
+        (
+            "merge_forward",
+            serde_json::json!({"message_id":"om_forwarded"}),
+        ),
+    ];
+    for (index, (kind, content)) in cases.into_iter().enumerate() {
+        let payload = make_event(
+            "oc_group_chat",
+            "group",
+            &format!("om_rich_{index}"),
+            kind,
+            &content,
+            None,
+            &serde_json::json!([]),
+        );
+        let (event, _) = unwrap_event(
+            normalizer
+                .normalize(payload.as_bytes())
+                .await
+                .expect("rich message should normalize"),
+        );
+        match (kind, event.parts.as_slice()) {
+            ("audio", [MessagePart::Audio(media)]) => {
+                assert_eq!(media.key.as_deref(), Some("aud_key"));
+                assert_eq!(media.metadata.duration_ms, Some(1234));
+                assert_eq!(media.status, PartStatus::Available);
+            }
+            ("media", [MessagePart::Video(media)]) => {
+                assert_eq!(media.key.as_deref(), Some("vid_key"));
+                assert_eq!(media.thumbnail_key.as_deref(), Some("thumb_key"));
+                assert_eq!(media.metadata.duration_ms, Some(5678));
+            }
+            ("interactive", [MessagePart::Card { status }]) => {
+                assert_eq!(*status, PartStatus::Unsupported);
+            }
+            ("merge_forward", [MessagePart::Forward { message_id, status }]) => {
+                assert_eq!(message_id.as_deref(), Some("om_forwarded"));
+                assert_eq!(*status, PartStatus::Available);
+            }
+            _ => panic!("unexpected typed part for {kind}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn audio_client_transcript_is_absent_from_the_durable_event() {
+    let server = StubServer::start(im_stub(|_| chat_mode_ok("group"), failing)).await;
+    let normalizer = normalizer_for(&server);
+    let payload = make_event(
+        "oc_group_chat",
+        "group",
+        "om_audio_text",
+        "audio",
+        &serde_json::json!({
+            "file_key": "aud_key",
+            "duration": 2100,
+            "text": "  please review the patch  "
+        }),
+        None,
+        &serde_json::json!([]),
+    );
+    let outcome = normalizer
+        .normalize(payload.as_bytes())
+        .await
+        .expect("audio with transcript should normalize");
+    let NormalizeOutcome::Event {
+        event,
+        live_transcripts,
+        ..
+    } = outcome
+    else {
+        panic!("expected audio event")
+    };
+    assert!(!format!("{live_transcripts:?}").contains("please review the patch"));
+    let event = *event;
+    assert!(
+        event.text.is_empty(),
+        "inbound recognition must not bypass the configured tool limit"
+    );
+    match event.parts.as_slice() {
+        [MessagePart::Audio(media)] => {
+            assert_eq!(media.key.as_deref(), Some("aud_key"));
+            assert_eq!(
+                media.metadata.transcript_failure,
+                Some(TranscriptFailure::NotRetained)
+            );
+            let serialized = serde_json::to_string(&media.metadata).expect("metadata JSON");
+            assert!(!serialized.contains("please review the patch"));
+        }
+        _ => panic!("expected one audio part"),
+    }
+}
+
+#[tokio::test]
+async fn malformed_and_oversize_audio_transcripts_keep_non_content_failure_classification() {
+    let server = StubServer::start(im_stub(|_| chat_mode_ok("group"), failing)).await;
+    let normalizer = normalizer_for(&server);
+    for (message_id, transcript, expected) in [
+        (
+            "om_audio_invalid",
+            serde_json::json!({"nested": "must-not-fall-back"}),
+            TranscriptFailure::Invalid,
+        ),
+        (
+            "om_audio_oversize",
+            serde_json::Value::String("x".repeat(ASR_TRANSCRIPT_MAX_BYTES + 1)),
+            TranscriptFailure::TooLarge,
+        ),
+    ] {
+        let payload = make_event(
+            "oc_group_chat",
+            "group",
+            message_id,
+            "audio",
+            &serde_json::json!({
+                "file_key": "aud_key",
+                "duration": 2100,
+                "text": transcript,
+                "recognition": {"text": "must-not-replace-a-present-invalid-value"}
+            }),
+            None,
+            &serde_json::json!([]),
+        );
+        let (event, _) = unwrap_event(
+            normalizer
+                .normalize(payload.as_bytes())
+                .await
+                .expect("audio rejection metadata should normalize"),
+        );
+        let [MessagePart::Audio(media)] = event.parts.as_slice() else {
+            panic!("expected audio part")
+        };
+        assert_eq!(media.metadata.transcript_failure, Some(expected));
+        let debug = format!("{:?}", media.metadata);
+        assert!(!debug.contains("must-not"));
+        assert!(
+            !serde_json::to_string(&media.metadata)
+                .expect("serialize normalized metadata")
+                .contains("must-not")
+        );
+    }
+}
+
+#[tokio::test]
+async fn unsafe_optional_media_metadata_is_dropped_without_losing_the_handle() {
+    let server = StubServer::start(im_stub(|_| chat_mode_ok("group"), failing)).await;
+    let normalizer = normalizer_for(&server);
+    let payload = make_event(
+        "oc_group_chat",
+        "group",
+        "om_unsafe_metadata",
+        "file",
+        &serde_json::json!({
+            "file_key":"safe_key",
+            "file_name":"../escape",
+            "mime_type":"text/plain\nsecret"
+        }),
+        None,
+        &serde_json::json!([]),
+    );
+    let (event, _) = unwrap_event(
+        normalizer
+            .normalize(payload.as_bytes())
+            .await
+            .expect("normalize"),
+    );
+    let [MessagePart::File(media)] = event.parts.as_slice() else {
+        panic!("expected file part");
+    };
+    assert_eq!(media.key.as_deref(), Some("safe_key"));
+    assert_eq!(media.metadata.file_name, None);
+    assert_eq!(media.metadata.mime_type, None);
 }
 
 #[test]

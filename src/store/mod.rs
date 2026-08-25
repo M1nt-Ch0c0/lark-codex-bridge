@@ -3,16 +3,16 @@
 //! Durable SQLite store behind a single-writer task.
 //!
 //! The store owns one `rusqlite::Connection` on a dedicated blocking thread
-//! ([`writer`]); every query — reads included — travels one bounded command
+//! (`writer`); every query — reads included — travels one bounded command
 //! channel and is answered by oneshot, so there is a single code path and
 //! exactly one author for every transaction (plan decision 5, design §8).
 //! The database runs in WAL mode with `foreign_keys = ON`,
 //! `synchronous = NORMAL`, and a bounded `busy_timeout`; schema changes are
 //! `user_version` migrations ([`schema`]).
 //!
-//! Typed query groups live in [`dedup`] (inbound event registration and
-//! state machine), [`sessions`] (scopes/threads/turns), [`outbox`] (durable
-//! outbound queue), and [`attachments`] (content-addressed cache rows and
+//! Typed query groups live in `dedup` (inbound event registration and state
+//! machine), `sessions` (scopes/threads/turns), `outbox` (durable outbound
+//! queue), and `attachments` (content-addressed cache rows and
 //! leases).
 //!
 //! Redaction: errors and `Debug` output carry static contexts, states, IDs,
@@ -20,6 +20,8 @@
 
 mod attachments;
 mod dedup;
+mod external;
+mod external_write;
 mod outbox;
 pub mod schema;
 mod sessions;
@@ -41,6 +43,19 @@ pub use dedup::{
     BeginTurnOutcome, ClaimedInbound, DedupOutcome, InboundDisposition, InboundEventState,
     InboundKey, InboundRejectionKind, InboundTerminal, ResolveTurnOutcome, SkippedInbound,
     TurnResolution,
+};
+pub use external::{
+    ExternalApplyOutcome, ExternalEndpointState, ExternalEpochReservation, ExternalFenceOutcome,
+    ExternalItemTerminal, ExternalTerminalStatus, ExternalThreadSnapshot, ExternalThreadState,
+    ExternalTurnTerminal, ExternalUncertaintyReason,
+};
+pub use external_write::{
+    ExternalApprovalClaim, ExternalApprovalClaimOutcome, ExternalApprovalKind,
+    ExternalApprovalReassignmentOutcome, ExternalApprovalReceiveOutcome,
+    ExternalApprovalResolution, ExternalApprovalState, ExternalMutationIntent,
+    ExternalMutationKind, ExternalMutationOwner, ExternalMutationResolution, ExternalMutationState,
+    ExternalPrepareOutcome, ExternalTransitionOutcome, ExternalWriteFenceState,
+    NewExternalApprovalClaim, NewExternalMutationIntent,
 };
 pub use outbox::{NewOutboxRow, OutboxDepth, OutboxEnqueue, OutboxRow, OutboxState};
 pub use sessions::{NewTurnRow, ScopeRow, ThreadRow, ThreadStatus, TurnRow, TurnState};

@@ -106,16 +106,16 @@ impl std::fmt::Debug for ScopeRow {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ScopeRow")
-            .field("scope_key", &self.scope_key)
+            .field("scope_key_len", &self.scope_key.len())
             .field("cwd_len", &self.cwd.to_string_lossy().len())
-            .field("policy_fingerprint", &self.policy_fingerprint)
+            .field("policy_fingerprint_len", &self.policy_fingerprint.len())
             .field("updated_ms", &self.updated_ms)
             .finish_non_exhaustive()
     }
 }
 
 /// One row of the `threads` table.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ThreadRow {
     /// Owning scope key.
     pub scope_key: String,
@@ -127,10 +127,26 @@ pub struct ThreadRow {
     pub created_ms: i64,
     /// Archive time, milliseconds since the Unix epoch.
     pub archived_ms: Option<i64>,
+    /// Bridge context-tool contract installed when this thread was created.
+    pub context_tools_version: u32,
+}
+
+impl std::fmt::Debug for ThreadRow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ThreadRow")
+            .field("scope_key_len", &self.scope_key.len())
+            .field("codex_thread_id_len", &self.codex_thread_id.len())
+            .field("status", &self.status)
+            .field("created_ms", &self.created_ms)
+            .field("archived_ms", &self.archived_ms)
+            .field("context_tools_version", &self.context_tools_version)
+            .finish_non_exhaustive()
+    }
 }
 
 /// One row of the `turns` table.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct TurnRow {
     /// Row ID.
     pub id: i64,
@@ -154,8 +170,32 @@ pub struct TurnRow {
     pub inbound_count: usize,
 }
 
+impl std::fmt::Debug for TurnRow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TurnRow")
+            .field("id", &self.id)
+            .field("scope_key_len", &self.scope_key.len())
+            .field("client_message_id_len", &self.client_message_id.len())
+            .field(
+                "codex_thread_id_len",
+                &self.codex_thread_id.as_ref().map(String::len),
+            )
+            .field(
+                "codex_turn_id_len",
+                &self.codex_turn_id.as_ref().map(String::len),
+            )
+            .field("state", &self.state)
+            .field("uncertain", &self.uncertain)
+            .field("created_ms", &self.created_ms)
+            .field("updated_ms", &self.updated_ms)
+            .field("inbound_count", &self.inbound_count)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Fields needed to record a new turn row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct NewTurnRow {
     /// Owning scope key.
     pub scope_key: String,
@@ -165,6 +205,21 @@ pub struct NewTurnRow {
     pub codex_thread_id: Option<String>,
     /// Initial state (normally [`TurnState::Starting`]).
     pub state: TurnState,
+}
+
+impl std::fmt::Debug for NewTurnRow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NewTurnRow")
+            .field("scope_key_len", &self.scope_key.len())
+            .field("client_message_id_len", &self.client_message_id.len())
+            .field(
+                "codex_thread_id_len",
+                &self.codex_thread_id.as_ref().map(String::len),
+            )
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
 }
 
 impl StoreHandle {
@@ -243,15 +298,34 @@ impl StoreHandle {
         scope: &ScopeKey,
         codex_thread_id: &str,
     ) -> Result<(), StoreError> {
+        self.record_active_thread_with_context_tools(scope, codex_thread_id, 0)
+            .await
+    }
+
+    /// Records a new active thread mapping together with its bridge context
+    /// tool contract version.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the scope already has an active thread or the
+    /// mapping already exists.
+    pub async fn record_active_thread_with_context_tools(
+        &self,
+        scope: &ScopeKey,
+        codex_thread_id: &str,
+        context_tools_version: u32,
+    ) -> Result<(), StoreError> {
         let scope_key = scope.to_string();
         let codex_thread_id = codex_thread_id.to_owned();
         let request_size = request_bytes(&[&scope_key, &codex_thread_id]);
         self.run_sized(request_size, move |connection| {
             connection
                 .execute(
-                    "INSERT INTO threads (scope_key, codex_thread_id, status, created_ms)
-                     VALUES (?1, ?2, 'active', ?3)",
-                    params![scope_key, codex_thread_id, now_ms()],
+                    "INSERT INTO threads (
+                         scope_key, codex_thread_id, status, created_ms,
+                         context_tools_version
+                     ) VALUES (?1, ?2, 'active', ?3, ?4)",
+                    params![scope_key, codex_thread_id, now_ms(), context_tools_version],
                 )
                 .map_err(|error| sqlite_error("recording an active thread", &error))?;
             Ok(())
@@ -269,7 +343,8 @@ impl StoreHandle {
         let request_size = request_bytes(&[&scope_key]);
         self.run_sized(request_size, move |connection| {
             let row = connection.query_row(
-                "SELECT scope_key, codex_thread_id, status, created_ms, archived_ms
+                "SELECT scope_key, codex_thread_id, status, created_ms, archived_ms,
+                        context_tools_version
                  FROM threads WHERE scope_key = ?1 AND status = 'active'",
                 params![scope_key],
                 read_thread_row,
@@ -293,7 +368,8 @@ impl StoreHandle {
         self.run_sized(request_size, move |connection| {
             let now = now_ms();
             let active = connection.query_row(
-                "SELECT scope_key, codex_thread_id, status, created_ms, archived_ms
+                "SELECT scope_key, codex_thread_id, status, created_ms, archived_ms,
+                        context_tools_version
                  FROM threads WHERE scope_key = ?1 AND status = 'active'",
                 params![scope_key],
                 read_thread_row,
@@ -598,6 +674,7 @@ fn read_thread_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadRow> {
         })?,
         created_ms: row.get(3)?,
         archived_ms: row.get(4)?,
+        context_tools_version: row.get(5)?,
     })
 }
 

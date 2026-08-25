@@ -1,1 +1,4 @@
 owners = ["ou_owner_123456"]
+
+[codex.backend]
+mode = "spawned_stdio"

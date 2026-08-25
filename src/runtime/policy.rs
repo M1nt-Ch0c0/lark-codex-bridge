@@ -14,22 +14,34 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::channel::ConversationMode as ChatMode;
 use crate::codex::types::{ApprovalPolicy, SandboxMode};
 use crate::config::{BridgeConfig, ConfigError};
-use crate::lark::api::ChatMode;
 use crate::lark::normalize::InboundEvent;
 use crate::limits::{
     MAX_CONFIG_ALLOW_ROOT_BYTES, MAX_CONFIG_ALLOW_ROOTS, MAX_PLATFORM_PROTECTED_ROOT_BYTES,
     MAX_PLATFORM_PROTECTED_ROOTS,
 };
+use crate::store::InboundRejectionKind;
 
 /// Static access result that is safe to log.
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub enum AccessDecision {
     Allow,
+    /// Sender is a human P2P caller with no owner, sender, or group grant.
     DenyNotOwner,
+    /// Sender is not an ordinary human (bot/app/system/anonymous).
+    DenyNotSender,
+    /// Sender is a human group/topic caller with no owner, sender, or allowed
+    /// group grant.
+    DenyNotGroup,
+    /// A group/topic message lacked a real direct bot mention.
     DenyMissingMention,
-    DenyWorkspace { reason: &'static str },
+    /// An owner-only control command arrived from a non-owner sender.
+    DenyOwnerCommandRequired,
+    DenyWorkspace {
+        reason: &'static str,
+    },
 }
 
 impl fmt::Debug for AccessDecision {
@@ -37,9 +49,31 @@ impl fmt::Debug for AccessDecision {
         formatter.write_str(match self {
             Self::Allow => "Allow",
             Self::DenyNotOwner => "DenyNotOwner",
+            Self::DenyNotSender => "DenyNotSender",
+            Self::DenyNotGroup => "DenyNotGroup",
             Self::DenyMissingMention => "DenyMissingMention",
+            Self::DenyOwnerCommandRequired => "DenyOwnerCommandRequired",
             Self::DenyWorkspace { .. } => "DenyWorkspace",
         })
+    }
+}
+
+impl AccessDecision {
+    /// Maps a policy denial to the closed, content-free store rejection
+    /// category. `Allow` maps to `None`; workspace denials keep the generic
+    /// policy bucket because workspace validation is a separate concern from
+    /// identity and mention authorization.
+    #[must_use]
+    pub fn rejection_kind(self) -> Option<InboundRejectionKind> {
+        match self {
+            Self::Allow => None,
+            Self::DenyNotOwner => Some(InboundRejectionKind::NotOwner),
+            Self::DenyNotSender => Some(InboundRejectionKind::NotSender),
+            Self::DenyNotGroup => Some(InboundRejectionKind::NotGroup),
+            Self::DenyMissingMention => Some(InboundRejectionKind::MissingMention),
+            Self::DenyOwnerCommandRequired => Some(InboundRejectionKind::OwnerCommandRequired),
+            Self::DenyWorkspace { .. } => Some(InboundRejectionKind::Policy),
+        }
     }
 }
 
@@ -138,6 +172,23 @@ impl PolicyFingerprint {
     }
 }
 
+/// Opaque actor identity minted only after a concrete Lark event passes the access policy.
+#[derive(Clone, Eq, PartialEq)]
+pub struct AuthorizedLarkActor(String);
+
+impl AuthorizedLarkActor {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for AuthorizedLarkActor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AuthorizedLarkActor([redacted])")
+    }
+}
+
 impl fmt::Debug for PolicyFingerprint {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -151,6 +202,8 @@ impl fmt::Debug for PolicyFingerprint {
 #[derive(Clone)]
 pub struct AccessPolicy {
     owners: Vec<String>,
+    allowed_senders: Vec<String>,
+    allowed_groups: Vec<String>,
     allow_roots: Vec<PathBuf>,
     roots: PlatformRoots,
     sandbox: SandboxMode,
@@ -167,6 +220,8 @@ impl fmt::Debug for AccessPolicy {
         formatter
             .debug_struct("AccessPolicy")
             .field("owner_count", &self.owners.len())
+            .field("allowed_sender_count", &self.allowed_senders.len())
+            .field("allowed_group_count", &self.allowed_groups.len())
             .field("allow_root_count", &self.allow_roots.len())
             .field("platform_roots", &self.roots)
             .field("sandbox", &self.sandbox)
@@ -232,6 +287,8 @@ impl AccessPolicy {
     pub(crate) fn from_prepared_config(config: &BridgeConfig, roots: &PlatformRoots) -> Self {
         Self {
             owners: config.owners.clone(),
+            allowed_senders: config.allowed_senders.clone(),
+            allowed_groups: config.allowed_groups.clone(),
             allow_roots: config.workspace.allow_roots.clone(),
             roots: roots.clone(),
             sandbox: config.codex.sandbox,
@@ -240,13 +297,112 @@ impl AccessPolicy {
         }
     }
 
-    /// Gates inbound events: owners only, with a direct bot mention required
-    /// in group and topic chats. P2P messages are mention-exempt.
+    /// Gates ordinary turns across owner, allowed-sender, and allowed-group
+    /// authorization. P2P messages are mention-exempt; group/topic messages
+    /// additionally require a real direct bot mention (`@all` never counts).
+    /// Non-human senders are never authorized.
     #[must_use]
     pub fn decide(&self, event: &InboundEvent) -> AccessDecision {
-        if !self.owners.iter().any(|owner| owner == &event.sender_id) {
-            return AccessDecision::DenyNotOwner;
+        if !event.sender_is_human {
+            return AccessDecision::DenyNotSender;
         }
+        if self.is_owner(&event.sender_id) {
+            return Self::mention_gate(event);
+        }
+        if self.is_allowed_sender(&event.sender_id) {
+            return Self::mention_gate(event);
+        }
+        if event.chat_type != ChatMode::P2p && self.is_allowed_group(&event.chat_id) {
+            return Self::mention_gate(event);
+        }
+        if event.chat_type == ChatMode::P2p {
+            AccessDecision::DenyNotOwner
+        } else {
+            AccessDecision::DenyNotGroup
+        }
+    }
+
+    /// Gates owner-only control commands. This path deliberately never consults
+    /// the sender or group allowlists, so future command handlers are safe by
+    /// construction.
+    #[must_use]
+    pub fn decide_command(&self, event: &InboundEvent) -> AccessDecision {
+        if !event.sender_is_human {
+            return AccessDecision::DenyNotSender;
+        }
+        if !self.is_owner(&event.sender_id) {
+            return AccessDecision::DenyOwnerCommandRequired;
+        }
+        Self::mention_gate(event)
+    }
+
+    /// Mints a stable opaque source actor only for an authorized ordinary Lark turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exact access decision when the concrete event is not authorized.
+    pub fn authorize_external_source(
+        &self,
+        event: &InboundEvent,
+    ) -> Result<AuthorizedLarkActor, AccessDecision> {
+        let decision = self.decide(event);
+        if decision != AccessDecision::Allow {
+            return Err(decision);
+        }
+        Ok(authorized_lark_actor(&event.sender_id))
+    }
+
+    /// Mints the single-recipient approval actor only for an authorized owner command event.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exact owner-command decision when the concrete event is not authorized.
+    pub fn authorize_external_approval_recipient(
+        &self,
+        event: &InboundEvent,
+    ) -> Result<AuthorizedLarkActor, AccessDecision> {
+        let decision = self.decide_command(event);
+        if decision != AccessDecision::Allow {
+            return Err(decision);
+        }
+        Ok(authorized_lark_actor(&event.sender_id))
+    }
+
+    /// Authorizes the sender of a directly quoted parent after Lark has
+    /// returned its identity. Parent messages do not need to mention the bot,
+    /// but they must independently satisfy the human sender/owner/group
+    /// policy; authorization of the quoting child is not transitive.
+    #[must_use]
+    pub(crate) fn allows_quoted_parent(
+        &self,
+        sender_id: &str,
+        sender_is_human: bool,
+        chat_id: &str,
+        chat_type: ChatMode,
+    ) -> bool {
+        sender_is_human
+            && (self.is_owner(sender_id)
+                || self.is_allowed_sender(sender_id)
+                || (chat_type != ChatMode::P2p && self.is_allowed_group(chat_id)))
+    }
+
+    fn is_owner(&self, sender_id: &str) -> bool {
+        self.owners.iter().any(|owner| owner.as_str() == sender_id)
+    }
+
+    fn is_allowed_sender(&self, sender_id: &str) -> bool {
+        self.allowed_senders
+            .iter()
+            .any(|sender| sender.as_str() == sender_id)
+    }
+
+    fn is_allowed_group(&self, chat_id: &str) -> bool {
+        self.allowed_groups
+            .iter()
+            .any(|group| group.as_str() == chat_id)
+    }
+
+    fn mention_gate(event: &InboundEvent) -> AccessDecision {
         if event.chat_type != ChatMode::P2p && !event.mentions_bot {
             return AccessDecision::DenyMissingMention;
         }
@@ -304,6 +460,21 @@ impl AccessPolicy {
             self.network_access,
         ))
     }
+}
+
+fn authorized_lark_actor(sender_id: &str) -> AuthorizedLarkActor {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut hash = Sha256::new();
+    hash.update(b"lark-codex-authorized-actor-v1\0");
+    hash.update(sender_id.as_bytes());
+    let digest = hash.finalize();
+    let mut actor = String::with_capacity(43);
+    actor.push_str("lark-");
+    for byte in digest.iter().take(19) {
+        actor.push(char::from(HEX[usize::from(byte >> 4)]));
+        actor.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    AuthorizedLarkActor(actor)
 }
 
 const POLICY_FINGERPRINT_VERSION: &[u8] = b"lark-codex-policy-v1";

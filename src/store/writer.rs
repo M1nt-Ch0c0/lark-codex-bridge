@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::schema::MIGRATIONS;
 use super::{FileReservation, StoreError, sqlite_error, tighten_database_sidecars};
-use crate::limits::{STORE_BUSY_TIMEOUT, STORE_WRITER_CAPACITY};
+use crate::limits::{STORE_ATTACHMENT_LEASE_MAX_ROWS, STORE_BUSY_TIMEOUT, STORE_WRITER_CAPACITY};
 
 /// One request toward the writer task.
 pub(crate) enum StoreRequest {
@@ -138,7 +138,8 @@ fn open_and_migrate(location: &StoreLocation) -> Result<Connection, StoreError> 
 fn apply_pragmas(connection: &Connection) -> Result<(), StoreError> {
     connection
         .execute_batch(
-            "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL;",
+            "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL;
+             PRAGMA secure_delete = ON;",
         )
         .map_err(|error| sqlite_error("applying store pragmas", &error))?;
     let busy_timeout_ms = i64::try_from(STORE_BUSY_TIMEOUT.as_millis()).unwrap_or(i64::MAX);
@@ -148,25 +149,57 @@ fn apply_pragmas(connection: &Connection) -> Result<(), StoreError> {
 }
 
 fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
-    validate_migrations()?;
+    migrate_through(connection, MIGRATIONS)
+}
+
+fn migrate_through(
+    connection: &mut Connection,
+    migrations: &[super::schema::Migration],
+) -> Result<(), StoreError> {
+    validate_migrations(migrations)?;
     let current: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| sqlite_error("reading the schema version", &error))?;
-    let latest = MIGRATIONS.last().map_or(0, |migration| migration.version);
+    let latest = migrations.last().map_or(0, |migration| migration.version);
     if current > latest {
         return Err(StoreError::Migration {
             version: current,
             name: "database schema is newer than this binary",
         });
     }
-    for migration in MIGRATIONS
+    for migration in migrations
         .iter()
         .filter(|migration| migration.version > current)
     {
+        if migration.name == "remove durable media capabilities and transcripts" {
+            super::dedup::scrub_persisted_inbound_secrets(connection).map_err(
+                |error| match error {
+                    StoreError::Sqlite { .. } => StoreError::Migration {
+                        version: migration.version,
+                        name: migration.name,
+                    },
+                    other => other,
+                },
+            )?;
+            // Updating a row is insufficient: old bytes can remain in free
+            // pages or WAL frames. Compact before advancing `user_version`;
+            // a failure therefore retries this cleanup on the next open.
+            connection
+                .execute_batch(
+                    "PRAGMA wal_checkpoint(TRUNCATE);
+                     VACUUM;
+                     PRAGMA wal_checkpoint(TRUNCATE);",
+                )
+                .map_err(|_| StoreError::Migration {
+                    version: migration.version,
+                    name: migration.name,
+                })?;
+        }
         let apply = |connection: &mut Connection| -> Result<(), StoreError> {
             let transaction = connection
                 .transaction()
                 .map_err(|error| sqlite_error("starting a migration transaction", &error))?;
+            prepare_migration(&transaction, migration.name)?;
             transaction
                 .execute_batch(migration.sql)
                 .map_err(|error| sqlite_error("applying a migration", &error))?;
@@ -190,8 +223,38 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn validate_migrations() -> Result<(), StoreError> {
-    for (index, migration) in MIGRATIONS.iter().enumerate() {
+fn prepare_migration(
+    transaction: &rusqlite::Transaction<'_>,
+    migration_name: &str,
+) -> Result<(), StoreError> {
+    if migration_name != "tokenize attachment lease acquisitions" {
+        return Ok(());
+    }
+    transaction
+        .execute(
+            "DELETE FROM attachment_leases WHERE turn_row_id IN (
+                 SELECT id FROM turns
+                 WHERE state IN ('completed', 'failed', 'interrupted')
+                    OR (state = 'uncertain' AND uncertain = 0)
+             )",
+            [],
+        )
+        .map_err(|error| sqlite_error("cleaning stale leases before migration", &error))?;
+    let lease_count: i64 = transaction
+        .query_row("SELECT COUNT(*) FROM attachment_leases", [], |row| {
+            row.get(0)
+        })
+        .map_err(|error| sqlite_error("checking lease migration capacity", &error))?;
+    if u64::try_from(lease_count).unwrap_or(u64::MAX) > STORE_ATTACHMENT_LEASE_MAX_ROWS {
+        return Err(StoreError::CapacityExceeded {
+            context: "migrating attachment leases",
+        });
+    }
+    Ok(())
+}
+
+fn validate_migrations(migrations: &[super::schema::Migration]) -> Result<(), StoreError> {
+    for (index, migration) in migrations.iter().enumerate() {
         let expected = u32::try_from(index + 1).unwrap_or(u32::MAX);
         if migration.version != expected {
             return Err(StoreError::Migration {
@@ -206,6 +269,7 @@ fn validate_migrations() -> Result<(), StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn full_channel_maps_to_queue_full() {
@@ -217,5 +281,53 @@ mod tests {
             .try_send(StoreRequest::Shutdown)
             .expect_err("bounded channel rejects overflow");
         assert!(matches!(error, mpsc::error::TrySendError::Full(_)));
+    }
+
+    #[test]
+    fn file_upgrade_sets_v2_outbox_fence_and_v1_binary_refuses_downgrade() {
+        let temp = tempdir().expect("tempdir");
+        let path = temp.path().join("upgrade.sqlite");
+        {
+            let mut connection = Connection::open(&path).expect("open legacy file");
+            apply_pragmas(&connection).expect("legacy pragmas");
+            migrate_through(&mut connection, &MIGRATIONS[..5]).expect("seed schema v5");
+            connection
+                .execute(
+                    "INSERT INTO outbox
+                     (idempotency_key, scope_key, kind, payload_json, payload_bytes,
+                      state, attempts, next_retry_ms, created_ms, updated_ms)
+                     VALUES ('legacy', 'im:scope', 'final', ?1, length(?1),
+                             'pending', 0, 0, 1, 1)",
+                    [r#"{"version":1,"op":"reply_text","message_id":"om_old","text":"**literal**"}"#],
+                )
+                .expect("seed legacy payload");
+        }
+
+        {
+            let mut connection = Connection::open(&path).expect("reopen for upgrade");
+            migrate(&mut connection).expect("upgrade to schema v10");
+            let version: u32 = connection
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .expect("read upgraded version");
+            assert_eq!(version, 10);
+            let count: u32 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM outbox WHERE idempotency_key = 'legacy'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("legacy row survives upgrade");
+            assert_eq!(count, 1);
+        }
+
+        let mut legacy = Connection::open(&path).expect("legacy reopen");
+        assert!(matches!(
+            migrate_through(&mut legacy, &MIGRATIONS[..5]),
+            Err(StoreError::Migration { version: 10, .. })
+        ));
+        let version: u32 = legacy
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("downgrade fence stays intact");
+        assert_eq!(version, 10);
     }
 }

@@ -16,7 +16,7 @@ use lark_codex_bridge::lark::credentials::LarkCredentials;
 use lark_codex_bridge::lark::error::{LarkError, LarkErrorKind};
 use lark_codex_bridge::lark::http::LarkHttp;
 use lark_codex_bridge::lark::register::{
-    RegistrationFlow, RegistrationOutcome, encode_addons, validate_credentials,
+    QrChallenge, RegistrationFlow, RegistrationOutcome, encode_addons, validate_credentials,
 };
 use larkstub::{Handler, StubResponse, StubServer};
 use secrecy::{ExposeSecret, SecretString};
@@ -39,6 +39,19 @@ fn flow_for(server: &StubServer, addons: Option<Value>) -> RegistrationFlow {
         addons,
         Duration::from_secs(60),
     )
+}
+
+#[test]
+fn qr_challenge_debug_redacts_the_device_authorization_url() {
+    let challenge = QrChallenge {
+        url: "https://accounts.example.test/verify?device_code=sensitive-code".to_owned(),
+        expires_in: 600,
+        interval: 5,
+    };
+    let debug = format!("{challenge:?}");
+    assert!(!debug.contains("sensitive-code"));
+    assert!(!debug.contains("accounts.example.test"));
+    assert!(debug.contains("url_bytes"));
 }
 
 fn begin_response() -> StubResponse {

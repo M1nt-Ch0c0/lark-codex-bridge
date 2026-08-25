@@ -1,0 +1,23 @@
+# cargo-nextest profile used by CI (`cargo nextest run --profile ci`).
+[test-groups]
+# Every channel-sidecar test owns a real Node process tree. Serial execution
+# avoids turning scheduler contention into a false handshake-timeout result,
+# especially on Windows runners.
+channel-sidecar-process-tree = { max-threads = 1 }
+
+[profile.ci]
+# One retry per failing test to absorb environment flakiness without hiding
+# deterministic failures (tests that spawn child processes are prone to it).
+retries = 1
+# Keep running all tests and report every failure in one pass.
+fail-fast = false
+# Surface slow/hung tests instead of waiting forever; two periods then kill.
+slow-timeout = { period = "120s", terminate-after = 2 }
+
+[[profile.ci.overrides]]
+filter = "binary(channel_sidecar)"
+test-group = "channel-sidecar-process-tree"
+
+# Machine-readable results uploaded with the workflow run artifacts.
+[profile.ci.junit]
+path = "target/nextest/ci/junit.xml"

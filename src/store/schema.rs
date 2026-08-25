@@ -182,4 +182,194 @@ BEGIN
 END;
 ",
     },
+    Migration {
+        version: 3,
+        name: "attachment scan cursor",
+        sql: "
+CREATE TABLE attachment_scan_cursor (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    entry_name TEXT NOT NULL
+);
+",
+    },
+    Migration {
+        version: 4,
+        name: "remove obsolete attachment scan cursor",
+        sql: "DROP TABLE attachment_scan_cursor;",
+    },
+    Migration {
+        version: 5,
+        name: "track bridge context tools on threads",
+        sql: "
+ALTER TABLE threads ADD COLUMN context_tools_version INTEGER NOT NULL DEFAULT 0
+    CHECK (context_tools_version >= 0);
+",
+    },
+    Migration {
+        version: 6,
+        name: "tokenize attachment lease acquisitions",
+        sql: "
+ALTER TABLE attachment_leases RENAME TO attachment_leases_v1;
+
+CREATE TABLE attachment_leases (
+    lease_token TEXT PRIMARY KEY CHECK (
+        length(lease_token) BETWEEN 1 AND 64
+    ),
+    sha256 TEXT NOT NULL,
+    turn_row_id INTEGER NOT NULL,
+    created_ms INTEGER NOT NULL,
+    FOREIGN KEY (sha256) REFERENCES attachments (sha256) ON DELETE CASCADE,
+    FOREIGN KEY (turn_row_id) REFERENCES turns (id) ON DELETE CASCADE
+);
+CREATE INDEX attachment_leases_sha256 ON attachment_leases (sha256);
+CREATE INDEX attachment_leases_turn ON attachment_leases (turn_row_id);
+
+INSERT INTO attachment_leases (lease_token, sha256, turn_row_id, created_ms)
+SELECT printf('legacy-%016x', rowid), sha256, turn_row_id, created_ms
+FROM attachment_leases_v1;
+
+DROP TABLE attachment_leases_v1;
+",
+    },
+    Migration {
+        version: 7,
+        name: "fence versioned Markdown outbox payloads",
+        // No table shape changes are needed: outbox payloads are deliberately
+        // opaque JSON. Advancing `user_version` is nevertheless required so a
+        // v1-only binary refuses to open a database after this binary may have
+        // persisted payload v2 rows it cannot understand.
+        sql: "SELECT 1;",
+    },
+    Migration {
+        version: 8,
+        name: "remove durable media capabilities and transcripts",
+        // The data rewrite is implemented by the writer immediately before
+        // this marker migration because it must decode and validate the
+        // versioned application payload rather than mutate JSON in SQL.
+        sql: "SELECT 1;",
+    },
+    Migration {
+        version: 9,
+        name: "external Codex reconciliation epochs",
+        sql: "
+CREATE TABLE IF NOT EXISTS external_endpoint_epochs (
+    endpoint_label TEXT PRIMARY KEY,
+    current_epoch INTEGER NOT NULL CHECK (current_epoch > 0),
+    state TEXT NOT NULL CHECK (state IN ('connecting', 'reconciling', 'ready', 'unavailable', 'stopped')),
+    updated_ms INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS external_managed_threads (
+    endpoint_label TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    epoch INTEGER NOT NULL CHECK (epoch >= 0),
+    state TEXT NOT NULL CHECK (state IN ('unavailable', 'reconciling', 'ready', 'uncertain')),
+    reason TEXT CHECK (reason IS NULL OR reason IN (
+        'bridge_restart', 'socket_disconnect', 'request_timeout', 'buffer_overflow',
+        'page_limit', 'server_restart', 'protocol_violation', 'conflicting_terminal'
+    )),
+    updated_ms INTEGER NOT NULL,
+    PRIMARY KEY (endpoint_label, thread_id),
+    FOREIGN KEY (endpoint_label) REFERENCES external_endpoint_epochs(endpoint_label)
+        ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS external_turn_terminals (
+    endpoint_label TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('completed', 'failed', 'interrupted')),
+    observed_epoch INTEGER NOT NULL CHECK (observed_epoch > 0),
+    PRIMARY KEY (endpoint_label, thread_id, turn_id),
+    FOREIGN KEY (endpoint_label, thread_id)
+        REFERENCES external_managed_threads(endpoint_label, thread_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS external_item_terminals (
+    endpoint_label TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    item_id TEXT NOT NULL,
+    observed_epoch INTEGER NOT NULL CHECK (observed_epoch > 0),
+    PRIMARY KEY (endpoint_label, thread_id, turn_id, item_id),
+    FOREIGN KEY (endpoint_label, thread_id)
+        REFERENCES external_managed_threads(endpoint_label, thread_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS external_managed_threads_state
+    ON external_managed_threads(endpoint_label, state, thread_id);
+",
+    },
+    Migration {
+        version: 10,
+        name: "external Codex write and approval fences",
+        sql: "
+CREATE TABLE IF NOT EXISTS external_write_fences (
+    endpoint_label TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    epoch INTEGER NOT NULL CHECK (epoch > 0),
+    state TEXT NOT NULL CHECK (state IN ('open', 'active', 'uncertain')),
+    active_intent_id TEXT,
+    approval_actor TEXT NOT NULL,
+    updated_ms INTEGER NOT NULL,
+    PRIMARY KEY (endpoint_label, thread_id),
+    FOREIGN KEY (endpoint_label, thread_id)
+        REFERENCES external_managed_threads(endpoint_label, thread_id) ON DELETE CASCADE,
+    CHECK ((state = 'active') = (active_intent_id IS NOT NULL))
+);
+
+CREATE TABLE IF NOT EXISTS external_mutation_intents (
+    endpoint_label TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    intent_id TEXT NOT NULL,
+    epoch INTEGER NOT NULL CHECK (epoch > 0),
+    kind TEXT NOT NULL CHECK (kind IN (
+        'turn_start', 'turn_steer', 'turn_interrupt', 'queue_add', 'queue_start'
+    )),
+    expected_turn_id TEXT,
+    client_message_id TEXT,
+    source_actor TEXT NOT NULL,
+    client_actor TEXT NOT NULL,
+    approval_actor TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN (
+        'prepared', 'sent', 'applied', 'rejected', 'uncertain'
+    )),
+    result_id TEXT,
+    created_ms INTEGER NOT NULL,
+    updated_ms INTEGER NOT NULL,
+    PRIMARY KEY (endpoint_label, thread_id, intent_id),
+    FOREIGN KEY (endpoint_label, thread_id)
+        REFERENCES external_managed_threads(endpoint_label, thread_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS external_mutation_intents_state
+    ON external_mutation_intents(endpoint_label, thread_id, state, updated_ms);
+
+CREATE TABLE IF NOT EXISTS external_approval_claims (
+    endpoint_label TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    approval_id TEXT NOT NULL,
+    request_key TEXT NOT NULL,
+    epoch INTEGER NOT NULL CHECK (epoch > 0),
+    turn_id TEXT NOT NULL,
+    item_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('command', 'file_change', 'permissions')),
+    source_actor TEXT NOT NULL,
+    client_actor TEXT NOT NULL,
+    approval_actor TEXT NOT NULL,
+    recipient_actor TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN (
+        'received', 'claimed', 'responding', 'resolved', 'denied', 'uncertain'
+    )),
+    deadline_ms INTEGER NOT NULL,
+    created_ms INTEGER NOT NULL,
+    updated_ms INTEGER NOT NULL,
+    PRIMARY KEY (endpoint_label, thread_id, approval_id),
+    UNIQUE (endpoint_label, epoch, request_key),
+    FOREIGN KEY (endpoint_label, thread_id)
+        REFERENCES external_managed_threads(endpoint_label, thread_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS external_approval_claims_state
+    ON external_approval_claims(endpoint_label, thread_id, state, deadline_ms);
+",
+    },
 ];

@@ -84,10 +84,19 @@ impl FakeControl {
     }
 
     pub(crate) async fn next_request(&self) -> Value {
-        timeout(TEST_TIMEOUT, self.requests_rx.lock().await.recv())
+        self.next_request_within(TEST_TIMEOUT).await
+    }
+
+    pub(crate) async fn next_request_within(&self, duration: Duration) -> Value {
+        timeout(duration, self.requests_rx.lock().await.recv())
             .await
             .expect("fake request timeout")
             .expect("fake request channel remains open")
+    }
+
+    pub(crate) async fn expect_no_request_for(&self, duration: Duration) {
+        let result = timeout(duration, self.requests_rx.lock().await.recv()).await;
+        assert!(result.is_err(), "fake observed an unexpected request");
     }
 
     pub(crate) async fn send_json(&self, value: Value) {

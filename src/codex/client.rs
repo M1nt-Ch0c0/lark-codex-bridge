@@ -16,16 +16,16 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     codex::{
+        compat::WireAdapter,
         protocol::value_memory_weight,
         rpc::{ConnectionEpoch, RpcConnection, RpcError, RpcEvent, RpcHandle, ServerRequest},
         transport::TransportExit,
         types::{
-            AgentMessageDeltaNotification, CommandExecutionOutputDeltaNotification,
-            ErrorNotification, ItemCompletedNotification, ItemStartedNotification, Thread,
-            ThreadItem, ThreadResumeParams, ThreadResumeResult, ThreadStartParams,
-            ThreadStartResult, ThreadTokenUsageUpdatedNotification, TokenUsageBreakdown, Turn,
-            TurnCompletedNotification, TurnError, TurnInterruptParams, TurnInterruptResult,
-            TurnStartParams, TurnStartResult, TurnStartedNotification, TurnStatus,
+            ErrorNotification, ItemCompletedNotification, Thread, ThreadItem, ThreadListParams,
+            ThreadListResult, ThreadReadParams, ThreadReadResult, ThreadResumeParams,
+            ThreadStartParams, ThreadStartResult, ThreadTokenUsageUpdatedNotification,
+            TokenUsageBreakdown, Turn, TurnCompletedNotification, TurnError, TurnInterruptParams,
+            TurnInterruptResult, TurnStartParams, TurnStatus,
         },
     },
     limits::{
@@ -36,6 +36,34 @@ use crate::{
         THREAD_PROJECTION_BYTE_BUDGET, THREAD_SUBSCRIBER_CAPACITY, THREAD_TERMINAL_CAPACITY,
     },
 };
+
+/// Reverse request currently consumed by the bridge runtime.
+pub const DYNAMIC_TOOL_CALL_METHOD: &str = "item/tool/call";
+
+/// Canonical successful lifecycle order exercised by the production router.
+pub const NORMAL_NOTIFICATION_ORDER: &[&str] = &[
+    "thread/started",
+    "turn/started",
+    "item/started",
+    "item/agentMessage/delta",
+    "item/commandExecution/outputDelta",
+    "item/completed",
+    "thread/tokenUsage/updated",
+    "turn/completed",
+];
+
+/// Every notification whose parameters the production router interprets.
+pub const CONSUMED_NOTIFICATION_METHODS: &[&str] = &[
+    "thread/started",
+    "turn/started",
+    "item/started",
+    "item/agentMessage/delta",
+    "item/commandExecution/outputDelta",
+    "item/completed",
+    "thread/tokenUsage/updated",
+    "error",
+    "turn/completed",
+];
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ThreadId(Arc<str>);
@@ -372,6 +400,26 @@ impl fmt::Display for ClientError {
 
 impl std::error::Error for ClientError {}
 
+impl ClientError {
+    /// Reports whether a failed `turn/start` is known not to have reached a
+    /// point where Codex could execute it. Callers may safely finalize local
+    /// resources immediately only in this case; every other error remains
+    /// uncertain until the owning connection epoch ends.
+    #[must_use]
+    pub fn turn_start_definitely_not_applied(&self) -> bool {
+        match self {
+            Self::Rpc(error) => definitely_not_applied(error),
+            Self::RouterClosed(_)
+            | Self::RouterTaskFailed(_)
+            | Self::RouterTimeout(_)
+            | Self::Capacity
+            | Self::ControlEventsTaken
+            | Self::InvalidNotification { .. } => true,
+            Self::ConfirmedThreadUntracked { .. } | Self::ConfirmedTurnUntracked { .. } => false,
+        }
+    }
+}
+
 impl From<RpcError> for ClientError {
     fn from(value: RpcError) -> Self {
         Self::Rpc(value)
@@ -381,6 +429,7 @@ impl From<RpcError> for ClientError {
 #[derive(Clone)]
 pub struct AppServerClient {
     rpc: RpcHandle,
+    wire: WireAdapter,
     router_tx: mpsc::Sender<RouterCommand>,
     cancellation: CancellationToken,
     faulted: Arc<std::sync::atomic::AtomicBool>,
@@ -397,7 +446,7 @@ struct RouterLifecycle {
 
 impl AppServerClient {
     #[must_use]
-    pub fn spawn(mut connection: RpcConnection) -> Self {
+    pub fn spawn(mut connection: RpcConnection, wire: WireAdapter) -> Self {
         let rpc = connection.handle.clone();
         let epoch = rpc.epoch();
         let cancellation = CancellationToken::new();
@@ -417,11 +466,13 @@ impl AppServerClient {
                 control_budget,
                 router_faulted,
                 router_cancel,
+                wire,
             )
             .await
         });
         Self {
             rpc,
+            wire,
             router_tx,
             cancellation,
             faulted,
@@ -439,20 +490,61 @@ impl AppServerClient {
         }
     }
 
+    /// Lists Codex threads without binding any returned thread to bridge state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a safe client error when the read-only RPC fails.
+    pub async fn list_threads(
+        &self,
+        params: ThreadListParams,
+    ) -> Result<ThreadListResult, ClientError> {
+        let params = Self::encode_params("thread/list", self.wire.thread_list_params(&params))?;
+        self.rpc
+            .request_budgeted::<_, Value>("thread/list", &params, CONTROL_RPC_TIMEOUT)
+            .await?
+            .try_map(|value| {
+                Self::decode_result("thread/list", self.wire.thread_list_response(value))
+            })
+            .map(crate::codex::rpc::BudgetedResponse::into_inner)
+    }
+
+    /// Reads one Codex thread without binding it to bridge state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a safe client error when the read-only RPC fails.
+    pub async fn read_thread(
+        &self,
+        params: ThreadReadParams,
+    ) -> Result<ThreadReadResult, ClientError> {
+        let params = Self::encode_params("thread/read", self.wire.thread_read_params(&params))?;
+        self.rpc
+            .request_budgeted::<_, Value>("thread/read", &params, CONTROL_RPC_TIMEOUT)
+            .await?
+            .try_map(|value| {
+                Self::decode_result("thread/read", self.wire.thread_read_response(value))
+            })
+            .map(crate::codex::rpc::BudgetedResponse::into_inner)
+    }
+
     /// Creates a Codex thread. This non-idempotent RPC is never retried locally.
     ///
     /// # Errors
     ///
     /// Returns a safe client error when the RPC fails.
     pub async fn start_thread(&self, params: ThreadStartParams) -> Result<Thread, ClientError> {
+        let params = Self::encode_params("thread/start", self.wire.thread_start_params(&params))?;
         let mut guard =
             NonIdempotentGuard::new(self.cancellation.clone(), Arc::clone(&self.faulted));
         let result = match self
             .rpc
-            .request_budgeted::<_, ThreadStartResult>("thread/start", &params, CONTROL_RPC_TIMEOUT)
+            .request_budgeted::<_, Value>("thread/start", &params, CONTROL_RPC_TIMEOUT)
             .await
         {
-            Ok(result) => result,
+            Ok(result) => result.try_map(|value| {
+                Self::decode_result("thread/start", self.wire.thread_start_response(value))
+            })?,
             Err(error) => {
                 if definitely_not_applied(&error) {
                     guard.disarm();
@@ -481,18 +573,17 @@ impl AppServerClient {
     pub async fn resume_thread(&self, params: ThreadResumeParams) -> Result<Thread, ClientError> {
         self.ensure_thread_route(ThreadId::from(params.thread_id.as_str()))
             .await?;
+        let params = Self::encode_params("thread/resume", self.wire.thread_resume_params(&params))?;
         let mut guard =
             NonIdempotentGuard::new(self.cancellation.clone(), Arc::clone(&self.faulted));
         let result = match self
             .rpc
-            .request_budgeted::<_, ThreadResumeResult>(
-                "thread/resume",
-                &params,
-                CONTROL_RPC_TIMEOUT,
-            )
+            .request_budgeted::<_, Value>("thread/resume", &params, CONTROL_RPC_TIMEOUT)
             .await
         {
-            Ok(result) => result,
+            Ok(result) => result.try_map(|value| {
+                Self::decode_result("thread/resume", self.wire.thread_resume_response(value))
+            })?,
             Err(error) => {
                 if definitely_not_applied(&error) {
                     guard.disarm();
@@ -518,6 +609,7 @@ impl AppServerClient {
     /// Returns a safe client error when the RPC fails.
     pub async fn start_turn(&self, params: TurnStartParams) -> Result<Turn, ClientError> {
         let thread_id = ThreadId::from(params.thread_id.as_str());
+        let params = Self::encode_params("turn/start", self.wire.turn_start_params(&params))?;
         let attempt_id = TurnStartAttemptId::new();
         self.ensure_thread_route(thread_id.clone()).await?;
         self.begin_turn_start(thread_id.clone(), attempt_id).await?;
@@ -530,10 +622,12 @@ impl AppServerClient {
         );
         let result = match self
             .rpc
-            .request_budgeted::<_, TurnStartResult>("turn/start", &params, CONTROL_RPC_TIMEOUT)
+            .request_budgeted::<_, Value>("turn/start", &params, CONTROL_RPC_TIMEOUT)
             .await
         {
-            Ok(result) => result,
+            Ok(result) => result.try_map(|value| {
+                Self::decode_result("turn/start", self.wire.turn_start_response(value))
+            })?,
             Err(error) => {
                 if definitely_not_applied(&error) {
                     pending_start.abort_known_failure();
@@ -585,10 +679,14 @@ impl AppServerClient {
             return Err(ClientError::Capacity);
         }
         let params = TurnInterruptParams::new(thread_id.as_str(), turn_id.as_str());
-        let _: TurnInterruptResult = self
+        let params =
+            Self::encode_params("turn/interrupt", self.wire.turn_interrupt_params(&params))?;
+        let value: Value = self
             .rpc
             .request_high("turn/interrupt", &params, INTERRUPT_TIMEOUT)
             .await?;
+        let _: TurnInterruptResult =
+            Self::decode_result("turn/interrupt", self.wire.turn_interrupt_response(value))?;
         Ok(())
     }
 
@@ -678,6 +776,57 @@ impl AppServerClient {
     {
         self.rpc.respond_request(request, result).await?;
         Ok(())
+    }
+
+    /// Decodes the only promoted reverse-request contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted error if the method or generated wire value is invalid.
+    pub fn decode_dynamic_tool_call(
+        &self,
+        request: &ServerRequest,
+    ) -> Result<crate::codex::types::DynamicToolCallParams, ClientError> {
+        if request.method != DYNAMIC_TOOL_CALL_METHOD {
+            return Err(ClientError::Rpc(RpcError::UnknownServerRequest));
+        }
+        Self::decode_result(
+            DYNAMIC_TOOL_CALL_METHOD,
+            self.wire
+                .dynamic_tool_call_params(request.params.clone().unwrap_or(Value::Null)),
+        )
+    }
+
+    /// Encodes and answers the promoted dynamic-tool reverse request.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted error for incompatible output, a stale request, or transport loss.
+    pub async fn respond_dynamic_tool_call(
+        &self,
+        request: &mut ServerRequest,
+        result: &crate::codex::types::DynamicToolCallResponse,
+    ) -> Result<(), ClientError> {
+        let result = Self::encode_params(
+            DYNAMIC_TOOL_CALL_METHOD,
+            self.wire.dynamic_tool_call_response(result),
+        )?;
+        self.rpc.respond_request(request, &result).await?;
+        Ok(())
+    }
+
+    fn encode_params<T>(
+        method: &'static str,
+        result: Result<T, crate::codex::compat::CompatError>,
+    ) -> Result<T, ClientError> {
+        result.map_err(|_| ClientError::Rpc(RpcError::Serialize { method }))
+    }
+
+    fn decode_result<T>(
+        method: &'static str,
+        result: Result<T, crate::codex::compat::CompatError>,
+    ) -> Result<T, ClientError> {
+        result.map_err(|_| ClientError::Rpc(RpcError::Deserialize { method }))
     }
 
     /// Rejects an app-server request emitted on the control stream.
@@ -1103,6 +1252,7 @@ enum ItemUpsert {
     Conflict,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_router(
     connection: &mut RpcConnection,
     mut command_rx: mpsc::Receiver<RouterCommand>,
@@ -1111,6 +1261,7 @@ async fn run_router(
     control_budget: Arc<Semaphore>,
     faulted: Arc<std::sync::atomic::AtomicBool>,
     cancellation: CancellationToken,
+    wire: WireAdapter,
 ) -> TransportExit {
     let mut routes = HashMap::<ThreadId, ThreadRoute>::new();
     let mut router_fault = None;
@@ -1124,7 +1275,7 @@ async fn run_router(
             }
             command = command_rx.recv() => {
                 if let Some(command) = command {
-                    if !handle_router_command(command, &mut routes, &control_tx) {
+                    if !handle_router_command(command, &mut routes, &control_tx, wire) {
                         router_fault = Some(TransportExit::TaskFailed);
                         break connection.shutdown().await;
                     }
@@ -1134,7 +1285,7 @@ async fn run_router(
             },
             event = connection.events.recv() => match event {
                 Some(RpcEvent::Notification { method, params }) => {
-                    if !route_notification(method, params, &mut routes, &control_tx) {
+                    if !route_notification(method, params, &mut routes, &control_tx, wire) {
                         router_fault = Some(TransportExit::ProtocolViolation);
                         break connection.shutdown().await;
                     }
@@ -1187,6 +1338,7 @@ fn handle_router_command(
     command: RouterCommand,
     routes: &mut HashMap<ThreadId, ThreadRoute>,
     control_tx: &mpsc::Sender<ControlEvent>,
+    wire: WireAdapter,
 ) -> bool {
     match command {
         RouterCommand::Subscribe {
@@ -1249,7 +1401,7 @@ fn handle_router_command(
             _budget,
         } => {
             let accepted = route_turn_started(&thread_id, (*turn).clone(), routes);
-            let keep_open = finish_turn_start(&thread_id, attempt_id, routes, control_tx);
+            let keep_open = finish_turn_start(&thread_id, attempt_id, routes, control_tx, wire);
             let _ = ack.send(accepted.then_some(turn));
             keep_open
         }
@@ -1268,7 +1420,7 @@ fn handle_router_command(
                 }
             });
             if ack.send(accepted).is_err() && accepted {
-                finish_turn_start(&thread_id, attempt_id, routes, control_tx)
+                finish_turn_start(&thread_id, attempt_id, routes, control_tx, wire)
             } else {
                 true
             }
@@ -1276,7 +1428,7 @@ fn handle_router_command(
         RouterCommand::AbortTurnStart {
             thread_id,
             attempt_id,
-        } => finish_turn_start(&thread_id, attempt_id, routes, control_tx),
+        } => finish_turn_start(&thread_id, attempt_id, routes, control_tx, wire),
         RouterCommand::ObserveThreadStarted {
             thread_id,
             ack,
@@ -1365,6 +1517,7 @@ fn route_notification(
     params: Option<Value>,
     routes: &mut HashMap<ThreadId, ThreadRoute>,
     control_tx: &mpsc::Sender<ControlEvent>,
+    wire: WireAdapter,
 ) -> bool {
     let raw_thread_id = extract_thread_id(params.as_ref());
     if method != "turn/started" {
@@ -1405,7 +1558,7 @@ fn route_notification(
     }
     match method.as_str() {
         "thread/started" => {
-            match parse_params::<crate::codex::types::ThreadStartedNotification>(&method, params) {
+            match decode_notification(params, |value| wire.thread_started_notification(value)) {
                 Ok(params) => {
                     let thread_id = ThreadId::from(params.thread.id);
                     route_thread_started(&thread_id, routes);
@@ -1415,15 +1568,19 @@ fn route_notification(
                 }
             }
         }
-        "turn/started" => match parse_params::<TurnStartedNotification>(&method, params) {
+        "turn/started" => match decode_notification(params, |value| {
+            wire.turn_started_notification(value)
+        }) {
             Ok(params) => {
                 let thread_id = ThreadId::from(params.thread_id);
                 route_turn_started(&thread_id, params.turn, routes);
-                return stop_deferring_notifications(&thread_id, routes, control_tx);
+                return stop_deferring_notifications(&thread_id, routes, control_tx, wire);
             }
             Err(_) => report_invalid_notification(method, false, raw_thread_id, routes, control_tx),
         },
-        "item/started" => match parse_params::<ItemStartedNotification>(&method, params) {
+        "item/started" => match decode_notification(params, |value| {
+            wire.item_started_notification(value)
+        }) {
             Ok(params) => {
                 let thread_id = ThreadId::from(params.thread_id);
                 route_item_started(
@@ -1436,7 +1593,8 @@ fn route_notification(
             Err(_) => report_invalid_notification(method, false, raw_thread_id, routes, control_tx),
         },
         "item/agentMessage/delta" => {
-            match parse_params::<AgentMessageDeltaNotification>(&method, params) {
+            match decode_notification(params, |value| wire.agent_message_delta_notification(value))
+            {
                 Ok(params) => {
                     let thread_id = ThreadId::from(params.thread_id);
                     if valid_routing_id(thread_id.as_str())
@@ -1468,7 +1626,9 @@ fn route_notification(
             }
         }
         "item/commandExecution/outputDelta" => {
-            match parse_params::<CommandExecutionOutputDeltaNotification>(&method, params) {
+            match decode_notification(params, |value| {
+                wire.command_output_delta_notification(value)
+            }) {
                 Ok(params) => {
                     let thread_id = ThreadId::from(params.thread_id);
                     if valid_routing_id(thread_id.as_str())
@@ -1500,7 +1660,9 @@ fn route_notification(
             }
         }
         "item/completed" => {
-            if let Ok(params) = parse_params::<ItemCompletedNotification>(&method, params) {
+            if let Ok(params) =
+                decode_notification(params, |value| wire.item_completed_notification(value))
+            {
                 if !route_item_completed(params, routes) {
                     report_routing_capacity(control_tx);
                     return false;
@@ -1511,7 +1673,8 @@ fn route_notification(
             }
         }
         "thread/tokenUsage/updated" => {
-            match parse_params::<ThreadTokenUsageUpdatedNotification>(&method, params) {
+            match decode_notification(params, |value| wire.token_usage_updated_notification(value))
+            {
                 Ok(params) => route_usage(params, routes),
                 Err(_) => {
                     report_invalid_notification(method, false, raw_thread_id, routes, control_tx);
@@ -1519,7 +1682,8 @@ fn route_notification(
             }
         }
         "error" => {
-            if let Ok(params) = parse_params::<ErrorNotification>(&method, params) {
+            if let Ok(params) = decode_notification(params, |value| wire.error_notification(value))
+            {
                 if !route_error(params, routes) {
                     report_routing_capacity(control_tx);
                     return false;
@@ -1530,7 +1694,9 @@ fn route_notification(
             }
         }
         "turn/completed" => {
-            if let Ok(params) = parse_params::<TurnCompletedNotification>(&method, params) {
+            if let Ok(params) =
+                decode_notification(params, |value| wire.turn_completed_notification(value))
+            {
                 if !route_turn_completed(params, routes) {
                     report_routing_capacity(control_tx);
                     return false;
@@ -1539,6 +1705,13 @@ fn route_notification(
                 report_invalid_notification(method, true, raw_thread_id, routes, control_tx);
                 return false;
             }
+        }
+        _ if CONSUMED_NOTIFICATION_METHODS.contains(&method.as_str()) => {
+            // The catalog and dispatch must change atomically. If a future edit
+            // updates only the catalog, fail closed instead of treating a
+            // bridge-owned notification as an opaque extension.
+            report_invalid_notification(method, true, raw_thread_id, routes, control_tx);
+            return false;
         }
         _ => {
             if let Some(thread_id) = extract_thread_id(params.as_ref()) {
@@ -1593,6 +1766,7 @@ fn finish_turn_start(
     attempt_id: TurnStartAttemptId,
     routes: &mut HashMap<ThreadId, ThreadRoute>,
     control_tx: &mpsc::Sender<ControlEvent>,
+    wire: WireAdapter,
 ) -> bool {
     let matching = routes
         .get(thread_id)
@@ -1603,13 +1777,14 @@ fn finish_turn_start(
     if let Some(route) = routes.get_mut(thread_id) {
         route.pending_turn_start = None;
     }
-    stop_deferring_notifications(thread_id, routes, control_tx)
+    stop_deferring_notifications(thread_id, routes, control_tx, wire)
 }
 
 fn stop_deferring_notifications(
     thread_id: &ThreadId,
     routes: &mut HashMap<ThreadId, ThreadRoute>,
     control_tx: &mpsc::Sender<ControlEvent>,
+    wire: WireAdapter,
 ) -> bool {
     let deferred = routes.get_mut(thread_id).map(|route| {
         route.defer_turn_notifications = false;
@@ -1618,7 +1793,7 @@ fn stop_deferring_notifications(
     });
     if let Some(deferred) = deferred {
         for (method, params) in deferred {
-            if !route_notification(method, params, routes, control_tx) {
+            if !route_notification(method, params, routes, control_tx, wire) {
                 return false;
             }
         }
@@ -1663,15 +1838,11 @@ fn report_invalid_notification(
     });
 }
 
-fn parse_params<T>(method: &str, params: Option<Value>) -> Result<T, ClientError>
-where
-    T: serde::de::DeserializeOwned,
-{
-    serde_json::from_value(params.unwrap_or(Value::Null)).map_err(|_| {
-        ClientError::InvalidNotification {
-            method: method.to_owned(),
-        }
-    })
+fn decode_notification<T>(
+    params: Option<Value>,
+    decode: impl FnOnce(Value) -> Result<T, crate::codex::compat::CompatError>,
+) -> Result<T, crate::codex::compat::CompatError> {
+    decode(params.unwrap_or(Value::Null))
 }
 
 fn extract_thread_id(params: Option<&Value>) -> Option<ThreadId> {

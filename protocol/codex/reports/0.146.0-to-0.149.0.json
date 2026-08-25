@@ -1,0 +1,625 @@
+{
+  "baselineVersion": "0.146.0",
+  "candidateVersion": "0.149.0",
+  "changes": [
+    {
+      "classification": "additive",
+      "kind": "definition_added",
+      "path": "roots/notification.item.completed/definitions/AgentMessageDelivery"
+    },
+    {
+      "classification": "additive",
+      "kind": "definition_added",
+      "path": "roots/notification.item.completed/definitions/ImageGenerationFailure"
+    },
+    {
+      "classification": "additive",
+      "kind": "definition_added",
+      "path": "roots/notification.thread.started/definitions/ThreadSection"
+    },
+    {
+      "classification": "additive",
+      "kind": "definition_added",
+      "path": "roots/notification.thread.started/definitions/ThreadSectionAppearance"
+    },
+    {
+      "classification": "additive",
+      "kind": "finite_values_added",
+      "path": "roots/thread.list.params/definitions/ThreadSortKey",
+      "values": [
+        "section_position"
+      ]
+    },
+    {
+      "classification": "additive",
+      "kind": "notification_added",
+      "path": "notifications/autoApprovalReview/strictReviewRequired"
+    },
+    {
+      "classification": "additive",
+      "kind": "notification_added",
+      "path": "notifications/project/changed"
+    },
+    {
+      "classification": "additive",
+      "kind": "notification_added",
+      "path": "notifications/thread/project/updated"
+    },
+    {
+      "classification": "additive",
+      "kind": "notification_added",
+      "path": "notifications/thread/queue/changed"
+    },
+    {
+      "classification": "additive",
+      "kind": "notification_added",
+      "path": "notifications/thread/reverted"
+    },
+    {
+      "classification": "additive",
+      "kind": "selected_root_added",
+      "path": "roots/notification.server_request.resolved"
+    },
+    {
+      "classification": "additive",
+      "kind": "selected_root_added",
+      "path": "roots/notification.thread.queue.changed"
+    },
+    {
+      "classification": "additive",
+      "kind": "selected_root_added",
+      "path": "roots/notification.thread.status.changed"
+    },
+    {
+      "classification": "additive",
+      "kind": "selected_root_added",
+      "path": "roots/server_request.command_execution.request_approval.params"
+    },
+    {
+      "classification": "additive",
+      "kind": "selected_root_added",
+      "path": "roots/server_request.command_execution.request_approval.response"
+    },
+    {
+      "classification": "additive",
+      "kind": "selected_root_added",
+      "path": "roots/server_request.file_change.request_approval.params"
+    },
+    {
+      "classification": "additive",
+      "kind": "selected_root_added",
+      "path": "roots/server_request.file_change.request_approval.response"
+    },
+    {
+      "classification": "additive",
+      "kind": "selected_root_added",
+      "path": "roots/server_request.permissions.request_approval.params"
+    },
+    {
+      "classification": "additive",
+      "kind": "selected_root_added",
+      "path": "roots/server_request.permissions.request_approval.response"
+    },
+    {
+      "classification": "additive",
+      "kind": "selected_root_added",
+      "path": "roots/thread.items.list.params"
+    },
+    {
+      "classification": "additive",
+      "kind": "selected_root_added",
+      "path": "roots/thread.items.list.response"
+    },
+    {
+      "classification": "additive",
+      "kind": "selected_root_added",
+      "path": "roots/thread.queue.add.params"
+    },
+    {
+      "classification": "additive",
+      "kind": "selected_root_added",
+      "path": "roots/thread.queue.add.response"
+    },
+    {
+      "classification": "additive",
+      "kind": "selected_root_added",
+      "path": "roots/thread.queue.list.params"
+    },
+    {
+      "classification": "additive",
+      "kind": "selected_root_added",
+      "path": "roots/thread.queue.list.response"
+    },
+    {
+      "classification": "additive",
+      "kind": "selected_root_added",
+      "path": "roots/thread.queue.start.params"
+    },
+    {
+      "classification": "additive",
+      "kind": "selected_root_added",
+      "path": "roots/thread.queue.start.response"
+    },
+    {
+      "classification": "additive",
+      "kind": "selected_root_added",
+      "path": "roots/thread.turns.list.params"
+    },
+    {
+      "classification": "additive",
+      "kind": "selected_root_added",
+      "path": "roots/thread.turns.list.response"
+    },
+    {
+      "classification": "additive",
+      "kind": "selected_root_added",
+      "path": "roots/thread.unsubscribe.params"
+    },
+    {
+      "classification": "additive",
+      "kind": "selected_root_added",
+      "path": "roots/thread.unsubscribe.response"
+    },
+    {
+      "classification": "additive",
+      "kind": "selected_root_added",
+      "path": "roots/turn.steer.params"
+    },
+    {
+      "classification": "additive",
+      "kind": "selected_root_added",
+      "path": "roots/turn.steer.response"
+    },
+    {
+      "classification": "breaking",
+      "kind": "incoming_closed_values_added",
+      "path": "roots/notification.error/definitions/CodexErrorInfo/oneOf/0",
+      "values": [
+        "misalignmentPolicyViolation"
+      ]
+    },
+    {
+      "classification": "breaking",
+      "construct": "anyOf",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/AdditionalPermissionProfile/properties/fileSystem"
+    },
+    {
+      "classification": "breaking",
+      "construct": "anyOf",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/AdditionalPermissionProfile/properties/network"
+    },
+    {
+      "classification": "breaking",
+      "construct": "enum",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/AgentMessageDelivery"
+    },
+    {
+      "classification": "breaking",
+      "construct": "oneOf",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/CommandExecutionApprovalDecision"
+    },
+    {
+      "classification": "breaking",
+      "construct": "enum",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/CommandExecutionApprovalDecision/oneOf/0"
+    },
+    {
+      "classification": "breaking",
+      "construct": "enum",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/CommandExecutionApprovalDecision/oneOf/1"
+    },
+    {
+      "classification": "breaking",
+      "construct": "enum",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/CommandExecutionApprovalDecision/oneOf/4"
+    },
+    {
+      "classification": "breaking",
+      "construct": "enum",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/CommandExecutionApprovalDecision/oneOf/5"
+    },
+    {
+      "classification": "breaking",
+      "construct": "oneOf",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/FileChangeApprovalDecision"
+    },
+    {
+      "classification": "breaking",
+      "construct": "enum",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/FileChangeApprovalDecision/oneOf/0"
+    },
+    {
+      "classification": "breaking",
+      "construct": "enum",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/FileChangeApprovalDecision/oneOf/1"
+    },
+    {
+      "classification": "breaking",
+      "construct": "enum",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/FileChangeApprovalDecision/oneOf/2"
+    },
+    {
+      "classification": "breaking",
+      "construct": "enum",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/FileChangeApprovalDecision/oneOf/3"
+    },
+    {
+      "classification": "breaking",
+      "construct": "enum",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/FileSystemAccessMode"
+    },
+    {
+      "classification": "breaking",
+      "construct": "oneOf",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/FileSystemPath"
+    },
+    {
+      "classification": "breaking",
+      "construct": "enum",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/FileSystemPath/oneOf/0/properties/type"
+    },
+    {
+      "classification": "breaking",
+      "construct": "enum",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/FileSystemPath/oneOf/1/properties/type"
+    },
+    {
+      "classification": "breaking",
+      "construct": "enum",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/FileSystemPath/oneOf/2/properties/type"
+    },
+    {
+      "classification": "breaking",
+      "construct": "oneOf",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/FileSystemSpecialPath"
+    },
+    {
+      "classification": "breaking",
+      "construct": "enum",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/FileSystemSpecialPath/oneOf/0/properties/kind"
+    },
+    {
+      "classification": "breaking",
+      "construct": "enum",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/FileSystemSpecialPath/oneOf/1/properties/kind"
+    },
+    {
+      "classification": "breaking",
+      "construct": "enum",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/FileSystemSpecialPath/oneOf/2/properties/kind"
+    },
+    {
+      "classification": "breaking",
+      "construct": "anyOf",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/FileSystemSpecialPath/oneOf/2/properties/subpath"
+    },
+    {
+      "classification": "breaking",
+      "construct": "enum",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/FileSystemSpecialPath/oneOf/3/properties/kind"
+    },
+    {
+      "classification": "breaking",
+      "construct": "enum",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/FileSystemSpecialPath/oneOf/4/properties/kind"
+    },
+    {
+      "classification": "breaking",
+      "construct": "enum",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/FileSystemSpecialPath/oneOf/5/properties/kind"
+    },
+    {
+      "classification": "breaking",
+      "construct": "anyOf",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/FileSystemSpecialPath/oneOf/5/properties/subpath"
+    },
+    {
+      "classification": "breaking",
+      "construct": "anyOf",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/GrantedPermissionProfile/properties/fileSystem"
+    },
+    {
+      "classification": "breaking",
+      "construct": "anyOf",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/GrantedPermissionProfile/properties/network"
+    },
+    {
+      "classification": "breaking",
+      "construct": "oneOf",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/ImageGenerationFailure"
+    },
+    {
+      "classification": "breaking",
+      "construct": "enum",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/ImageGenerationFailure/oneOf/0/properties/type"
+    },
+    {
+      "classification": "breaking",
+      "construct": "enum",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/NetworkApprovalProtocol"
+    },
+    {
+      "classification": "breaking",
+      "construct": "enum",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/NetworkPolicyRuleAction"
+    },
+    {
+      "classification": "breaking",
+      "construct": "enum",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/PermissionGrantScope"
+    },
+    {
+      "classification": "breaking",
+      "construct": "anyOf",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/RequestId"
+    },
+    {
+      "classification": "breaking",
+      "construct": "anyOf",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/RequestPermissionProfile/properties/fileSystem"
+    },
+    {
+      "classification": "breaking",
+      "construct": "anyOf",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/RequestPermissionProfile/properties/network"
+    },
+    {
+      "classification": "breaking",
+      "construct": "anyOf",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/Thread/properties/section"
+    },
+    {
+      "classification": "breaking",
+      "construct": "anyOf",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/ThreadItem/oneOf/14/properties/failure"
+    },
+    {
+      "classification": "breaking",
+      "construct": "anyOf",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/ThreadItem/oneOf/2/properties/delivery"
+    },
+    {
+      "classification": "breaking",
+      "construct": "anyOf",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/ThreadSection/properties/appearance"
+    },
+    {
+      "classification": "breaking",
+      "construct": "enum",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "definitions/ThreadUnsubscribeStatus"
+    },
+    {
+      "classification": "breaking",
+      "construct": "anyOf",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "roots/server_request.command_execution.request_approval.params/properties/additionalPermissions"
+    },
+    {
+      "classification": "breaking",
+      "construct": "anyOf",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "roots/server_request.command_execution.request_approval.params/properties/cwd"
+    },
+    {
+      "classification": "breaking",
+      "construct": "anyOf",
+      "fallbackEvidence": "incoming_closed_union_additions_are_breaking",
+      "handling": "promotion-blocking",
+      "kind": "incoming_construct_added",
+      "path": "roots/server_request.command_execution.request_approval.params/properties/networkApprovalContext"
+    },
+    {
+      "classification": "breaking",
+      "kind": "optional_property_added",
+      "path": "roots/initialize.params/definitions/InitializeCapabilities/properties/extensions"
+    },
+    {
+      "classification": "breaking",
+      "kind": "optional_property_added",
+      "path": "roots/notification.item.completed/definitions/ThreadItem/oneOf/14/properties/failure"
+    },
+    {
+      "classification": "breaking",
+      "kind": "optional_property_added",
+      "path": "roots/notification.item.completed/definitions/ThreadItem/oneOf/14/properties/transparentBackground"
+    },
+    {
+      "classification": "breaking",
+      "kind": "optional_property_added",
+      "path": "roots/notification.item.completed/definitions/ThreadItem/oneOf/2/properties/delivery"
+    },
+    {
+      "classification": "breaking",
+      "kind": "optional_property_added",
+      "path": "roots/notification.item.completed/definitions/ThreadItem/oneOf/7/properties/readOnlyHint"
+    },
+    {
+      "classification": "breaking",
+      "kind": "optional_property_added",
+      "path": "roots/notification.thread.started/definitions/Thread/properties/section"
+    },
+    {
+      "classification": "breaking",
+      "kind": "optional_property_added",
+      "path": "roots/notification.thread.started/definitions/Thread/properties/sectionEnteredAt"
+    },
+    {
+      "classification": "breaking",
+      "kind": "optional_property_added",
+      "path": "roots/thread.list.params/properties/projectId"
+    },
+    {
+      "classification": "breaking",
+      "kind": "optional_property_added",
+      "path": "roots/thread.list.params/properties/sectionId"
+    },
+    {
+      "classification": "breaking",
+      "kind": "optional_property_added",
+      "path": "roots/thread.resume.params/definitions/ResponseItem/oneOf/4/properties/encrypted_function_args"
+    },
+    {
+      "classification": "breaking",
+      "kind": "optional_property_added",
+      "path": "roots/thread.start.params/properties/projectId"
+    },
+    {
+      "classification": "breaking",
+      "kind": "property_removed",
+      "path": "roots/notification.thread.started/definitions/Thread/properties/isPinned"
+    },
+    {
+      "classification": "breaking",
+      "kind": "property_removed",
+      "path": "roots/thread.list.params/properties/isPinned"
+    },
+    {
+      "classification": "breaking",
+      "kind": "reference_changed",
+      "path": "roots/notification.item.completed/definitions/CommandAction/oneOf/0/properties/path"
+    },
+    {
+      "classification": "breaking",
+      "kind": "required_property_added",
+      "path": "roots/notification.thread.started/definitions/Thread/properties/projectId"
+    }
+  ],
+  "compatible": false,
+  "formatVersion": 1,
+  "protocolFamily": "codex-app-server-jsonrpc/v1+v2-experimental",
+  "summary": {
+    "additive": 33,
+    "breaking": 61,
+    "total": 94
+  }
+}

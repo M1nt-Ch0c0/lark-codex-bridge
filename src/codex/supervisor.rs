@@ -20,10 +20,12 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     codex::{
         client::AppServerClient,
+        compat::WireAdapter,
         process::{CodexProcess, CodexProcessConfig, ProcessError, ProcessExit, spawn_app_server},
-        rpc::{ConnectionEpoch, RpcError, initialize_connection, spawn_rpc},
+        rpc::{ConnectionEpoch, RpcError, initialize_connection_with_dynamic_tools, spawn_rpc},
         transport::spawn_stream_transport,
         types::InitializeResult,
+        wire::SUPPORTED_CODEX_VERSIONS,
     },
     limits::SUPERVISOR_SHUTDOWN_GRACE,
 };
@@ -487,6 +489,33 @@ async fn run_supervisor(
 }
 
 fn publish(state_tx: &watch::Sender<SupervisorState>, state: SupervisorState) {
+    match &state {
+        SupervisorState::Starting { epoch } => {
+            tracing::info!(epoch, "Codex supervisor epoch starting");
+        }
+        SupervisorState::Ready { epoch, version, .. } => {
+            tracing::info!(epoch, version = %version, "Codex supervisor epoch ready");
+        }
+        SupervisorState::Backoff {
+            epoch,
+            attempt,
+            delay,
+        } => {
+            tracing::warn!(
+                epoch,
+                attempt,
+                delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                "Codex supervisor retry backoff"
+            );
+        }
+        SupervisorState::Degraded { .. } => {
+            // The operator-facing state may carry an actionable local error,
+            // including a configured path. Terminal tracing keeps only the
+            // static lifecycle classification.
+            tracing::warn!("Codex supervisor degraded");
+        }
+        SupervisorState::Stopped => tracing::info!("Codex supervisor stopped"),
+    }
     let _ = state_tx.send(state);
 }
 
@@ -497,6 +526,14 @@ async fn connect_epoch(
     shutdown: &CancellationToken,
 ) -> Result<RunningEpoch, EpochStartError> {
     let version = process.version().clone();
+    let Some(wire) = WireAdapter::for_version(&version) else {
+        return Err(EpochStartError {
+            process,
+            permanent: Some(format!(
+                "Codex {version} has no promoted wire compatibility adapter"
+            )),
+        });
+    };
     let stdio = match process.take_stdio() {
         Ok(stdio) => stdio,
         Err(error) => {
@@ -510,7 +547,7 @@ async fn connect_epoch(
         spawn_stream_transport(stdio.stdout, stdio.stdin, stdio.stderr, shutdown.clone());
     let mut connection = spawn_rpc(transport, ConnectionEpoch::new(epoch), shutdown.clone());
     let handle = connection.handle.clone();
-    let initialize = match initialize_connection(&handle).await {
+    let initialize = match initialize_connection_with_dynamic_tools(&handle, wire).await {
         Ok(initialize) => initialize,
         Err(error) => {
             let _ = connection.shutdown().await;
@@ -521,7 +558,7 @@ async fn connect_epoch(
         }
     };
     let peer = PeerInfo::from(&initialize);
-    let client = Arc::new(AppServerClient::spawn(connection));
+    let client = Arc::new(AppServerClient::spawn(connection, wire));
     Ok(RunningEpoch {
         process,
         client,
@@ -536,9 +573,7 @@ fn permanent_process_reason(error: &ProcessError) -> Option<String> {
         ProcessError::InvalidCodexHome { .. } => {
             Some("configured Codex home must be an existing directory".to_owned())
         }
-        ProcessError::Spawn { binary, .. } => {
-            Some(format!("unable to run Codex binary {}", binary.display()))
-        }
+        ProcessError::Spawn { .. } => Some("unable to run Codex binary".to_owned()),
         ProcessError::ProbeFailed { code } => Some(format!(
             "Codex version probe exited unsuccessfully (code: {code:?})"
         )),
@@ -549,7 +584,8 @@ fn permanent_process_reason(error: &ProcessError) -> Option<String> {
             Some("Codex version output must exactly match `codex-cli X.Y.Z`".to_owned())
         }
         ProcessError::UnsupportedVersion { found } => Some(format!(
-            "Codex {found} is unsupported; expected >=0.146.0,<0.147.0"
+            "Codex {found} is unsupported; expected an exact reviewed version ({})",
+            SUPPORTED_CODEX_VERSIONS.join(", ")
         )),
         ProcessError::ProbeTimeout(_)
         | ProcessError::ProbeIo { .. }

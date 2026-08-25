@@ -1,12 +1,19 @@
 use std::{fmt, io, sync::Arc, time::Duration};
 
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
     task::JoinHandle,
-    time::Instant,
+    time::{Instant, timeout},
+};
+use tokio_tungstenite::{
+    WebSocketStream,
+    tungstenite::{
+        Error as WebSocketError, Message,
+        protocol::{CloseFrame, frame::coding::CloseCode},
+    },
 };
 use tokio_util::{
     codec::{FramedRead, LinesCodec, LinesCodecError},
@@ -16,8 +23,10 @@ use tokio_util::{
 use crate::{
     codex::protocol::{InboundMessage, OutboundMessage, ProtocolError, decode_line, encode_line},
     limits::{
-        EVENT_CAPACITY, HIGH_PRIORITY_BURST, MAX_JSONL_LINE_BYTES, MAX_STDERR_LINE_BYTES,
-        RPC_HIGH_CAPACITY, RPC_NORMAL_CAPACITY, TRANSPORT_BYTE_BUDGET, TRANSPORT_HIGH_BYTE_BUDGET,
+        EVENT_CAPACITY, EXTERNAL_WS_CLOSE_TIMEOUT, EXTERNAL_WS_IO_TIMEOUT,
+        EXTERNAL_WS_MESSAGE_BYTES, HIGH_PRIORITY_BURST, MAX_JSONL_LINE_BYTES,
+        MAX_STDERR_LINE_BYTES, RPC_HIGH_CAPACITY, RPC_NORMAL_CAPACITY, TRANSPORT_BYTE_BUDGET,
+        TRANSPORT_HIGH_BYTE_BUDGET,
     },
 };
 
@@ -50,6 +59,8 @@ pub enum TransportEvent {
     WriteError(TransportIoError),
     StdoutEof,
     StderrLine { byte_len: usize },
+    WebSocketClosed(WebSocketCloseReport),
+    ConnectionError,
     Cancelled,
 }
 
@@ -82,7 +93,31 @@ pub enum TransportExit {
     ProtocolViolation,
     ReadError(io::ErrorKind),
     WriteError(io::ErrorKind),
+    WebSocketClosed(WebSocketCloseReport),
+    ConnectionFailed,
+    Aborted,
     TaskFailed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WebSocketCloseInitiator {
+    Local,
+    Peer,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WebSocketCloseHandshake {
+    Complete,
+    Incomplete,
+}
+
+/// Content-free WebSocket close evidence. A missing code is kept distinct from an abnormal 1006
+/// observation, and remote close reasons are never retained.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WebSocketCloseReport {
+    pub initiator: WebSocketCloseInitiator,
+    pub handshake: WebSocketCloseHandshake,
+    pub code: Option<u16>,
 }
 
 #[derive(Debug, Error)]
@@ -264,6 +299,9 @@ impl TransportHandle {
 impl Drop for TransportHandle {
     fn drop(&mut self) {
         self.cancellation.cancel();
+        if let Some(driver) = &self.driver {
+            driver.abort();
+        }
     }
 }
 
@@ -322,6 +360,366 @@ where
         cancellation,
         driver: Some(driver),
         exit: None,
+    }
+}
+
+/// Starts a bounded text-frame WebSocket transport. The socket is the only external resource this
+/// owner can close; the type graph contains no process factory, child, PID, wait, or signal handle.
+#[must_use]
+pub fn spawn_websocket_transport<S>(
+    socket: WebSocketStream<S>,
+    parent_cancellation: CancellationToken,
+) -> TransportHandle
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let cancellation = parent_cancellation.child_token();
+    drop(parent_cancellation);
+    let outbound_high_budget = Arc::new(Semaphore::new(TRANSPORT_HIGH_BYTE_BUDGET));
+    let outbound_normal_budget = Arc::new(Semaphore::new(TRANSPORT_BYTE_BUDGET));
+    let inbound_budget = Arc::new(Semaphore::new(TRANSPORT_BYTE_BUDGET));
+    let (high_tx, high_rx) = mpsc::channel(RPC_HIGH_CAPACITY);
+    let (normal_tx, normal_rx) = mpsc::channel(RPC_NORMAL_CAPACITY);
+    let (event_tx, event_rx) = mpsc::channel(EVENT_CAPACITY);
+    let (terminal_tx, terminal_rx) = oneshot::channel();
+    let driver_cancel = cancellation.clone();
+    let driver = tokio::spawn(drive_websocket(
+        socket,
+        high_rx,
+        normal_rx,
+        event_tx,
+        inbound_budget,
+        terminal_tx,
+        driver_cancel,
+    ));
+
+    TransportHandle {
+        high_tx: TransportSender {
+            tx: high_tx,
+            budget: outbound_high_budget,
+            cancellation: cancellation.clone(),
+        },
+        normal_tx: TransportSender {
+            tx: normal_tx,
+            budget: outbound_normal_budget,
+            cancellation: cancellation.clone(),
+        },
+        events: TransportEventReceiver {
+            rx: event_rx,
+            terminal_rx: Some(terminal_rx),
+            normal_closed: false,
+        },
+        cancellation,
+        driver: Some(driver),
+        exit: None,
+    }
+}
+
+enum WebSocketAction {
+    Cancel,
+    Inbound(Option<Result<Message, WebSocketError>>),
+    Outbound(Option<(QueuedFrame, bool)>),
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
+async fn drive_websocket<S>(
+    mut socket: WebSocketStream<S>,
+    mut high_rx: mpsc::Receiver<QueuedFrame>,
+    mut normal_rx: mpsc::Receiver<QueuedFrame>,
+    event_tx: mpsc::Sender<InternalEvent>,
+    inbound_budget: Arc<Semaphore>,
+    terminal_tx: oneshot::Sender<TransportEvent>,
+    cancellation: CancellationToken,
+) -> TransportExit
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut high_burst = 0_usize;
+    let (exit, terminal) = loop {
+        let outbound = receive_websocket_outbound(&mut high_rx, &mut normal_rx, high_burst);
+        tokio::pin!(outbound);
+        let action = tokio::select! {
+            () = cancellation.cancelled() => WebSocketAction::Cancel,
+            inbound = socket.next() => WebSocketAction::Inbound(inbound),
+            outbound = &mut outbound => WebSocketAction::Outbound(outbound),
+        };
+        match action {
+            WebSocketAction::Cancel | WebSocketAction::Outbound(None) => {
+                let report = close_websocket(&mut socket).await;
+                break (
+                    TransportExit::WebSocketClosed(report),
+                    TransportEvent::WebSocketClosed(report),
+                );
+            }
+            WebSocketAction::Outbound(Some((frame, high))) => {
+                if high {
+                    high_burst = high_burst.saturating_add(1);
+                } else {
+                    high_burst = 0;
+                }
+                if let Err(error) = send_websocket_frame(&mut socket, frame).await {
+                    break websocket_error_terminal(&error, WebSocketCloseInitiator::Local);
+                }
+            }
+            WebSocketAction::Inbound(Some(Ok(Message::Text(text)))) => {
+                if text.len() > EXTERNAL_WS_MESSAGE_BYTES {
+                    break protocol_terminal(ProtocolError::LineTooLong {
+                        length: text.len(),
+                        maximum: EXTERNAL_WS_MESSAGE_BYTES,
+                    });
+                }
+                let message = match decode_line(text.as_bytes()) {
+                    Ok(message) => message,
+                    Err(error) => break protocol_terminal(error),
+                };
+                let weight = text.len().max(message.retained_memory_weight());
+                if weight > TRANSPORT_BYTE_BUDGET {
+                    break protocol_terminal(ProtocolError::RetainedMessageTooLarge {
+                        maximum: TRANSPORT_BYTE_BUDGET,
+                    });
+                }
+                let permit = tokio::select! {
+                    () = cancellation.cancelled() => {
+                        let report = close_websocket(&mut socket).await;
+                        break (
+                            TransportExit::WebSocketClosed(report),
+                            TransportEvent::WebSocketClosed(report),
+                        );
+                    }
+                    permit = Arc::clone(&inbound_budget).acquire_many_owned(byte_permits(weight)) => {
+                        match permit {
+                            Ok(permit) => permit,
+                            Err(_) => break (
+                                TransportExit::ConnectionFailed,
+                                TransportEvent::ConnectionError,
+                            ),
+                        }
+                    }
+                };
+                let event = InternalEvent {
+                    event: TransportEvent::Message(BudgetedInboundMessage {
+                        message,
+                        budget: permit,
+                    }),
+                };
+                if !send_event(&event_tx, event, &cancellation).await {
+                    let report = close_websocket(&mut socket).await;
+                    break (
+                        TransportExit::WebSocketClosed(report),
+                        TransportEvent::WebSocketClosed(report),
+                    );
+                }
+            }
+            WebSocketAction::Inbound(Some(Ok(Message::Binary(_) | Message::Frame(_)))) => {
+                break protocol_terminal(ProtocolError::InvalidEnvelope(
+                    "external WebSocket accepts text RPC frames only",
+                ));
+            }
+            WebSocketAction::Inbound(Some(Ok(Message::Ping(payload)))) => {
+                let result =
+                    timeout(EXTERNAL_WS_IO_TIMEOUT, socket.send(Message::Pong(payload))).await;
+                if !matches!(result, Ok(Ok(()))) {
+                    break (
+                        TransportExit::ConnectionFailed,
+                        TransportEvent::ConnectionError,
+                    );
+                }
+            }
+            WebSocketAction::Inbound(Some(Ok(Message::Pong(_)))) => {}
+            WebSocketAction::Inbound(Some(Ok(Message::Close(frame)))) => {
+                let code = frame.map(|frame| u16::from(frame.code));
+                let _ = timeout(EXTERNAL_WS_IO_TIMEOUT, socket.flush()).await;
+                let report = WebSocketCloseReport {
+                    initiator: WebSocketCloseInitiator::Peer,
+                    handshake: WebSocketCloseHandshake::Complete,
+                    code,
+                };
+                break (
+                    TransportExit::WebSocketClosed(report),
+                    TransportEvent::WebSocketClosed(report),
+                );
+            }
+            WebSocketAction::Inbound(Some(Err(error))) => {
+                break websocket_error_terminal(&error, WebSocketCloseInitiator::Peer);
+            }
+            WebSocketAction::Inbound(None) => {
+                let report = WebSocketCloseReport {
+                    initiator: WebSocketCloseInitiator::Peer,
+                    handshake: WebSocketCloseHandshake::Incomplete,
+                    code: None,
+                };
+                break (
+                    TransportExit::WebSocketClosed(report),
+                    TransportEvent::WebSocketClosed(report),
+                );
+            }
+        }
+    };
+    cancellation.cancel();
+    high_rx.close();
+    normal_rx.close();
+    let _ = terminal_tx.send(terminal);
+    exit
+}
+
+async fn receive_websocket_outbound(
+    high_rx: &mut mpsc::Receiver<QueuedFrame>,
+    normal_rx: &mut mpsc::Receiver<QueuedFrame>,
+    high_burst: usize,
+) -> Option<(QueuedFrame, bool)> {
+    if high_burst >= HIGH_PRIORITY_BURST {
+        tokio::select! {
+            biased;
+            frame = normal_rx.recv() => frame.map(|frame| (frame, false)),
+            frame = high_rx.recv() => frame.map(|frame| (frame, true)),
+        }
+    } else {
+        tokio::select! {
+            biased;
+            frame = high_rx.recv() => frame.map(|frame| (frame, true)),
+            frame = normal_rx.recv() => frame.map(|frame| (frame, false)),
+        }
+    }
+}
+
+async fn send_websocket_frame<S>(
+    socket: &mut WebSocketStream<S>,
+    mut frame: QueuedFrame,
+) -> Result<(), WebSocketError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if frame.bytes.last() == Some(&b'\n') {
+        frame.bytes.pop();
+    }
+    let Ok(text) = String::from_utf8(frame.bytes) else {
+        if let Some(written) = frame.written {
+            let _ = written.send(Err(TransportIoError {
+                kind: io::ErrorKind::InvalidData,
+            }));
+        }
+        return Err(WebSocketError::Utf8(
+            "outbound RPC was not UTF-8".to_owned(),
+        ));
+    };
+    let result = timeout(
+        EXTERNAL_WS_IO_TIMEOUT,
+        socket.send(Message::Text(text.into())),
+    )
+    .await
+    .map_err(|_| WebSocketError::Io(io::Error::new(io::ErrorKind::TimedOut, "write timeout")))?;
+    match result {
+        Ok(()) => {
+            if let Some(written) = frame.written {
+                let _ = written.send(Ok(()));
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if let Some(written) = frame.written {
+                let _ = written.send(Err(TransportIoError {
+                    kind: io::ErrorKind::BrokenPipe,
+                }));
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn close_websocket<S>(socket: &mut WebSocketStream<S>) -> WebSocketCloseReport
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let frame = CloseFrame {
+        code: CloseCode::Normal,
+        reason: "".into(),
+    };
+    if !matches!(
+        timeout(
+            EXTERNAL_WS_IO_TIMEOUT,
+            socket.send(Message::Close(Some(frame)))
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
+        return WebSocketCloseReport {
+            initiator: WebSocketCloseInitiator::Local,
+            handshake: WebSocketCloseHandshake::Incomplete,
+            code: None,
+        };
+    }
+    let peer = timeout(EXTERNAL_WS_CLOSE_TIMEOUT, async {
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Close(frame))) => {
+                    return Some(frame.map(|frame| u16::from(frame.code)));
+                }
+                Some(Ok(Message::Ping(payload))) => {
+                    if socket.send(Message::Pong(payload)).await.is_err() {
+                        return None;
+                    }
+                }
+                Some(Ok(Message::Pong(_) | Message::Text(_) | Message::Binary(_))) => {}
+                Some(Err(WebSocketError::ConnectionClosed)) => return Some(None),
+                Some(Ok(Message::Frame(_)) | Err(_)) | None => return None,
+            }
+        }
+    })
+    .await;
+    match peer {
+        Ok(Some(code)) => WebSocketCloseReport {
+            initiator: WebSocketCloseInitiator::Local,
+            handshake: WebSocketCloseHandshake::Complete,
+            code,
+        },
+        Ok(None) | Err(_) => WebSocketCloseReport {
+            initiator: WebSocketCloseInitiator::Local,
+            handshake: WebSocketCloseHandshake::Incomplete,
+            code: None,
+        },
+    }
+}
+
+fn protocol_terminal(error: ProtocolError) -> (TransportExit, TransportEvent) {
+    (
+        TransportExit::ProtocolViolation,
+        TransportEvent::ProtocolError(error),
+    )
+}
+
+fn websocket_error_terminal(
+    error: &WebSocketError,
+    initiator: WebSocketCloseInitiator,
+) -> (TransportExit, TransportEvent) {
+    match error {
+        WebSocketError::ConnectionClosed => {
+            let report = WebSocketCloseReport {
+                initiator,
+                handshake: WebSocketCloseHandshake::Complete,
+                code: None,
+            };
+            (
+                TransportExit::WebSocketClosed(report),
+                TransportEvent::WebSocketClosed(report),
+            )
+        }
+        WebSocketError::Capacity(_)
+        | WebSocketError::Protocol(_)
+        | WebSocketError::Utf8(_)
+        | WebSocketError::AttackAttempt => protocol_terminal(ProtocolError::InvalidEnvelope(
+            "external WebSocket framing violated protocol policy",
+        )),
+        WebSocketError::AlreadyClosed
+        | WebSocketError::Io(_)
+        | WebSocketError::Tls(_)
+        | WebSocketError::WriteBufferFull(_)
+        | WebSocketError::Url(_)
+        | WebSocketError::Http(_)
+        | WebSocketError::HttpFormat(_) => (
+            TransportExit::ConnectionFailed,
+            TransportEvent::ConnectionError,
+        ),
     }
 }
 
@@ -607,4 +1005,53 @@ enum ReaderExit {
 enum WriterExit {
     Cancelled,
     Write(TransportIoError),
+}
+
+#[cfg(test)]
+mod websocket_queue_tests {
+    use super::*;
+
+    async fn queued(marker: u8) -> QueuedFrame {
+        let budget = Arc::new(Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .expect("test byte permit is available");
+        QueuedFrame {
+            bytes: vec![marker],
+            _budget: budget,
+            written: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_queues_prioritize_high_with_a_normal_starvation_bound() {
+        let (high_tx, mut high_rx) = mpsc::channel(16);
+        let (normal_tx, mut normal_rx) = mpsc::channel(2);
+        normal_tx
+            .send(queued(b'n').await)
+            .await
+            .expect("normal frame queues");
+        for marker in b'a'..=b'i' {
+            high_tx
+                .send(queued(marker).await)
+                .await
+                .expect("high frame queues");
+        }
+
+        let mut high_burst = 0;
+        for expected in b'a'..=b'h' {
+            let (frame, high) =
+                receive_websocket_outbound(&mut high_rx, &mut normal_rx, high_burst)
+                    .await
+                    .expect("queued frame is selected");
+            assert!(high);
+            assert_eq!(frame.bytes, vec![expected]);
+            high_burst = high_burst.saturating_add(1);
+        }
+        let (normal, high) = receive_websocket_outbound(&mut high_rx, &mut normal_rx, high_burst)
+            .await
+            .expect("normal starvation bound selects a frame");
+        assert!(!high);
+        assert_eq!(normal.bytes, vec![b'n']);
+    }
 }

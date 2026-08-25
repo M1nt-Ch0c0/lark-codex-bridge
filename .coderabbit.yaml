@@ -1,0 +1,15 @@
+# CodeRabbit AI 代码审查配置（PR 自动触发，中文评论）。
+# 官方文档: https://docs.coderabbit.ai/reference/configuration
+language: zh-CN
+
+reviews:
+  # assertive: 反馈最全（对本仓库 clippy pedantic / -D warnings 的门禁文化比较合适）;
+  # 觉得太啰嗦可改为 chill 或 quiet。
+  profile: assertive
+  # 在 PR 描述/走查中生成变更高级摘要。
+  high_level_summary: true
+  # 审查被跳过时在 walkthrough 里贴状态说明。
+  review_status: true
+  auto_review:
+    enabled: true
+    drafts: false

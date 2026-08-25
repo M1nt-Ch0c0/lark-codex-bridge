@@ -16,7 +16,7 @@
 //!   timer);
 //! - duplicate `seq`, missing/`seq >= sum`, `sum == 0`, and a conflicting
 //!   `sum` for an in-flight `message_id` are rejected and logged as protocol
-//!   anomalies with IDs only — never payload bytes.
+//!   anomalies with static classifications only — never IDs or payload bytes.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -159,7 +159,7 @@ impl Reassembler {
     ///
     /// Returns a [`ReassemblyError`] for protocol anomalies (duplicate,
     /// out-of-range, expired) and for bound violations; every rejection is
-    /// logged with the `message_id`/`trace_id` only.
+    /// logged with only a static classification.
     ///
     /// # Panics
     ///
@@ -174,12 +174,7 @@ impl Reassembler {
         let message_id = headers.message_id().unwrap_or_default();
         let trace_id = headers.trace_id().map(str::to_owned);
         let reject = |error: ReassemblyError| {
-            tracing::warn!(
-                message_id,
-                trace_id = trace_id.as_deref().unwrap_or(""),
-                kind = error.as_str(),
-                "lark fragment rejected"
-            );
+            tracing::warn!(kind = error.as_str(), "lark fragment rejected");
             error
         };
 
@@ -290,10 +285,8 @@ impl Reassembler {
             .entries
             .iter()
             .filter(|(_, entry)| now.duration_since(entry.created) > LARK_FRAGMENT_TTL)
-            .map(|(message_id, entry)| {
+            .map(|(message_id, _entry)| {
                 tracing::warn!(
-                    message_id = message_id.as_str(),
-                    trace_id = entry.trace_id.as_deref().unwrap_or(""),
                     kind = ReassemblyError::Expired.as_str(),
                     "lark fragment message expired"
                 );

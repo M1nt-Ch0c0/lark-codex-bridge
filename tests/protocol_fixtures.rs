@@ -19,6 +19,19 @@ const ITEM_COMPLETED: &[u8] = include_bytes!("fixtures/codex/item_completed.json
 const TURN_COMPLETED: &[u8] = include_bytes!("fixtures/codex/turn_completed.json");
 
 #[test]
+fn sandbox_debug_redacts_writable_workspace_paths() {
+    let policy = TurnSandboxPolicy::WorkspaceWrite {
+        writable_roots: vec!["/sensitive/customer/workspace".into()],
+        network_access: false,
+        exclude_slash_tmp: true,
+        exclude_tmpdir_env_var: true,
+    };
+    let debug = format!("{policy:?}");
+    assert!(!debug.contains("/sensitive/customer"));
+    assert!(debug.contains("writable_root_count"));
+}
+
+#[test]
 fn decodes_string_and_integer_response_ids() {
     let initialized = decode_line(INITIALIZE_RESPONSE).expect("initialize fixture should decode");
     match initialized {

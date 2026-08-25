@@ -2,21 +2,26 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::task::{Context, Poll, Waker};
 
-use lark_codex_bridge::lark::api::ChatMode;
+use lark_codex_bridge::lark::api::{ChatMode, ResourceKind};
 use lark_codex_bridge::lark::config::TenantBrand;
 use lark_codex_bridge::lark::credentials::LarkCredentials;
-use lark_codex_bridge::lark::normalize::{InboundEvent, ScopeKey};
+use lark_codex_bridge::lark::normalize::{
+    InboundEvent, MediaMetadata, MediaPart, MentionIdentity, MessagePart, PartStatus, ResourceDesc,
+    ScopeKey, TranscriptFailure,
+};
 use lark_codex_bridge::limits::{
-    STORE_OUTBOX_CLAIM_MAX_BYTES, STORE_OUTBOX_MAX_QUEUED_BYTES, STORE_OUTBOX_PAYLOAD_MAX_BYTES,
-    STORE_RECOVERY_TURN_MAX_BYTES, STORE_RECOVERY_TURN_MAX_ROWS, STORE_REQUEST_MAX_BYTES,
-    STORE_WRITER_BYTE_BUDGET, STORE_WRITER_CAPACITY,
+    OUTBOX_TERMINAL_MAX_ROWS, STORE_ATTACHMENT_LEASE_MAX_ROWS, STORE_OUTBOX_CLAIM_MAX_BYTES,
+    STORE_OUTBOX_MAX_QUEUED_BYTES, STORE_OUTBOX_PAYLOAD_MAX_BYTES, STORE_RECOVERY_TURN_MAX_BYTES,
+    STORE_RECOVERY_TURN_MAX_ROWS, STORE_REQUEST_MAX_BYTES, STORE_WRITER_BYTE_BUDGET,
+    STORE_WRITER_CAPACITY,
 };
 use lark_codex_bridge::runtime::intake::DurableIntake;
 use lark_codex_bridge::runtime::intake::TenantNamespace;
 use lark_codex_bridge::store::{
     BeginTurnOutcome, DedupOutcome, InboundDisposition, InboundEventState, InboundKey,
     InboundRejectionKind, InboundTerminal, NewOutboxRow, NewTurnRow, OutboxEnqueue, OutboxState,
-    ResolveTurnOutcome, StoreError, StoreHandle, TurnResolution, TurnState,
+    ResolveTurnOutcome, ScopeRow, StoreError, StoreHandle, ThreadRow, ThreadStatus, TurnResolution,
+    TurnRow, TurnState,
 };
 use secrecy::SecretString;
 use tempfile::tempdir;
@@ -34,6 +39,9 @@ fn event(event_id: &str, message_id: &str) -> InboundEvent {
         text: "not persisted".to_owned(),
         mentions_bot: true,
         mention_all: false,
+        sender_is_human: true,
+        mentions: Vec::new(),
+        parts: Vec::new(),
         resources: Vec::new(),
         message_type: "text".to_owned(),
         create_time_ms: 1,
@@ -62,6 +70,50 @@ fn turn(message_id: &str, state: TurnState) -> NewTurnRow {
 
 fn tenant_namespace(app_id: &str) -> TenantNamespace {
     TenantNamespace::from_credentials(&credentials_for(app_id))
+}
+
+fn assert_sqlite_files_exclude(path: &std::path::Path, sentinels: &[&str]) {
+    let file_name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .expect("test database filename");
+    for suffix in ["", "-wal", "-shm"] {
+        let candidate = path.with_file_name(format!("{file_name}{suffix}"));
+        let Ok(bytes) = std::fs::read(&candidate) else {
+            continue;
+        };
+        for sentinel in sentinels {
+            assert!(
+                !bytes
+                    .windows(sentinel.len())
+                    .any(|window| window == sentinel.as_bytes()),
+                "SQLite file {} retained a forbidden plaintext sentinel",
+                candidate.display()
+            );
+        }
+    }
+}
+
+fn downgrade_attachment_lease_schema_to_v5(connection: &rusqlite::Connection) {
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP INDEX attachment_leases_sha256;
+             DROP INDEX attachment_leases_turn;
+             ALTER TABLE attachment_leases RENAME TO attachment_leases_v7;
+             CREATE TABLE attachment_leases (
+                 sha256 TEXT NOT NULL,
+                 turn_row_id INTEGER NOT NULL,
+                 created_ms INTEGER NOT NULL,
+                 PRIMARY KEY (sha256, turn_row_id),
+                 FOREIGN KEY (sha256) REFERENCES attachments (sha256) ON DELETE CASCADE,
+                 FOREIGN KEY (turn_row_id) REFERENCES turns (id) ON DELETE CASCADE
+             );
+             INSERT INTO attachment_leases (sha256, turn_row_id, created_ms)
+             SELECT sha256, turn_row_id, created_ms FROM attachment_leases_v7;
+             DROP TABLE attachment_leases_v7;",
+        )
+        .expect("downgrade lease table to v5 shape");
 }
 
 fn credentials_for(app_id: &str) -> LarkCredentials {
@@ -229,10 +281,19 @@ async fn migration_two_persists_strict_inbound_payload_columns() {
     let temp = tempdir().expect("tempdir");
     let path = temp.path().join("store.sqlite");
     let store = StoreHandle::open(&path).await.expect("open");
-    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 2);
+    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 10);
     store.shutdown().await.expect("shutdown");
 
     let connection = rusqlite::Connection::open(&path).expect("inspect");
+    let obsolete_cursor_tables: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'attachment_scan_cursor'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("inspect obsolete attachment cursor");
+    assert_eq!(obsolete_cursor_tables, 0);
     let inbound_columns = connection
         .prepare("PRAGMA table_info(inbound_events)")
         .expect("prepare inbound columns")
@@ -335,6 +396,397 @@ async fn registration_replays_canonical_payload_and_atomic_turn_resolution() {
 }
 
 #[tokio::test]
+async fn extended_inbound_payload_v1_round_trips_mentions_parts_and_metadata() {
+    let store = StoreHandle::open_in_memory().await.expect("open");
+    let tenant = tenant_namespace("cli_store_rich_v2");
+    let mut rich = event("event-rich", "message-rich");
+    rich.message_type = "audio".to_owned();
+    rich.text.clear();
+    rich.mentions = vec![MentionIdentity {
+        key: Some("@_user_1".to_owned()),
+        open_id: Some("ou_mentioned".to_owned()),
+        user_id: Some("user_mentioned".to_owned()),
+        union_id: Some("on_mentioned".to_owned()),
+        name: Some("Mentioned User".to_owned()),
+    }];
+    rich.parts = vec![MessagePart::Audio(MediaPart {
+        key: Some("file_audio".to_owned()),
+        thumbnail_key: None,
+        metadata: MediaMetadata {
+            file_name: Some("voice.opus".to_owned()),
+            mime_type: Some("audio/opus".to_owned()),
+            size_bytes: Some(123),
+            duration_ms: Some(456),
+            transcript_failure: None,
+        },
+        status: PartStatus::Available,
+    })];
+    store
+        .register_inbound(&tenant, &rich)
+        .await
+        .expect("register rich event");
+    let replay = store
+        .register_inbound(&tenant, &rich)
+        .await
+        .expect("replay rich event");
+    let DedupOutcome::ReplayReceived(retained) = replay else {
+        panic!("expected retained rich event");
+    };
+    assert_eq!(retained.event().mentions, rich.mentions);
+    assert_eq!(retained.event().parts, rich.parts);
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn sqlite_and_wal_never_receive_plaintext_resource_keys() {
+    const KEY: &str = "issue20_key_sentinel_5aa85c7131";
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("privacy.sqlite");
+    let tenant = tenant_namespace("cli_store_privacy_sentinel");
+    let store = StoreHandle::open(&path).await.expect("open");
+    let mut rich = event("event-private-media", "message-private-media");
+    rich.message_type = "audio".to_owned();
+    rich.text.clear();
+    rich.parts = vec![MessagePart::Audio(MediaPart {
+        key: Some(KEY.to_owned()),
+        thumbnail_key: None,
+        metadata: MediaMetadata::default(),
+        status: PartStatus::Available,
+    })];
+    rich.resources = vec![ResourceDesc {
+        kind: ResourceKind::File,
+        key: KEY.to_owned(),
+    }];
+
+    let retained = store
+        .register_inbound(&tenant, &rich)
+        .await
+        .expect("register private media");
+    let DedupOutcome::New(retained) = retained else {
+        panic!("new private media row")
+    };
+    assert_eq!(
+        retained.event(),
+        &rich,
+        "live path keeps in-memory capability"
+    );
+    assert_sqlite_files_exclude(&path, &[KEY]);
+
+    let begun = store
+        .begin_turn_and_claim_inbound(
+            turn("privacy-turn", TurnState::Starting),
+            &[InboundKey::new(
+                tenant.clone(),
+                "event-private-media".to_owned(),
+            )],
+        )
+        .await
+        .expect("claim secret-free descriptor");
+    let BeginTurnOutcome::Started {
+        turn_row_id,
+        claimed,
+        ..
+    } = begun
+    else {
+        panic!("privacy turn starts")
+    };
+    assert!(matches!(
+        claimed[0].retained.event().parts.as_slice(),
+        [MessagePart::Audio(MediaPart {
+            key: None,
+            status: PartStatus::Unavailable,
+            ..
+        })]
+    ));
+    assert_sqlite_files_exclude(&path, &[KEY]);
+
+    store
+        .resolve_turn_and_finish_inbound_batch(
+            turn_row_id,
+            TurnResolution::Failed,
+            InboundTerminal::Rejected,
+        )
+        .await
+        .expect("terminalize privacy row");
+    assert_sqlite_files_exclude(&path, &[KEY]);
+    store.shutdown().await.expect("shutdown");
+    assert_sqlite_files_exclude(&path, &[KEY]);
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn v5_upgrade_scrubs_historical_plaintext_from_database_and_wal_pages() {
+    const KEY: &str = "issue20_upgrade_key_sentinel_d415f82";
+    const TRANSCRIPT: &str = "issue20_upgrade_transcript_sentinel_f0cc31";
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("privacy-upgrade.sqlite");
+    let tenant = tenant_namespace("cli_store_privacy_upgrade");
+    let store = StoreHandle::open(&path).await.expect("seed store");
+    store
+        .register_inbound(
+            &tenant,
+            &event("event-private-upgrade", "message-private-upgrade"),
+        )
+        .await
+        .expect("seed row");
+    store.shutdown().await.expect("shutdown seed");
+
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "event_id": "event-private-upgrade",
+        "message_id": "message-private-upgrade",
+        "chat_id": "oc_test",
+        "sender_id": "ou_test",
+        "chat_type": "group",
+        "thread_id": null,
+        "root_id": null,
+        "reply_to_message_id": null,
+        "text": "",
+        "mentions_bot": true,
+        "mention_all": false,
+        "sender_is_human": true,
+        "mentions": [],
+        "parts": [{
+            "kind": "audio",
+            "value": {
+                "key": KEY,
+                "thumbnail_key": null,
+                "metadata": {
+                    "file_name": null,
+                    "mime_type": null,
+                    "size_bytes": null,
+                    "duration_ms": null,
+                    "transcript": TRANSCRIPT
+                },
+                "status": "available"
+            }
+        }],
+        "resources": [{"kind": "file", "key": KEY}],
+        "message_type": "audio",
+        "create_time_ms": 1,
+        "scope": {"kind": "chat", "chat_id": "oc_test", "thread_id": null}
+    }))
+    .expect("legacy payload");
+    let payload_bytes = i64::try_from(payload.len()).expect("payload length");
+    {
+        let connection = rusqlite::Connection::open(&path).expect("open legacy database");
+        downgrade_attachment_lease_schema_to_v5(&connection);
+        connection
+            .execute(
+                "UPDATE inbound_events
+                 SET payload_blob = ?1, payload_bytes = ?2
+                 WHERE event_id = 'event-private-upgrade'",
+                rusqlite::params![payload, payload_bytes],
+            )
+            .expect("write legacy secret payload");
+        connection
+            .pragma_update(None, "user_version", 5_u32)
+            .expect("rewind version");
+    }
+
+    let store = StoreHandle::open(&path).await.expect("privacy migration");
+    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 10);
+    let recovered = store.recover_received(&tenant).await.expect("recover");
+    assert!(matches!(
+        recovered[0].event().parts.as_slice(),
+        [MessagePart::Audio(MediaPart {
+            key: None,
+            status: PartStatus::Unavailable,
+            ..
+        })]
+    ));
+    assert_sqlite_files_exclude(&path, &[KEY, TRANSCRIPT]);
+    store.shutdown().await.expect("shutdown");
+    assert_sqlite_files_exclude(&path, &[KEY, TRANSCRIPT]);
+
+    // Model a crash after the scrub/compaction completed but before the v6
+    // marker transaction committed. Re-running the data migration over an
+    // already-sanitized v5 payload must be harmless and advance normally.
+    {
+        let connection = rusqlite::Connection::open(&path).expect("reopen scrubbed v5 database");
+        downgrade_attachment_lease_schema_to_v5(&connection);
+        connection
+            .pragma_update(None, "user_version", 5_u32)
+            .expect("rewind privacy marker");
+    }
+    let store = StoreHandle::open(&path)
+        .await
+        .expect("retry idempotent privacy migration");
+    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 10);
+    let recovered = store
+        .recover_received(&tenant)
+        .await
+        .expect("recover after retry");
+    assert!(matches!(
+        recovered[0].event().parts.as_slice(),
+        [MessagePart::Audio(MediaPart {
+            key: None,
+            status: PartStatus::Unavailable,
+            ..
+        })]
+    ));
+    store.shutdown().await.expect("shutdown migration retry");
+    assert_sqlite_files_exclude(&path, &[KEY, TRANSCRIPT]);
+}
+
+#[tokio::test]
+async fn accepted_live_transcript_never_enters_sqlite_wal_or_reopened_payload() {
+    const SENTINEL: &str = "private-live-transcript-0f2c80d5";
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("transcript-boundary.sqlite");
+    let tenant = tenant_namespace("cli_transcript_boundary");
+    let mut audio = event("event-live-transcript", "message-live-transcript");
+    audio.text.clear();
+    audio.message_type = "audio".to_owned();
+    audio.parts = vec![MessagePart::Audio(MediaPart {
+        key: Some("audio-resource".to_owned()),
+        thumbnail_key: None,
+        metadata: MediaMetadata {
+            duration_ms: Some(800),
+            transcript_failure: Some(TranscriptFailure::NotRetained),
+            ..MediaMetadata::default()
+        },
+        status: PartStatus::Available,
+    })];
+
+    let permit = std::sync::Arc::new(tokio::sync::Semaphore::new(1))
+        .try_acquire_owned()
+        .expect("permit");
+    let queued = lark_codex_bridge::lark::bridge::QueuedInboundEvent::from_authenticated_event(
+        audio.clone(),
+        permit,
+        vec![(0, SENTINEL.to_owned())],
+    );
+    assert!(!format!("{queued:?}").contains(SENTINEL));
+    assert!(!format!("{:?}", queued.event).contains(SENTINEL));
+
+    let assert_artifacts_absent = || {
+        for entry in std::fs::read_dir(temp.path()).expect("database directory") {
+            let artifact = entry.expect("sidecar entry").path();
+            if artifact.is_file() {
+                let bytes = std::fs::read(&artifact).expect("read database artifact");
+                assert!(
+                    !bytes
+                        .windows(SENTINEL.len())
+                        .any(|window| window == SENTINEL.as_bytes()),
+                    "transcript leaked into {}",
+                    artifact.display()
+                );
+            }
+        }
+    };
+
+    let store = StoreHandle::open(&path).await.expect("open");
+    store
+        .register_inbound(&tenant, &queued.event)
+        .await
+        .expect("received boundary");
+    assert_artifacts_absent();
+    let begun = store
+        .begin_turn_and_claim_inbound(
+            turn("turn-live-transcript", TurnState::Starting),
+            &[InboundKey::new(
+                tenant.clone(),
+                "event-live-transcript".to_owned(),
+            )],
+        )
+        .await
+        .expect("accepted boundary");
+    assert!(matches!(begun, BeginTurnOutcome::Started { .. }));
+    store
+        .enqueue_outbox(outbox("transcript-safe-outbox", "{\"status\":\"safe\"}"))
+        .await
+        .expect("benign outbox");
+    assert_artifacts_absent();
+    store.shutdown().await.expect("checkpoint and close");
+    assert_artifacts_absent();
+
+    let reopened = StoreHandle::open(&path)
+        .await
+        .expect("reopen after crash boundary");
+    assert_eq!(
+        reopened
+            .inbound_state(&tenant, "event-live-transcript")
+            .await
+            .expect("reopened state"),
+        Some(InboundEventState::Accepted)
+    );
+    reopened.shutdown().await.expect("final checkpoint");
+    let connection = rusqlite::Connection::open(&path).expect("inspect persisted payload");
+    let payload: Vec<u8> = connection
+        .query_row(
+            "SELECT payload_blob FROM inbound_events WHERE event_id = 'event-live-transcript'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("payload row");
+    assert!(
+        !payload
+            .windows(SENTINEL.len())
+            .any(|window| window == SENTINEL.as_bytes())
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&payload).expect("payload JSON");
+    assert_eq!(
+        payload["parts"][0]["value"]["metadata"]["transcript_failure"],
+        "not_retained"
+    );
+    drop(connection);
+    assert_artifacts_absent();
+}
+
+#[tokio::test]
+async fn payload_v1_is_read_and_upgraded_to_typed_parts() {
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("payload-v1.sqlite");
+    let tenant = tenant_namespace("cli_store_payload_v1");
+    let store = StoreHandle::open(&path).await.expect("open");
+    let legacy = event("event-v1", "message-v1");
+    store
+        .register_inbound(&tenant, &legacy)
+        .await
+        .expect("seed row");
+    store.shutdown().await.expect("shutdown seed");
+
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "event_id":"event-v1",
+        "message_id":"message-v1",
+        "chat_id":"oc_test",
+        "sender_id":"ou_test",
+        "chat_type":"group",
+        "thread_id":null,
+        "root_id":null,
+        "reply_to_message_id":null,
+        "text":"not persisted",
+        "mentions_bot":true,
+        "mention_all":false,
+        "resources":[],
+        "message_type":"text",
+        "create_time_ms":1,
+        "scope":{"kind":"chat","chat_id":"oc_test","thread_id":null}
+    }))
+    .expect("encode v1");
+    let connection = rusqlite::Connection::open(&path).expect("open raw");
+    connection
+        .execute(
+            "UPDATE inbound_events
+             SET payload_version = 1, payload_blob = ?1, payload_bytes = ?2
+             WHERE event_id = 'event-v1'",
+            rusqlite::params![payload, i64::try_from(payload.len()).expect("length")],
+        )
+        .expect("replace with v1 payload");
+    drop(connection);
+
+    let store = StoreHandle::open(&path).await.expect("reopen");
+    let recovered = store.recover_received(&tenant).await.expect("recover v1");
+    assert_eq!(recovered.len(), 1);
+    assert!(recovered[0].event().mentions.is_empty());
+    assert!(matches!(
+        recovered[0].event().parts.as_slice(),
+        [MessagePart::Text { text }] if text == "not persisted"
+    ));
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
 async fn file_store_applies_pragmas_and_persists_every_typed_table() {
     let temp = tempdir().expect("tempdir");
     let path = temp.path().join("store.sqlite");
@@ -346,7 +798,7 @@ async fn file_store_applies_pragmas_and_persists_every_typed_table() {
     assert!(pragmas.foreign_keys);
     assert_eq!(pragmas.busy_timeout_ms, 5_000);
     assert_eq!(pragmas.synchronous, 1);
-    assert_eq!(pragmas.user_version, 2);
+    assert_eq!(pragmas.user_version, 10);
     store
         .upsert_scope(&scope, temp.path(), "fp")
         .await
@@ -382,7 +834,7 @@ async fn file_store_applies_pragmas_and_persists_every_typed_table() {
     store.shutdown().await.expect("shutdown");
 
     let store = StoreHandle::open(&path).await.expect("reopen");
-    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 2);
+    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 10);
     assert!(store.scope_row(&scope).await.expect("scope").is_some());
     assert_eq!(
         store
@@ -421,13 +873,179 @@ async fn file_store_applies_pragmas_and_persists_every_typed_table() {
 }
 
 #[tokio::test]
+async fn migration_seven_preserves_legacy_lease_as_one_unique_acquisition() {
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("legacy-lease.sqlite");
+    let store = StoreHandle::open(&path).await.expect("open");
+    let turn_id = store
+        .record_turn(turn("legacy-lease-turn", TurnState::Starting))
+        .await
+        .expect("turn");
+    let token = store
+        .put_attachment_and_lease("legacy-hash", 1, "file", turn_id)
+        .await
+        .expect("seed lease");
+    store.shutdown().await.expect("shutdown");
+
+    let connection = rusqlite::Connection::open(&path).expect("legacy setup");
+    downgrade_attachment_lease_schema_to_v5(&connection);
+    connection
+        .pragma_update(None, "user_version", 5_u32)
+        .expect("rewind schema version");
+    drop(connection);
+
+    let store = StoreHandle::open(&path)
+        .await
+        .expect("migrate v5 through v8");
+    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 10);
+    let leases = store
+        .attachment_leases("legacy-hash")
+        .await
+        .expect("migrated lease");
+    assert_eq!(leases.len(), 1);
+    assert_ne!(leases[0].lease_token, token);
+    assert!(leases[0].lease_token.starts_with("legacy-"));
+    let overlapping = store
+        .add_attachment_lease("legacy-hash", turn_id)
+        .await
+        .expect("independent post-migration acquisition");
+    assert_ne!(overlapping, leases[0].lease_token);
+    assert_eq!(
+        store
+            .attachment_leases("legacy-hash")
+            .await
+            .expect("both leases")
+            .len(),
+        2
+    );
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn migration_seven_rejects_active_legacy_leases_over_the_runtime_cap() {
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("legacy-lease-over-cap.sqlite");
+    let store = StoreHandle::open(&path)
+        .await
+        .expect("create current store");
+    store.shutdown().await.expect("shutdown current store");
+
+    let mut connection = rusqlite::Connection::open(&path).expect("legacy setup");
+    downgrade_attachment_lease_schema_to_v5(&connection);
+    let transaction = connection.transaction().expect("seed transaction");
+    {
+        let mut insert_attachment = transaction
+            .prepare(
+                "INSERT INTO attachments (sha256, bytes, kind, created_ms, last_used_ms)
+                 VALUES (?1, 1, 'file', 1, 1)",
+            )
+            .expect("prepare legacy attachment");
+        let mut insert_turn = transaction
+            .prepare(
+                "INSERT INTO turns (
+                     id, scope_key, client_message_id, state, uncertain, created_ms, updated_ms
+                 ) VALUES (?1, 'im:legacy', ?2, 'running', 0, 1, 1)",
+            )
+            .expect("prepare legacy turn");
+        let mut insert_lease = transaction
+            .prepare(
+                "INSERT INTO attachment_leases (sha256, turn_row_id, created_ms)
+                 VALUES (?1, ?2, 1)",
+            )
+            .expect("prepare legacy lease");
+        for index in 0..=STORE_ATTACHMENT_LEASE_MAX_ROWS {
+            let row_id = i64::try_from(index + 1).expect("bounded row id");
+            let hash = format!("legacy-hash-{row_id}");
+            let message_id = format!("legacy-turn-{row_id}");
+            insert_attachment
+                .execute(rusqlite::params![&hash])
+                .expect("seed legacy attachment");
+            insert_turn
+                .execute(rusqlite::params![row_id, message_id])
+                .expect("seed legacy turn");
+            insert_lease
+                .execute(rusqlite::params![hash, row_id])
+                .expect("seed legacy lease");
+        }
+    }
+    transaction
+        .pragma_update(None, "user_version", 5_u32)
+        .expect("rewind schema version");
+    transaction.commit().expect("commit legacy leases");
+    drop(connection);
+
+    assert!(matches!(
+        StoreHandle::open(&path).await,
+        Err(StoreError::CapacityExceeded {
+            context: "migrating attachment leases"
+        })
+    ));
+    let connection = rusqlite::Connection::open(&path).expect("inspect rolled-back store");
+    let version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .expect("version");
+    let leases: i64 = connection
+        .query_row("SELECT COUNT(*) FROM attachment_leases", [], |row| {
+            row.get(0)
+        })
+        .expect("legacy lease count");
+    assert_eq!(version, 5);
+    assert_eq!(
+        u64::try_from(leases).expect("non-negative lease count"),
+        STORE_ATTACHMENT_LEASE_MAX_ROWS + 1
+    );
+}
+
+#[tokio::test]
+async fn attachment_lease_capacity_is_enforced_before_an_extra_acquisition() {
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("lease-capacity.sqlite");
+    let store = StoreHandle::open(&path).await.expect("open");
+    let turn_id = store
+        .record_turn(turn("lease-capacity-turn", TurnState::Starting))
+        .await
+        .expect("turn");
+    store
+        .put_attachment("capacity-hash", 1, "file")
+        .await
+        .expect("attachment");
+    store.shutdown().await.expect("shutdown");
+
+    let mut connection = rusqlite::Connection::open(&path).expect("seed capacity");
+    let transaction = connection.transaction().expect("transaction");
+    {
+        let mut insert = transaction
+            .prepare(
+                "INSERT INTO attachment_leases
+                     (lease_token, sha256, turn_row_id, created_ms)
+                 VALUES (?1, 'capacity-hash', ?2, 1)",
+            )
+            .expect("prepare leases");
+        for index in 0..STORE_ATTACHMENT_LEASE_MAX_ROWS {
+            insert
+                .execute(rusqlite::params![format!("capacity-{index:016x}"), turn_id])
+                .expect("seed bounded lease");
+        }
+    }
+    transaction.commit().expect("commit leases");
+    drop(connection);
+
+    let store = StoreHandle::open(&path).await.expect("reopen");
+    assert!(matches!(
+        store.add_attachment_lease("capacity-hash", turn_id).await,
+        Err(StoreError::CapacityExceeded { .. })
+    ));
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
 async fn rejects_future_schema_versions_without_mutating_the_database() {
     let temp = tempdir().expect("tempdir");
     let path = temp.path().join("future.sqlite");
     {
         let connection = rusqlite::Connection::open(&path).expect("seed");
         connection
-            .pragma_update(None, "user_version", 3_u32)
+            .pragma_update(None, "user_version", 11_u32)
             .expect("version");
     }
     assert!(matches!(
@@ -438,7 +1056,7 @@ async fn rejects_future_schema_versions_without_mutating_the_database() {
     let version: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .expect("version");
-    assert_eq!(version, 3);
+    assert_eq!(version, 11);
 }
 
 #[tokio::test]
@@ -890,6 +1508,67 @@ async fn attachment_leases_require_both_parents_and_protect_gc_deletion() {
 }
 
 #[tokio::test]
+async fn exact_attachment_lease_release_preserves_sibling_turn_resources() {
+    let store = StoreHandle::open_in_memory().await.expect("open");
+    let turn_id = store
+        .record_turn(turn("exact-release", TurnState::Starting))
+        .await
+        .expect("turn");
+    let first_token = store
+        .put_attachment_and_lease("first", 1, "file", turn_id)
+        .await
+        .expect("first acquisition");
+    let overlapping_token = store
+        .put_attachment_and_lease("first", 1, "file", turn_id)
+        .await
+        .expect("overlapping acquisition");
+    let sibling_token = store
+        .put_attachment_and_lease("second", 1, "file", turn_id)
+        .await
+        .expect("sibling acquisition");
+    assert_ne!(first_token, overlapping_token);
+    assert_ne!(first_token, sibling_token);
+
+    assert!(
+        store
+            .release_attachment_lease(&first_token)
+            .await
+            .expect("exact release")
+    );
+    assert!(
+        !store
+            .release_attachment_lease(&first_token)
+            .await
+            .expect("idempotent exact release")
+    );
+    assert_eq!(
+        store
+            .attachment_leases("first")
+            .await
+            .expect("overlapping lease survives")
+            .len(),
+        1
+    );
+    assert!(
+        !store
+            .delete_attachment("first")
+            .await
+            .expect("still protected"),
+        "one cancelled consumer must not expose another consumer to GC"
+    );
+    assert_eq!(
+        store
+            .attachment_leases("second")
+            .await
+            .expect("sibling leases")
+            .len(),
+        1,
+        "cancellation compensation must not release sibling media"
+    );
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
 async fn debug_never_contains_outbox_payload() {
     let row = outbox("key", "prompt-sentinel-must-not-leak");
     let debug = format!("{row:?}");
@@ -1069,6 +1748,57 @@ async fn scope_paths_are_redacted_and_non_utf8_paths_are_refused() {
     store.shutdown().await.expect("shutdown");
 }
 
+#[test]
+fn durable_session_rows_redact_scope_and_workspace_values_from_debug() {
+    let scope_key = "im:oc_sensitive:thread:omt_sensitive".to_owned();
+    let thread_id = "codex-thread-sensitive".to_owned();
+    let scope = ScopeRow {
+        scope_key: scope_key.clone(),
+        cwd: std::path::PathBuf::from("/workspace/secret-project"),
+        policy_fingerprint: "secret-policy-fingerprint".to_owned(),
+        updated_ms: 1,
+    };
+    let thread = ThreadRow {
+        scope_key: scope_key.clone(),
+        codex_thread_id: thread_id.clone(),
+        status: ThreadStatus::Active,
+        created_ms: 2,
+        archived_ms: None,
+        context_tools_version: 0,
+    };
+    let turn = TurnRow {
+        id: 3,
+        scope_key: scope_key.clone(),
+        client_message_id: "client-message-sensitive".to_owned(),
+        codex_thread_id: Some(thread_id.clone()),
+        codex_turn_id: Some("codex-turn-sensitive".to_owned()),
+        state: TurnState::Running,
+        uncertain: false,
+        created_ms: 4,
+        updated_ms: 5,
+        inbound_count: 1,
+    };
+    let new_turn = NewTurnRow {
+        scope_key,
+        client_message_id: "new-client-message-sensitive".to_owned(),
+        codex_thread_id: Some(thread_id),
+        state: TurnState::Starting,
+    };
+
+    for debug in [
+        format!("{scope:?}"),
+        format!("{thread:?}"),
+        format!("{turn:?}"),
+        format!("{new_turn:?}"),
+    ] {
+        assert!(
+            !debug.contains("sensitive"),
+            "leaked session value: {debug}"
+        );
+        assert!(!debug.contains("secret-project"), "leaked path: {debug}");
+    }
+}
+
 #[tokio::test]
 async fn outbox_enforces_aggregate_bytes_and_claim_batch_bytes() {
     let store = StoreHandle::open_in_memory().await.expect("open");
@@ -1095,6 +1825,25 @@ async fn outbox_enforces_aggregate_bytes_and_claim_batch_bytes() {
         claimed.len(),
         STORE_OUTBOX_CLAIM_MAX_BYTES / STORE_OUTBOX_PAYLOAD_MAX_BYTES
     );
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn outbox_debug_redacts_payload_routing_and_idempotency_values() {
+    let store = StoreHandle::open_in_memory().await.expect("open");
+    let row = NewOutboxRow {
+        idempotency_key: "sensitive-idempotency-key".to_owned(),
+        scope_key: "im:oc_sensitive:thread:omt_sensitive".to_owned(),
+        kind: "notice".to_owned(),
+        payload_json: "{\"text\":\"sensitive-payload\"}".to_owned(),
+        next_retry_ms: 0,
+    };
+    let new_debug = format!("{row:?}");
+    assert!(!new_debug.contains("sensitive"));
+    let persisted = store.enqueue_outbox(row).await.expect("enqueue");
+    let persisted_debug = format!("{persisted:?}");
+    assert!(!persisted_debug.contains("sensitive"));
+    assert!(persisted_debug.contains("payload_bytes"));
     store.shutdown().await.expect("shutdown");
 }
 
@@ -1513,6 +2262,133 @@ async fn atomic_rejection_notice_rolls_back_at_real_outbox_byte_capacity() {
 }
 
 #[tokio::test]
+async fn rejection_notice_inherits_the_retry_watermark() {
+    let store = StoreHandle::open_in_memory().await.expect("open");
+    // Park a row for retry: enqueue, claim, then fail it retryably so it goes
+    // back to `pending` with a future retry time.
+    store
+        .enqueue_outbox(outbox("watermark-first", "first"))
+        .await
+        .expect("enqueue first");
+    let retry_ms = 60_000_000;
+    let claimed = store.claim_outbox_batch(i64::MAX, 1).await.expect("claim");
+    assert_eq!(claimed.len(), 1);
+    store
+        .fail_outbox(claimed[0].id, 1, retry_ms, false)
+        .await
+        .expect("fail first");
+
+    let tenant = tenant_namespace("cli_notice_watermark");
+    let inbound = event("event-notice-watermark", "message-notice-watermark");
+    store
+        .register_inbound(&tenant, &inbound)
+        .await
+        .expect("register");
+    let notice = outbox("watermark-notice", "body");
+    assert_eq!(
+        store
+            .reject_received_and_enqueue_notice(
+                &InboundKey::new(tenant, inbound.event_id),
+                InboundRejectionKind::Policy,
+                notice.clone(),
+            )
+            .await
+            .expect("atomic reject+notice"),
+        InboundDisposition::Rejected
+    );
+
+    let claimed = store
+        .claim_outbox_batch(i64::MAX, 8)
+        .await
+        .expect("claim all");
+    assert_eq!(
+        claimed
+            .iter()
+            .map(|row| row.idempotency_key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["watermark-first", "watermark-notice"],
+        "the parked row claims before the notice (global id order)"
+    );
+    let notice_row = claimed
+        .iter()
+        .find(|row| row.idempotency_key == notice.idempotency_key)
+        .expect("notice row");
+    assert_eq!(
+        notice_row.next_retry_ms, retry_ms,
+        "the notice inherits the parked row's retry watermark"
+    );
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn rejection_notice_respects_the_all_states_total_hard_cap() {
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("notice-total-cap.sqlite");
+    // Open once to migrate the schema, then shut down so a raw connection can
+    // seed terminal rows putting the table exactly at the all-states hard cap.
+    let seed_store = StoreHandle::open(&path).await.expect("open seed store");
+    seed_store.shutdown().await.expect("shutdown seed store");
+
+    let mut connection = rusqlite::Connection::open(&path).expect("raw seed connection");
+    let transaction = connection.transaction().expect("seed transaction");
+    {
+        let mut statement = transaction
+            .prepare(
+                "INSERT INTO outbox
+                 (idempotency_key, scope_key, kind, payload_json, payload_bytes,
+                  state, attempts, next_retry_ms, receipt_message_id, created_ms, updated_ms)
+                 VALUES (?1, 'im:oc_test', 'final', '', 0, 'sent', 1, 0, 'om_r', 1, 1)",
+            )
+            .expect("prepare terminal seed");
+        let cap = usize::try_from(OUTBOX_TERMINAL_MAX_ROWS).unwrap();
+        for index in 0..cap {
+            statement
+                .execute(rusqlite::params![format!("term:{index}")])
+                .expect("insert terminal row");
+        }
+    }
+    transaction.commit().expect("commit seed");
+    drop(connection);
+
+    let store = StoreHandle::open(&path).await.expect("reopen store");
+    let tenant = tenant_namespace("cli_notice_total_cap");
+    let inbound = event("event-notice-total-cap", "message-notice-total-cap");
+    store
+        .register_inbound(&tenant, &inbound)
+        .await
+        .expect("register");
+    assert!(matches!(
+        store
+            .reject_received_and_enqueue_notice(
+                &InboundKey::new(tenant.clone(), inbound.event_id.clone()),
+                InboundRejectionKind::Overloaded,
+                outbox("total-cap-notice", "x"),
+            )
+            .await,
+        Err(StoreError::CapacityExceeded { .. })
+    ));
+    assert_eq!(
+        store
+            .inbound_state(&tenant, &inbound.event_id)
+            .await
+            .expect("state"),
+        Some(InboundEventState::Received),
+        "the rejection must roll back, leaving the inbound row received"
+    );
+    assert_eq!(
+        store.recover_received(&tenant).await.expect("replay").len(),
+        1,
+        "the received row is retained for the existing retry path"
+    );
+    assert_eq!(
+        store.outbox_depth().await.expect("depth").pending,
+        0,
+        "the notice must roll back, leaving no pending row"
+    );
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
 async fn atomic_rejection_notice_and_turn_claim_have_one_consistent_winner() {
     let store = StoreHandle::open_in_memory().await.expect("open");
     let tenant = tenant_namespace("cli_notice_claim_race");
@@ -1842,10 +2718,7 @@ async fn debug_redacts_inbound_sender_resource_keys_and_content() {
     let permit = Arc::new(Semaphore::new(1))
         .try_acquire_owned()
         .expect("permit");
-    let queued = QueuedInboundEvent {
-        event: sensitive.clone(),
-        permit,
-    };
+    let queued = QueuedInboundEvent::new(sensitive.clone(), permit);
     let key = InboundKey::new(
         tenant_namespace("cli_debug_key"),
         "event-id-sentinel".to_owned(),
@@ -1976,5 +2849,59 @@ async fn inbound_writer_permits_account_for_the_captured_event_and_payload() {
     );
     lock.execute_batch("ROLLBACK").expect("release lock");
     drop(pending);
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn no_turn_completion_is_durable_idempotent_and_erases_replay_content() {
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let tenant = tenant_namespace("cli_no_turn_completion");
+    let inbound = event("event-no-turn", "message-no-turn");
+    store
+        .register_inbound(&tenant, &inbound)
+        .await
+        .expect("register");
+    let key = InboundKey::new(tenant.clone(), inbound.event_id.clone());
+
+    assert_eq!(
+        store
+            .complete_received_without_turn(&key)
+            .await
+            .expect("complete without turn"),
+        InboundDisposition::Completed
+    );
+    assert_eq!(
+        store
+            .complete_received_without_turn(&key)
+            .await
+            .expect("idempotent completion"),
+        InboundDisposition::AlreadyCompleted
+    );
+    assert!(
+        store
+            .recover_received(&tenant)
+            .await
+            .expect("recover")
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .inbound_state(&tenant, "event-no-turn")
+            .await
+            .expect("state"),
+        Some(InboundEventState::Completed)
+    );
+    assert!(matches!(
+        store
+            .register_inbound(&tenant, &inbound)
+            .await
+            .expect("terminal duplicate"),
+        DedupOutcome::Duplicate {
+            state: InboundEventState::Completed,
+            turn_row_id: None,
+            ..
+        }
+    ));
+    assert!(store.uncertain_turns().await.expect("turns").is_empty());
     store.shutdown().await.expect("shutdown");
 }
