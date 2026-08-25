@@ -56,6 +56,35 @@ cargo run --locked -- run
 私聊可直接发消息；群聊和话题需要直接 @机器人。按 `Ctrl-C` 结束。当前真实飞书的
 “发消息 → Codex 回答 → 飞书收到回复”验收由操作者手动执行。
 
+### 终端日志与排障
+
+日志默认只显示错误和必要告警；全局 `-v` 打开 info 级连接、turn、恢复与 outbox
+生命周期，`-vv` 再打开队列深度、批次和重试等 debug 状态。全局参数可写在子命令前后：
+
+```bash
+cargo run --locked -- run -v
+cargo run --locked -- -vv run
+```
+
+设置 `RUST_LOG` 时会覆盖上述 bridge 默认过滤器，并使用
+[`tracing-subscriber` EnvFilter](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html)
+语法；无效值会在启动前报错并给出示例，不会被静默忽略：
+
+```bash
+RUST_LOG='warn,lark_codex_bridge=debug' cargo run --locked -- run
+cargo run --locked -- --log-format json run -v
+```
+
+为维持日志脱敏边界，终端 subscriber 只接收 `lark_codex_bridge` 自身经过审计的事件；
+即使设置 `RUST_LOG=trace` 或指定第三方 crate，也不会输出 HTTP/WebSocket 依赖库可能包含
+完整 endpoint、header 或 frame payload 的诊断日志。
+
+human 与 JSON 日志都只写入 stderr；`codex probe`、`lark probe` 和认证检查等命令的
+stdout JSON 契约保持独立。因此 launchd/systemd 可分别重定向 stdout 与 stderr，后者
+即可用于基本故障诊断。日志字段限于静态分类、计数、耗时、重试次数和 supervisor epoch；
+不会记录 App Secret、tenant token、完整 WebSocket endpoint、消息/prompt/模型/工具正文、
+媒体内容、完整本地路径、用户身份或原始事件 payload。
+
 已登记应用与诊断场景保持不变；如需分别检查两侧连接：
 
 ```bash

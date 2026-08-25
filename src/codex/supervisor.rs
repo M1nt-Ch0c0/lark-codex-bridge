@@ -487,6 +487,33 @@ async fn run_supervisor(
 }
 
 fn publish(state_tx: &watch::Sender<SupervisorState>, state: SupervisorState) {
+    match &state {
+        SupervisorState::Starting { epoch } => {
+            tracing::info!(epoch, "Codex supervisor epoch starting");
+        }
+        SupervisorState::Ready { epoch, version, .. } => {
+            tracing::info!(epoch, version = %version, "Codex supervisor epoch ready");
+        }
+        SupervisorState::Backoff {
+            epoch,
+            attempt,
+            delay,
+        } => {
+            tracing::warn!(
+                epoch,
+                attempt,
+                delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                "Codex supervisor retry backoff"
+            );
+        }
+        SupervisorState::Degraded { .. } => {
+            // The operator-facing state may carry an actionable local error,
+            // including a configured path. Terminal tracing keeps only the
+            // static lifecycle classification.
+            tracing::warn!("Codex supervisor degraded");
+        }
+        SupervisorState::Stopped => tracing::info!("Codex supervisor stopped"),
+    }
     let _ = state_tx.send(state);
 }
 
@@ -536,9 +563,7 @@ fn permanent_process_reason(error: &ProcessError) -> Option<String> {
         ProcessError::InvalidCodexHome { .. } => {
             Some("configured Codex home must be an existing directory".to_owned())
         }
-        ProcessError::Spawn { binary, .. } => {
-            Some(format!("unable to run Codex binary {}", binary.display()))
-        }
+        ProcessError::Spawn { .. } => Some("unable to run Codex binary".to_owned()),
         ProcessError::ProbeFailed { code } => Some(format!(
             "Codex version probe exited unsuccessfully (code: {code:?})"
         )),

@@ -9,3 +9,4 @@ pub mod outbox;
 pub mod render;
 pub mod runtime;
 pub mod store;
+pub mod telemetry;
