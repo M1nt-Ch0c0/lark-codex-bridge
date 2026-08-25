@@ -7,7 +7,7 @@ use std::{
 };
 
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
@@ -27,7 +27,7 @@ use crate::{
         rpc::ConnectionEpoch,
         types::{
             CommandExecutionApprovalDecision, CommandExecutionRequestApprovalResult,
-            FileChangeRequestApprovalResult, PermissionsRequestApprovalResult,
+            FileChangeRequestApprovalResult, PermissionProfile, PermissionsRequestApprovalResult,
             SimpleApprovalDecision, SortDirection, ThreadItemsListParams, ThreadQueueAddParams,
             ThreadQueueListParams, ThreadQueueStartParams, ThreadReadParams, ThreadTurnsListParams,
             TurnInterruptParams, TurnStartParams, TurnStatus, TurnSteerParams,
@@ -1659,7 +1659,7 @@ fn denial_for(request: &ExternalApprovalRequest) -> ExternalApprovalDecision {
         }
         ExternalApprovalRequest::Permissions { .. } => {
             ExternalApprovalDecision::Permissions(PermissionsRequestApprovalResult {
-                permissions: json!({}),
+                permissions: PermissionProfile::default(),
                 scope: None,
                 strict_auto_review: None,
             })
