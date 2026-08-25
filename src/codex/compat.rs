@@ -960,12 +960,24 @@ impl WireAdapter {
         crate::codex::wire::v0_149_0::ThreadQueueStartResponse,
         "thread/queue/start response"
     );
-    shared_outgoing_adapter!(
-        thread_turns_list_params,
-        crate::codex::types::ThreadTurnsListParams,
-        thread_turns_list_params,
-        "thread/turns/list params"
-    );
+    pub fn thread_turns_list_params(
+        self,
+        value: &crate::codex::types::ThreadTurnsListParams,
+    ) -> Result<Value, CompatError> {
+        match self {
+            Self::V0_149_0 => {
+                validate_v0_149_shared_sort_direction(
+                    value.sort_direction.as_ref(),
+                    "thread/turns/list params",
+                )?;
+                encode(
+                    shared_v0_149_0::thread_turns_list_params(value)?,
+                    "thread/turns/list params",
+                )
+            }
+            Self::V0_146_0 => Err(CompatError::new("thread/turns/list params")),
+        }
+    }
     shared_incoming_adapter!(
         thread_turns_list_response,
         crate::codex::types::ThreadTurnsListResult,
@@ -973,12 +985,24 @@ impl WireAdapter {
         crate::codex::wire::v0_149_0::ThreadTurnsListResponse,
         "thread/turns/list response"
     );
-    shared_outgoing_adapter!(
-        thread_items_list_params,
-        crate::codex::types::ThreadItemsListParams,
-        thread_items_list_params,
-        "thread/items/list params"
-    );
+    pub fn thread_items_list_params(
+        self,
+        value: &crate::codex::types::ThreadItemsListParams,
+    ) -> Result<Value, CompatError> {
+        match self {
+            Self::V0_149_0 => {
+                validate_v0_149_shared_sort_direction(
+                    value.sort_direction.as_ref(),
+                    "thread/items/list params",
+                )?;
+                encode(
+                    shared_v0_149_0::thread_items_list_params(value)?,
+                    "thread/items/list params",
+                )
+            }
+            Self::V0_146_0 => Err(CompatError::new("thread/items/list params")),
+        }
+    }
     shared_incoming_adapter!(
         thread_items_list_response,
         crate::codex::types::ThreadItemsListResult,
@@ -1215,6 +1239,16 @@ fn validate_v0_149_turn_start_params(
             .is_some_and(|value| !matches!(value, "auto" | "concise" | "detailed" | "none"))
     {
         return Err(CompatError::new("turn/start params"));
+    }
+    Ok(())
+}
+
+fn validate_v0_149_shared_sort_direction(
+    value: Option<&crate::codex::types::SortDirection>,
+    contract: &'static str,
+) -> Result<(), CompatError> {
+    if matches!(value, Some(crate::codex::types::SortDirection::Unknown(_))) {
+        return Err(CompatError::new(contract));
     }
     Ok(())
 }

@@ -207,16 +207,59 @@ ALTER TABLE threads ADD COLUMN context_tools_version INTEGER NOT NULL DEFAULT 0
     },
     Migration {
         version: 6,
+        name: "tokenize attachment lease acquisitions",
+        sql: "
+ALTER TABLE attachment_leases RENAME TO attachment_leases_v1;
+
+CREATE TABLE attachment_leases (
+    lease_token TEXT PRIMARY KEY CHECK (
+        length(lease_token) BETWEEN 1 AND 64
+    ),
+    sha256 TEXT NOT NULL,
+    turn_row_id INTEGER NOT NULL,
+    created_ms INTEGER NOT NULL,
+    FOREIGN KEY (sha256) REFERENCES attachments (sha256) ON DELETE CASCADE,
+    FOREIGN KEY (turn_row_id) REFERENCES turns (id) ON DELETE CASCADE
+);
+CREATE INDEX attachment_leases_sha256 ON attachment_leases (sha256);
+CREATE INDEX attachment_leases_turn ON attachment_leases (turn_row_id);
+
+INSERT INTO attachment_leases (lease_token, sha256, turn_row_id, created_ms)
+SELECT printf('legacy-%016x', rowid), sha256, turn_row_id, created_ms
+FROM attachment_leases_v1;
+
+DROP TABLE attachment_leases_v1;
+",
+    },
+    Migration {
+        version: 7,
+        name: "fence versioned Markdown outbox payloads",
+        // No table shape changes are needed: outbox payloads are deliberately
+        // opaque JSON. Advancing `user_version` is nevertheless required so a
+        // v1-only binary refuses to open a database after this binary may have
+        // persisted payload v2 rows it cannot understand.
+        sql: "SELECT 1;",
+    },
+    Migration {
+        version: 8,
+        name: "remove durable media capabilities and transcripts",
+        // The data rewrite is implemented by the writer immediately before
+        // this marker migration because it must decode and validate the
+        // versioned application payload rather than mutate JSON in SQL.
+        sql: "SELECT 1;",
+    },
+    Migration {
+        version: 9,
         name: "external Codex reconciliation epochs",
         sql: "
-CREATE TABLE external_endpoint_epochs (
+CREATE TABLE IF NOT EXISTS external_endpoint_epochs (
     endpoint_label TEXT PRIMARY KEY,
     current_epoch INTEGER NOT NULL CHECK (current_epoch > 0),
     state TEXT NOT NULL CHECK (state IN ('connecting', 'reconciling', 'ready', 'unavailable', 'stopped')),
     updated_ms INTEGER NOT NULL
 );
 
-CREATE TABLE external_managed_threads (
+CREATE TABLE IF NOT EXISTS external_managed_threads (
     endpoint_label TEXT NOT NULL,
     thread_id TEXT NOT NULL,
     epoch INTEGER NOT NULL CHECK (epoch >= 0),
@@ -231,7 +274,7 @@ CREATE TABLE external_managed_threads (
         ON DELETE CASCADE
 );
 
-CREATE TABLE external_turn_terminals (
+CREATE TABLE IF NOT EXISTS external_turn_terminals (
     endpoint_label TEXT NOT NULL,
     thread_id TEXT NOT NULL,
     turn_id TEXT NOT NULL,
@@ -242,7 +285,7 @@ CREATE TABLE external_turn_terminals (
         REFERENCES external_managed_threads(endpoint_label, thread_id) ON DELETE CASCADE
 );
 
-CREATE TABLE external_item_terminals (
+CREATE TABLE IF NOT EXISTS external_item_terminals (
     endpoint_label TEXT NOT NULL,
     thread_id TEXT NOT NULL,
     turn_id TEXT NOT NULL,
@@ -253,15 +296,15 @@ CREATE TABLE external_item_terminals (
         REFERENCES external_managed_threads(endpoint_label, thread_id) ON DELETE CASCADE
 );
 
-CREATE INDEX external_managed_threads_state
+CREATE INDEX IF NOT EXISTS external_managed_threads_state
     ON external_managed_threads(endpoint_label, state, thread_id);
 ",
     },
     Migration {
-        version: 7,
+        version: 10,
         name: "external Codex write and approval fences",
         sql: "
-CREATE TABLE external_write_fences (
+CREATE TABLE IF NOT EXISTS external_write_fences (
     endpoint_label TEXT NOT NULL,
     thread_id TEXT NOT NULL,
     epoch INTEGER NOT NULL CHECK (epoch > 0),
@@ -275,7 +318,7 @@ CREATE TABLE external_write_fences (
     CHECK ((state = 'active') = (active_intent_id IS NOT NULL))
 );
 
-CREATE TABLE external_mutation_intents (
+CREATE TABLE IF NOT EXISTS external_mutation_intents (
     endpoint_label TEXT NOT NULL,
     thread_id TEXT NOT NULL,
     intent_id TEXT NOT NULL,
@@ -298,10 +341,10 @@ CREATE TABLE external_mutation_intents (
     FOREIGN KEY (endpoint_label, thread_id)
         REFERENCES external_managed_threads(endpoint_label, thread_id) ON DELETE CASCADE
 );
-CREATE INDEX external_mutation_intents_state
+CREATE INDEX IF NOT EXISTS external_mutation_intents_state
     ON external_mutation_intents(endpoint_label, thread_id, state, updated_ms);
 
-CREATE TABLE external_approval_claims (
+CREATE TABLE IF NOT EXISTS external_approval_claims (
     endpoint_label TEXT NOT NULL,
     thread_id TEXT NOT NULL,
     approval_id TEXT NOT NULL,
@@ -325,7 +368,7 @@ CREATE TABLE external_approval_claims (
     FOREIGN KEY (endpoint_label, thread_id)
         REFERENCES external_managed_threads(endpoint_label, thread_id) ON DELETE CASCADE
 );
-CREATE INDEX external_approval_claims_state
+CREATE INDEX IF NOT EXISTS external_approval_claims_state
     ON external_approval_claims(endpoint_label, thread_id, state, deadline_ms);
 ",
     },

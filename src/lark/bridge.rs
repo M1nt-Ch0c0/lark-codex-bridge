@@ -31,15 +31,24 @@ use super::credentials::LarkCredentials;
 use super::error::LarkError;
 use super::frame::MessageType;
 use super::http::LarkHttp;
-use super::normalize::{InboundEvent, NormalizeOutcome, Normalizer, ShortId};
+use super::normalize::{
+    InboundEvent, LiveTranscriptHandoff, NormalizeOutcome, Normalizer, ShortId,
+};
 use super::token::TenantTokenProvider;
 use super::transport::{InboundFrameHandler, LarkTransport, TransportConfig, TransportHandle};
+use crate::channel::ChatMessageQuery;
 use crate::limits::{LARK_INBOUND_EVENT_BYTE_BUDGET, LARK_INBOUND_EVENT_CAPACITY};
 use crate::runtime::intake::IntakeRuntime;
 
 /// Durable receipt-boundary hook invoked after normalization.
 pub type IntakeHook = Arc<
     dyn Fn(Box<InboundEvent>) -> BoxFuture<'static, Result<IntakeVerdict, LarkError>> + Send + Sync,
+>;
+
+/// Transport-independent handler for one complete Lark event payload.
+/// Success is returned only after durable intake and bounded enqueue finish.
+pub type InboundEventHandler = Arc<
+    dyn Fn(Bytes) -> BoxFuture<'static, Result<Option<serde_json::Value>, LarkError>> + Send + Sync,
 >;
 
 /// Durable intake decision for one normalized event.
@@ -104,9 +113,52 @@ pub struct QueuedInboundEvent {
     /// Byte-budget permit sized by raw wire bytes in legacy mode and exact
     /// persisted payload bytes in durable-runtime mode; held until drop.
     pub permit: OwnedSemaphorePermit,
+    live_transcripts: LiveTranscriptHandoff,
 }
 
 impl QueuedInboundEvent {
+    /// Builds a recovery/synthetic queued event without live-only recognition
+    /// data.
+    #[must_use]
+    pub fn new(event: InboundEvent, permit: OwnedSemaphorePermit) -> Self {
+        Self {
+            event,
+            permit,
+            live_transcripts: LiveTranscriptHandoff::empty(),
+        }
+    }
+
+    /// Builds a queued event from recognition text supplied by an already
+    /// authenticated transport adapter. Every entry is rebound to the event's
+    /// exact audio part index and resource key; non-audio/mismatched entries
+    /// are discarded.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn from_authenticated_event(
+        event: InboundEvent,
+        permit: OwnedSemaphorePermit,
+        live_transcripts: Vec<(usize, String)>,
+    ) -> Self {
+        let live_transcripts = LiveTranscriptHandoff::bound(&event, live_transcripts);
+        Self::with_live_transcripts(event, permit, live_transcripts)
+    }
+
+    fn with_live_transcripts(
+        event: InboundEvent,
+        permit: OwnedSemaphorePermit,
+        live_transcripts: LiveTranscriptHandoff,
+    ) -> Self {
+        Self {
+            event,
+            permit,
+            live_transcripts,
+        }
+    }
+
+    pub(crate) fn take_live_transcripts(&mut self) -> LiveTranscriptHandoff {
+        std::mem::take(&mut self.live_transcripts)
+    }
+
     /// Consumes the wrapper, releasing the byte permit, and returns the event.
     #[must_use]
     pub fn into_event(self) -> InboundEvent {
@@ -204,29 +256,22 @@ impl LarkBridge {
             let budget = Arc::clone(&budget);
             Box::pin(async move {
                 if matches!(headers.ty(), Some(MessageType::Card)) {
-                    tracing::info!(
-                        message_id = headers.message_id().unwrap_or(""),
-                        "lark card action is unsupported in this milestone; acknowledging"
-                    );
+                    tracing::info!("lark card action is unsupported; acknowledging");
                     return Ok(Some(json!({ "status": "unsupported" })));
                 }
                 let outcome = normalizer.normalize(&payload).await?;
                 match outcome {
                     NormalizeOutcome::Ignored { reason } => {
-                        tracing::debug!(
-                            reason,
-                            message_id = headers.message_id().unwrap_or(""),
-                            "lark event ignored by the normalizer"
-                        );
+                        tracing::debug!(reason, "lark event ignored by the normalizer");
                         Ok(None)
                     }
-                    NormalizeOutcome::Event { event, degradation } => {
+                    NormalizeOutcome::Event {
+                        event,
+                        live_transcripts,
+                        degradation,
+                    } => {
                         if let Some(degradation) = degradation {
-                            tracing::warn!(
-                                ?degradation,
-                                message_id = %event.message_id,
-                                "lark event normalized with degradation"
-                            );
+                            tracing::warn!(?degradation, "lark event normalized with degradation");
                         }
                         let size = u32::try_from(payload.len()).unwrap_or(u32::MAX);
                         let permit = budget.clone().try_acquire_many_owned(size).map_err(|_| {
@@ -235,10 +280,11 @@ impl LarkBridge {
                                 config.event_byte_budget as u64,
                             )
                         })?;
-                        tx.try_send(QueuedInboundEvent {
-                            event: *event,
+                        tx.try_send(QueuedInboundEvent::with_live_transcripts(
+                            *event,
                             permit,
-                        })
+                            live_transcripts,
+                        ))
                         .map_err(|_| {
                             LarkError::exhausted(
                                 "the inbound event channel is full",
@@ -271,7 +317,66 @@ impl LarkBridge {
         config: BridgeConfig,
         intake: IntakeRuntime,
     ) -> Result<(TransportHandle, mpsc::Receiver<QueuedInboundEvent>), LarkError> {
-        if !intake.matches(&creds) {
+        let http = LarkHttp::new(endpoints)?;
+        let tokens = TenantTokenProvider::new(http.clone(), creds.clone());
+        let api = LarkApi::new(http.clone(), tokens);
+        let info = api.bot_info().await?;
+        let bot_open_id = info
+            .open_id
+            .filter(|open_id| !open_id.is_empty())
+            .ok_or_else(|| LarkError::protocol("bot info response missing open_id"))?;
+        let query: Arc<dyn ChatMessageQuery> =
+            Arc::new(crate::channel::native::NativeChannel::new(api));
+        let normalizer = Arc::new(Normalizer::with_query(query, bot_open_id));
+        let (event_handler, rx) = Self::prepare_durable(&creds, config, intake, normalizer)?;
+        let handle = Self::start_prepared_native(http, creds, config, event_handler);
+        Ok((handle, rx))
+    }
+
+    /// Starts the native WebSocket over an already-prepared durable event
+    /// handler. Card actions remain explicitly unsupported and are answered
+    /// without entering the message pipeline.
+    #[must_use]
+    pub fn start_prepared_native(
+        http: LarkHttp,
+        creds: LarkCredentials,
+        config: BridgeConfig,
+        event_handler: InboundEventHandler,
+    ) -> TransportHandle {
+        let handler: InboundFrameHandler = Arc::new(move |headers, payload: Bytes| {
+            let event_handler = Arc::clone(&event_handler);
+            Box::pin(async move {
+                if matches!(headers.ty(), Some(MessageType::Card)) {
+                    tracing::info!(
+                        message_id = headers.message_id().unwrap_or(""),
+                        "lark card action is unsupported in this milestone; acknowledging"
+                    );
+                    return Ok(Some(json!({ "status": "unsupported" })));
+                }
+                event_handler(payload).await
+            })
+        });
+        LarkTransport::start_with_config(http, creds, handler, config.transport)
+    }
+
+    /// Prepares the transport-independent durable normalization pipeline.
+    ///
+    /// The returned handler is suitable for either the native WebSocket or
+    /// the Node sidecar. A successful result is the upstream acknowledgement
+    /// boundary: normalize → `SQLite` registration → bounded queue reservation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a static classified error for a credential binding mismatch,
+    /// invalid bounds, or an oversized startup recovery set.
+    #[allow(clippy::too_many_lines)]
+    pub fn prepare_durable(
+        creds: &LarkCredentials,
+        config: BridgeConfig,
+        intake: IntakeRuntime,
+        normalizer: Arc<Normalizer>,
+    ) -> Result<(InboundEventHandler, mpsc::Receiver<QueuedInboundEvent>), LarkError> {
+        if !intake.matches(creds) {
             return Err(LarkError::protocol(
                 "durable intake credential binding mismatch",
             ));
@@ -288,15 +393,6 @@ impl LarkBridge {
                 "durable inbound channel bound exceeds Tokio semaphore limits",
             ));
         }
-        let http = LarkHttp::new(endpoints)?;
-        let tokens = TenantTokenProvider::new(http.clone(), creds.clone());
-        let api = LarkApi::new(http.clone(), tokens);
-        let info = api.bot_info().await?;
-        let bot_open_id = info
-            .open_id
-            .filter(|open_id| !open_id.is_empty())
-            .ok_or_else(|| LarkError::protocol("bot info response missing open_id"))?;
-        let normalizer = Arc::new(Normalizer::new(api, bot_open_id));
         let (recovery, hook) = intake.into_parts();
 
         let recovery_count = recovery.len();
@@ -320,6 +416,11 @@ impl LarkBridge {
                 u64::try_from(config.event_byte_budget).unwrap_or(u64::MAX),
             ));
         }
+        tracing::info!(
+            recovered_events = recovery_count,
+            recovered_bytes = recovery_bytes,
+            "durable inbound recovery scan complete"
+        );
 
         let (tx, rx) = mpsc::channel(config.event_capacity);
         let budget = Arc::new(Semaphore::new(config.event_byte_budget));
@@ -336,35 +437,26 @@ impl LarkBridge {
             preload.push((reserve, retained, permit));
         }
         for (reserve, retained, permit) in preload {
-            reserve.send(QueuedInboundEvent {
-                event: *retained.into_event(),
-                permit,
-            });
+            reserve.send(QueuedInboundEvent::new(*retained.into_event(), permit));
         }
 
-        let handler: InboundFrameHandler = Arc::new(move |headers, payload: Bytes| {
+        let handler: InboundEventHandler = Arc::new(move |payload: Bytes| {
             let normalizer = Arc::clone(&normalizer);
             let hook = Arc::clone(&hook);
             let tx = tx.clone();
             let budget = Arc::clone(&budget);
             Box::pin(async move {
-                if matches!(headers.ty(), Some(MessageType::Card)) {
-                    tracing::info!(
-                        message_id = headers.message_id().unwrap_or(""),
-                        "lark card action is unsupported in this milestone; acknowledging"
-                    );
-                    return Ok(Some(json!({ "status": "unsupported" })));
-                }
                 let outcome = normalizer.normalize(&payload).await?;
-                let NormalizeOutcome::Event { event, degradation } = outcome else {
+                let NormalizeOutcome::Event {
+                    event,
+                    live_transcripts,
+                    degradation,
+                } = outcome
+                else {
                     return Ok(None);
                 };
                 if let Some(degradation) = degradation {
-                    tracing::warn!(
-                        ?degradation,
-                        message_id = %event.message_id,
-                        "lark event normalized with degradation"
-                    );
+                    tracing::warn!(?degradation, "lark event normalized with degradation");
                 }
                 let retained = match hook(event).await? {
                     IntakeVerdict::DropDuplicate => return Ok(None),
@@ -384,14 +476,16 @@ impl LarkBridge {
                         u64::try_from(config.event_byte_budget).unwrap_or(u64::MAX),
                     )
                 })?;
-                reserve.send(QueuedInboundEvent {
-                    event: *retained.into_event(),
+                let live_transcripts = live_transcripts.retain_if_bound(retained.event());
+                reserve.send(QueuedInboundEvent::with_live_transcripts(
+                    *retained.into_event(),
                     permit,
-                });
+                    live_transcripts,
+                ));
+                tracing::debug!(payload_bytes = size, "durable inbound event queued");
                 Ok(None)
             })
         });
-        let handle = LarkTransport::start_with_config(http, creds, handler, config.transport);
-        Ok((handle, rx))
+        Ok((handler, rx))
     }
 }

@@ -5,11 +5,24 @@ use lark_codex_bridge::runtime::commands::{
 };
 
 #[test]
-fn parses_the_five_first_stage_commands() {
+fn parses_the_eight_first_stage_commands() {
     assert_eq!(parse_command("/new"), Ok(Some(BridgeCommand::New)));
     assert_eq!(parse_command(" /stop "), Ok(Some(BridgeCommand::Stop)));
     assert_eq!(parse_command("/status"), Ok(Some(BridgeCommand::Status)));
     assert_eq!(parse_command("/help"), Ok(Some(BridgeCommand::Help)));
+    assert_eq!(
+        parse_command("/threads opaque-next-page"),
+        Ok(Some(BridgeCommand::Threads {
+            cursor: Some("opaque-next-page".to_owned())
+        }))
+    );
+    assert_eq!(
+        parse_command("/adopt t-candidate --handoff-complete"),
+        Ok(Some(BridgeCommand::Adopt {
+            selector: "t-candidate".to_owned()
+        }))
+    );
+    assert_eq!(parse_command("/release"), Ok(Some(BridgeCommand::Release)));
     assert_eq!(
         parse_command("/cd ./workspace with spaces"),
         Ok(Some(BridgeCommand::Cd {
@@ -40,15 +53,39 @@ fn recognized_commands_reject_invalid_arguments() {
         parse_command("/stop now"),
         Err(CommandParseError::UnexpectedArgument { command: "/stop" })
     );
+    assert_eq!(
+        parse_command("/threads one two"),
+        Err(CommandParseError::UnexpectedArgument {
+            command: "/threads"
+        })
+    );
+    assert_eq!(
+        parse_command("/adopt t-candidate"),
+        Err(CommandParseError::HandoffConfirmationRequired)
+    );
+    assert_eq!(
+        parse_command("/adopt t-candidate --handoff-complete extra"),
+        Err(CommandParseError::HandoffConfirmationRequired)
+    );
+    assert_eq!(
+        parse_command(&format!("/threads {}", "c".repeat(513))),
+        Err(CommandParseError::TooLong)
+    );
+    assert_eq!(
+        parse_command(&format!("/adopt {} --handoff-complete", "s".repeat(129))),
+        Err(CommandParseError::TooLong)
+    );
 }
 
 #[test]
 fn command_table_is_the_single_exact_help_source() {
     let specs = command_specs();
-    assert_eq!(specs.len(), 5);
+    assert_eq!(specs.len(), 8);
     assert_eq!(
         specs.iter().map(|spec| spec.name).collect::<Vec<_>>(),
-        vec!["/new", "/stop", "/status", "/cd", "/help"]
+        vec![
+            "/new", "/stop", "/status", "/cd", "/threads", "/adopt", "/release", "/help"
+        ]
     );
     assert!(specs.iter().all(|spec| !spec.usage.is_empty()));
     assert!(specs.iter().all(|spec| !spec.description.is_empty()));
@@ -80,4 +117,20 @@ fn command_limits_and_debug_never_expose_a_workspace_path() {
     assert!(!debug.contains("sensitive"));
     assert!(!debug.contains("customer"));
     assert!(debug.contains("path_bytes"));
+
+    let cursor = "sensitive-cursor".to_owned();
+    let command = BridgeCommand::Threads {
+        cursor: Some(cursor.clone()),
+    };
+    let debug = format!("{command:?}");
+    assert!(!debug.contains(&cursor));
+    assert!(debug.contains("cursor_bytes"));
+
+    let selector = "sensitive-thread-selector".to_owned();
+    let command = BridgeCommand::Adopt {
+        selector: selector.clone(),
+    };
+    let debug = format!("{command:?}");
+    assert!(!debug.contains(&selector));
+    assert!(debug.contains("selector_bytes"));
 }

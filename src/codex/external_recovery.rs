@@ -204,6 +204,9 @@ impl ExternalRecoveryCoordinator {
     /// # Errors
     ///
     /// Returns `Store` if registration cannot be persisted, or `Closed` if the actor has stopped.
+    /// Registration is fenced by the actor's first durable epoch reservation, so a call that races
+    /// actor startup can surface `Store` (a store not-found); callers should retry once the actor
+    /// has published its first epoch.
     pub async fn manage_thread(&self, thread_id: &str) -> Result<(), ExternalRecoveryError> {
         self.store
             .register_external_thread(self.endpoint_label.as_str(), thread_id)
@@ -985,6 +988,9 @@ async fn apply_live_event(
     epoch: u64,
     event: ExternalReadEvent,
 ) -> Result<(), EpochFailure> {
+    if matches!(event, ExternalReadEvent::RemoteControlStatusChanged(_)) {
+        return Ok(());
+    }
     let Some(thread_id) = event_thread_id(&event).map(str::to_owned) else {
         return Err(EpochFailure::ConnectionLost);
     };

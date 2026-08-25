@@ -81,6 +81,34 @@ fn standalone_final_is_the_final_answer() {
 }
 
 #[test]
+fn final_render_remasks_addresses_exposed_by_html_stripping() {
+    let projector = ReplyProjector::with_defaults();
+    // The pre-render mask cannot see through raw HTML: `<b>` breaks the
+    // terminal label and the dotted comment moves the last dot. Rendering
+    // strips both, exposing clean addresses that the post-render mask must
+    // still catch.
+    let turn = outcome(
+        vec![agent(
+            "a1",
+            "contact user@<b>example.com</b> or admin@<!--x.y-->example.org",
+            Some(MessagePhase::FinalAnswer),
+        )],
+        TurnStatus::Completed,
+    );
+
+    match projector.project_final(&turn) {
+        ProjectedReply::Final { parts } => {
+            assert_eq!(
+                parts,
+                vec!["contact user[at]example.com or admin[at]example.org"]
+            );
+        }
+        ProjectedReply::ProgressFinal { .. } => panic!("no progress card exists"),
+        ProjectedReply::Empty => panic!("expected a standalone final"),
+    }
+}
+
+#[test]
 fn final_only_turn_produces_no_progress() {
     let mut projector = ReplyProjector::with_defaults();
     let now = Instant::now();
@@ -463,6 +491,83 @@ fn email_mask_leaves_version_like_tokens_and_mentions_untouched() {
     // A real address is still masked; an already-masked one has no '@' left.
     assert_eq!(email_mask("user@example.com"), "user[at]example.com");
     assert_eq!(email_mask("user[at]example.com"), "user[at]example.com");
+}
+
+#[test]
+fn single_pass_email_mask_matches_the_legacy_predicate_corpus() {
+    fn legacy_is_email_at(text: &str, index: usize) -> bool {
+        let Some(left) = text[..index].chars().next_back() else {
+            return false;
+        };
+        if !(left.is_ascii_alphanumeric() || matches!(left, '.' | '_' | '%' | '+' | '-')) {
+            return false;
+        }
+        let token: String = text[index + 1..]
+            .chars()
+            .take_while(|character| !character.is_whitespace())
+            .collect();
+        let Some(first) = token.chars().next() else {
+            return false;
+        };
+        if first.is_ascii_digit() {
+            return false;
+        }
+        let Some(last_dot) = token.rfind('.') else {
+            return false;
+        };
+        let label = &token[last_dot + 1..];
+        let length = label.chars().count();
+        (2..=24).contains(&length)
+            && label
+                .chars()
+                .all(|character| character.is_ascii_alphabetic())
+    }
+
+    fn legacy_email_mask(text: &str) -> String {
+        let mut output = String::with_capacity(text.len());
+        let mut cursor = 0;
+        for (index, _) in text.match_indices('@') {
+            output.push_str(&text[cursor..index]);
+            if legacy_is_email_at(text, index) {
+                output.push_str("[at]");
+            } else {
+                output.push('@');
+            }
+            cursor = index + 1;
+        }
+        output.push_str(&text[cursor..]);
+        output
+    }
+
+    let alphabet = [
+        'a', 'Z', '1', '@', '.', ' ', '\t', '-', '_', '%', '+', '/', 'é', ',', ' ',
+    ];
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    for case in 0..20_000 {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let length = usize::from(state.to_le_bytes()[0] % 64).saturating_add(case % 3);
+        let mut sample = String::new();
+        for _ in 0..length {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            sample.push(alphabet[usize::from(state.to_le_bytes()[0]) % alphabet.len()]);
+        }
+        assert_eq!(
+            email_mask(&sample),
+            legacy_email_mask(&sample),
+            "{sample:?}"
+        );
+    }
+
+    let pairs = 64 * 1024;
+    let dense = format!("{}x.com", "a@".repeat(pairs));
+    let masked = email_mask(&dense);
+    assert_eq!(masked.matches("[at]").count(), pairs);
+    assert!(!masked.contains('@'));
+    assert!(masked.ends_with("x.com"));
 }
 
 #[test]

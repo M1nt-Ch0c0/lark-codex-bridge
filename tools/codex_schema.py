@@ -33,7 +33,7 @@ from urllib.parse import unquote, urldefrag, urljoin
 
 
 GENERATOR_NAME = "lark-codex-bridge/codex-schema"
-GENERATOR_VERSION = "1.2.0"
+GENERATOR_VERSION = "1.2.1"
 LEGACY_GENERATOR_VERSIONS = {"0.146.0": "1.1.0"}
 LEGACY_TEMPLATE_SHA256 = {
     "0.146.0": "4d07c5c97841b0c9fb14aa525e611026543e785347c293ff70498c36051de19e"
@@ -1393,6 +1393,43 @@ def render_wire(version: str, protocol_family: str, schema_sha: str, bundle: dic
     }
     thread_fields = generated_value_fields(thread_properties, thread_required, base_thread_fields)
 
+    thread_start_schema = roots["thread.start.params"]
+    thread_start_properties = thread_start_schema.get("properties", {})
+    if not isinstance(thread_start_properties, dict):
+        fail("selected ThreadStartParams schema has no object properties")
+    base_thread_start_fields = {
+        "allowProviderModelFallback",
+        "sandbox",
+        "approvalPolicy",
+        "approvalsReviewer",
+        "baseInstructions",
+        "config",
+        "cwd",
+        "developerInstructions",
+        "dynamicTools",
+        "environments",
+        "experimentalRawEvents",
+        "historyMode",
+        "mockExperimentalField",
+        "multiAgentMode",
+        "permissions",
+        "runtimeWorkspaceRoots",
+        "selectedCapabilityRoots",
+        "serviceTier",
+        "serviceName",
+        "ephemeral",
+        "personality",
+        "sessionStartSource",
+        "threadSource",
+        "model",
+        "modelProvider",
+    }
+    thread_start_fields = generated_value_fields(
+        thread_start_properties,
+        set(thread_start_schema.get("required", [])),
+        base_thread_start_fields,
+    )
+
     list_schema = roots["thread.list.params"]
     list_properties = list_schema.get("properties", {})
     if not isinstance(list_properties, dict):
@@ -1424,6 +1461,7 @@ def render_wire(version: str, protocol_family: str, schema_sha: str, bundle: dic
         "@PROTOCOL_FAMILY@": protocol_family,
         "@SCHEMA_SHA256@": schema_sha,
         "@THREAD_VERSION_FIELDS@": thread_fields,
+        "@THREAD_START_VERSION_FIELDS@": f"{thread_start_fields}\n" if thread_start_fields else "",
         "@THREAD_LIST_VERSION_FIELDS@": list_fields,
         "@SHARED_WIRE_TYPES@": shared_wire,
     }

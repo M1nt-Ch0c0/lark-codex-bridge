@@ -1,7 +1,11 @@
 use assert_cmd::cargo::cargo_bin_cmd;
 use clap::Parser;
-use lark_codex_bridge::cli::Cli;
+use lark_codex_bridge::{
+    cli::{Cli, LogFormat},
+    runtime::adoption::ThreadAdoptionGate,
+};
 use predicates::prelude::*;
+use serde_json::json;
 
 #[test]
 fn help_describes_the_codex_command() {
@@ -21,6 +25,58 @@ fn version_matches_the_package_version() {
         .assert()
         .success()
         .stdout(predicate::str::contains("0.1.0-alpha.1"));
+}
+
+#[test]
+fn adoption_status_is_machine_readable_and_fail_closed() {
+    let availability = ThreadAdoptionGate.availability();
+    let assertion = cargo_bin_cmd!("lark-codex-bridge")
+        .args(["codex", "adoption-status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("thread/resume").not())
+        .stdout(predicate::str::contains("CODEX_HOME").not());
+    let report: serde_json::Value = serde_json::from_slice(&assertion.get_output().stdout)
+        .expect("adoption status should be JSON");
+
+    assert_eq!(
+        report,
+        json!({
+            "available": availability.is_available(),
+            "classification": availability.code(),
+            "guidance": availability.guidance(),
+            "requiresExplicitHandoff": true,
+            "sharedEndpointIssue": 8,
+        })
+    );
+}
+
+#[test]
+fn adoption_status_does_not_spawn_codex_or_read_its_profile() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let empty_path = temp.path().join("empty-path");
+    let poisoned_home = temp.path().join("poisoned-codex-home");
+    let missing_home = temp.path().join("missing-codex-home");
+    std::fs::create_dir(&empty_path).expect("empty PATH directory");
+    std::fs::create_dir(&poisoned_home).expect("poisoned CODEX_HOME directory");
+    std::fs::write(
+        poisoned_home.join("config.toml"),
+        b"this is deliberately invalid Codex configuration = [",
+    )
+    .expect("poisoned Codex configuration");
+    assert!(!missing_home.exists());
+
+    for codex_home in [&poisoned_home, &missing_home] {
+        cargo_bin_cmd!("lark-codex-bridge")
+            .env("CODEX_HOME", codex_home)
+            .env("PATH", &empty_path)
+            .args(["codex", "adoption-status"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(
+                "\"classification\":\"unavailable_no_reliable_writer_release\"",
+            ));
+    }
 }
 
 #[test]
@@ -75,4 +131,109 @@ fn parsed_cli_debug_redacts_secrets_ids_and_absolute_paths() {
     let run_debug = format!("{run:?}");
     assert!(run_debug.contains("config_configured"));
     assert!(!run_debug.contains("/sensitive/customer"));
+}
+
+#[test]
+fn verbosity_and_log_format_are_global_cli_options() {
+    let before = Cli::try_parse_from([
+        "lark-codex-bridge",
+        "-vv",
+        "--log-format",
+        "json",
+        "codex",
+        "probe",
+    ])
+    .expect("global options before subcommand");
+    assert_eq!(before.verbose, 2);
+    assert_eq!(before.log_format, LogFormat::Json);
+
+    let after = Cli::try_parse_from([
+        "lark-codex-bridge",
+        "codex",
+        "probe",
+        "-v",
+        "--log-format",
+        "human",
+    ])
+    .expect("global options after subcommand");
+    assert_eq!(after.verbose, 1);
+    assert_eq!(after.log_format, LogFormat::Human);
+}
+
+#[test]
+fn verbose_diagnostics_use_stderr_and_redact_configured_paths() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let secret_marker = "SECRET_APP_TOKEN_AND_PROMPT_CONTENT";
+    let missing_binary = temp.path().join(secret_marker).join("missing-codex");
+    let output = cargo_bin_cmd!("lark-codex-bridge")
+        .env_remove("RUST_LOG")
+        .args(["-vv", "codex", "probe", "--binary"])
+        .arg(&missing_binary)
+        .output()
+        .expect("run verbose probe");
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty(), "tracing must never use stdout");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Codex supervisor epoch starting"));
+    assert!(stderr.contains("Codex supervisor degraded"));
+    assert!(stderr.contains("error: unable to run Codex binary"));
+    assert!(!stderr.contains(secret_marker));
+    assert!(!stderr.contains(&*missing_binary.to_string_lossy()));
+}
+
+#[test]
+fn rust_log_overrides_verbose_defaults() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let missing_binary = temp.path().join("missing-codex");
+    let output = cargo_bin_cmd!("lark-codex-bridge")
+        .env("RUST_LOG", "error")
+        .args(["-vv", "codex", "probe", "--binary"])
+        .arg(missing_binary)
+        .output()
+        .expect("run filtered probe");
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("error: unable to run Codex binary"));
+    assert!(!stderr.contains("terminal tracing initialized"));
+    assert!(!stderr.contains("Codex supervisor epoch starting"));
+    assert!(!stderr.contains("Codex supervisor degraded"));
+}
+
+#[test]
+fn invalid_rust_log_is_actionable_and_does_not_echo_its_value() {
+    let secret_filter = "[SECRET_FILTER_CONTENT";
+    let output = cargo_bin_cmd!("lark-codex-bridge")
+        .env("RUST_LOG", secret_filter)
+        .args(["codex", "probe", "--binary", "missing-codex"])
+        .output()
+        .expect("run invalid filter probe");
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("invalid RUST_LOG filter"));
+    assert!(stderr.contains("lark_codex_bridge=debug"));
+    assert!(!stderr.contains(secret_filter));
+}
+
+#[test]
+fn json_log_format_is_structured_and_still_stderr_only() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let missing_binary = temp.path().join("missing-codex");
+    let output = cargo_bin_cmd!("lark-codex-bridge")
+        .env_remove("RUST_LOG")
+        .args(["-v", "--log-format", "json", "codex", "probe", "--binary"])
+        .arg(missing_binary)
+        .output()
+        .expect("run JSON probe");
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(r#""level":"INFO""#));
+    assert!(stderr.contains(r#""message":"CLI command started""#));
+    assert!(stderr.contains(r#""command":"codex""#));
 }
