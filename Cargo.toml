@@ -19,6 +19,7 @@ flate2 = "1.1.9"
 futures-util = "0.3.34"
 fs2 = "0.4.3"
 libc = "0.2.183"
+process-wrap = { version = "=8.2.1", default-features = false, features = ["job-object", "kill-on-drop", "process-group", "tokio1"] }
 prost = { version = "0.14.4", default-features = false, features = ["derive", "std"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "multipart", "form"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
@@ -28,19 +29,21 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"
 thiserror = "2.0.20"
+tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["macros", "process", "rt-multi-thread", "signal", "sync", "time", "io-util"] }
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-native-roots"] }
 tokio-util = { version = "0.7.19", features = ["codec", "rt"] }
 toml = "1.0.6"
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
 url = "2.5.8"
 uuid = { version = "1.24.0", features = ["v4", "serde"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-acl = "=0.3.0"
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
 predicates = "3.1.4"
-tempfile = "3.27.0"
 
 [profile.release]
 codegen-units = 1
