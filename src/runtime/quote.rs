@@ -164,21 +164,17 @@ fn status_for_error(error: &LarkError) -> QuoteStatus {
         // missing permission, and invisible message all fail closed as an
         // authorization boundary. A recalled parent has a stable deleted
         // degradation. Unknown envelope failures remain unavailable.
-        LarkError::PermanentAuth { .. }
-        | LarkError::Retryable {
-            code: Some(230_002 | 230_006 | 230_027 | 230_050),
-            ..
-        } => QuoteStatus::Unauthorized,
-        LarkError::Retryable {
-            code: Some(230_011),
-            ..
-        }
-        | LarkError::ProtocolViolation {
-            code: Some(404), ..
-        } => QuoteStatus::Deleted,
-        LarkError::Retryable { .. }
-        | LarkError::ProtocolViolation { .. }
-        | LarkError::InvalidRequest { .. } => QuoteStatus::Unavailable,
+        // `check_code` now classifies those business codes as protocol
+        // violations; match the numeric code on both variants so the quote
+        // contract survives that taxonomy change.
+        LarkError::PermanentAuth { .. } => QuoteStatus::Unauthorized,
+        LarkError::Retryable { code, .. } | LarkError::ProtocolViolation { code, .. } => match code
+        {
+            Some(230_002 | 230_006 | 230_027 | 230_050) => QuoteStatus::Unauthorized,
+            Some(230_011 | 404) => QuoteStatus::Deleted,
+            _ => QuoteStatus::Unavailable,
+        },
+        LarkError::InvalidRequest { .. } => QuoteStatus::Unavailable,
     }
 }
 
