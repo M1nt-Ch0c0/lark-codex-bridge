@@ -668,8 +668,12 @@ async fn run_router(
     // The startup round above replaces the interval's immediate first tick.
     stale_sweep.tick().await;
     let mut supervisor_open = true;
-    let mut tool_task =
-        start_context_tool_task(&supervisor, &attachments, &contexts, settings.asr.clone());
+    let mut tool_task = start_context_tool_task(
+        &supervisor,
+        attachments.as_ref(),
+        contexts.as_ref(),
+        settings.asr.clone(),
+    );
     loop {
         tokio::select! {
             biased;
@@ -699,8 +703,8 @@ async fn run_router(
                         }
                         tool_task = start_context_tool_task(
                             &supervisor,
-                            &attachments,
-                            &contexts,
+                            attachments.as_ref(),
+                            contexts.as_ref(),
                             settings.asr.clone(),
                         );
                     }
@@ -845,12 +849,12 @@ async fn finish_stale_sweep(task: Option<StaleSweepTask>) {
 #[allow(clippy::ref_option, clippy::too_many_arguments)]
 fn start_context_tool_task(
     supervisor: &SupervisorHandle,
-    attachments: &Option<Arc<AttachmentCache>>,
-    contexts: &Option<Arc<ContextRegistry>>,
+    attachments: Option<&Arc<AttachmentCache>>,
+    contexts: Option<&Arc<ContextRegistry>>,
     asr: AsrSection,
 ) -> Option<ContextToolTask> {
-    let attachments = attachments.as_ref().map(Arc::clone)?;
-    let contexts = contexts.as_ref().map(Arc::clone)?;
+    let attachments = attachments.map(Arc::clone)?;
+    let contexts = contexts.map(Arc::clone)?;
     let client = supervisor.client().ok()?;
     let epoch = client.epoch();
     let mut events = client.take_control_events().ok()?;
@@ -960,7 +964,7 @@ async fn route_one(
     quote_resolver: Option<&Arc<dyn QuoteResolver>>,
     actors: &mut HashMap<String, ScopeActorHandle>,
     queued: QueuedInboundEvent,
-) -> Result<(), RouteFailure> {
+) -> Result<(), Box<RouteFailure>> {
     let key = InboundKey::new(tenant.clone(), queued.event.event_id.clone());
     if queued.event.chat_type != ChatMode::P2p && is_conversation_media(&queued.event.message_type)
     {
@@ -968,20 +972,24 @@ async fn route_one(
             .complete_received_without_turn(&key)
             .await
             .map(|_| ())
-            .map_err(|_| RouteFailure {
-                error: RouteError::Store,
-                event: queued,
-                retryable: true,
+            .map_err(|_| {
+                Box::new(RouteFailure {
+                    error: RouteError::Store,
+                    event: queued,
+                    retryable: true,
+                })
             });
     }
     let decision = policy.decide(&queued.event);
     if let Some(kind) = decision.rejection_kind() {
         return reject_with_notice(store, sink.as_ref(), &key, &queued.event, kind)
             .await
-            .map_err(|error| RouteFailure {
-                error,
-                event: queued,
-                retryable: true,
+            .map_err(|error| {
+                Box::new(RouteFailure {
+                    error,
+                    event: queued,
+                    retryable: true,
+                })
             });
     }
     let scope_key = queued.event.scope.to_string();
@@ -1003,10 +1011,12 @@ async fn route_one(
                     InboundRejectionKind::Overloaded,
                 )
                 .await
-                .map_err(|error| RouteFailure {
-                    error,
-                    event: queued,
-                    retryable: true,
+                .map_err(|error| {
+                    Box::new(RouteFailure {
+                        error,
+                        event: queued,
+                        retryable: true,
+                    })
                 });
             }
         }
@@ -1027,11 +1037,11 @@ async fn route_one(
         );
     }
     let Some(actor) = actors.get(&scope_key) else {
-        return Err(RouteFailure {
+        return Err(Box::new(RouteFailure {
             error: RouteError::ActorUnavailable,
             event: queued,
             retryable: false,
-        });
+        }));
     };
     let route = actor.try_route(key.clone(), queued);
     match route {
@@ -1046,17 +1056,19 @@ async fn route_one(
                 InboundRejectionKind::Overloaded,
             )
             .await
-            .map_err(|error| RouteFailure {
-                error,
-                event: queued,
-                retryable: true,
+            .map_err(|error| {
+                Box::new(RouteFailure {
+                    error,
+                    event: queued,
+                    retryable: true,
+                })
             })
         }
-        Err(ActorRouteError::Closed(queued)) => Err(RouteFailure {
+        Err(ActorRouteError::Closed(queued)) => Err(Box::new(RouteFailure {
             error: RouteError::ActorUnavailable,
             event: *queued,
             retryable: false,
-        }),
+        })),
     }
 }
 
