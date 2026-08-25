@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::schema::MIGRATIONS;
 use super::{FileReservation, StoreError, sqlite_error, tighten_database_sidecars};
-use crate::limits::{STORE_BUSY_TIMEOUT, STORE_WRITER_CAPACITY};
+use crate::limits::{STORE_ATTACHMENT_LEASE_MAX_ROWS, STORE_BUSY_TIMEOUT, STORE_WRITER_CAPACITY};
 
 /// One request toward the writer task.
 pub(crate) enum StoreRequest {
@@ -167,6 +167,7 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
             let transaction = connection
                 .transaction()
                 .map_err(|error| sqlite_error("starting a migration transaction", &error))?;
+            prepare_migration(&transaction, migration.version)?;
             transaction
                 .execute_batch(migration.sql)
                 .map_err(|error| sqlite_error("applying a migration", &error))?;
@@ -186,6 +187,36 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
             },
             other => other,
         })?;
+    }
+    Ok(())
+}
+
+fn prepare_migration(
+    transaction: &rusqlite::Transaction<'_>,
+    version: u32,
+) -> Result<(), StoreError> {
+    if version != 6 {
+        return Ok(());
+    }
+    transaction
+        .execute(
+            "DELETE FROM attachment_leases WHERE turn_row_id IN (
+                 SELECT id FROM turns
+                 WHERE state IN ('completed', 'failed', 'interrupted')
+                    OR (state = 'uncertain' AND uncertain = 0)
+             )",
+            [],
+        )
+        .map_err(|error| sqlite_error("cleaning stale leases before migration", &error))?;
+    let lease_count: i64 = transaction
+        .query_row("SELECT COUNT(*) FROM attachment_leases", [], |row| {
+            row.get(0)
+        })
+        .map_err(|error| sqlite_error("checking lease migration capacity", &error))?;
+    if u64::try_from(lease_count).unwrap_or(u64::MAX) > STORE_ATTACHMENT_LEASE_MAX_ROWS {
+        return Err(StoreError::CapacityExceeded {
+            context: "migrating attachment leases",
+        });
     }
     Ok(())
 }
