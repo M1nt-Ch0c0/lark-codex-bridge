@@ -47,7 +47,11 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::lark::api::{LarkApi, ResourceKind};
+use crate::channel::{
+    ChannelError, ChannelErrorKind, ControlledMediaResolver, MediaKind as ResourceKind,
+    MediaRequest,
+};
+use crate::lark::api::LarkApi;
 use crate::lark::error::LarkError;
 use crate::lark::normalize::ResourceDesc;
 use crate::limits::{
@@ -364,8 +368,8 @@ pub trait ResourceDownloader: Send + Sync {
 }
 
 /// [`ResourceDownloader`] adapter over the real [`LarkApi`] download path.
-/// Wiring this into scope/turn input is Task 8 integration and intentionally
-/// out of scope here.
+/// The runtime invokes it only after a turn-scoped opaque handle passes
+/// context authorization and the per-turn read meter.
 pub struct LarkResourceDownloader {
     api: LarkApi,
 }
@@ -405,6 +409,46 @@ impl fmt::Debug for LarkResourceDownloader {
     }
 }
 
+/// [`ResourceDownloader`] adapter over the provider-neutral controlled-media
+/// boundary. Production assembly uses this type so cache policy never depends
+/// on a vendor SDK or concrete HTTP client.
+pub struct ChannelResourceDownloader {
+    resolver: Arc<dyn ControlledMediaResolver>,
+}
+
+impl ChannelResourceDownloader {
+    /// Creates an adapter around a shared resolver capability.
+    #[must_use]
+    pub fn new(resolver: Arc<dyn ControlledMediaResolver>) -> Self {
+        Self { resolver }
+    }
+}
+
+impl ResourceDownloader for ChannelResourceDownloader {
+    fn download(
+        &self,
+        message_id: &str,
+        key: &str,
+        kind: ResourceKind,
+    ) -> BoxFuture<'static, Result<Bytes, AttachError>> {
+        let resolver = Arc::clone(&self.resolver);
+        let request = MediaRequest {
+            message_id: message_id.to_owned(),
+            resource_key: key.to_owned(),
+            kind,
+        };
+        Box::pin(async move { resolver.resolve(request).await.map_err(map_channel_error) })
+    }
+}
+
+impl fmt::Debug for ChannelResourceDownloader {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ChannelResourceDownloader")
+            .finish_non_exhaustive()
+    }
+}
+
 // `map_err` requires the adapter to accept the error by value even though the
 // body only reads its classification.
 #[allow(clippy::needless_pass_by_value)]
@@ -416,6 +460,16 @@ fn map_lark_error(error: LarkError) -> AttachError {
             DownloadKind::Protocol
         }
         LarkError::Exhausted { .. } => DownloadKind::Exhausted,
+    };
+    AttachError::Download { kind }
+}
+
+fn map_channel_error(error: ChannelError) -> AttachError {
+    let kind = match error.kind() {
+        ChannelErrorKind::PermanentAuth => DownloadKind::PermanentAuth,
+        ChannelErrorKind::Retryable => DownloadKind::Retryable,
+        ChannelErrorKind::Protocol => DownloadKind::Protocol,
+        ChannelErrorKind::Exhausted => DownloadKind::Exhausted,
     };
     AttachError::Download { kind }
 }
@@ -585,12 +639,13 @@ impl AttachmentCache {
     /// ([`AttachmentLimits::check_resource_key`]) and the single-object byte
     /// cap ([`AttachmentLimits::check_attachment_bytes`]). The per-message
     /// count ([`AttachmentLimits::check_resource_batch`]) and the per-turn
-    /// byte total ([`AttachmentLimits::check_turn_total`]) are turn-assembly
-    /// responsibilities (plan Task 8 / B8), not fetch's; the display file-name
-    /// and MIME checkers ([`AttachmentLimits::check_file_name`] and
+    /// byte total ([`AttachmentLimits::check_turn_total`]) are enforced by
+    /// turn assembly and the context-tool read meter, not by `fetch` itself;
+    /// the display file-name and MIME checkers
+    /// ([`AttachmentLimits::check_file_name`] and
     /// [`AttachmentLimits::check_mime`]) apply to metadata that
     /// [`ResourceDesc`] does not carry (only `kind` + `key`), so they remain
-    /// public for the scope-actor wiring point that does carry that metadata.
+    /// public for the lazy context-tool path that does carry that metadata.
     ///
     /// The install/commit/re-verify sequence runs under the per-cache lock so
     /// a concurrent same-process `gc`/`reconcile` cannot delete the file

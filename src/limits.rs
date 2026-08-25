@@ -135,6 +135,30 @@ pub const LARK_INBOUND_EVENT_CAPACITY: usize = 256;
 /// exact persisted normalized payload bytes. Permits are held until drop.
 pub const LARK_INBOUND_EVENT_BYTE_BUDGET: usize = 8 * 1024 * 1024;
 
+/// Maximum bytes before the newline of one Rust↔Node sidecar frame. This is
+/// deliberately no larger than one native reassembled event.
+pub const CHANNEL_SIDECAR_FRAME_BYTES: usize = LARK_FRAGMENT_MESSAGE_BYTES;
+/// Events admitted by the Rust wire reader but not yet decided by the durable
+/// intake hook. Saturation returns an explicit negative ack.
+pub const CHANNEL_SIDECAR_EVENT_CAPACITY: usize = 64;
+/// Frames waiting for the child stdin writer.
+pub const CHANNEL_SIDECAR_WRITE_CAPACITY: usize = 128;
+/// Deadline for protocol/version/capability configuration.
+pub const CHANNEL_SIDECAR_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Deadline for the official SDK to report its first live connection after
+/// protocol configuration succeeds.
+pub const CHANNEL_SIDECAR_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// A process epoch must remain continuously connected for this long before a
+/// later crash starts a fresh restart-backoff sequence.
+pub const CHANNEL_SIDECAR_HEALTHY_UPTIME: Duration = Duration::from_secs(30);
+/// Deadline shared with the Node handler before upstream must receive failure.
+pub const CHANNEL_SIDECAR_HANDLER_TIMEOUT: Duration = LARK_HANDLER_TIMEOUT;
+/// Extra time for a negative handler-timeout ack to reach Node before Node
+/// independently rejects the pending SDK handler.
+pub const CHANNEL_SIDECAR_ACK_GRACE: Duration = Duration::from_secs(5);
+/// Grace for a correlated shutdown response and clean child exit.
+pub const CHANNEL_SIDECAR_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
 /// Count bound of the single-writer store command channel. Every store
 /// request (reads included) travels this channel to the one blocking writer
 /// task; a full channel fails the caller fast instead of growing an
@@ -345,6 +369,18 @@ pub const THREAD_ADOPTION_SELECTOR_MAX_BYTES: usize = 128;
 pub const THREAD_DISCOVERY_MAX_RESULTS: usize = 20;
 /// Maximum encoded bytes a future enabled discovery page may expose.
 pub const THREAD_DISCOVERY_MAX_PAGE_BYTES: usize = 16 * 1024;
+
+/// Lifetime of attachment descriptors staged by one direct-message scope.
+/// Bytes are never downloaded while a descriptor is pending.
+pub const PENDING_MEDIA_TTL: Duration = Duration::from_secs(10 * 60);
+/// Maximum attachment messages staged by one direct-message scope.
+pub const PENDING_MEDIA_MAX_COUNT: usize = 16;
+/// Aggregate variable metadata bytes retained by one pending-media queue.
+pub const PENDING_MEDIA_MAX_METADATA_BYTES: usize = 256 * 1024;
+/// Maximum serialized content accepted from a directly quoted Lark message.
+pub const QUOTE_CONTENT_MAX_BYTES: usize = 256 * 1024;
+/// Maximum typed parts accepted from one directly quoted message.
+pub const QUOTE_MAX_PARTS: usize = 16;
 
 /// Maximum characters (Unicode scalar values) in one projected reply message
 /// before deterministic splitting. A part never exceeds this bound.

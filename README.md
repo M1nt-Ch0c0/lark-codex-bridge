@@ -13,7 +13,8 @@
 
 - Codex app-server 的有界 stdio transport、RPC broker、typed thread/turn client、
   长驻 supervisor、thread 复用、`codex probe` 和门控的真实 Codex smoke；
-- Rust 原生飞书/Lark 凭证登记、OpenAPI、WebSocket transport、事件归一化、
+- Rust 原生飞书/Lark 凭证登记、OpenAPI、WebSocket transport、事件归一化，
+  以及可灰度启用、受 Rust 监督的官方 Node SDK 入站 sidecar；
   `lark probe` 和门控的真实 Lark smoke；
 - SQLite WAL 单写者 store、持久 inbox/outbox、去重、owner/指定 sender/指定群组 allowlist 授权、安全工作区策略、
   scope actor、同 scope 串行 turn 和不同 scope 的有界并发；
@@ -31,7 +32,7 @@
 
 ## 最小试用
 
-前提：本机已安装并登录当前精确支持的 `codex-cli 0.146.0`，飞书/Lark 应用机器人已创建并
+前提：本机已安装并登录当前精确支持的 `codex-cli 0.146.0` 或 `0.149.0`，飞书/Lark 应用机器人已创建并
 加入目标会话。首次运行不再需要手写 TOML、手动查询 `open_id` 或预先创建工作区。
 
 直接启动常驻桥接器，按提示完成扫码授权即可：
@@ -132,6 +133,36 @@ cargo run --locked -- codex adoption-status
 完整的负向互操作证据、生命周期规则和未来启用条件见
 [`docs/thread-adoption.md`](docs/thread-adoption.md)。实时多客户端共享不属于该顺序交接方案，
 由 [Issue #8](https://github.com/M1nt-Ch0c0/lark-codex-bridge/issues/8) 单独研究。
+
+## 会话富媒体与单跳引用
+
+- 私聊图片、视频和文件只暂存有界描述符，不下载、不启动 Codex；下一条普通文字把当前
+  pending media 合并进同一个 turn。队列受 10 分钟 TTL、16 条和 256 KiB 元数据上限约束，
+  消费、显式引用、`/cancel`、`/new`、`/stop`、中断、scope 回收和超时都会清理。
+- 私聊语音是独立的完整输入，会直接触发 turn，但不会消费之前暂存的图片/文件。语音字节和
+  ASR 仍只在 `bridge_media.read` 时发生。
+- 群聊/话题里未触发的图片、视频、文件和语音直接忽略并做无 turn 的 durable settlement；
+  不创建 scope actor，不进入 pending/context/附件缓存，也不运行 ASR。
+- 群聊/话题用“直接 @机器人并回复媒体消息”触发。Bridge 在当前触发消息通过 sender/group/
+  mention 策略后只拉取直接父消息一跳，并对父消息 sender 再独立执行 human/owner/sender/group
+  授权；资源 key 留在 turn-scoped capability registry，
+  `bridge_context.resolve` 只返回 opaque handle。删除、无权限、超限、不支持和暂时不可用均有
+  稳定状态，不递归读取引用链或聊天历史。
+
+真实移动端引用 smoke 是人工操作、显式门控的测试。运行后按终端提示，在指定群里先发送一条
+不 `@bot` 的图片/视频/文件/语音，再用飞书移动端直接回复该消息并 `@bot` 附带给出的 marker。
+启用路径会验证 standalone 群媒体完成 no-turn settlement 且未创建 actor/context/cache 工作，随后
+验证触发消息策略、父消息发送者授权、单跳引用解析、opaque handle（序列化结果不含 resource key）
+以及通过有界附件缓存的真实按需读取；全过程不打印 resource key 或媒体内容。未设置 gate 时会
+明确报告 skip，而 skip 不算验收证据。
+
+```bash
+LARK_MEDIA_E2E=1 LARK_E2E_APP_ID=… LARK_E2E_APP_SECRET=… LARK_E2E_TENANT=feishu \
+LARK_MEDIA_E2E_GROUP_CHAT_ID=oc_… \
+  cargo test --test lark_smoke --locked real_mobile_group_quote_resolves_direct_media_parent \
+  -- --ignored --nocapture
+```
+
 ## 本地语音转写（ASR sidecar）
 
 飞书语音气泡默认**不会**把 `localAudio` 交给 Codex。`bridge_media.read` 对音频按需转写后只回传文本：
@@ -218,6 +249,45 @@ LARK_E2E=1 LARK_E2E_APP_ID=… LARK_E2E_APP_SECRET=… LARK_E2E_TENANT=feishu LA
   cargo test --test lark_smoke --locked -- --ignored --nocapture
 ```
 
+### 官方 Node SDK 入站 sidecar（可选）
+
+默认 `native` 行为不变。要只把入站 WebSocket 灰度切到固定版本的官方 Node SDK，先在
+构建/部署阶段安装 lockfile 依赖（运行时不会执行 npm）：
+
+```bash
+npm ci --ignore-scripts --prefix sidecar
+npm run check --prefix sidecar
+```
+
+然后在 `config.toml` 显式选择；相对 `sidecar_entrypoint` 按配置文件目录解析，部署时建议
+使用绝对路径：
+
+```toml
+[channel]
+transport = "node-sidecar"       # 默认 "native"
+node_binary = "node"
+sidecar_entrypoint = "/opt/lark-codex-bridge/sidecar/index.cjs"
+fallback_to_native = true
+```
+
+sidecar 只接收入站事件与连接状态；查询、媒体下载和出站仍走 Rust OpenAPI。Rust 在完成
+SQLite durable intake 和有界队列预留后才回送正 ack；失败、超时或背压都会使 SDK handler
+失败，让上游保留重投语义。协议、脱敏与容量细节见
+[`docs/channel-wire-v1.md`](docs/channel-wire-v1.md)。
+
+`fallback_to_native` 只用于首次启动：只有在 sidecar 完成协议配置并由 SDK 报告真实
+`connected` 后启动才算成功；在此之前失败会稳定返回给组装层，由该开关决定是否启用原生
+transport。首次连接成功后的崩溃不会在运行中切换来源，而是按有界退避重启；连续健康连接
+30 秒后才重置退避。Rust 在 POSIX 上拥有整个 sidecar 进程组、在 Windows 上拥有 Job
+object，协议错误、stdout EOF、超时、关闭和 handle drop 都会终止其全部后代进程。
+
+真实 sidecar smoke 还要求操作者在连接后发送一条新私聊；未运行或 skip 不算证据：
+
+```bash
+LARK_SIDECAR_E2E=1 LARK_SIDECAR_E2E_APP_ID=… LARK_SIDECAR_E2E_APP_SECRET=… \
+  LARK_SIDECAR_E2E_TENANT=feishu \
+  cargo test --test lark_sidecar_smoke --locked -- --ignored --nocapture
+```
 ## 回复显示与 Markdown 验收
 
 输出层显式保留语义载体，不会根据字符串中是否出现 Markdown 符号来猜消息类型：

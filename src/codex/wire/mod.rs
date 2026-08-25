@@ -7,12 +7,13 @@ pub mod v0_146_0;
 pub mod v0_149_0;
 
 /// Exact versions whose schema and contracts have passed review.
-pub const SUPPORTED_CODEX_VERSIONS: &[&str] = &["0.146.0"];
+pub const SUPPORTED_CODEX_VERSIONS: &[&str] = &["0.146.0", "0.149.0"];
+const SUPPORTED_CODEX_VERSION_TRIPLES: &[(u64, u64, u64)] = &[(0, 146, 0), (0, 149, 0)];
 
 /// Returns true only for an exact, reviewed schema/contract version.
 #[must_use]
 pub fn is_supported_codex_version(version: &semver::Version) -> bool {
-    matches!((version.major, version.minor, version.patch), (0, 146, 0))
+    SUPPORTED_CODEX_VERSION_TRIPLES.contains(&(version.major, version.minor, version.patch))
         && version.pre.is_empty()
         && version.build.is_empty()
 }

@@ -240,4 +240,12 @@ DROP TABLE attachment_leases_v1;
         // persisted payload v2 rows it cannot understand.
         sql: "SELECT 1;",
     },
+    Migration {
+        version: 8,
+        name: "remove durable media capabilities and transcripts",
+        // The data rewrite is implemented by the writer immediately before
+        // this marker migration because it must decode and validate the
+        // versioned application payload rather than mutate JSON in SQL.
+        sql: "SELECT 1;",
+    },
 ];

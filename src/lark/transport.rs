@@ -64,6 +64,7 @@ use super::error::{LarkError, LarkErrorKind};
 use super::fragments::{Reassembler, Reassembly};
 use super::frame::{Frame, FrameHeaders, FrameMethod, Header, MessageType, header_key};
 use super::http::LarkHttp;
+pub use crate::channel::ConnectionState as TransportState;
 use crate::codex::supervisor::AppServerSupervisor;
 use crate::limits::{
     LARK_DEFAULT_PING_INTERVAL, LARK_FRAGMENT_MESSAGE_BYTES, LARK_HANDLER_TIMEOUT,
@@ -110,34 +111,6 @@ impl fmt::Debug for WsEndpoint {
             .field("reconnect_nonce", &self.reconnect_nonce)
             .finish()
     }
-}
-
-/// Lifecycle states published by the transport actor.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TransportState {
-    /// A bootstrap + connect attempt is in progress (1-based consecutive
-    /// failure count plus one).
-    Connecting {
-        /// 1-based attempt number within the current outage.
-        attempt: u32,
-    },
-    /// The WebSocket is open and the ping loop is running.
-    Connected,
-    /// Waiting before the next attempt.
-    Backoff {
-        /// Number of consecutive failures so far.
-        attempt: u32,
-        /// The exact delay being slept (deterministic jittered backoff).
-        delay: Duration,
-    },
-    /// A permanent failure (bad credentials, connection limit, handshake
-    /// auth error, exhausted attempt cap); no further retries are made.
-    Degraded {
-        /// Static classified reason, never server-supplied text.
-        reason: String,
-    },
-    /// The actor shut down cleanly.
-    Stopped,
 }
 
 /// Observation events emitted by the transport actor.

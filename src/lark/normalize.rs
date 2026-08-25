@@ -26,15 +26,19 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::api::{ChatMode, LarkApi, ResourceKind};
-use super::error::{LarkError, LarkErrorKind};
+use super::api::LarkApi;
+use super::error::LarkError;
+use crate::channel::native::NativeChannel;
+use crate::channel::{
+    ChannelErrorKind, ChatMessageQuery, ConversationMode as ChatMode, MediaKind as ResourceKind,
+};
 use crate::limits::{
     ASR_TRANSCRIPT_MAX_BYTES, ATTACHMENT_FILE_NAME_MAX_BYTES, ATTACHMENT_MIME_MAX_BYTES,
     LARK_CHAT_MODE_CACHE_CAPACITY, LARK_CHAT_MODE_CACHE_KEY_BYTES, LARK_CHAT_MODE_CACHE_TTL,
@@ -508,7 +512,7 @@ pub enum Degradation {
     /// failed; scoped to the chat instead of the thread.
     ThreadBackfillFailed {
         /// Retry classification of the backfill error.
-        kind: LarkErrorKind,
+        kind: ChannelErrorKind,
     },
     /// The backfill fetch succeeded but the raw item carried no `thread_id`
     /// either; scoped to the chat.
@@ -539,11 +543,12 @@ pub enum NormalizeOutcome {
 
 /// Normalizes raw event payloads into [`InboundEvent`]s.
 ///
-/// Holds the bot `open_id` (mention detection), a [`LarkApi`] (chat-mode
-/// resolution and one-shot thread backfill), and a bounded chat-mode cache.
+/// Holds the bot `open_id` (mention detection), a provider-neutral query
+/// capability (chat-mode resolution and one-shot thread backfill), and a
+/// bounded chat-mode cache.
 /// The normalizer owns no unbounded state.
 pub struct Normalizer {
-    api: LarkApi,
+    query: Arc<dyn ChatMessageQuery>,
     bot_open_id: String,
     chat_modes: Mutex<HashMap<String, ChatModeEntry>>,
 }
@@ -557,8 +562,14 @@ impl Normalizer {
     /// Creates a normalizer for one tenant/bot identity.
     #[must_use]
     pub fn new(api: LarkApi, bot_open_id: impl Into<String>) -> Self {
+        Self::with_query(Arc::new(NativeChannel::new(api)), bot_open_id)
+    }
+
+    /// Creates a normalizer over a provider-neutral query capability.
+    #[must_use]
+    pub fn with_query(query: Arc<dyn ChatMessageQuery>, bot_open_id: impl Into<String>) -> Self {
         Self {
-            api,
+            query,
             bot_open_id: bot_open_id.into(),
             chat_modes: Mutex::new(HashMap::new()),
         }
@@ -751,7 +762,7 @@ impl Normalizer {
             // Topic-group event without a thread_id: backfill once via the
             // raw message item, which keeps thread_id even when the event
             // dropped it (reference thread-id.ts).
-            match self.api.get_message(&parsed.message_id).await {
+            match self.query.message(parsed.message_id.clone()).await {
                 Ok(raw) => {
                     if let Some(backfilled) = non_empty(raw.thread_id) {
                         ScopeKey::Thread(parsed.chat_id.clone(), backfilled)
@@ -781,7 +792,7 @@ impl Normalizer {
         if let Some(mode) = self.cached_chat_mode(chat_id, now) {
             return (mode, None);
         }
-        match self.api.get_chat_mode(chat_id).await {
+        match self.query.conversation_mode(chat_id.to_owned()).await {
             Ok(mode) => {
                 self.store_chat_mode(chat_id, mode, now);
                 (mode, None)
@@ -987,6 +998,17 @@ fn extract_message_content(
         }
         _ => unreachable!("known message type handled above"),
     }
+}
+
+/// Parses one already-fetched message body through the exact same typed,
+/// sanitizing content path used for receive events. This narrow crate-local
+/// seam lets the authorized one-hop quote resolver avoid duplicating wire
+/// parsing or retaining the raw JSON beyond resolution.
+pub(crate) fn normalize_message_parts(
+    message_type: &str,
+    content: &str,
+) -> Result<Vec<MessagePart>, LarkError> {
+    extract_message_content(message_type, content).map(|extracted| extracted.parts)
 }
 
 fn unsupported_content(message_type: &str) -> ExtractedContent {
