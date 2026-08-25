@@ -12,9 +12,9 @@
     },
     {
       "compatibilityReviewSha256": "54db032e367e3dab67d3dae96bde59bcd75e00411e86c3a9f614007c50c38d65",
-      "contractSha256": "27d2d6814acea7152f6d13bedfcf6c89cae5269db4afa1c6934b10fb61b1fc1b",
+      "contractSha256": "e265eddbfe61a72d13a852f6b1b8979b6e34c2b70e7334f4e42a83eb355e740f",
       "decision": "supported",
-      "rustWireSha256": "86e1394a5c91584c65e79c1beef99864a8b2b7c24b1c2f02e7c25f79db3f8718",
+      "rustWireSha256": "d1f254644600232ade927c2ad7b02ed47701443bb1f57223f924c116324eb511",
       "schemaSha256": "b4da974f1e701e919fd647ebff780463970314e81b2e7676dbfe0acf4140f3a6",
       "version": "0.149.0"
     }

@@ -526,6 +526,92 @@ impl StoreHandle {
         .await
     }
 
+    /// Atomically replaces a definitely-not-applied final-card update with its
+    /// durable standalone fallback and returns the row to `pending`.
+    ///
+    /// The existing deterministic idempotency key is retained, so replaying
+    /// turn finalization cannot enqueue a second fallback. Attempts reset
+    /// because the standalone post is a different delivery operation. Any
+    /// already-claimed tail is released in the same transaction to preserve
+    /// global FIFO ordering.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::PayloadTooLarge`] before enqueue, or a state/store
+    /// error when the target is absent or no longer `sending`.
+    pub async fn replace_outbox_with_fallback(
+        &self,
+        id: i64,
+        payload_json: String,
+    ) -> Result<(), StoreError> {
+        if payload_json.len() > STORE_OUTBOX_PAYLOAD_MAX_BYTES {
+            return Err(StoreError::PayloadTooLarge {
+                context: "persisting an outbox fallback",
+                limit: STORE_OUTBOX_PAYLOAD_MAX_BYTES as u64,
+            });
+        }
+        self.run(move |connection| {
+            let transaction = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|error| sqlite_error("starting an outbox fallback", &error))?;
+            require_sending(&transaction, id, "persisting an outbox fallback")?;
+            let now = now_ms();
+            let payload_bytes = i64::try_from(payload_json.len()).unwrap_or(i64::MAX);
+            let old_payload_bytes: i64 = transaction
+                .query_row(
+                    "SELECT payload_bytes FROM outbox WHERE id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| sqlite_error("reading the replaced outbox payload", &error))?;
+            let live_bytes: i64 = transaction
+                .query_row(
+                    "SELECT COALESCE(SUM(payload_bytes), 0) FROM outbox
+                     WHERE state IN ('pending', 'sending')",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|error| sqlite_error("checking fallback outbox capacity", &error))?;
+            let (_, total_bytes) = total_outbox_count_bytes(&transaction)?;
+            let replacement_delta = payload_bytes.saturating_sub(old_payload_bytes).max(0);
+            if u64::try_from(live_bytes.saturating_add(replacement_delta)).unwrap_or(u64::MAX)
+                > STORE_OUTBOX_MAX_QUEUED_BYTES
+                || total_bytes.saturating_add(u64::try_from(replacement_delta).unwrap_or(u64::MAX))
+                    > OUTBOX_TERMINAL_MAX_BYTES
+            {
+                return Err(StoreError::CapacityExceeded {
+                    context: "persisting an outbox fallback",
+                });
+            }
+            transaction
+                .execute(
+                    "UPDATE outbox
+                     SET payload_json = ?2, payload_bytes = ?3, state = 'pending',
+                         attempts = 0, next_retry_ms = ?4, updated_ms = ?4
+                     WHERE id = ?1",
+                    params![id, payload_json, payload_bytes, now],
+                )
+                .map_err(|error| sqlite_error("persisting an outbox fallback", &error))?;
+            transaction
+                .execute(
+                    "UPDATE outbox
+                     SET state = 'pending',
+                         next_retry_ms = CASE
+                             WHEN next_retry_ms < ?2 THEN ?2
+                             ELSE next_retry_ms
+                         END,
+                         updated_ms = ?2
+                     WHERE id > ?1 AND state IN ('pending', 'sending')",
+                    params![id, now],
+                )
+                .map_err(|error| sqlite_error("releasing the outbox fallback tail", &error))?;
+            transaction
+                .commit()
+                .map_err(|error| sqlite_error("committing an outbox fallback", &error))
+        })
+        .await
+    }
+
     /// Returns a claimed `sending` row to `pending` without counting a send
     /// attempt.
     ///

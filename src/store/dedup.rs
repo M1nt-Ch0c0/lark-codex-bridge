@@ -13,7 +13,7 @@ use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use super::{StoreError, StoreHandle, now_ms, query_optional, request_bytes, sqlite_error};
-use crate::lark::api::{ChatMode, ResourceKind};
+use crate::channel::{ConversationMode as ChatMode, MediaKind as ResourceKind};
 use crate::lark::bridge::RetainedInbound;
 use crate::lark::normalize::ShortId;
 use crate::lark::normalize::{
@@ -943,10 +943,7 @@ fn encode_event(event: &InboundEvent) -> Result<Vec<u8>, StoreError> {
     Ok(payload)
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "the complete inbound invariant set remains auditable in one validator"
-)]
+#[allow(clippy::too_many_lines)]
 fn validate_event(event: &InboundEvent) -> Result<(), StoreError> {
     validate_incoming_key(event)?;
     validate_id(&event.chat_id, "validating an inbound chat ID")?;

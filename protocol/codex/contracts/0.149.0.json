@@ -23,7 +23,8 @@
       "method": "thread/start",
       "params": {
         "cwd": "/contract/workspace",
-        "ephemeral": true
+        "ephemeral": true,
+        "projectId": "project-contract-1"
       },
       "result": {
         "approvalPolicy": "on-request",

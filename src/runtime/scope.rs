@@ -1,6 +1,6 @@
 //! One-scope runtime contracts shared by the router and reply projector.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -13,12 +13,12 @@ use tokio::time::{Instant, sleep, sleep_until, timeout};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::channel::MediaKind as ResourceKind;
 use crate::codex::client::{AppServerClient, AppServerEvent, ThreadId, TurnId, TurnOutcome};
 use crate::codex::types::{
     SandboxMode, ThreadResumeParams, ThreadStartParams, TurnSandboxPolicy, TurnStartParams,
     TurnStatus, UserInput,
 };
-use crate::lark::api::ResourceKind;
 use crate::lark::bridge::QueuedInboundEvent;
 use crate::lark::normalize::{InboundEvent, ScopeKey};
 use crate::limits::{
@@ -352,6 +352,16 @@ impl ScopeActorHandle {
         let Some(active) = active else {
             return Ok(InterruptOutcome::NoActiveTurn);
         };
+        if let Some((registry, binding)) = &active.context_binding {
+            // Revoke before asking Codex to acknowledge the interrupt. Any
+            // response that already committed is allowed to finish first;
+            // every other media read is forced to return only cancellation.
+            // This ordering makes it impossible for transcript/media content
+            // to follow a successful interrupt acknowledgement.
+            let _ = registry
+                .revoke_turn_and_wait(binding, RevocationReason::Cancelled)
+                .await;
+        }
         active
             .client
             .interrupt_turn(&active.thread_id, &active.turn_id)
@@ -379,6 +389,7 @@ struct ActiveTurn {
     client: Arc<AppServerClient>,
     thread_id: ThreadId,
     turn_id: TurnId,
+    context_binding: Option<(ContextRegistry, PendingBinding)>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -488,6 +499,7 @@ async fn process_batch(
     shutdown: &CancellationToken,
 ) -> Result<(), ScopeFailureKind> {
     let batch = deduplicate_batch(batch);
+    tracing::debug!(batch_messages = batch.len(), "scope batch ready");
     let _active_permit = tokio::select! {
         biased;
         () = shutdown.cancelled() => return Err(ScopeFailureKind::Supervisor),
@@ -513,7 +525,7 @@ async fn process_batch(
     if eligible.is_empty() {
         return Ok(());
     }
-    let batch = eligible;
+    let mut batch = eligible;
     let (cwd, fingerprint) = match prepare_workspace(scope, store, policy, settings).await {
         Ok(workspace) => workspace,
         Err(ScopeFailureKind::Policy) => {
@@ -550,6 +562,13 @@ async fn process_batch(
         }
     };
     let client_message_id = Uuid::new_v4().to_string();
+    let mut live_transcripts = HashMap::with_capacity(batch.len());
+    for item in &mut batch {
+        let handoff = item.queued.take_live_transcripts();
+        if !handoff.is_empty() {
+            live_transcripts.insert(item.key.clone(), handoff);
+        }
+    }
     let keys = batch
         .iter()
         .map(|item| item.key.clone())
@@ -585,6 +604,7 @@ async fn process_batch(
         .collect::<Vec<_>>();
     let assembly = match assemble_turn_inputs(
         &claimed,
+        &mut live_transcripts,
         attachments,
         contexts,
         &thread_id,
@@ -624,12 +644,21 @@ async fn process_batch(
         return Ok(());
     };
     let mut context_lease = assembly.contexts;
+    let input_count = assembly.inputs.len();
+    let source_count = sources.len();
     let mut params = TurnStartParams::new(&thread_id, assembly.inputs);
     params.client_user_message_id = Some(client_message_id);
     params.cwd = Some(rpc_cwd.clone());
     params.approval_policy = Some(settings.approval_policy.clone());
     params.model.clone_from(&settings.model);
     params.sandbox_policy = Some(turn_sandbox(settings, rpc_cwd));
+    let turn_started_at = StdInstant::now();
+    tracing::info!(
+        epoch = turn_epoch,
+        source_count,
+        input_count,
+        "Codex turn starting"
+    );
     let start_result = tokio::select! {
         biased;
         () = shutdown.cancelled() => None,
@@ -638,6 +667,13 @@ async fn process_batch(
     let started = match start_result {
         Some(Ok(started)) => started,
         Some(Err(error)) if error.turn_start_definitely_not_applied() => {
+            tracing::warn!(
+                epoch = turn_epoch,
+                elapsed_ms =
+                    u64::try_from(turn_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                outcome = "rejected",
+                "Codex turn start failed"
+            );
             finalize_failed(
                 store,
                 sink.as_ref(),
@@ -652,6 +688,13 @@ async fn process_batch(
             return Ok(());
         }
         None | Some(Err(_)) => {
+            tracing::warn!(
+                epoch = turn_epoch,
+                elapsed_ms =
+                    u64::try_from(turn_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                outcome = "uncertain",
+                "Codex turn start outcome is uncertain"
+            );
             finalize_uncertain_and_settle_attachments(
                 store,
                 sink.as_ref(),
@@ -707,12 +750,20 @@ async fn process_batch(
         return Ok(());
     }
     set_state(state, ScopeState::Running { turn_row_id });
+    tracing::info!(
+        epoch = turn_epoch,
+        start_elapsed_ms = u64::try_from(turn_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "Codex turn running"
+    );
     set_active_turn(
         active_turn,
         Some(ActiveTurn {
             client: Arc::clone(&client),
             thread_id: ThreadId::from(thread_id.as_str()),
             turn_id: TurnId::from(started.id.as_str()),
+            context_binding: context_lease
+                .as_ref()
+                .map(TurnContextLease::cancellation_binding),
         }),
     )?;
     let mut projector = ReplyProjector::with_defaults();
@@ -764,7 +815,6 @@ async fn process_batch(
                             projector.restore_progress(&text);
                             tracing::warn!(
                                 error = %error,
-                                turn_row_id,
                                 "durable progress projection was rejected"
                             );
                         }
@@ -777,6 +827,16 @@ async fn process_batch(
     set_active_turn(active_turn, None)?;
     set_state(state, ScopeState::Finalizing { turn_row_id });
     let Some(outcome) = outcome else {
+        if let Some(lease) = context_lease.as_mut() {
+            lease.reason = RevocationReason::Failed;
+        }
+        drop(context_lease.take());
+        tracing::warn!(
+            epoch = turn_epoch,
+            elapsed_ms = u64::try_from(turn_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+            outcome = "uncertain",
+            "Codex turn ended without an authoritative completion"
+        );
         finalize_uncertain_and_settle_attachments(
             store,
             sink.as_ref(),
@@ -812,6 +872,13 @@ async fn process_batch(
         .resolve_turn_and_finish_inbound_batch(turn_row_id, resolution, inbound)
         .await
         .map_err(|_| ScopeFailureKind::Store)?;
+    tracing::info!(
+        epoch = turn_epoch,
+        resolution = ?resolution,
+        elapsed_ms = u64::try_from(turn_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+        source_count,
+        "Codex turn completed"
+    );
     if let Some(lease) = context_lease.as_mut() {
         lease.reason = match resolution {
             TurnResolution::Completed => RevocationReason::Completed,
@@ -819,6 +886,10 @@ async fn process_batch(
             TurnResolution::Failed | TurnResolution::Uncertain => RevocationReason::Failed,
         };
     }
+    // Revoke/cancel tool capabilities before the attachment release pass.
+    // A cancelled fetch that commits at the boundary then compensates its
+    // exact lease instead of recreating one after finalization.
+    drop(context_lease.take());
     if resolution != TurnResolution::Uncertain {
         release_attachments(attachments, turn_row_id).await?;
     }
@@ -886,6 +957,7 @@ fn deduplicate_batch(batch: Vec<ActorInbound>) -> Vec<ActorInbound> {
 
 async fn assemble_turn_inputs(
     claimed: &[ClaimedInbound],
+    live_transcripts: &mut HashMap<InboundKey, crate::lark::normalize::LiveTranscriptHandoff>,
     attachments: Option<&AttachmentCache>,
     contexts: Option<&ContextRegistry>,
     codex_thread_id: &str,
@@ -917,7 +989,11 @@ async fn assemble_turn_inputs(
         inputs.push(UserInput::text(event.text.clone()));
         if let (Some(registry), Some(lease)) = (contexts, context_lease.as_mut()) {
             let registered = registry
-                .register_pending(binding.clone(), ContextDraft::from_inbound(event))
+                .register_pending_with_transcripts(
+                    binding.clone(),
+                    ContextDraft::from_inbound(event),
+                    live_transcripts.remove(&claimed.key).unwrap_or_default(),
+                )
                 .map_err(|_| AttachmentAssemblyError::Failed)?;
             let wake = if event.mentions_bot {
                 "mention"
@@ -1008,6 +1084,10 @@ impl TurnContextLease {
         }
         Ok(())
     }
+
+    fn cancellation_binding(&self) -> (ContextRegistry, PendingBinding) {
+        (self.registry.clone(), self.binding.clone())
+    }
 }
 
 impl Drop for TurnContextLease {
@@ -1062,6 +1142,7 @@ async fn reject_item(
         .reject_received_and_enqueue_notice(&item.key, reason, notice)
         .await
         .map_err(|_| ScopeFailureKind::Store)?;
+    tracing::info!(reason = reason.as_str(), "inbound event rejected");
     Ok(())
 }
 
@@ -1149,11 +1230,7 @@ async fn release_thread_route(
     }
 }
 
-#[allow(
-    clippy::if_not_else,
-    clippy::too_many_arguments,
-    reason = "the mismatch-first branch archives stale state before the explicit dependencies start a replacement"
-)]
+#[allow(clippy::too_many_arguments)]
 async fn ensure_thread(
     scope: &ScopeKey,
     store: &StoreHandle,
@@ -1174,15 +1251,7 @@ async fn ensure_thread(
         } else {
             0
         };
-        if active.context_tools_version != required_version {
-            store
-                .archive_active_thread(scope)
-                .await
-                .map_err(|_| ScopeFailureKind::Store)?;
-            let _ = client
-                .release_thread(&ThreadId::from(active.codex_thread_id.as_str()))
-                .await;
-        } else {
+        if active.context_tools_version == required_version {
             let rpc_cwd = revalidate_workspace(policy, cwd, fingerprint)?;
             let mut params = ThreadResumeParams::new(&active.codex_thread_id);
             params.overrides.cwd = Some(rpc_cwd);
@@ -1195,6 +1264,13 @@ async fn ensure_thread(
                 .map_err(|_| ScopeFailureKind::Client)?;
             return Ok(thread.id);
         }
+        store
+            .archive_active_thread(scope)
+            .await
+            .map_err(|_| ScopeFailureKind::Store)?;
+        let _ = client
+            .release_thread(&ThreadId::from(active.codex_thread_id.as_str()))
+            .await;
     }
     let rpc_cwd = revalidate_workspace(policy, cwd, fingerprint)?;
     let params = ThreadStartParams {
