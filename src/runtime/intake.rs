@@ -154,10 +154,18 @@ impl DurableIntake {
                     .await
                     .map_err(|error| map_store_error(&error))?
                 {
-                    DedupOutcome::New(retained) | DedupOutcome::ReplayReceived(retained) => {
+                    DedupOutcome::New(retained) => {
+                        tracing::debug!(disposition = "new", "inbound event registered");
                         Ok(IntakeVerdict::Enqueue(retained))
                     }
-                    DedupOutcome::Duplicate { .. } => Ok(IntakeVerdict::DropDuplicate),
+                    DedupOutcome::ReplayReceived(retained) => {
+                        tracing::debug!(disposition = "replayed", "inbound event registered");
+                        Ok(IntakeVerdict::Enqueue(retained))
+                    }
+                    DedupOutcome::Duplicate { .. } => {
+                        tracing::debug!(disposition = "duplicate", "inbound event registered");
+                        Ok(IntakeVerdict::DropDuplicate)
+                    }
                 }
             }
             .boxed()

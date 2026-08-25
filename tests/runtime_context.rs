@@ -5,7 +5,7 @@ use lark_codex_bridge::{
         api::{ChatMode, ResourceKind},
         normalize::{
             InboundEvent, MediaMetadata as InboundMediaMetadata, MediaPart, MentionIdentity,
-            MessagePart, PartStatus, ResourceDesc, ScopeKey,
+            MessagePart, PartStatus, ResourceDesc, ScopeKey, TranscriptFailure,
         },
     },
     runtime::context::{
@@ -72,6 +72,7 @@ fn draft(message_id: &str) -> ContextDraft {
                     mime_type: Some("image/png".to_owned()),
                     ..MediaMetadata::default()
                 },
+                transcript_failure: None,
             },
         ],
     }
@@ -162,6 +163,82 @@ fn media_key_is_hidden_and_handle_is_bound_to_exact_context_and_turn() {
         .authorize_media(&first.context_id, handle, &wrong_turn)
         .expect_err("handle is scoped to its turn");
     assert_eq!(error.code, ContextErrorCode::Forbidden);
+
+    assert!(!resource.is_cancelled());
+    assert_eq!(
+        registry.revoke_turn(&pending(1), RevocationReason::Cancelled),
+        1
+    );
+    assert!(
+        resource.is_cancelled(),
+        "revocation must cancel already-authorized media work"
+    );
+}
+
+#[test]
+fn durable_context_types_have_no_transcript_content_field() {
+    let registry = ContextRegistry::new(config(4, Duration::from_secs(60))).expect("registry");
+    let mut context = draft("om_audio_private");
+    context.message_type = "audio".to_owned();
+    context.parts = vec![DraftPart::Media {
+        kind: MediaKind::Audio,
+        resource: ResourceDesc {
+            kind: ResourceKind::File,
+            key: "audio_secret_key".to_owned(),
+        },
+        thumbnail: None,
+        metadata: MediaMetadata {
+            duration_ms: Some(800),
+            ..MediaMetadata::default()
+        },
+        transcript_failure: Some(TranscriptFailure::NotRetained),
+    }];
+    let registered = registry
+        .register_pending(pending(41), context)
+        .expect("register audio context");
+    let snapshot = registry
+        .resolve_for_tool(&registered.context_id, "thread-a", "turn-private")
+        .expect("resolve audio context");
+    let serialized = serde_json::to_string(&snapshot).expect("serialize snapshot");
+    let serialized_value: serde_json::Value =
+        serde_json::from_str(&serialized).expect("parse snapshot");
+    assert_no_key_named_transcript(&serialized_value);
+    let TypedPart::Media {
+        handle, metadata, ..
+    } = &snapshot.parts[0]
+    else {
+        panic!("audio media part")
+    };
+    assert_no_key_named_transcript(
+        &serde_json::to_value(metadata).expect("serialize typed metadata"),
+    );
+
+    let authorized = registry
+        .authorize_media_for_tool(&registered.context_id, handle, "thread-a", "turn-private")
+        .expect("authorize exact grant");
+    assert_eq!(authorized.transcript, None);
+    assert_eq!(
+        authorized.transcript_failure,
+        Some(TranscriptFailure::NotRetained)
+    );
+    assert!(format!("{authorized:?}").contains("has_live_transcript: false"));
+}
+
+fn assert_no_key_named_transcript(value: &serde_json::Value) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            assert!(!fields.contains_key("transcript"));
+            for value in fields.values() {
+                assert_no_key_named_transcript(value);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                assert_no_key_named_transcript(value);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[test]
@@ -217,6 +294,7 @@ fn inbound_rich_parts_become_opaque_typed_context_parts() {
                     mime_type: Some("video/mp4".to_owned()),
                     size_bytes: Some(10),
                     duration_ms: Some(20),
+                    transcript_failure: None,
                 },
                 status: PartStatus::Available,
             }),

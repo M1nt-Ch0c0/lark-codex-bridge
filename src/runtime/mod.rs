@@ -1,6 +1,7 @@
 //! Runtime policy boundaries.
 
 pub mod adoption;
+pub mod asr;
 pub mod attachments;
 pub mod commands;
 pub mod context;
