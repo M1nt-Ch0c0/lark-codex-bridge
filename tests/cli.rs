@@ -1,7 +1,11 @@
 use assert_cmd::cargo::cargo_bin_cmd;
 use clap::Parser;
-use lark_codex_bridge::cli::{Cli, LogFormat};
+use lark_codex_bridge::{
+    cli::{Cli, LogFormat},
+    runtime::adoption::ThreadAdoptionGate,
+};
 use predicates::prelude::*;
+use serde_json::json;
 
 #[test]
 fn help_describes_the_codex_command() {
@@ -21,6 +25,58 @@ fn version_matches_the_package_version() {
         .assert()
         .success()
         .stdout(predicate::str::contains("0.1.0-alpha.1"));
+}
+
+#[test]
+fn adoption_status_is_machine_readable_and_fail_closed() {
+    let availability = ThreadAdoptionGate.availability();
+    let assertion = cargo_bin_cmd!("lark-codex-bridge")
+        .args(["codex", "adoption-status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("thread/resume").not())
+        .stdout(predicate::str::contains("CODEX_HOME").not());
+    let report: serde_json::Value = serde_json::from_slice(&assertion.get_output().stdout)
+        .expect("adoption status should be JSON");
+
+    assert_eq!(
+        report,
+        json!({
+            "available": availability.is_available(),
+            "classification": availability.code(),
+            "guidance": availability.guidance(),
+            "requiresExplicitHandoff": true,
+            "sharedEndpointIssue": 8,
+        })
+    );
+}
+
+#[test]
+fn adoption_status_does_not_spawn_codex_or_read_its_profile() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let empty_path = temp.path().join("empty-path");
+    let poisoned_home = temp.path().join("poisoned-codex-home");
+    let missing_home = temp.path().join("missing-codex-home");
+    std::fs::create_dir(&empty_path).expect("empty PATH directory");
+    std::fs::create_dir(&poisoned_home).expect("poisoned CODEX_HOME directory");
+    std::fs::write(
+        poisoned_home.join("config.toml"),
+        b"this is deliberately invalid Codex configuration = [",
+    )
+    .expect("poisoned Codex configuration");
+    assert!(!missing_home.exists());
+
+    for codex_home in [&poisoned_home, &missing_home] {
+        cargo_bin_cmd!("lark-codex-bridge")
+            .env("CODEX_HOME", codex_home)
+            .env("PATH", &empty_path)
+            .args(["codex", "adoption-status"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(
+                "\"classification\":\"unavailable_no_reliable_writer_release\"",
+            ));
+    }
 }
 
 #[test]

@@ -7,7 +7,9 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use crate::limits::BRIDGE_COMMAND_MAX_BYTES;
+use crate::limits::{
+    BRIDGE_COMMAND_MAX_BYTES, THREAD_ADOPTION_SELECTOR_MAX_BYTES, THREAD_DISCOVERY_CURSOR_MAX_BYTES,
+};
 
 /// One recognized first-stage command.
 #[derive(Clone, Eq, PartialEq)]
@@ -24,6 +26,18 @@ pub enum BridgeCommand {
         /// it through `AccessPolicy` before any persistence or RPC.
         path: PathBuf,
     },
+    /// Request a bounded page of persisted-thread candidates.
+    Threads {
+        /// Opaque page cursor. Debug output exposes only its byte length.
+        cursor: Option<String>,
+    },
+    /// Explicitly request sequential adoption after completing handoff.
+    Adopt {
+        /// Stable candidate selector, never a guessed "most recent" thread.
+        selector: String,
+    },
+    /// Release a previously adopted persisted thread.
+    Release,
     /// Render the command table.
     Help,
 }
@@ -38,6 +52,15 @@ impl fmt::Debug for BridgeCommand {
                 .debug_struct("Cd")
                 .field("path_bytes", &path.as_os_str().len())
                 .finish(),
+            Self::Threads { cursor } => formatter
+                .debug_struct("Threads")
+                .field("cursor_bytes", &cursor.as_ref().map(String::len))
+                .finish(),
+            Self::Adopt { selector } => formatter
+                .debug_struct("Adopt")
+                .field("selector_bytes", &selector.len())
+                .finish(),
+            Self::Release => formatter.write_str("Release"),
             Self::Help => formatter.write_str("Help"),
         }
     }
@@ -61,6 +84,9 @@ pub enum CommandParseError {
         /// Static recognized command name.
         command: &'static str,
     },
+    /// Adoption was requested without the exact explicit-handoff acknowledgement.
+    #[error("/adopt requires the exact --handoff-complete acknowledgement")]
+    HandoffConfirmationRequired,
 }
 
 /// Stable command metadata used to render `/help` and audit command drift.
@@ -74,7 +100,7 @@ pub struct CommandSpec {
     pub description: &'static str,
 }
 
-const COMMAND_SPECS: [CommandSpec; 5] = [
+const COMMAND_SPECS: [CommandSpec; 8] = [
     CommandSpec {
         name: "/new",
         usage: "/new",
@@ -94,6 +120,21 @@ const COMMAND_SPECS: [CommandSpec; 5] = [
         name: "/cd",
         usage: "/cd <path>",
         description: "change workspace and reset the session",
+    },
+    CommandSpec {
+        name: "/threads",
+        usage: "/threads [cursor]",
+        description: "list persisted-thread candidates when safe adoption is available",
+    },
+    CommandSpec {
+        name: "/adopt",
+        usage: "/adopt <selector> --handoff-complete",
+        description: "adopt one explicitly selected thread after sequential handoff",
+    },
+    CommandSpec {
+        name: "/release",
+        usage: "/release",
+        description: "release an adopted thread without changing its global lifecycle",
     },
     CommandSpec {
         name: "/help",
@@ -137,7 +178,10 @@ pub fn parse_command(text: &str) -> Result<Option<BridgeCommand>, CommandParseEr
     let Some((name, arguments)) = split_command(trimmed) else {
         return Ok(None);
     };
-    let recognized = matches!(name, "/new" | "/stop" | "/status" | "/cd" | "/help");
+    let recognized = matches!(
+        name,
+        "/new" | "/stop" | "/status" | "/cd" | "/threads" | "/adopt" | "/release" | "/help"
+    );
     if !recognized {
         return Ok(None);
     }
@@ -148,6 +192,7 @@ pub fn parse_command(text: &str) -> Result<Option<BridgeCommand>, CommandParseEr
         "/new" => no_argument(arguments, "/new", BridgeCommand::New),
         "/stop" => no_argument(arguments, "/stop", BridgeCommand::Stop),
         "/status" => no_argument(arguments, "/status", BridgeCommand::Status),
+        "/release" => no_argument(arguments, "/release", BridgeCommand::Release),
         "/help" => no_argument(arguments, "/help", BridgeCommand::Help),
         "/cd" => {
             let path = arguments.trim();
@@ -158,6 +203,37 @@ pub fn parse_command(text: &str) -> Result<Option<BridgeCommand>, CommandParseEr
                     path: PathBuf::from(path),
                 }))
             }
+        }
+        "/threads" => {
+            let mut values = arguments.split_whitespace();
+            let cursor = values.next().map(str::to_owned);
+            if values.next().is_some() {
+                return Err(CommandParseError::UnexpectedArgument {
+                    command: "/threads",
+                });
+            }
+            if cursor
+                .as_ref()
+                .is_some_and(|value| value.len() > THREAD_DISCOVERY_CURSOR_MAX_BYTES)
+            {
+                return Err(CommandParseError::TooLong);
+            }
+            Ok(Some(BridgeCommand::Threads { cursor }))
+        }
+        "/adopt" => {
+            let mut values = arguments.split_whitespace();
+            let Some(selector) = values.next() else {
+                return Err(CommandParseError::MissingArgument { command: "/adopt" });
+            };
+            if selector.len() > THREAD_ADOPTION_SELECTOR_MAX_BYTES {
+                return Err(CommandParseError::TooLong);
+            }
+            if values.next() != Some("--handoff-complete") || values.next().is_some() {
+                return Err(CommandParseError::HandoffConfirmationRequired);
+            }
+            Ok(Some(BridgeCommand::Adopt {
+                selector: selector.to_owned(),
+            }))
         }
         _ => Ok(None),
     }

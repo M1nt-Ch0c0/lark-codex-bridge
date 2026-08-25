@@ -115,6 +115,25 @@ platform family/OS 和 epoch；不包含 Codex home、账户身份、token 或�
 CODEX_E2E=1 cargo test --test codex_smoke --locked -- --ignored --nocapture
 ```
 
+### Persisted thread adoption（当前禁用）
+
+顺序接管既有 Codex thread 当前明确 fail closed。受支持的 app-server 契约可以用
+`thread/resume` 取得 writer，但没有经验证的、在 app-server 继续运行时释放该 writer 的操作；
+本地退订或丢弃 bridge route 不等于释放远端 ownership。因此 bridge 不列出候选、不调用
+`thread/resume`、不写 scope mapping，也不会以 idle 状态猜测 thread 已无人持有。
+
+`/threads`、`/adopt <selector> --handoff-complete` 和 `/release` 已保留为显式命令语法；当前
+slash handler 尚未接线，且任何未来 handler 都必须先通过零状态 capability gate。可用下面的
+只读诊断查看稳定分类（不读取 `CODEX_HOME`，也不启动 Codex）：
+
+```bash
+cargo run --locked -- codex adoption-status
+```
+
+完整的负向互操作证据、生命周期规则和未来启用条件见
+[`docs/thread-adoption.md`](docs/thread-adoption.md)。实时多客户端共享不属于该顺序交接方案，
+由 [Issue #8](https://github.com/M1nt-Ch0c0/lark-codex-bridge/issues/8) 单独研究。
+
 ## 会话富媒体与单跳引用
 
 - 私聊图片、视频和文件只暂存有界描述符，不下载、不启动 Codex；下一条普通文字把当前
