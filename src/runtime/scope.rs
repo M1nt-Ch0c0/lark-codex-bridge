@@ -1074,6 +1074,7 @@ async fn process_batch(
     params.cwd = Some(rpc_cwd.clone());
     params.approval_policy = Some(settings.approval_policy.clone());
     params.model.clone_from(&settings.model);
+    params.effort.clone_from(&settings.effort);
     params.sandbox_policy = Some(turn_sandbox(settings, rpc_cwd));
     let turn_started_at = StdInstant::now();
     tracing::info!(
