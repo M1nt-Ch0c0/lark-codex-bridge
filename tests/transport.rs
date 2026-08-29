@@ -534,71 +534,47 @@ async fn full_event_queue_and_broken_stdin_do_not_deadlock_terminal_delivery() {
 }
 
 #[cfg(unix)]
-fn install_executable_fixture(
-    directory: &std::path::Path,
-    name: &str,
-    script: &str,
-) -> std::path::PathBuf {
-    use std::io::Write as _;
+fn install_executable_fixture(directory: &std::path::Path, name: &str) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::symlink;
 
-    let staging = directory.join(".executable-fixture-staging");
-    let binary = directory.join(name);
-    let mut staged = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&staging)
-        .expect("executable fixture should be staged");
-    staged
-        .write_all(script.as_bytes())
-        .expect("executable fixture should be written");
-    staged
-        .sync_all()
-        .expect("executable fixture should be flushed");
-    drop(staged);
-    let mut permissions = std::fs::metadata(&staging)
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/codex-executable-fixture.sh");
+    let mode = std::fs::metadata(&fixture)
         .expect("executable fixture metadata should be readable")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&staging, permissions)
-        .expect("executable fixture should be executable");
-    // Install only after the writer has explicitly flushed and closed.
-    // Executing an inode with a live write handle fails with ETXTBSY on Linux.
-    std::fs::rename(staging, &binary).expect("executable fixture should install atomically");
+        .permissions()
+        .mode();
+    assert_ne!(mode & 0o111, 0, "committed fixture must be executable");
+    let binary = directory.join(name);
+    // The target is committed and therefore has no concurrent writer. Creating only
+    // a symlink here avoids Linux ETXTBSY races seen when llvm-cov executes a script
+    // immediately after a test writes it.
+    symlink(fixture, &binary).expect("executable fixture should be linked");
     binary
 }
 
 #[cfg(unix)]
-fn fake_codex(version_output: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+fn fake_codex(fixture_name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     let directory = tempfile::tempdir().expect("temporary directory should be created");
-    let script = format!(
-        "#!/bin/sh\n[ \"$1\" = \"--version\" ] || exit 91\nprintf '%s\\n' '{version_output}'\n"
-    );
-    let binary = install_executable_fixture(directory.path(), "codex binary with spaces", &script);
+    let binary = install_executable_fixture(directory.path(), fixture_name);
     (directory, binary)
 }
 
 #[cfg(unix)]
 fn fake_app_server() -> (tempfile::TempDir, std::path::PathBuf) {
     let directory = tempfile::tempdir().expect("temporary directory should be created");
-    let script = "#!/bin/sh\n\
-        if [ \"$1\" = \"--version\" ]; then printf '%s\\n' 'codex-cli 0.146.0'; exit 0; fi\n\
-        [ \"$1\" = \"app-server\" ] || exit 91\n\
-        [ \"$2\" = \"--listen\" ] || exit 92\n\
-        [ \"$3\" = \"stdio://\" ] || exit 93\n\
-        while IFS= read -r line; do :; done\n";
-    let binary = install_executable_fixture(directory.path(), "codex app server fixture", script);
+    let binary = install_executable_fixture(directory.path(), "codex app server fixture");
     (directory, binary)
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn version_probe_executes_the_binary_directly_for_each_supported_version() {
-    for (output, expected) in [
-        ("codex-cli 0.146.0", semver::Version::new(0, 146, 0)),
-        ("codex-cli 0.149.0", semver::Version::new(0, 149, 0)),
+    for (fixture_name, expected) in [
+        ("codex supported 0.146.0", semver::Version::new(0, 146, 0)),
+        ("codex supported 0.149.0", semver::Version::new(0, 149, 0)),
     ] {
-        let (_directory, binary) = fake_codex(output);
+        let (_directory, binary) = fake_codex(fixture_name);
         let version = probe_version(&CodexProcessConfig {
             binary,
             codex_home: None,
@@ -613,15 +589,15 @@ async fn version_probe_executes_the_binary_directly_for_each_supported_version()
 #[cfg(unix)]
 #[tokio::test]
 async fn version_probe_rejects_malformed_and_unsupported_versions() {
-    for output in [
-        "codex 0.146.0",
-        "codex-cli 0.145.9",
-        "codex-cli 0.147.0",
-        "codex-cli 0.150.0",
-        "codex-cli 0.146.0-rc.1",
-        "codex-cli 0.146.0+build.1",
+    for (fixture_name, output) in [
+        ("codex malformed prefix", "codex 0.146.0"),
+        ("codex unsupported 0.145.9", "codex-cli 0.145.9"),
+        ("codex unsupported 0.147.0", "codex-cli 0.147.0"),
+        ("codex unsupported 0.150.0", "codex-cli 0.150.0"),
+        ("codex prerelease", "codex-cli 0.146.0-rc.1"),
+        ("codex build metadata", "codex-cli 0.146.0+build.1"),
     ] {
-        let (_directory, binary) = fake_codex(output);
+        let (_directory, binary) = fake_codex(fixture_name);
         let result = probe_version(&CodexProcessConfig {
             binary,
             codex_home: None,
