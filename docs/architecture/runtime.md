@@ -45,9 +45,15 @@ durable backlog，不能无界缓存。
 
 ## Policy fingerprint
 
-scope row 保存 policy fingerprint。它代表影响执行安全的配置快照，例如 owner/sender/group
-allowlist、allow roots、sandbox/network。恢复或复用 thread 时必须检查 fingerprint，不能在
-策略变更后静默沿用旧安全上下文。
+scope row 保存 policy fingerprint。它绑定平台、canonical cwd、sandbox、approval policy 与
+network policy；owner/sender/group allowlist 和 allow roots 在每次处理时另行实时校验。恢复或复用
+thread 时必须检查 fingerprint，不能在策略变更后静默沿用旧安全上下文。fingerprint 变化
+本身不会删除上下文：runtime 先按当前
+allow roots 重新验证 cwd，再以当前 model/sandbox/approval overrides 恢复原 active thread；
+后续 `turn/start` 仍携带当前 sandbox/network policy。只有 `thread/resume` 成功后才更新 scope
+row 的 fingerprint。恢复失败时保留旧 fingerprint 和原 active mapping，且不得降级为
+`thread/start` 创建替代 thread。这样故障可重试、可诊断，也不会把普通配置调整表现成静默
+丢失会话历史。
 
 ## Context registry
 

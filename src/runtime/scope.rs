@@ -930,22 +930,23 @@ async fn process_batch(
         return Ok(());
     }
     let mut batch = eligible;
-    let (cwd, fingerprint) = match prepare_workspace(scope, store, policy, settings).await {
-        Ok(workspace) => workspace,
-        Err(ScopeFailureKind::Policy) => {
-            for item in &batch {
-                reject_item(
-                    store,
-                    sink.as_ref(),
-                    &item.inbound,
-                    InboundRejectionKind::Policy,
-                )
-                .await?;
+    let (cwd, fingerprint, policy_changed) =
+        match prepare_workspace(scope, store, policy, settings).await {
+            Ok(workspace) => workspace,
+            Err(ScopeFailureKind::Policy) => {
+                for item in &batch {
+                    reject_item(
+                        store,
+                        sink.as_ref(),
+                        &item.inbound,
+                        InboundRejectionKind::Policy,
+                    )
+                    .await?;
+                }
+                return Ok(());
             }
-            return Ok(());
-        }
-        Err(kind) => return Err(kind),
-    };
+            Err(kind) => return Err(kind),
+        };
     let (turn_epoch, client) = wait_for_client(&mut supervisor, shutdown).await?;
     set_state(state, ScopeState::StartingTurn);
     let thread_id = tokio::select! {
@@ -959,6 +960,7 @@ async fn process_batch(
             &client,
             &cwd,
             &fingerprint,
+            policy_changed,
             contexts.is_some(),
         ) => {
             result?
@@ -1642,7 +1644,7 @@ async fn prepare_workspace(
     store: &StoreHandle,
     policy: &AccessPolicy,
     settings: &RouterSettings,
-) -> Result<(PathBuf, String), ScopeFailureKind> {
+) -> Result<(PathBuf, String, bool), ScopeFailureKind> {
     if let Some(row) = store
         .scope_row(scope)
         .await
@@ -1657,17 +1659,8 @@ async fn prepare_workspace(
         let fingerprint = policy
             .fingerprint(&canonical)
             .map_err(|_| ScopeFailureKind::Policy)?;
-        if fingerprint.as_str() != row.policy_fingerprint {
-            store
-                .archive_active_thread(scope)
-                .await
-                .map_err(|_| ScopeFailureKind::Store)?;
-            store
-                .upsert_scope(scope, &canonical, fingerprint.as_str())
-                .await
-                .map_err(|_| ScopeFailureKind::Store)?;
-        }
-        return Ok((canonical, fingerprint.as_str().to_owned()));
+        let policy_changed = fingerprint.as_str() != row.policy_fingerprint;
+        return Ok((canonical, fingerprint.as_str().to_owned(), policy_changed));
     }
     let cwd = settings
         .default_workspace
@@ -1683,7 +1676,7 @@ async fn prepare_workspace(
         .upsert_scope(scope, &canonical, fingerprint.as_str())
         .await
         .map_err(|_| ScopeFailureKind::Store)?;
-    Ok((canonical, fingerprint.as_str().to_owned()))
+    Ok((canonical, fingerprint.as_str().to_owned(), false))
 }
 
 async fn wait_for_client(
@@ -1730,6 +1723,7 @@ async fn ensure_thread(
     client: &AppServerClient,
     cwd: &Path,
     fingerprint: &str,
+    policy_changed: bool,
     context_tools: bool,
 ) -> Result<String, ScopeFailureKind> {
     if let Some(active) = store
@@ -1753,6 +1747,12 @@ async fn ensure_thread(
                 .resume_thread(params)
                 .await
                 .map_err(|_| ScopeFailureKind::Client)?;
+            if policy_changed {
+                store
+                    .upsert_scope(scope, cwd, fingerprint)
+                    .await
+                    .map_err(|_| ScopeFailureKind::Store)?;
+            }
             return Ok(thread.id);
         }
         store
@@ -1788,6 +1788,12 @@ async fn ensure_thread(
         )
         .await
         .map_err(|_| ScopeFailureKind::Store)?;
+    if policy_changed {
+        store
+            .upsert_scope(scope, cwd, fingerprint)
+            .await
+            .map_err(|_| ScopeFailureKind::Store)?;
+    }
     Ok(thread.id)
 }
 
