@@ -1147,6 +1147,10 @@ async fn debounce_batch_claims_one_turn_and_uses_the_exact_client_message_id() {
 
     let start_turn = control.next_request().await;
     assert_eq!(start_turn["method"], "turn/start");
+    assert!(
+        start_turn["params"].get("effort").is_none(),
+        "omitted effort must remain absent from turn/start"
+    );
     assert_eq!(start_turn["params"]["threadId"], "thread-runtime");
     assert_eq!(
         start_turn["params"]["input"]
@@ -3929,8 +3933,10 @@ async fn shutdown_uses_a_fresh_deadline_for_an_async_uncertain_finalization() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn message_while_running_waits_then_resumes_the_same_thread() {
-    let config = validated_config();
+    let mut config = validated_config();
+    config.codex.effort = Some("future-tier".to_owned());
     let workspace = config.default_workspace.clone().expect("workspace");
     let policy = AccessPolicy::from_config(&config).expect("policy");
     let settings = RouterSettings::from_config(&config);
@@ -3961,11 +3967,13 @@ async fn message_while_running_waits_then_resumes_the_same_thread() {
         .expect("route first turn");
     let start_thread = control.next_request().await;
     assert_eq!(start_thread["method"], "thread/start");
+    assert!(start_thread["params"].get("effort").is_none());
     control
         .respond(&start_thread, thread_result("thread-reused", &workspace))
         .await;
     let first_turn = control.next_request().await;
     assert_eq!(first_turn["method"], "turn/start");
+    assert_eq!(first_turn["params"]["effort"], "future-tier");
     control
         .respond(
             &first_turn,
@@ -4000,12 +4008,14 @@ async fn message_while_running_waits_then_resumes_the_same_thread() {
     let resume_thread = control.next_request().await;
     assert_eq!(resume_thread["method"], "thread/resume");
     assert_eq!(resume_thread["params"]["threadId"], "thread-reused");
+    assert!(resume_thread["params"].get("effort").is_none());
     control
         .respond(&resume_thread, thread_result("thread-reused", &workspace))
         .await;
     let second_turn = control.next_request().await;
     assert_eq!(second_turn["method"], "turn/start");
     assert_eq!(second_turn["params"]["threadId"], "thread-reused");
+    assert_eq!(second_turn["params"]["effort"], "future-tier");
     control
         .respond(
             &second_turn,

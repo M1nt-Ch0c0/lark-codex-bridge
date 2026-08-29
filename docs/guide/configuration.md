@@ -32,6 +32,7 @@ max_scope_actors = 256
 binary = "codex"
 # codex_home = "/absolute/path/to/codex-home"
 # model = "model-name"
+# effort = "high"
 sandbox = "workspace-write"
 approval_policy = "never"
 
@@ -91,6 +92,8 @@ allow root 只是 bridge 的 cwd 准入边界，不替代 Codex sandbox。
 - `binary`：Codex CLI 可执行文件路径或命令名。
 - `codex_home`：可选的独立 `CODEX_HOME`。
 - `model`：可选模型覆盖。
+- `effort`：可选的非空字符串，原样传给每次 `turn/start`。省略时不发送该字段，继续使用
+  Codex 自身默认；bridge 不限制枚举，以保持对未来档位的兼容。
 - `sandbox`：`read-only`、`workspace-write` 或 `danger-full-access`。
 - `approval_policy`：传给 app-server 的策略。当前建议 `never`，因为飞书审批卡尚未接线。
 

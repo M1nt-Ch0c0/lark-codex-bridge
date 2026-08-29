@@ -65,6 +65,8 @@ pub enum ConfigError {
     PlatformRoots,
     #[error("bridge configuration contains an invalid Codex backend")]
     InvalidCodexBackend,
+    #[error("bridge configuration contains an invalid Codex reasoning effort")]
+    InvalidCodexEffort,
     #[error("bridge configuration contains an invalid ASR sidecar command")]
     InvalidAsrCommand,
     #[error("bridge configuration has too many ASR sidecar arguments")]
@@ -98,6 +100,7 @@ impl fmt::Debug for ConfigError {
             Self::InvalidDefaultWorkspace => "InvalidDefaultWorkspace",
             Self::PlatformRoots => "PlatformRoots",
             Self::InvalidCodexBackend => "InvalidCodexBackend",
+            Self::InvalidCodexEffort => "InvalidCodexEffort",
             Self::InvalidAsrCommand => "InvalidAsrCommand",
             Self::TooManyAsrArgs => "TooManyAsrArgs",
             Self::AsrArgsTooLarge => "AsrArgsTooLarge",
@@ -237,6 +240,14 @@ impl BridgeConfig {
             .backend
             .validate()
             .map_err(|_| ConfigError::InvalidCodexBackend)?;
+        if self
+            .codex
+            .effort
+            .as_deref()
+            .is_some_and(|effort| effort.trim().is_empty())
+        {
+            return Err(ConfigError::InvalidCodexEffort);
+        }
         self.asr.validate()?;
         if self.channel.node_binary.as_os_str().is_empty()
             || self.channel.sidecar_entrypoint.as_os_str().is_empty()
@@ -345,6 +356,7 @@ impl Default for ConcurrencyConfig {
 pub struct CodexSection {
     pub backend: CodexBackendConfig,
     pub model: Option<String>,
+    pub effort: Option<String>,
     pub sandbox: SandboxMode,
     pub approval_policy: ApprovalPolicy,
 }
@@ -358,6 +370,7 @@ impl<'de> Deserialize<'de> for CodexSection {
         Ok(Self {
             backend: config.backend,
             model: config.model,
+            effort: config.effort,
             sandbox: config.sandbox,
             approval_policy: config.approval_policy.into(),
         })
@@ -369,6 +382,7 @@ impl<'de> Deserialize<'de> for CodexSection {
 struct CodexSectionConfig {
     backend: CodexBackendConfig,
     model: Option<String>,
+    effort: Option<String>,
     sandbox: SandboxMode,
     approval_policy: ConfigApprovalPolicy,
 }
@@ -379,6 +393,7 @@ impl Default for CodexSectionConfig {
         Self {
             backend: defaults.backend,
             model: defaults.model,
+            effort: defaults.effort,
             sandbox: defaults.sandbox,
             approval_policy: ConfigApprovalPolicy::default(),
         }
@@ -448,6 +463,7 @@ impl Default for CodexSection {
         Self {
             backend: CodexBackendConfig::default(),
             model: None,
+            effort: None,
             sandbox: SandboxMode::WorkspaceWrite,
             approval_policy: ApprovalPolicy::Named("never".to_owned()),
         }
@@ -471,6 +487,7 @@ impl fmt::Debug for CodexSection {
             .debug_struct("CodexSection")
             .field("backend", &self.backend)
             .field("model_configured", &self.model.is_some())
+            .field("has_effort", &self.effort.is_some())
             .field("sandbox", &self.sandbox)
             .field("approval_policy_kind", &approval_policy_kind)
             .finish()

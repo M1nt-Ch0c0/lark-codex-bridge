@@ -45,6 +45,7 @@ pub struct RouterSettings {
     pub(crate) sandbox: SandboxMode,
     pub(crate) approval_policy: ApprovalPolicy,
     pub(crate) model: Option<String>,
+    pub(crate) effort: Option<String>,
     pub(crate) network_access: bool,
     pub(crate) debounce: Duration,
     pub(crate) message_max_age: Duration,
@@ -67,6 +68,7 @@ impl RouterSettings {
             sandbox: config.codex.sandbox,
             approval_policy: config.codex.approval_policy.clone(),
             model: config.codex.model.clone(),
+            effort: config.codex.effort.clone(),
             network_access: config.workspace.network_access,
             debounce: Duration::from_millis(600),
             message_max_age: Duration::from_secs(15 * 60),
@@ -159,6 +161,7 @@ impl fmt::Debug for RouterSettings {
             .field("sandbox", &self.sandbox)
             .field("approval_policy_kind", &approval_policy_kind)
             .field("model_configured", &self.model.is_some())
+            .field("has_effort", &self.effort.is_some())
             .field("network_access", &self.network_access)
             .field("debounce", &self.debounce)
             .field("message_max_age", &self.message_max_age)
