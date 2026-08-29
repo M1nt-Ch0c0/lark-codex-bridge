@@ -299,6 +299,12 @@ pub const ATTACHMENT_GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
 pub const ATTACHMENT_GC_BATCH: usize = 256;
 /// Maximum directory entries scanned by one reconciliation pass.
 pub const ATTACHMENT_RECONCILE_BATCH: usize = 4096;
+/// Delay between completed attachment-cache reconciliation cycles.
+pub const ATTACHMENT_RECONCILE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// Grace for the runtime reconciliation actor to observe cancellation before
+/// its Tokio task is aborted. A blocking-pool mutation retains its owned cache
+/// and instance-lock guards after the async waiter is aborted.
+pub const ATTACHMENT_RECONCILE_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// In-cache temp-file name prefix (never a valid SHA-256 name).
 pub const ATTACHMENT_TEMP_PREFIX: &str = ".tmp-";
 /// Cache-directory marker file name proving the directory is a dedicated

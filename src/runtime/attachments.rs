@@ -1,4 +1,4 @@
-//! Content-addressed attachment cache with leases, GC, and startup
+//! Content-addressed attachment cache with leases, GC, and bounded runtime
 //! reconciliation (design §10, Task 7 core).
 //!
 //! Files are stored under a cache root named by their SHA-256 hex digest; the
@@ -10,7 +10,7 @@
 //!
 //! Ordering invariant: content is installed on disk *before* its store row and
 //! lease are committed, and GC drops a store row *before* removing its file.
-//! A crash therefore leaves an orphan file (reconciled at the next startup)
+//! A crash therefore leaves an orphan file (reconciled during startup/runtime)
 //! rather than a dangling store row that promises a missing file.
 //!
 //! Redaction: no `Debug`, tracing, or error carries attachment bytes, message
@@ -44,6 +44,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use futures_util::future::BoxFuture;
 use sha2::{Digest, Sha256};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -58,8 +59,9 @@ use crate::limits::{
     ATTACHMENT_CACHE_MARKER, ATTACHMENT_CACHE_MAX_BYTES, ATTACHMENT_CACHE_MAX_FILES,
     ATTACHMENT_FILE_NAME_MAX_BYTES, ATTACHMENT_GC_AGE, ATTACHMENT_GC_BATCH,
     ATTACHMENT_INSTANCE_LOCK, ATTACHMENT_MAX_BYTES, ATTACHMENT_MAX_PER_MESSAGE,
-    ATTACHMENT_MIME_MAX_BYTES, ATTACHMENT_RECONCILE_BATCH, ATTACHMENT_RESOURCE_KEY_MAX_BYTES,
-    ATTACHMENT_TEMP_PREFIX, ATTACHMENT_TURN_TOTAL_BYTES,
+    ATTACHMENT_MIME_MAX_BYTES, ATTACHMENT_RECONCILE_BATCH, ATTACHMENT_RECONCILE_INTERVAL,
+    ATTACHMENT_RECONCILE_SHUTDOWN_GRACE, ATTACHMENT_RESOURCE_KEY_MAX_BYTES, ATTACHMENT_TEMP_PREFIX,
+    ATTACHMENT_TURN_TOTAL_BYTES,
 };
 use crate::store::{StoreError, StoreHandle};
 
@@ -534,8 +536,106 @@ pub struct ReconcileStats {
     pub skipped_dirs: u64,
     /// Directory entries that could not be inspected.
     pub errors: u64,
+    /// This pass observed EOF and completed the current directory scan cycle.
+    /// A pass that consumes exactly the configured batch may need one more
+    /// bounded call to observe EOF.
+    pub completed_cycle: bool,
     /// Over-capacity cleanup performed at the end of reconciliation.
     pub gc: GcStats,
+}
+
+/// Tunables for the runtime reconciliation actor. Production defaults finish
+/// one cycle immediately and then repeat hourly; explicit values keep actor
+/// tests deterministic without changing cache limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachmentReconcileConfig {
+    /// Delay after a completed or failed cycle before starting the next one.
+    pub interval: Duration,
+    /// Maximum time to wait for the Tokio actor after requesting shutdown.
+    pub shutdown_grace: Duration,
+}
+
+impl Default for AttachmentReconcileConfig {
+    fn default() -> Self {
+        Self {
+            interval: ATTACHMENT_RECONCILE_INTERVAL,
+            shutdown_grace: ATTACHMENT_RECONCILE_SHUTDOWN_GRACE,
+        }
+    }
+}
+
+/// Owner of the single production runtime reconciliation actor.
+///
+/// Dropping the handle cancels and aborts the actor task. An in-flight bounded
+/// pass has its own Tokio task and continues settling; if it has entered a
+/// blocking-pool mutation, that job retains the cache mutation and OS
+/// instance-lock guards until it finishes.
+pub struct AttachmentReconcileRuntime {
+    shutdown: CancellationToken,
+    task: Option<JoinHandle<()>>,
+    shutdown_grace: Duration,
+}
+
+impl fmt::Debug for AttachmentReconcileRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AttachmentReconcileRuntime")
+            .finish_non_exhaustive()
+    }
+}
+
+impl AttachmentReconcileRuntime {
+    /// Starts one actor. It immediately advances the cache's resumable cursor
+    /// until EOF, then repeats after the configured interval. The cache's
+    /// `reconcile_lock` also excludes manual or terminal reconciliation calls.
+    #[must_use]
+    pub fn start(cache: Arc<AttachmentCache>, config: AttachmentReconcileConfig) -> Self {
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(run_reconcile_runtime(
+            cache,
+            shutdown.clone(),
+            config.interval,
+        ));
+        Self {
+            shutdown,
+            task: Some(task),
+            shutdown_grace: config.shutdown_grace,
+        }
+    }
+
+    /// Returns whether the actor ended unexpectedly or has already shut down.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.task.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    /// Cancels the actor and joins it within the configured grace. An actor
+    /// waiting for its next interval exits immediately; an actor that outlives
+    /// the grace is aborted without aborting its separately-owned in-flight
+    /// pass or dropping blocking-pool safety guards.
+    pub async fn shutdown(mut self) {
+        self.shutdown.cancel();
+        if let Some(mut task) = self.task.take() {
+            match tokio::time::timeout(self.shutdown_grace, &mut task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => tracing::warn!("attachment reconciliation actor failed"),
+                Err(_) => {
+                    tracing::warn!("attachment reconciliation shutdown grace elapsed");
+                    task.abort();
+                    let _ = task.await;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for AttachmentReconcileRuntime {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
 }
 
 /// Content-addressed attachment cache rooted at one directory, backed by the
@@ -938,7 +1038,7 @@ impl AttachmentCache {
         Ok(stats)
     }
 
-    /// Reconciles the cache directory with the store at startup. Handles
+    /// Reconciles one bounded cache-directory batch with the store. Handles
     /// residual temp files, files without a store row, store rows without a
     /// file, size-mismatched files, stale leases, and over-capacity caches.
     ///
@@ -991,14 +1091,18 @@ impl AttachmentCache {
         .map_err(|_| AttachError::Io {
             context: "scanning the cache directory",
         })??;
+        let ScanBatch { candidates, next } = scan;
+        let completed_cycle = next.is_none();
         *self.scan.lock().map_err(|_| AttachError::Io {
             context: "locking the reconciliation scan state",
-        })? = scan.next;
+        })? = next;
 
         // Phase C — apply the candidates under the per-cache lock, re-verified
         // against fresh store rows.
         let mut guard = Some(Arc::clone(&self.lock).lock_owned().await);
-        self.reconcile_locked(scan.candidates, &mut guard).await
+        let mut stats = self.reconcile_locked(candidates, &mut guard).await?;
+        stats.completed_cycle = completed_cycle;
+        Ok(stats)
     }
 
     /// Destructive half of reconciliation; the caller holds the per-cache
@@ -1082,6 +1186,69 @@ impl AttachmentCache {
             .map_err(|error| store_err("deleting stale attachment leases", error))?;
         stats.gc = self.gc_inner(guard).await?;
         Ok(stats)
+    }
+}
+
+/// Runs complete reconciliation cycles without ever materializing the full
+/// directory. A cycle is a sequence of individually bounded `reconcile`
+/// calls ending at EOF. Runtime failures only postpone the next attempt.
+async fn run_reconcile_runtime(
+    cache: Arc<AttachmentCache>,
+    shutdown: CancellationToken,
+    interval: Duration,
+) {
+    loop {
+        match reconcile_runtime_cycle(&cache, &shutdown).await {
+            None => break,
+            Some(Ok(batches)) => {
+                tracing::debug!(batches, "attachment reconciliation cycle complete");
+            }
+            Some(Err(error)) => {
+                tracing::warn!(error = %error, "attachment reconciliation cycle failed");
+            }
+        }
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => break,
+            () = tokio::time::sleep(interval) => {}
+        }
+    }
+}
+
+/// Returns `None` on cancellation, otherwise one completed/failed cycle. Each
+/// successful call advances the cache-owned `ReadDir` cursor by one bounded
+/// batch; yielding between batches keeps unrelated runtime work schedulable.
+async fn reconcile_runtime_cycle(
+    cache: &Arc<AttachmentCache>,
+    shutdown: &CancellationToken,
+) -> Option<Result<u64, AttachError>> {
+    let mut batches = 0_u64;
+    loop {
+        if shutdown.is_cancelled() {
+            return None;
+        }
+        let pass_cache = Arc::clone(cache);
+        let mut pass = tokio::spawn(async move { pass_cache.reconcile().await });
+        let result = tokio::select! {
+            biased;
+            // Dropping a JoinHandle detaches rather than aborts its task. The
+            // in-flight bounded pass therefore settles its store/filesystem
+            // ordering after actor cancellation, while terminal reconcile
+            // remains serialized behind the same reconcile lock.
+            () = shutdown.cancelled() => return None,
+            result = &mut pass => result.map_err(|_| AttachError::Io {
+                context: "running attachment reconciliation",
+            }),
+        };
+        let stats = match result.and_then(std::convert::identity) {
+            Ok(stats) => stats,
+            Err(error) => return Some(Err(error)),
+        };
+        batches = batches.saturating_add(1);
+        if stats.completed_cycle {
+            return Some(Ok(batches));
+        }
+        tokio::task::yield_now().await;
     }
 }
 
