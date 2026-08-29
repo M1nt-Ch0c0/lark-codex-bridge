@@ -65,9 +65,12 @@ fn fast_config(mode: &str, marker: &Path) -> NodeSidecarConfig {
 async fn wait_for_file(path: &Path) {
     // A supervised restart includes bounded process-tree cleanup, jittered
     // backoff, and a fresh Node handshake. Allow that whole sequence rather
-    // than imposing a deadline shorter than its configured components.
+    // than imposing a deadline shorter than its configured components. Wait
+    // for payload bytes, not only directory-entry creation: `writeFileSync`
+    // creates/truncates the marker before writing, and llvm-cov exposed the
+    // otherwise tiny window where a reader could observe an empty file.
     tokio::time::timeout(Duration::from_secs(20), async {
-        while !path.exists() {
+        while !std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
