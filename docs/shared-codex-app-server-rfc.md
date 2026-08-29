@@ -1,12 +1,42 @@
 # RFC: connect to a shared external Codex app-server
 
-- Status: research complete; implementation not started
-- Date: 2026-08-23
+- Status: research and bounded follow-ups complete; production `run` integration remains gated
+- Date: 2026-08-23; closeout audited 2026-08-29
 - Issue: [#8](https://github.com/M1nt-Ch0c0/lark-codex-bridge/issues/8)
 - Local subject: `codex-cli 0.149.0` on Darwin arm64
-- Decision: conditional go for bounded follow-up work; no production external-write support yet
+- Decision: the bounded external endpoint, transport, recovery, write-coordination,
+  and Unix-contract work is implemented and tested; it remains an opt-in lower-level
+  capability and is not selected by the ordinary `run` assembly
 
-## Decision summary
+## 2026-08-29 implementation closeout
+
+Issue #8 was an RFC and bounded-research issue, not a request to replace the
+production `spawned_stdio` backend directly. Its six required follow-ups are now
+closed with committed implementation and issue-local verification:
+
+| Follow-up | Delivery | Current evidence |
+| --- | --- | --- |
+| [#27](https://github.com/M1nt-Ch0c0/lark-codex-bridge/issues/27) exact protocol contract | [#36](https://github.com/M1nt-Ch0c0/lark-codex-bridge/pull/36), [#43](https://github.com/M1nt-Ch0c0/lark-codex-bridge/pull/43) | promoted 0.149 contract, compatibility gate, exact schema checks |
+| [#28](https://github.com/M1nt-Ch0c0/lark-codex-bridge/issues/28) endpoint security and auth | [#36](https://github.com/M1nt-Ch0c0/lark-codex-bridge/pull/36) | fail-closed tagged configuration, bearer/TLS/version/capability gate, real smoke |
+| [#29](https://github.com/M1nt-Ch0c0/lark-codex-bridge/issues/29) bounded transport | [#37](https://github.com/M1nt-Ch0c0/lark-codex-bridge/pull/37) | authenticated WebSocket lifecycle, limits, two-client/non-ownership smoke |
+| [#30](https://github.com/M1nt-Ch0c0/lark-codex-bridge/issues/30) recovery | [#38](https://github.com/M1nt-Ch0c0/lark-codex-bridge/pull/38) | persisted epochs, reconnect/restart reconciliation, no mutation replay |
+| [#31](https://github.com/M1nt-Ch0c0/lark-codex-bridge/issues/31) writes and approvals | [#39](https://github.com/M1nt-Ch0c0/lark-codex-bridge/pull/39) | durable intent fencing, start/steer/interrupt/queue races, one approval handler |
+| [#32](https://github.com/M1nt-Ch0c0/lark-codex-bridge/issues/32) Unix contract RFC | [#40](https://github.com/M1nt-Ch0c0/lark-codex-bridge/pull/40) | raw WebSocket handshake, peer/filesystem policy, Darwin/Linux gate |
+
+The implementation lives in `src/codex/external*.rs`,
+`src/store/external*.rs`, and the `tests/external_*` suites. Exact-binary smokes
+remain explicitly gated: a skipped smoke is not evidence. The ordinary `run`
+path still rejects `external_endpoint`; that is a deliberate assembly boundary,
+not an unfinished criterion of this RFC. Desktop/private-endpoint discovery,
+automatic takeover, arbitrary simultaneous writers, and using Unix transport as
+a JSONL/TCP alias remain unsupported.
+
+## Original decision summary (historical snapshot)
+
+The sections below preserve the evidence and decisions available when the RFC
+was written on 2026-08-23. Statements such as “not implemented” describe that
+snapshot; the closeout table above is authoritative for current repository
+status.
 
 A committed, bounded real-server probe (E17) shows only that two read-only raw
 clients can initialize against one explicitly started Codex app-server WebSocket
@@ -48,7 +78,7 @@ If the follow-up approval-routing and write-coordination gates cannot be proven,
 the safe fallback remains Issue #4's explicit sequential handoff after the prior
 owner exits. There is no automatic takeover.
 
-## Acceptance traceability
+## Original acceptance traceability (2026-08-23)
 
 | Issue #8 criterion | RFC evidence |
 | --- | --- |
@@ -870,6 +900,10 @@ production-support claim.
 
 ## Bounded implementation follow-ups
 
+Closeout status: all six required tracking issues below are closed and their
+delivery PRs are listed in the implementation closeout table above. The detailed
+scope remains here as the audit record for why the work was split.
+
 Before Issue #8 can close, maintainers must create or link one bounded GitHub
 issue for each of the six work packages below and record those links in this
 section. An equivalent split is acceptable only if it preserves every scope and
@@ -939,7 +973,13 @@ untracked prose.
      cross-platform support decision before any implementation issue is opened.
    - Do not silently alias Unix to JSONL or TCP.
 
-## Final recommendation
+## Original final recommendation (superseded)
+
+The recommendation below led to follow-ups #27-#32 and is retained as historical
+design context. Those follow-ups are now complete. Current policy is the
+closeout decision at the top of this RFC: keep the implemented external
+capabilities explicit and fail closed, while leaving ordinary `run` integration
+and unsupported sharing topologies outside Issue #8.
 
 Create or link the five core issues and the Unix RFC before closing #8. The only
 committed real-server reproduction today is E17's bounded, unauthenticated,
