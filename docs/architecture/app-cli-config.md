@@ -32,25 +32,35 @@
 3. 创建 `AccessPolicy` 和 `RouterSettings`；
 4. 打开 `StoreHandle`；
 5. 打开并 reconcile `AttachmentCache`；
-6. prepare `DurableIntake`；
-7. 启动 `LarkBridge`；
-8. 启动 `AppServerSupervisor`；
+6. 启动 `AppServerSupervisor`，首次永久 degraded 时在入站装配前 fail closed；
+7. prepare `DurableIntake`；
+8. 启动 `LarkBridge`；
 9. 启动 outbox sink/pump；
 10. 启动带附件的 `Router`；
-11. 进入 `drive_inbound`。
+11. 启动 attachment runtime reconcile actor；
+12. 进入 `drive_inbound`。
 
 后创建的组件依赖前面的组件。任何中间失败必须停止已创建组件，不能遗留 app-server 子进程
 或 store writer。
+
+入站装配期间持续监听 supervisor；Router task 接管 ownership、完成 terminal 检查并回传
+startup ack 后，应用层才可打印 `bridge runtime ready`。ack 前的启动 future 若被取消，先通过
+协作式 cancellation 统一停止 tool task、等待 stale sweep、关闭 supervisor 并 reconcile 附件；
+有界 watchdog 只在清理超时后强制中止。永久 supervisor reason 只沿应用错误链交给 CLI
+stderr；tracing 和 scope actor 只接收静态状态或无内容的 terminal 标志。运行期进入 terminal
+状态时，等待 client 的 received 入站必须原子拒绝并写入静态 notice，不能无限等待下一次
+supervisor 通知。
 
 ## 退出顺序
 
 生产退出顺序不是简单逆序：
 
 1. Lark transport 停止生产新事件；
-2. Router/ScopeActor 完成有限 finalization；
-3. outbox pump 停止；
-4. attachment cache 被 drop，释放实例锁；
-5. Store writer flush/stop。
+2. attachment runtime reconcile actor cancel 并有界 join；
+3. Router/ScopeActor 完成有限 finalization，并执行 terminal reconcile；
+4. outbox pump 停止；
+5. attachment cache 被 drop，释放实例锁；
+6. Store writer flush/stop。
 
 这个顺序保证 actor 在退出前仍能写 outbox，pump 在 actor 完成前仍可投递，store 最后关闭。
 

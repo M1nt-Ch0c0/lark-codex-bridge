@@ -63,7 +63,7 @@ lease 状态。业务模块通过有界 request channel 访问，不能直接持
 - 打开 WAL store 并执行受控 migration；
 - 预装有界数量的 `Received`；
 - 校验/回收 terminal turn 和 attachment lease；
-- reconcile attachment 磁盘与 store。
+- 启动先执行一个 attachment reconcile 批次，runtime actor 接续到 EOF 并周期复扫。
 
 当前限制：没有后台周期性 `Received` 全量重扫；极端积压可能需要后续批次或重启推进。
 

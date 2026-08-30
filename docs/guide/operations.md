@@ -63,13 +63,14 @@ RUST_LOG=info \
 按 `Ctrl-C` 后，应用按以下顺序收口：
 
 1. 停止 Lark 入站 producer；
-2. 停止并等待 scope actor 完成有限 finalization；
-3. 停止 outbox pump；
-4. 释放附件缓存锁；
-5. 停止 SQLite writer。
+2. cancel 并有界等待 attachment runtime reconcile actor；
+3. 停止并等待 scope actor 完成有限 finalization，再执行 terminal reconcile；
+4. 停止 outbox pump；
+5. 释放附件缓存锁；
+6. 停止 SQLite writer。
 
 不要把常规退出做成强制 kill。进程崩溃后，下次启动会校验 attachment cache 和持久状态，
-但周期性全量 inbox 重扫尚未实现。
+运行期也会逐批完成 attachment reconcile；但周期性全量 inbox 重扫尚未实现。
 
 ## 观察
 

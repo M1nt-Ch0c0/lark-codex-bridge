@@ -10,7 +10,8 @@ use bytes::Bytes;
 use fs2::FileExt;
 use futures_util::{FutureExt, future::BoxFuture};
 use lark_codex_bridge::codex::process::{CodexProcessConfig, ProcessError};
-use lark_codex_bridge::codex::supervisor::AppServerSupervisor;
+use lark_codex_bridge::codex::supervisor::{AppServerSupervisor, SupervisorSettings};
+use lark_codex_bridge::codex::wire::SUPPORTED_CODEX_VERSIONS;
 use lark_codex_bridge::config::{AsrSection, BridgeConfig, WorkspacePolicy};
 use lark_codex_bridge::lark::api::{ChatMode, ResourceKind};
 use lark_codex_bridge::lark::bridge::QueuedInboundEvent;
@@ -686,6 +687,37 @@ async fn degraded_supervisor() -> lark_codex_bridge::codex::supervisor::Supervis
     .expect("supervisor task")
 }
 
+async fn backing_off_supervisor() -> lark_codex_bridge::codex::supervisor::SupervisorHandle {
+    AppServerSupervisor::start_with_factory(
+        CodexProcessConfig::default(),
+        Arc::new(FakeFactory::new([FakeOutcome::Error(
+            ProcessError::ProbeTimeout(Duration::from_millis(1)),
+        )])),
+        SupervisorSettings::new(Duration::ZERO, |_, _| Duration::from_secs(60)),
+    )
+    .await
+    .expect("backing-off supervisor")
+}
+
+async fn supervisor_degrading_after_ready_loss() -> (
+    lark_codex_bridge::codex::supervisor::SupervisorHandle,
+    fakecodex::FakeControl,
+    fakecodex::FakeSpawnGate,
+) {
+    let (ready, control) = FakeFactory::ready();
+    let (degraded, gate) = FakeFactory::gated_error(ProcessError::UnsupportedVersion {
+        found: Version::new(0, 145, 0),
+    });
+    let supervisor = AppServerSupervisor::start_with_factory(
+        CodexProcessConfig::default(),
+        Arc::new(FakeFactory::new([ready, degraded])),
+        SupervisorSettings::new(Duration::ZERO, |_, _| Duration::ZERO),
+    )
+    .await
+    .expect("ready supervisor before gated degradation");
+    (supervisor, control, gate)
+}
+
 async fn ready_supervisor() -> (
     lark_codex_bridge::codex::supervisor::SupervisorHandle,
     fakecodex::FakeControl,
@@ -916,7 +948,7 @@ async fn router_rejects_non_owner_with_one_atomic_durable_notice() {
     let namespace = TenantNamespace::from_credentials(&credentials);
     let store = StoreHandle::open_in_memory().await.expect("store");
     let sink = Arc::new(RecordingSink::default());
-    let supervisor = degraded_supervisor().await;
+    let supervisor = backing_off_supervisor().await;
     let router = Router::start(
         store.clone(),
         namespace.clone(),
@@ -962,7 +994,7 @@ async fn router_retries_a_transient_rejection_projection_without_losing_the_rece
         namespace.clone(),
         policy,
         settings,
-        degraded_supervisor().await,
+        backing_off_supervisor().await,
         sink.clone(),
     )
     .await
@@ -1005,7 +1037,7 @@ async fn router_retry_lane_enforces_its_count_bound() {
         namespace.clone(),
         policy,
         settings,
-        degraded_supervisor().await,
+        backing_off_supervisor().await,
         Arc::new(UnavailableRejectionSink),
     )
     .await
@@ -1053,7 +1085,7 @@ async fn router_retry_lane_enforces_its_aggregate_byte_bound() {
         namespace.clone(),
         policy,
         settings,
-        degraded_supervisor().await,
+        backing_off_supervisor().await,
         Arc::new(UnavailableRejectionSink),
     )
     .await
@@ -1147,6 +1179,10 @@ async fn debounce_batch_claims_one_turn_and_uses_the_exact_client_message_id() {
 
     let start_turn = control.next_request().await;
     assert_eq!(start_turn["method"], "turn/start");
+    assert!(
+        start_turn["params"].get("effort").is_none(),
+        "omitted effort must remain absent from turn/start"
+    );
     assert_eq!(start_turn["params"]["threadId"], "thread-runtime");
     assert_eq!(
         start_turn["params"]["input"]
@@ -2322,7 +2358,7 @@ async fn group_media_flood_is_durably_ignored_without_actor_context_cache_or_asr
         namespace.clone(),
         policy,
         settings,
-        degraded_supervisor().await,
+        backing_off_supervisor().await,
         Arc::new(RecordingSink::default()),
         Arc::clone(&cache),
         Arc::clone(&contexts),
@@ -2394,7 +2430,7 @@ async fn pending_media_count_ttl_and_interrupt_bounds_clear_metadata() {
         namespace.clone(),
         policy,
         settings,
-        degraded_supervisor().await,
+        backing_off_supervisor().await,
         Arc::new(RecordingSink::default()),
     )
     .await
@@ -2806,7 +2842,7 @@ async fn pending_media_metadata_byte_bound_drops_an_oversize_descriptor() {
         namespace.clone(),
         policy,
         settings,
-        degraded_supervisor().await,
+        backing_off_supervisor().await,
         Arc::new(RecordingSink::default()),
     )
     .await
@@ -3641,7 +3677,7 @@ async fn permit_recheck_atomically_rejects_a_stale_event_before_any_rpc() {
     let namespace = TenantNamespace::from_credentials(&credentials());
     let store = StoreHandle::open_in_memory().await.expect("store");
     let sink = Arc::new(RecordingSink::default());
-    let supervisor = degraded_supervisor().await;
+    let supervisor = backing_off_supervisor().await;
     let router = Router::start(
         store.clone(),
         namespace.clone(),
@@ -3686,7 +3722,7 @@ async fn missing_default_workspace_is_a_durable_policy_rejection() {
     let namespace = TenantNamespace::from_credentials(&credentials());
     let store = StoreHandle::open_in_memory().await.expect("store");
     let sink = Arc::new(RecordingSink::default());
-    let supervisor = degraded_supervisor().await;
+    let supervisor = backing_off_supervisor().await;
     let router = Router::start(
         store.clone(),
         namespace.clone(),
@@ -3744,48 +3780,196 @@ async fn router_rejects_zero_and_hard_cap_runtime_settings() {
 }
 
 #[tokio::test]
-async fn shutdown_cancels_an_actor_waiting_for_a_supervisor_client() {
+async fn router_handoff_surfaces_a_terminal_reason_with_static_debug() {
     let config = validated_config();
     let policy = AccessPolicy::from_config(&config).expect("policy");
     let settings = RouterSettings::from_config(&config);
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let result = Router::start(
+        store.clone(),
+        TenantNamespace::from_credentials(&credentials()),
+        policy,
+        settings,
+        degraded_supervisor().await,
+        Arc::new(RecordingSink::default()),
+    )
+    .await;
+    let Err(RouteError::CodexUnavailable { reason }) = result else {
+        panic!("terminal supervisor must fail the router ownership handoff");
+    };
+    assert_eq!(
+        reason,
+        format!(
+            "Codex 0.145.0 is unsupported; expected an exact reviewed version ({})",
+            SUPPORTED_CODEX_VERSIONS.join(", ")
+        )
+    );
+    assert_eq!(
+        format!("{:?}", RouteError::CodexUnavailable { reason }),
+        "CodexUnavailable"
+    );
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn permanent_degradation_rejects_an_inbound_waiting_for_a_supervisor_client() {
+    let config = validated_config();
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config).with_test_timings(
+        Duration::from_millis(1),
+        Duration::from_secs(15 * 60),
+        Duration::from_millis(1),
+    );
     let namespace = TenantNamespace::from_credentials(&credentials());
     let store = StoreHandle::open_in_memory().await.expect("store");
-    let supervisor = degraded_supervisor().await;
+    let sink = Arc::new(RecordingSink::default());
+    let (supervisor, control, gate) = supervisor_degrading_after_ready_loss().await;
     let router = Router::start(
         store.clone(),
         namespace.clone(),
         policy,
         settings,
         supervisor,
-        Arc::new(RecordingSink::default()),
+        sink.clone(),
     )
     .await
     .expect("router");
+    control.unexpected_exit();
+    gate.wait_started().await;
     router
         .route(
             queued_registered(
                 &store,
                 &namespace,
-                event("event-shutdown", "owner-runtime-scope"),
+                event("event-supervisor-degraded", "owner-runtime-scope"),
             )
             .await,
         )
         .await
         .expect("route to waiting actor");
-    sleep(Duration::from_millis(700)).await;
-
-    timeout(Duration::from_millis(500), router.shutdown())
-        .await
-        .expect("router shutdown deadline")
-        .expect("router shutdown");
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if router
+                .scope_snapshot(&ScopeKey::Chat("chat-runtime-scope".to_owned()))
+                .await
+                .expect("snapshot")
+                .is_some_and(|snapshot| snapshot.state == ScopeState::WaitingPermit)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("actor waits while the replacement spawn is gated");
     assert_eq!(
         store
-            .inbound_state(&namespace, "event-shutdown")
+            .inbound_state(&namespace, "event-supervisor-degraded")
             .await
-            .expect("inbound state"),
+            .expect("inbound state before permanent degradation"),
         Some(InboundEventState::Received)
     );
+    gate.release();
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-supervisor-degraded"],
+        InboundEventState::Rejected,
+    )
+    .await;
+    assert_eq!(
+        *sink.rejections.lock().expect("rejections"),
+        vec![InboundRejectionKind::Internal]
+    );
+    assert_eq!(store.outbox_depth().await.expect("outbox").pending, 1);
+    router.shutdown().await.expect("router shutdown");
     store.shutdown().await.expect("store shutdown");
+}
+
+async fn assert_terminal_rejects_stale_client_before_claim(
+    event_id: &str,
+    active_thread: Option<&str>,
+    expected_method: &str,
+) {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config).with_test_timings(
+        Duration::from_millis(1),
+        Duration::from_secs(15 * 60),
+        Duration::from_millis(1),
+    );
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let inbound = event(event_id, "owner-runtime-scope");
+    if let Some(thread_id) = active_thread {
+        let fingerprint = policy.fingerprint(&workspace).expect("policy fingerprint");
+        store
+            .upsert_scope(&inbound.scope, &workspace, fingerprint.as_str())
+            .await
+            .expect("seed reusable scope");
+        store
+            .record_active_thread(&inbound.scope, thread_id)
+            .await
+            .expect("seed active thread");
+    }
+    let sink = Arc::new(RecordingSink::default());
+    let (supervisor, control, gate) = supervisor_degrading_after_ready_loss().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink.clone(),
+    )
+    .await
+    .expect("router");
+    router
+        .route(queued_registered(&store, &namespace, inbound).await)
+        .await
+        .expect("route event to ready epoch");
+    let request = control.next_request().await;
+    assert_eq!(request["method"], expected_method);
+
+    control.unexpected_exit();
+    gate.wait_started().await;
+    assert_eq!(
+        store
+            .inbound_state(&namespace, event_id)
+            .await
+            .expect("pre-claim inbound state"),
+        Some(InboundEventState::Received)
+    );
+    gate.release();
+    wait_for_inbound_states(&store, &namespace, &[event_id], InboundEventState::Rejected).await;
+    assert_eq!(
+        *sink.rejections.lock().expect("rejections"),
+        vec![InboundRejectionKind::Internal]
+    );
+    assert_eq!(store.outbox_depth().await.expect("outbox").pending, 1);
+    router.shutdown().await.expect("router shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn terminal_epoch_loss_during_thread_start_rejects_the_unclaimed_inbound() {
+    assert_terminal_rejects_stale_client_before_claim(
+        "event-terminal-during-thread-start",
+        None,
+        "thread/start",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn terminal_epoch_loss_during_thread_resume_rejects_the_unclaimed_inbound() {
+    assert_terminal_rejects_stale_client_before_claim(
+        "event-terminal-during-thread-resume",
+        Some("thread-terminal-resume"),
+        "thread/resume",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -3929,8 +4113,10 @@ async fn shutdown_uses_a_fresh_deadline_for_an_async_uncertain_finalization() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn message_while_running_waits_then_resumes_the_same_thread() {
-    let config = validated_config();
+    let mut config = validated_config();
+    config.codex.effort = Some("future-tier".to_owned());
     let workspace = config.default_workspace.clone().expect("workspace");
     let policy = AccessPolicy::from_config(&config).expect("policy");
     let settings = RouterSettings::from_config(&config);
@@ -3961,11 +4147,13 @@ async fn message_while_running_waits_then_resumes_the_same_thread() {
         .expect("route first turn");
     let start_thread = control.next_request().await;
     assert_eq!(start_thread["method"], "thread/start");
+    assert!(start_thread["params"].get("effort").is_none());
     control
         .respond(&start_thread, thread_result("thread-reused", &workspace))
         .await;
     let first_turn = control.next_request().await;
     assert_eq!(first_turn["method"], "turn/start");
+    assert_eq!(first_turn["params"]["effort"], "future-tier");
     control
         .respond(
             &first_turn,
@@ -4000,12 +4188,14 @@ async fn message_while_running_waits_then_resumes_the_same_thread() {
     let resume_thread = control.next_request().await;
     assert_eq!(resume_thread["method"], "thread/resume");
     assert_eq!(resume_thread["params"]["threadId"], "thread-reused");
+    assert!(resume_thread["params"].get("effort").is_none());
     control
         .respond(&resume_thread, thread_result("thread-reused", &workspace))
         .await;
     let second_turn = control.next_request().await;
     assert_eq!(second_turn["method"], "turn/start");
     assert_eq!(second_turn["params"]["threadId"], "thread-reused");
+    assert_eq!(second_turn["params"]["effort"], "future-tier");
     control
         .respond(
             &second_turn,
@@ -4339,23 +4529,83 @@ async fn oversized_single_message_is_durably_rejected_without_any_rpc() {
 }
 
 #[tokio::test]
-async fn policy_fingerprint_change_archives_the_old_thread_before_starting_a_new_one() {
-    let config = validated_config();
-    let workspace = config.default_workspace.clone().expect("workspace");
-    let policy = AccessPolicy::from_config(&config).expect("policy");
-    let settings = RouterSettings::from_config(&config);
+#[allow(clippy::too_many_lines)]
+async fn network_policy_change_resumes_the_existing_thread_before_committing_the_fingerprint() {
+    let mut previous_config = validated_config();
+    previous_config.workspace.network_access = false;
+    let previous_policy = AccessPolicy::from_config(&previous_config).expect("previous policy");
+    let previous_settings = RouterSettings::from_config(&previous_config);
+    let workspace = previous_config
+        .default_workspace
+        .clone()
+        .expect("workspace");
+    let previous_fingerprint = previous_policy
+        .fingerprint(&workspace)
+        .expect("previous fingerprint");
     let namespace = TenantNamespace::from_credentials(&credentials());
     let store = StoreHandle::open_in_memory().await.expect("store");
+    let first_inbound = event("event-before-network-policy-change", "owner-runtime-scope");
+    let (first_supervisor, first_control) = ready_supervisor().await;
+    let first_router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        previous_policy,
+        previous_settings,
+        first_supervisor,
+        Arc::new(RecordingSink::default()),
+    )
+    .await
+    .expect("first router");
+    first_router
+        .route(queued_registered(&store, &namespace, first_inbound.clone()).await)
+        .await
+        .expect("route first event");
+    let start_thread = first_control.next_request().await;
+    assert_eq!(start_thread["method"], "thread/start");
+    first_control
+        .respond(
+            &start_thread,
+            thread_result("thread-old-policy", &workspace),
+        )
+        .await;
+    let first_turn = first_control.next_request().await;
+    assert_eq!(first_turn["method"], "turn/start");
+    assert_eq!(
+        first_turn["params"]["sandboxPolicy"]["networkAccess"],
+        false
+    );
+    respond_turn_started(&first_control, &first_turn, "turn-before-policy-change").await;
+    send_turn_completed(
+        &first_control,
+        "thread-old-policy",
+        "turn-before-policy-change",
+        "completed",
+    )
+    .await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-before-network-policy-change"],
+        InboundEventState::Completed,
+    )
+    .await;
+    assert_eq!(
+        store
+            .scope_row(&first_inbound.scope)
+            .await
+            .expect("scope row before restart")
+            .expect("scope persisted before restart")
+            .policy_fingerprint,
+        previous_fingerprint.as_str()
+    );
+    first_router.shutdown().await.expect("first shutdown");
+
+    let mut config = previous_config;
+    config.workspace.network_access = true;
+    let policy = AccessPolicy::from_config(&config).expect("current policy");
+    let current_fingerprint = policy.fingerprint(&workspace).expect("current fingerprint");
+    let settings = RouterSettings::from_config(&config);
     let inbound = event("event-policy-fingerprint-change", "owner-runtime-scope");
-    store
-        .upsert_scope(&inbound.scope, &workspace, "stale-policy-fingerprint")
-        .await
-        .expect("seed stale scope policy");
-    store
-        .record_active_thread(&inbound.scope, "thread-old-policy")
-        .await
-        .expect("seed old active thread");
-    let sink = Arc::new(RecordingSink::default());
     let (supervisor, control) = ready_supervisor().await;
     let router = Router::start(
         store.clone(),
@@ -4363,7 +4613,7 @@ async fn policy_fingerprint_change_archives_the_old_thread_before_starting_a_new
         policy,
         settings,
         supervisor,
-        sink,
+        Arc::new(RecordingSink::default()),
     )
     .await
     .expect("router");
@@ -4372,26 +4622,38 @@ async fn policy_fingerprint_change_archives_the_old_thread_before_starting_a_new
         .await
         .expect("route event");
 
-    let new_thread = control.next_request().await;
-    assert_eq!(new_thread["method"], "thread/start");
+    let resume = control.next_request().await;
+    assert_eq!(resume["method"], "thread/resume");
+    assert_eq!(resume["params"]["threadId"], "thread-old-policy");
+    assert_eq!(
+        store
+            .scope_row(&inbound.scope)
+            .await
+            .expect("scope row before resume")
+            .expect("scope remains persisted")
+            .policy_fingerprint,
+        previous_fingerprint.as_str(),
+        "the new fingerprint must not commit before resume succeeds"
+    );
     control
-        .respond(&new_thread, thread_result("thread-new-policy", &workspace))
+        .respond(&resume, thread_result("thread-old-policy", &workspace))
         .await;
     let start_turn = control.next_request().await;
     assert_eq!(start_turn["method"], "turn/start");
-    assert_eq!(start_turn["params"]["threadId"], "thread-new-policy");
+    assert_eq!(start_turn["params"]["threadId"], "thread-old-policy");
+    assert_eq!(start_turn["params"]["sandboxPolicy"]["networkAccess"], true);
     control
         .respond(
             &start_turn,
-            json!({"turn": turn("turn-new-policy", "inProgress")}),
+            json!({"turn": turn("turn-resumed-policy", "inProgress")}),
         )
         .await;
     control
         .send_json(json!({
             "method": "turn/completed",
             "params": {
-                "threadId": "thread-new-policy",
-                "turn": turn("turn-new-policy", "completed")
+                "threadId": "thread-old-policy",
+                "turn": turn("turn-resumed-policy", "completed")
             }
         }))
         .await;
@@ -4407,15 +4669,298 @@ async fn policy_fingerprint_change_archives_the_old_thread_before_starting_a_new
         .await
         .expect("scope row")
         .expect("scope remains persisted");
-    assert_ne!(current_scope.policy_fingerprint, "stale-policy-fingerprint");
+    assert_eq!(
+        current_scope.policy_fingerprint,
+        current_fingerprint.as_str()
+    );
     assert_eq!(
         store
             .active_thread(&inbound.scope)
             .await
             .expect("active thread")
-            .expect("new active thread")
+            .expect("existing active thread")
             .codex_thread_id,
-        "thread-new-policy"
+        "thread-old-policy"
+    );
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn failed_policy_change_resume_preserves_the_mapping_and_old_fingerprint() {
+    let mut previous_config = validated_config();
+    previous_config.workspace.network_access = false;
+    let previous_policy = AccessPolicy::from_config(&previous_config).expect("previous policy");
+    let mut config = previous_config.clone();
+    config.workspace.network_access = true;
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let previous_fingerprint = previous_policy
+        .fingerprint(&workspace)
+        .expect("previous fingerprint");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let inbound = event("event-policy-resume-failed", "owner-runtime-scope");
+    store
+        .upsert_scope(&inbound.scope, &workspace, previous_fingerprint.as_str())
+        .await
+        .expect("seed previous scope policy");
+    store
+        .record_active_thread(&inbound.scope, "thread-old-policy")
+        .await
+        .expect("seed old active thread");
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        Arc::new(RecordingSink::default()),
+    )
+    .await
+    .expect("router");
+    router
+        .route(queued_registered(&store, &namespace, inbound.clone()).await)
+        .await
+        .expect("route event");
+
+    let resume = control.next_request().await;
+    assert_eq!(resume["method"], "thread/resume");
+    assert_eq!(resume["params"]["threadId"], "thread-old-policy");
+    control
+        .send_json(json!({
+            "id": resume["id"],
+            "error": {"code": -32602, "message": "deliberate resume rejection"}
+        }))
+        .await;
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if router
+                .scope_snapshot(&inbound.scope)
+                .await
+                .expect("snapshot")
+                .is_some_and(|snapshot| {
+                    matches!(
+                        snapshot.state,
+                        lark_codex_bridge::runtime::scope::ScopeState::Failed { .. }
+                    )
+                })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("actor records the resume failure");
+    control
+        .expect_no_request_for(Duration::from_millis(100))
+        .await;
+    assert_eq!(
+        store
+            .scope_row(&inbound.scope)
+            .await
+            .expect("scope row")
+            .expect("scope remains persisted")
+            .policy_fingerprint,
+        previous_fingerprint.as_str()
+    );
+    assert_eq!(
+        store
+            .active_thread(&inbound.scope)
+            .await
+            .expect("active thread")
+            .expect("old active thread remains mapped")
+            .codex_thread_id,
+        "thread-old-policy"
+    );
+    assert_eq!(
+        store
+            .inbound_state(&namespace, "event-policy-resume-failed")
+            .await
+            .expect("inbound state"),
+        Some(InboundEventState::Received)
+    );
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn failed_fingerprint_commit_after_thread_start_replays_with_resume() {
+    let mut previous_config = validated_config();
+    previous_config.workspace.network_access = false;
+    let previous_policy = AccessPolicy::from_config(&previous_config).expect("previous policy");
+    let mut config = previous_config;
+    config.workspace.network_access = true;
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let previous_fingerprint = previous_policy
+        .fingerprint(&workspace)
+        .expect("previous fingerprint");
+    let policy = AccessPolicy::from_config(&config).expect("current policy");
+    let current_fingerprint = policy.fingerprint(&workspace).expect("current fingerprint");
+    assert_ne!(previous_fingerprint, current_fingerprint);
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("policy-start-recovery.sqlite");
+    let store = StoreHandle::open(&path).await.expect("file-backed store");
+    let inbound = event("event-policy-start-recovery", "owner-runtime-scope");
+    store
+        .upsert_scope(&inbound.scope, &workspace, previous_fingerprint.as_str())
+        .await
+        .expect("seed stale scope policy");
+    assert!(
+        store
+            .active_thread(&inbound.scope)
+            .await
+            .expect("active thread before start")
+            .is_none(),
+        "the stale scope must begin without an active mapping"
+    );
+    let connection = rusqlite::Connection::open(&path).expect("open trigger connection");
+    connection
+        .execute_batch(
+            "PRAGMA busy_timeout = 5000;
+             CREATE TRIGGER fail_policy_fingerprint_update
+             BEFORE UPDATE OF policy_fingerprint ON scopes
+             WHEN NEW.policy_fingerprint <> OLD.policy_fingerprint
+             BEGIN
+                 SELECT RAISE(ABORT, 'deliberate policy fingerprint failure');
+             END;",
+        )
+        .expect("install policy fingerprint trigger");
+    drop(connection);
+
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        Arc::new(RecordingSink::default()),
+    )
+    .await
+    .expect("router");
+    router
+        .route(queued_registered(&store, &namespace, inbound.clone()).await)
+        .await
+        .expect("route first delivery");
+    let start = control.next_request().await;
+    assert_eq!(start["method"], "thread/start");
+    control
+        .respond(
+            &start,
+            thread_result("thread-started-before-fingerprint", &workspace),
+        )
+        .await;
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if router
+                .scope_snapshot(&inbound.scope)
+                .await
+                .expect("snapshot")
+                .is_some_and(|snapshot| {
+                    matches!(
+                        snapshot.state,
+                        lark_codex_bridge::runtime::scope::ScopeState::Failed {
+                            kind: lark_codex_bridge::runtime::scope::ScopeFailureKind::Store
+                        }
+                    )
+                })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("actor records the fingerprint persistence failure");
+    assert_eq!(
+        store
+            .active_thread(&inbound.scope)
+            .await
+            .expect("active thread after failed fingerprint commit")
+            .expect("thread mapping survives the failed fingerprint commit")
+            .codex_thread_id,
+        "thread-started-before-fingerprint"
+    );
+    assert_eq!(
+        store
+            .scope_row(&inbound.scope)
+            .await
+            .expect("scope row after failed fingerprint commit")
+            .expect("stale scope remains")
+            .policy_fingerprint,
+        previous_fingerprint.as_str()
+    );
+    assert_eq!(
+        store
+            .inbound_state(&namespace, "event-policy-start-recovery")
+            .await
+            .expect("inbound state after failed fingerprint commit"),
+        Some(InboundEventState::Received)
+    );
+    control
+        .expect_no_request_for(Duration::from_millis(100))
+        .await;
+
+    let connection = rusqlite::Connection::open(&path).expect("open trigger cleanup connection");
+    connection
+        .execute_batch("DROP TRIGGER fail_policy_fingerprint_update;")
+        .expect("remove policy fingerprint trigger");
+    drop(connection);
+    router
+        .route(queued_registered(&store, &namespace, inbound.clone()).await)
+        .await
+        .expect("replay received inbound");
+    let resume = control.next_request().await;
+    assert_eq!(
+        resume["method"], "thread/resume",
+        "replay must resume the durably mapped thread, never start another one"
+    );
+    assert_eq!(
+        resume["params"]["threadId"],
+        "thread-started-before-fingerprint"
+    );
+    control
+        .respond(
+            &resume,
+            thread_result("thread-started-before-fingerprint", &workspace),
+        )
+        .await;
+    let start_turn = control.next_request().await;
+    assert_eq!(start_turn["method"], "turn/start");
+    assert_eq!(
+        start_turn["params"]["threadId"],
+        "thread-started-before-fingerprint"
+    );
+    respond_turn_started(&control, &start_turn, "turn-after-fingerprint-replay").await;
+    send_turn_completed(
+        &control,
+        "thread-started-before-fingerprint",
+        "turn-after-fingerprint-replay",
+        "completed",
+    )
+    .await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-policy-start-recovery"],
+        InboundEventState::Completed,
+    )
+    .await;
+    assert_eq!(
+        store
+            .scope_row(&inbound.scope)
+            .await
+            .expect("scope row after replay")
+            .expect("scope remains persisted")
+            .policy_fingerprint,
+        current_fingerprint.as_str()
     );
     router.shutdown().await.expect("shutdown");
     store.shutdown().await.expect("store shutdown");
@@ -4804,7 +5349,7 @@ async fn full_scope_mailbox_atomically_rejects_the_overflow_with_a_busy_notice()
         namespace.clone(),
         policy,
         settings,
-        degraded_supervisor().await,
+        backing_off_supervisor().await,
         sink.clone(),
     )
     .await
@@ -4876,7 +5421,7 @@ async fn router_command_byte_budget_refuses_an_oversized_retained_item() {
         namespace.clone(),
         policy,
         settings,
-        degraded_supervisor().await,
+        backing_off_supervisor().await,
         Arc::new(RecordingSink::default()),
     )
     .await
@@ -4991,7 +5536,7 @@ async fn busy_actor_registry_rejects_a_new_scope_without_evicting_live_work() {
         namespace.clone(),
         policy,
         settings,
-        degraded_supervisor().await,
+        backing_off_supervisor().await,
         sink.clone(),
     )
     .await

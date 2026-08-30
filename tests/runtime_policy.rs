@@ -6,12 +6,13 @@ use lark_codex_bridge::codex::{
     types::{ApprovalPolicy, GranularApprovalPolicy, SandboxMode},
 };
 use lark_codex_bridge::config::{
-    AsrSection, BridgeConfig, ChannelTransport, CodexSection, ConcurrencyConfig, PathsSection,
-    WorkspacePolicy,
+    AsrSection, BridgeConfig, ChannelTransport, CodexSection, ConcurrencyConfig, ConfigError,
+    PathsSection, WorkspacePolicy,
 };
 use lark_codex_bridge::lark::api::ChatMode;
 use lark_codex_bridge::lark::normalize::{InboundEvent, ScopeKey};
 use lark_codex_bridge::runtime::policy::{AccessDecision, AccessPolicy, WorkspaceRejection};
+use lark_codex_bridge::runtime::router::RouterSettings;
 use tempfile::TempDir;
 
 const MINIMAL_CONFIG: &str = include_str!("fixtures/runtime/config_minimal.toml");
@@ -149,6 +150,7 @@ fn minimal_config_has_safe_defaults_and_resolves_relative_runtime_paths() {
     assert_eq!(config.concurrency.active_turn_permits, 4);
     assert_eq!(config.concurrency.max_scope_actors, 256);
     assert_eq!(config.codex.sandbox, SandboxMode::WorkspaceWrite);
+    assert!(config.codex.effort.is_none());
     assert_eq!(config.channel.transport, ChannelTransport::Native);
     assert!(config.channel.fallback_to_native);
     assert_eq!(config.channel.node_binary, PathBuf::from("node"));
@@ -182,6 +184,7 @@ fn full_config_round_trips_and_resolves_only_runtime_relative_paths() {
     assert_eq!(config.concurrency.active_turn_permits, 9);
     assert_eq!(config.concurrency.max_scope_actors, 31);
     assert_eq!(config.codex.model.as_deref(), Some("gpt-5.6"));
+    assert_eq!(config.codex.effort.as_deref(), Some("high"));
     assert_eq!(config.codex.sandbox, SandboxMode::ReadOnly);
     assert_eq!(
         config.codex.approval_policy,
@@ -214,7 +217,33 @@ fn full_config_round_trips_and_resolves_only_runtime_relative_paths() {
     assert_eq!(reparsed.allowed_senders, config.allowed_senders);
     assert_eq!(reparsed.allowed_groups, config.allowed_groups);
     assert_eq!(reparsed.codex.approval_policy, config.codex.approval_policy);
+    assert_eq!(reparsed.codex.effort, config.codex.effort);
     assert_eq!(reparsed.paths.database, config.paths.database);
+}
+
+#[test]
+fn codex_effort_accepts_future_non_blank_values_and_rejects_blank_values() {
+    let temp = scratch();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        "owners = [\"ou_owner_123456\"]\n[codex]\neffort = \"future-tier\"\n",
+    )
+    .expect("valid effort config should write");
+    let config = BridgeConfig::load(Some(&config_path)).expect("non-blank effort should load");
+    assert_eq!(config.codex.effort.as_deref(), Some("future-tier"));
+
+    for blank in ["", "   ", "\\t"] {
+        fs::write(
+            &config_path,
+            format!("owners = [\"ou_owner_123456\"]\n[codex]\neffort = \"{blank}\"\n"),
+        )
+        .expect("blank effort config should write");
+        assert!(matches!(
+            BridgeConfig::load(Some(&config_path)),
+            Err(ConfigError::InvalidCodexEffort)
+        ));
+    }
 }
 
 #[test]
@@ -1019,6 +1048,11 @@ fn fingerprint_is_stable_for_aliases_and_changes_for_every_policy_dimension() {
     network_config.workspace.network_access = true;
     let network = AccessPolicy::from_config(&network_config).unwrap();
     assert_ne!(first, network.fingerprint(&one).unwrap());
+
+    let mut effort_config = policy_config(one.parent().expect("safe root").to_path_buf());
+    effort_config.codex.effort = Some("future-tier".to_owned());
+    let effort = AccessPolicy::from_config(&effort_config).unwrap();
+    assert_eq!(first, effort.fingerprint(&one).unwrap());
 }
 
 fn granular_all_false() -> GranularApprovalPolicy {
@@ -1115,10 +1149,13 @@ fn unvalidated_config_debug_shows_only_counts_presence_and_static_summaries() {
         binary: path_sentinel.join("binary-sentinel"),
         codex_home: Some(path_sentinel.join("home-sentinel")),
     };
+    config.codex.effort = Some("EFFORT_VALUE_SENTINEL".to_owned());
     config.paths.database = path_sentinel.join("database-sentinel");
     config.paths.attachment_cache = path_sentinel.join("cache-sentinel");
 
     let debug = format!("{config:?}");
+    let codex_debug = format!("{:?}", config.codex);
+    let router_debug = format!("{:?}", RouterSettings::from_config(&config));
 
     assert!(debug.contains("owner_count: 1"));
     assert!(debug.contains("default_workspace_configured: true"));
@@ -1126,6 +1163,11 @@ fn unvalidated_config_debug_shows_only_counts_presence_and_static_summaries() {
     assert!(!debug.contains("OWNER_FRAGMENT"));
     assert!(!debug.contains(&path_sentinel.display().to_string()));
     assert!(!debug.contains("binary-sentinel"));
+    assert!(codex_debug.contains("has_effort: true"));
+    assert!(router_debug.contains("has_effort: true"));
+    assert!(!debug.contains("EFFORT_VALUE_SENTINEL"));
+    assert!(!codex_debug.contains("EFFORT_VALUE_SENTINEL"));
+    assert!(!router_debug.contains("EFFORT_VALUE_SENTINEL"));
     assert!(!debug.contains("database-sentinel"));
     assert!(!debug.contains("cache-sentinel"));
     assert!(!format!("{:?}", config.workspace).contains(&path_sentinel.display().to_string()));

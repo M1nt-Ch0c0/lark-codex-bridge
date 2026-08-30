@@ -25,10 +25,33 @@ lark-codex-bridge codex probe
 codex --version
 ```
 
-当前精确支持 `codex-cli 0.146.0` 和 `0.149.0`。还应确认 Codex 已登录、`codex app-server` 可以启动、
-`CODEX_HOME` 可访问。
+精确支持列表以源码中的 `SUPPORTED_CODEX_VERSIONS` 为准；当前是 `codex-cli 0.146.0` 和
+`0.149.0`。更高的 patch/minor 版本不会自动视为兼容。还应确认 Codex 已登录、
+`codex app-server` 可以启动、`CODEX_HOME` 可访问。
 
 probe 超时或 app-server 退出时，先单独修复 Codex 环境，不要同时排查 Lark。
+
+## run 报告 Codex supervisor degraded
+
+`Codex supervisor degraded` 表示 Codex supervisor 已进入本次进程内不可恢复的 terminal 状态。
+该 tracing 行故意不包含具体 reason，避免把本机路径或 secret 写进结构化日志。处理方式取决于
+它发生在 `bridge runtime ready` 之前还是之后：
+
+- **启动期降级**：`run` 会在打印 ready 之前清理已启动组件，以非零状态退出；紧随 tracing
+  行的 CLI 错误会给出可操作原因，Lark 入站不会启动。
+- **运行期降级**：进程保持运行，让 Router 对仍在等待或尚未 claim 的 `received` 入站做持久化
+  拒绝并写入静态内部提示，避免消息无限等待。运行时 terminal 通知不会携带具体 reason，也不会
+  把它写入 tracing 或用户提示；运维应停止当前进程、用下面的 probe 复核并修复后再启动。
+
+执行以下命令复核同一原因：
+
+```bash
+lark-codex-bridge codex probe
+```
+
+如果原因是 unsupported version，只安装 `SUPPORTED_CODEX_VERSIONS` 中列出的精确版本，或先按
+Schema/契约升级流程评审并提升新版本；不要仅因本机版本号更高就绕过门禁。若旧版 bridge 在
+运行期 degraded 后没有拒绝新消息，应先停止并升级，避免消息停留在 `received`。
 
 ## Lark auth 失败
 

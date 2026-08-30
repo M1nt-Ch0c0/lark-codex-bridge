@@ -56,7 +56,10 @@ use tokio_tungstenite::{
 use tokio_util::sync::CancellationToken;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(8);
-const REQUEST_TIMEOUT: Duration = Duration::from_millis(300);
+// This is a correctness-test budget, not a production default. Coverage
+// instrumentation and shared CI load must not turn a semaphore-coordinated race
+// into a transport timeout before the test releases the fake server.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const TOKEN: &str = "write-token-0123456789abcdef0123456789abcdef";
 const THREAD_ID: &str = "thread-contract-1";
 const APPROVAL_REVIEWER: &str = "user";
@@ -103,6 +106,7 @@ struct SharedServer {
     pause_bridge_steer: AtomicBool,
     bridge_steer_seen: Semaphore,
     release_bridge_steer: Semaphore,
+    operator_steer_applied: Semaphore,
     omit_bridge_steer_message: AtomicBool,
 }
 
@@ -121,6 +125,7 @@ impl Default for SharedServer {
             pause_bridge_steer: AtomicBool::new(false),
             bridge_steer_seen: Semaphore::new(0),
             release_bridge_steer: Semaphore::new(0),
+            operator_steer_applied: Semaphore::new(0),
             omit_bridge_steer_message: AtomicBool::new(false),
         }
     }
@@ -497,6 +502,9 @@ fn steer_turn_result(
             .or_default()
             .push(client_id.to_owned());
     }
+    if role == SessionRole::Operator {
+        shared.operator_steer_applied.add_permits(1);
+    }
     Ok(json!({"turnId": expected}))
 }
 
@@ -831,23 +839,32 @@ async fn two_clients_cover_exact_start_steer_interrupt_queue_and_ambiguous_races
             .await
             .expect("bridge steer reaches server");
         permit.forget();
-        let response = operator_request(
+        send_json(
             &mut operator,
-            12,
-            "turn/steer",
             json!({
+                "id": 12,
+                "method": "turn/steer",
+                "params": {
                 "threadId": THREAD_ID,
                 "expectedTurnId": final_turn,
                 "input": [{"type": "text", "text": "operator steer"}],
                 "clientUserMessageId": "operator-raced-steer",
+                }
             }),
         )
         .await;
+        let applied = timeout(TEST_TIMEOUT, server.shared.operator_steer_applied.acquire())
+            .await
+            .expect("operator steer application must remain bounded")
+            .expect("operator steer is applied before bridge release");
+        applied.forget();
         server
             .shared
             .omit_bridge_steer_message
             .store(true, Ordering::Release);
         server.shared.release_bridge_steer.add_permits(1);
+        let response = recv_json(&mut operator).await;
+        assert_eq!(response["id"], 12);
         response
     };
     let (bridge_result, operator_result) = tokio::join!(bridge_steer, operator_steer);

@@ -1,5 +1,5 @@
 //! Deterministic, offline tests for the content-addressed attachment cache:
-//! safe writes, leases, GC, and startup reconciliation.
+//! safe writes, leases, GC, and bounded startup/runtime reconciliation.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -12,8 +12,8 @@ use lark_codex_bridge::lark::api::ResourceKind;
 use lark_codex_bridge::lark::normalize::ResourceDesc;
 use lark_codex_bridge::limits::{ATTACHMENT_CACHE_MARKER, ATTACHMENT_INSTANCE_LOCK};
 use lark_codex_bridge::runtime::attachments::{
-    AttachError, AttachmentCache, AttachmentLimits, CachedAttachment, DownloadKind,
-    ResourceDownloader,
+    AttachError, AttachmentCache, AttachmentLimits, AttachmentReconcileConfig,
+    AttachmentReconcileRuntime, CachedAttachment, DownloadKind, ResourceDownloader,
 };
 use lark_codex_bridge::store::{NewTurnRow, StoreHandle, TurnState};
 use sha2::{Digest, Sha256};
@@ -619,10 +619,15 @@ async fn reconcile_is_idempotent() {
 
     let first = cache.reconcile().await.expect("reconcile");
     assert_eq!(first.temp_files, 1);
+    assert!(first.completed_cycle, "the small directory reaches EOF");
     let second = cache.reconcile().await.expect("reconcile");
     assert_eq!(second.temp_files, 0);
     assert_eq!(second.orphan_files, 0);
     assert_eq!(second.dropped_rows, 0);
+    assert!(
+        second.completed_cycle,
+        "the next scan cycle also reaches EOF"
+    );
     let _ = store.shutdown().await;
 }
 
@@ -667,6 +672,7 @@ async fn reconcile_streams_bounded_deletions_and_preserves_valid_entries() {
     let total_count = u64::try_from(total).unwrap_or(u64::MAX);
     let mut removed = 0_u64;
     let mut max_deletions = 0_u64;
+    let mut completed_cycle = false;
     for _ in 0..(total + 2) {
         let stats = cache.reconcile().await.expect("reconcile");
         assert!(stats.scanned_entries <= batch_cap);
@@ -677,7 +683,8 @@ async fn reconcile_streams_bounded_deletions_and_preserves_valid_entries() {
         );
         max_deletions = max_deletions.max(deletions);
         removed = removed.saturating_add(deletions);
-        if file_names(temp.path()) == vec![sha.clone()] {
+        completed_cycle |= stats.completed_cycle;
+        if completed_cycle && file_names(temp.path()) == vec![sha.clone()] {
             break;
         }
     }
@@ -689,6 +696,7 @@ async fn reconcile_streams_bounded_deletions_and_preserves_valid_entries() {
     );
     assert_eq!(removed, total_count, "every orphan removed exactly once");
     assert!(max_deletions <= batch_cap, "per-pass deletion cap held");
+    assert!(completed_cycle, "bounded calls eventually observe EOF");
     let rows = store.list_attachments().await.expect("list");
     assert_eq!(rows.len(), 1, "valid row survives every pass");
     assert_eq!(rows[0].sha256, sha);
@@ -699,6 +707,112 @@ async fn reconcile_streams_bounded_deletions_and_preserves_valid_entries() {
     );
     assert!(temp.path().join(&sha).is_file(), "valid file survives");
     let _ = store.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_reconcile_clears_multiple_batches_without_restart_and_repeats() {
+    let temp = tempdir().expect("tempdir");
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let batch = 3_usize;
+    let cache = Arc::new(cache(
+        temp.path(),
+        store.clone(),
+        downloader(&[]),
+        AttachmentLimits {
+            reconcile_batch: batch,
+            ..AttachmentLimits::default()
+        },
+    ));
+
+    for index in 0..(batch * 5) {
+        let name = if index % 2 == 0 {
+            format!(".tmp-runtime-{index}")
+        } else {
+            sha_hex(format!("runtime-orphan-{index}").as_bytes())
+        };
+        std::fs::write(temp.path().join(name), b"orphan").expect("write orphan");
+    }
+
+    // Production performs one fail-closed startup pass before starting the
+    // runtime actor. Prove the actor resumes that exact cursor instead of
+    // requiring a fresh process or a fresh scan cycle to reach the tail.
+    let startup = cache.reconcile().await.expect("startup reconcile");
+    assert!(startup.scanned_entries <= u64::try_from(batch).unwrap_or(u64::MAX));
+    assert!(
+        !startup.completed_cycle,
+        "one bounded startup pass cannot finish this directory"
+    );
+    assert!(
+        !file_names(temp.path()).is_empty(),
+        "startup intentionally leaves later batches for the runtime actor"
+    );
+    let runtime = AttachmentReconcileRuntime::start(
+        Arc::clone(&cache),
+        AttachmentReconcileConfig {
+            interval: Duration::from_millis(20),
+            shutdown_grace: Duration::from_secs(1),
+        },
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !file_names(temp.path()).is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the immediate runtime cycle clears every bounded batch");
+
+    // Add an orphan only after the immediate cycle has converged. A later
+    // periodic cycle must discover it without a process restart.
+    std::fs::write(temp.path().join(".tmp-periodic"), b"later").expect("write later orphan");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !file_names(temp.path()).is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a periodic runtime cycle clears a later orphan");
+
+    assert!(!runtime.is_finished(), "the periodic actor remains live");
+    tokio::time::timeout(Duration::from_secs(1), runtime.shutdown())
+        .await
+        .expect("runtime reconciliation shutdown is bounded");
+    drop(cache);
+    let _ = store.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_reconcile_store_failures_are_nonfatal_and_shutdown_stays_bounded() {
+    let temp = tempdir().expect("tempdir");
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let cache = Arc::new(cache(
+        temp.path(),
+        store.clone(),
+        downloader(&[]),
+        AttachmentLimits::default(),
+    ));
+    store.shutdown().await.expect("stop store");
+    assert!(
+        cache.reconcile().await.is_err(),
+        "a closed store makes the cache pass fail"
+    );
+
+    let runtime = AttachmentReconcileRuntime::start(
+        Arc::clone(&cache),
+        AttachmentReconcileConfig {
+            interval: Duration::from_millis(10),
+            shutdown_grace: Duration::from_millis(250),
+        },
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !runtime.is_finished(),
+        "failed cycles are retried instead of terminating the actor"
+    );
+    tokio::time::timeout(Duration::from_secs(1), runtime.shutdown())
+        .await
+        .expect("failed maintenance still observes bounded shutdown");
+    drop(cache);
 }
 
 #[tokio::test]
@@ -1159,7 +1273,7 @@ async fn fetch_download_is_outside_the_gc_lock() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_fetch_gc_never_leaves_a_leased_row_without_file() {
+async fn concurrent_fetch_gc_and_runtime_reconcile_preserve_leased_files() {
     let temp = tempdir().expect("tempdir");
     let store = StoreHandle::open_in_memory().await.expect("store");
     let dl = downloader(&[("k", b"race-content")]);
@@ -1168,9 +1282,21 @@ async fn concurrent_fetch_gc_never_leaves_a_leased_row_without_file() {
         max_cache_files: 0,
         max_cache_bytes: 0,
         gc_batch: 64,
+        reconcile_batch: 2,
         ..AttachmentLimits::default()
     };
     let cache = Arc::new(cache(temp.path(), store.clone(), dl, limits));
+    for index in 0..16 {
+        std::fs::write(temp.path().join(format!(".tmp-race-{index}")), b"orphan")
+            .expect("write orphan");
+    }
+    let reconcile = AttachmentReconcileRuntime::start(
+        Arc::clone(&cache),
+        AttachmentReconcileConfig {
+            interval: Duration::from_millis(10),
+            shutdown_grace: Duration::from_secs(1),
+        },
+    );
 
     for round in 0..60 {
         // Seed an unleased victim so GC has something to evict, then free the
@@ -1243,6 +1369,17 @@ async fn concurrent_fetch_gc_never_leaves_a_leased_row_without_file() {
             cache.release_turn(turn).await.expect("release fetch lease");
         }
     }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while file_names(temp.path())
+            .iter()
+            .any(|name| name.starts_with(".tmp-race-"))
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("runtime reconcile clears race orphans");
+    reconcile.shutdown().await;
     let _ = store.shutdown().await;
 }
 
