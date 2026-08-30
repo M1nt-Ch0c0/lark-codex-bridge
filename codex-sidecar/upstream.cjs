@@ -17,6 +17,22 @@ function delay(milliseconds) {
   });
 }
 
+async function waitUntilOrTimeout(promise, milliseconds, timeoutValue) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((resolve) => {
+        // Cleanup must keep an otherwise idle process alive until the hard
+        // bound, while a prompt exit must cancel the leftover timer.
+        timer = setTimeout(() => resolve(timeoutValue), milliseconds);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function safeEnvironment(codexHome) {
   const allowed = [
     "PATH",
@@ -128,7 +144,7 @@ async function terminateChild(child, graceMs) {
     child.stdin.end();
   }
   const exited = once(child, "exit").then(() => true, () => true);
-  if (await Promise.race([exited, delay(graceMs).then(() => false)])) {
+  if (await waitUntilOrTimeout(exited, graceMs, false)) {
     closeChildPipes(child);
     return;
   }
@@ -137,7 +153,7 @@ async function terminateChild(child, graceMs) {
   } catch {
     // The outer Rust process-group/Job owner remains authoritative.
   }
-  await Promise.race([exited, delay(Math.min(graceMs, 1_000))]);
+  await waitUntilOrTimeout(exited, Math.min(graceMs, 1_000), false);
   closeChildPipes(child);
 }
 
