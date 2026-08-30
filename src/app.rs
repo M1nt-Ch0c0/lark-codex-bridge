@@ -34,10 +34,18 @@ use crate::runtime::quote::LarkQuoteResolver;
 use crate::runtime::router::{RouteAttemptError, RouteError, Router, RouterHandle, RouterSettings};
 use crate::runtime::scope::DurableReplySink;
 use crate::store::{StoreError, StoreHandle};
-use crate::{codex::supervisor::AppServerSupervisor, config::BridgeConfig};
+use crate::{
+    codex::supervisor::{AppServerSupervisor, SupervisorState},
+    config::BridgeConfig,
+};
 
-/// Static application startup, runtime, and shutdown failure categories.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+/// Application startup, runtime, and shutdown failure categories.
+///
+/// All variants are content-free except [`AppError::CodexUnavailable`], whose
+/// reason is deliberately exposed only through [`fmt::Display`] at the CLI
+/// process boundary. Its [`fmt::Debug`] representation remains static so an
+/// accidental structured debug field cannot capture a local path or secret.
+#[derive(Clone, Eq, PartialEq, thiserror::Error)]
 pub enum AppError {
     /// Configuration loading or policy validation failed.
     #[error("bridge configuration is unavailable or invalid")]
@@ -54,6 +62,10 @@ pub enum AppError {
     /// The Codex app-server supervisor failed.
     #[error("the Codex supervisor failed")]
     Supervisor,
+    /// The supervisor reached a permanent failure before the runtime readiness
+    /// handoff completed.
+    #[error("{reason}")]
+    CodexUnavailable { reason: String },
     /// The injected durable outbound runtime failed to start.
     #[error("the durable outbound runtime failed")]
     Outbound,
@@ -66,6 +78,23 @@ pub enum AppError {
     /// The durable inbound producer disappeared without a shutdown request.
     #[error("the durable inbound stream closed unexpectedly")]
     InboundClosed,
+}
+
+impl fmt::Debug for AppError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Config => "Config",
+            Self::Credentials => "Credentials",
+            Self::Store => "Store",
+            Self::Lark => "Lark",
+            Self::Supervisor => "Supervisor",
+            Self::CodexUnavailable { .. } => "CodexUnavailable",
+            Self::Outbound => "Outbound",
+            Self::Attachments => "Attachments",
+            Self::Router => "Router",
+            Self::InboundClosed => "InboundClosed",
+        })
+    }
 }
 
 /// Static failure classification for constructing the outbound runtime.
@@ -155,8 +184,8 @@ impl fmt::Debug for OutboundRuntime {
 ///
 /// # Errors
 ///
-/// Returns only content-free classifications for startup, runtime, or orderly
-/// shutdown failures.
+/// Returns content-free classifications for startup, runtime, or orderly
+/// shutdown failures except for an actionable permanent Codex startup reason.
 pub async fn run_with_outbound_until<F, S>(
     config_path: Option<&Path>,
     outbound_factory: &F,
@@ -177,7 +206,7 @@ where
 ///
 /// # Errors
 ///
-/// Returns the same content-free startup/runtime classifications as
+/// Returns the same startup/runtime classifications as
 /// [`run_with_outbound_until`].
 pub async fn run_until<S>(config_path: Option<&Path>, shutdown: S) -> Result<DriveSummary, AppError>
 where
@@ -193,8 +222,9 @@ where
 ///
 /// # Errors
 ///
-/// Returns only content-free classifications. Components started before a
-/// later startup failure are stopped before the error is returned.
+/// Returns content-free classifications except for a permanent, actionable
+/// Codex startup reason. Components started before a later startup failure are
+/// stopped before the error is returned.
 #[allow(clippy::too_many_lines)]
 pub async fn run_config_with_outbound_until<F, S>(
     config: BridgeConfig,
@@ -248,38 +278,60 @@ where
         stop_store_after_error(store).await;
         return Err(AppError::Attachments);
     }
-    let context_registry = Arc::new(ContextRegistry::default());
-    let quote_resolver = Arc::new(LarkQuoteResolver::new(api.clone(), policy.clone()));
-    let Ok(InboundRuntime {
-        source,
-        events: inbound,
-    }) = start_inbound(
-        &config.channel,
-        &credentials,
-        &http,
-        &api,
-        Arc::clone(&native),
-        &store,
-    )
-    .await
-    else {
-        stop_store_after_error(store).await;
-        return Err(AppError::Lark);
-    };
     let Ok(supervisor) = AppServerSupervisor::start(process_config).await else {
-        source.shutdown().await;
+        drop(attachment_cache);
         stop_store_after_error(store).await;
         return Err(AppError::Supervisor);
+    };
+    if let SupervisorState::Degraded { reason } = supervisor.state() {
+        stop_supervisor_after_error(supervisor).await;
+        drop(attachment_cache);
+        stop_store_after_error(store).await;
+        return Err(AppError::CodexUnavailable { reason });
+    }
+    let mut supervisor_state = supervisor.subscribe_state();
+    let context_registry = Arc::new(ContextRegistry::default());
+    let quote_resolver = Arc::new(LarkQuoteResolver::new(api.clone(), policy.clone()));
+    let inbound_runtime = supervise_assembly_step(
+        &mut supervisor_state,
+        start_inbound(
+            &config.channel,
+            &credentials,
+            &http,
+            &api,
+            Arc::clone(&native),
+            &store,
+        ),
+    )
+    .await;
+    let InboundRuntime {
+        source,
+        events: inbound,
+    } = match inbound_runtime {
+        Ok(Ok(runtime)) => runtime,
+        Ok(Err(_)) => {
+            stop_supervisor_after_error(supervisor).await;
+            drop(attachment_cache);
+            stop_store_after_error(store).await;
+            return Err(AppError::Lark);
+        }
+        Err(error) => {
+            stop_supervisor_after_error(supervisor).await;
+            drop(attachment_cache);
+            stop_store_after_error(store).await;
+            return Err(error);
+        }
     };
     let delivery: Arc<dyn OutboundDelivery> = native;
     let Ok(outbound) = outbound_factory.start(store.clone(), delivery, source.subscribe_state())
     else {
         source.shutdown().await;
         stop_supervisor_after_error(supervisor).await;
+        drop(attachment_cache);
         stop_store_after_error(store).await;
         return Err(AppError::Outbound);
     };
-    let Ok(router) = Router::start_with_contexts_and_quotes(
+    let router_result = Router::start_with_contexts_and_quotes(
         store.clone(),
         tenant,
         policy,
@@ -290,12 +342,23 @@ where
         context_registry,
         quote_resolver,
     )
-    .await
-    else {
-        source.shutdown().await;
-        outbound.shutdown().await;
-        stop_store_after_error(store).await;
-        return Err(AppError::Router);
+    .await;
+    let router = match router_result {
+        Ok(router) => router,
+        Err(RouteError::CodexUnavailable { reason }) => {
+            source.shutdown().await;
+            outbound.shutdown().await;
+            drop(attachment_cache);
+            stop_store_after_error(store).await;
+            return Err(AppError::CodexUnavailable { reason });
+        }
+        Err(_) => {
+            source.shutdown().await;
+            outbound.shutdown().await;
+            drop(attachment_cache);
+            stop_store_after_error(store).await;
+            return Err(AppError::Router);
+        }
     };
     let attachment_reconcile = AttachmentReconcileRuntime::start(
         Arc::clone(&attachment_cache),
@@ -413,6 +476,42 @@ async fn start_inbound(
 async fn stop_supervisor_after_error(supervisor: crate::codex::supervisor::SupervisorHandle) {
     if supervisor.shutdown().await.is_err() {
         tracing::warn!("Codex supervisor cleanup failed after startup error");
+    }
+}
+
+async fn supervise_assembly_step<T>(
+    supervisor: &mut watch::Receiver<SupervisorState>,
+    step: impl Future<Output = T>,
+) -> Result<T, AppError> {
+    tokio::pin!(step);
+    loop {
+        match supervisor.borrow().clone() {
+            SupervisorState::Degraded { reason } => {
+                return Err(AppError::CodexUnavailable { reason });
+            }
+            SupervisorState::Stopped => return Err(AppError::Supervisor),
+            SupervisorState::Starting { .. }
+            | SupervisorState::Ready { .. }
+            | SupervisorState::Backoff { .. } => {}
+        }
+        tokio::select! {
+            biased;
+            changed = supervisor.changed() => match changed {
+                Ok(()) => match supervisor.borrow_and_update().clone() {
+                    SupervisorState::Degraded { reason } => {
+                        return Err(AppError::CodexUnavailable { reason });
+                    }
+                    SupervisorState::Stopped => return Err(AppError::Supervisor),
+                    SupervisorState::Starting { .. }
+                    | SupervisorState::Ready { .. }
+                    | SupervisorState::Backoff { .. } => {}
+                },
+                Err(_) => {
+                    return Err(AppError::Supervisor);
+                }
+            },
+            output = &mut step => return Ok(output),
+        }
     }
 }
 
@@ -559,17 +658,26 @@ mod tests {
     use std::future::pending;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use futures_util::{FutureExt, future::BoxFuture};
     use secrecy::SecretString;
-    use tokio::sync::{Semaphore, mpsc, watch};
+    use tokio::{
+        sync::{Barrier, Semaphore, mpsc, watch},
+        time::timeout,
+    };
 
     use super::{
-        DriveExit, EventRouteError, EventRouter, OutboundFactory, OutboundRuntime,
-        ProductionOutboundFactory, drive_inbound,
+        AppError, DriveExit, EventRouteError, EventRouter, OutboundFactory, OutboundRuntime,
+        ProductionOutboundFactory, drive_inbound, run_config_with_outbound_until,
+        supervise_assembly_step,
     };
     use crate::channel::OutboundDelivery;
     use crate::channel::native::NativeChannel;
+    use crate::codex::external::CodexBackendConfig;
+    use crate::codex::supervisor::SupervisorState;
+    use crate::codex::wire::SUPPORTED_CODEX_VERSIONS;
+    use crate::config::{BridgeConfig, PathsSection, WorkspacePolicy};
     use crate::lark::api::{ChatMode, LarkApi};
     use crate::lark::bridge::QueuedInboundEvent;
     use crate::lark::config::{LarkEndpoints, TenantBrand};
@@ -728,6 +836,118 @@ mod tests {
         ) -> BoxFuture<'static, Result<(), ReplySinkError>> {
             async { Err(ReplySinkError::Unavailable) }.boxed()
         }
+    }
+
+    #[tokio::test]
+    async fn assembly_step_observes_gated_permanent_degradation_after_backoff() {
+        let (state_tx, mut supervisor) = watch::channel(SupervisorState::Backoff {
+            epoch: 2,
+            attempt: 1,
+            delay: Duration::from_secs(30),
+        });
+        let terminal_gate = Arc::new(Barrier::new(2));
+        let publish_gate = Arc::clone(&terminal_gate);
+        let publisher = tokio::spawn(async move {
+            publish_gate.wait().await;
+            state_tx
+                .send(SupervisorState::Degraded {
+                    reason: format!(
+                        "Codex 0.148.0 is unsupported; expected an exact reviewed version ({})",
+                        SUPPORTED_CODEX_VERSIONS.join(", ")
+                    ),
+                })
+                .expect("assembly monitor remains subscribed");
+        });
+        let assembly = async move {
+            terminal_gate.wait().await;
+            pending::<()>().await;
+        };
+
+        let error = timeout(
+            Duration::from_secs(5),
+            supervise_assembly_step(&mut supervisor, assembly),
+        )
+        .await
+        .expect("assembly monitor observes gated degradation")
+        .expect_err("permanent retry failure stops assembly");
+        let AppError::CodexUnavailable { reason } = error else {
+            panic!("unexpected assembly error: {error:?}");
+        };
+        assert_eq!(
+            reason,
+            format!(
+                "Codex 0.148.0 is unsupported; expected an exact reviewed version ({})",
+                SUPPORTED_CODEX_VERSIONS.join(", ")
+            )
+        );
+        publisher.await.expect("terminal publisher");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn assembly_fails_closed_on_permanent_codex_degradation_before_lark_startup() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::Builder::new()
+            .prefix("app-fail-closed-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("temporary directory under the allowed checkout");
+        let binary = temp.path().join("unsupported-codex");
+        std::fs::write(&binary, b"#!/bin/sh\nprintf 'codex-cli 0.148.0\\n'\n")
+            .expect("write fake Codex");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))
+            .expect("make fake Codex executable");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let mut config = BridgeConfig {
+            owners: vec!["ou_owner_app_fail_closed".to_owned()],
+            default_workspace: Some(workspace.clone()),
+            workspace: WorkspacePolicy {
+                allow_roots: vec![workspace],
+                ..WorkspacePolicy::default()
+            },
+            paths: PathsSection {
+                database: temp.path().join("bridge.sqlite3"),
+                attachment_cache: temp.path().join("attachments"),
+            },
+            ..BridgeConfig::default()
+        };
+        config.codex.backend = CodexBackendConfig::SpawnedStdio {
+            binary,
+            codex_home: None,
+        };
+        config.validate().expect("valid test config");
+        let credentials = LarkCredentials::new(
+            "cli_app_fail_closed".to_owned(),
+            SecretString::from("test-secret"),
+            TenantBrand::Feishu,
+        );
+
+        let error = timeout(
+            Duration::from_secs(5),
+            run_config_with_outbound_until(
+                config,
+                credentials,
+                &ProductionOutboundFactory,
+                pending::<()>(),
+            ),
+        )
+        .await
+        .expect("assembly must fail before attempting Lark I/O")
+        .expect_err("unsupported Codex must stop assembly");
+        let AppError::CodexUnavailable { reason } = error else {
+            panic!("unexpected static application error: {error:?}");
+        };
+
+        assert_eq!(
+            reason,
+            format!(
+                "Codex 0.148.0 is unsupported; expected an exact reviewed version ({})",
+                SUPPORTED_CODEX_VERSIONS.join(", ")
+            )
+        );
+        let redacted_error = AppError::CodexUnavailable { reason };
+        assert_eq!(format!("{redacted_error:?}"), "CodexUnavailable");
     }
 
     #[tokio::test]

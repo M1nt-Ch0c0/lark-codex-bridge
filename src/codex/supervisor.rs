@@ -310,6 +310,35 @@ pub struct SupervisorHandle {
 }
 
 impl SupervisorHandle {
+    #[cfg(test)]
+    pub(crate) fn test_state_channel(
+        initial: SupervisorState,
+    ) -> (
+        Self,
+        watch::Sender<SupervisorState>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let (state_tx, state) = watch::channel(initial);
+        let (stopped_tx, stopped) = tokio::sync::oneshot::channel();
+        let client_slot = Arc::new(Mutex::new(None));
+        let shutdown = CancellationToken::new();
+        let task_shutdown = shutdown.clone();
+        let task = tokio::spawn(async move {
+            task_shutdown.cancelled().await;
+            let _ = stopped_tx.send(());
+        });
+        (
+            Self {
+                state,
+                client_slot,
+                shutdown,
+                task: Some(task),
+            },
+            state_tx,
+            stopped,
+        )
+    }
+
     /// Waits for the next state transition and returns the new state.
     ///
     /// # Errors
@@ -327,6 +356,11 @@ impl SupervisorHandle {
     #[must_use]
     pub fn state(&self) -> SupervisorState {
         self.state.borrow().clone()
+    }
+
+    /// Clones the lifecycle observation stream for startup assembly barriers.
+    pub(crate) fn subscribe_state(&self) -> watch::Receiver<SupervisorState> {
+        self.state.clone()
     }
 
     /// Returns the client for the current ready epoch.

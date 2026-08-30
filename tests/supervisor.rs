@@ -6,6 +6,7 @@ use lark_codex_bridge::codex::{
     process::{CodexProcessConfig, ProcessError},
     supervisor::{AppServerSupervisor, SupervisorError, SupervisorSettings, SupervisorState},
     types::ThreadStartParams,
+    wire::SUPPORTED_CODEX_VERSIONS,
 };
 use semver::Version;
 
@@ -74,10 +75,17 @@ async fn permanent_version_failure_degrades_without_retrying() {
     .await
     .expect("supervisor task starts");
 
-    assert!(matches!(
-        next_state(&mut handle).await,
-        SupervisorState::Degraded { .. }
-    ));
+    let state = next_state(&mut handle).await;
+    let SupervisorState::Degraded { reason } = state else {
+        panic!("permanent version failure must degrade");
+    };
+    assert_eq!(
+        reason,
+        format!(
+            "Codex 0.145.0 is unsupported; expected an exact reviewed version ({})",
+            SUPPORTED_CODEX_VERSIONS.join(", ")
+        )
+    );
     assert_eq!(factory.spawn_count(), 1);
     assert!(matches!(handle.client(), Err(SupervisorError::NotReady)));
     handle.shutdown().await.expect("shutdown");

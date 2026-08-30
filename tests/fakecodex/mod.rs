@@ -20,7 +20,7 @@ use semver::Version;
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, duplex},
-    sync::{Mutex as AsyncMutex, mpsc, oneshot},
+    sync::{Barrier, Mutex as AsyncMutex, Notify, mpsc, oneshot},
     time::timeout,
 };
 
@@ -39,6 +39,26 @@ pub(crate) struct FakeFactory {
 pub(crate) enum FakeOutcome {
     Ready(FakeControl),
     Error(ProcessError),
+    GatedError {
+        gate: FakeSpawnGate,
+        error: ProcessError,
+    },
+}
+
+#[derive(Clone)]
+pub(crate) struct FakeSpawnGate {
+    started: Arc<Barrier>,
+    release: Arc<Notify>,
+}
+
+impl FakeSpawnGate {
+    pub(crate) async fn wait_started(&self) {
+        self.started.wait().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.release.notify_one();
+    }
 }
 
 #[derive(Clone)]
@@ -138,6 +158,20 @@ impl FakeFactory {
         (FakeOutcome::Ready(control.clone()), control)
     }
 
+    pub(crate) fn gated_error(error: ProcessError) -> (FakeOutcome, FakeSpawnGate) {
+        let gate = FakeSpawnGate {
+            started: Arc::new(Barrier::new(2)),
+            release: Arc::new(Notify::new()),
+        };
+        (
+            FakeOutcome::GatedError {
+                gate: gate.clone(),
+                error,
+            },
+            gate,
+        )
+    }
+
     pub(crate) fn spawn_count(&self) -> usize {
         *self.spawns.lock().expect("spawn lock")
     }
@@ -158,6 +192,11 @@ impl ProcessFactory for FakeFactory {
                     Ok(Box::new(FakeProcess::new(control)) as Box<dyn AppServerProcess>)
                 }
                 FakeOutcome::Error(error) => Err(error),
+                FakeOutcome::GatedError { gate, error } => {
+                    gate.wait_started().await;
+                    gate.release.notified().await;
+                    Err(error)
+                }
             }
         })
     }
