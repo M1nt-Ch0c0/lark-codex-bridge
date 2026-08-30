@@ -9,6 +9,7 @@ pub mod external_write;
 pub mod process;
 pub mod protocol;
 pub mod rpc;
+pub mod sidecar;
 pub mod supervisor;
 pub mod transport;
 pub mod types;

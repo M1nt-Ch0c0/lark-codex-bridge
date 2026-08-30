@@ -29,12 +29,15 @@ active_turn_permits = 4
 max_scope_actors = 256
 
 [codex]
-binary = "codex"
-# codex_home = "/absolute/path/to/codex-home"
 # model = "model-name"
 # effort = "high"
 sandbox = "workspace-write"
 approval_policy = "never"
+
+[codex.backend]
+mode = "spawned_stdio"
+binary = "codex"
+# codex_home = "/absolute/path/to/codex-home"
 
 [paths]
 database = "state/bridge.sqlite3"
@@ -89,8 +92,6 @@ allow root 只是 bridge 的 cwd 准入边界，不替代 Codex sandbox。
 
 ## codex
 
-- `binary`：Codex CLI 可执行文件路径或命令名。
-- `codex_home`：可选的独立 `CODEX_HOME`。
 - `model`：可选模型覆盖。
 - `effort`：可选的非空字符串，原样传给每次 `turn/start`。省略时不发送该字段，继续使用
   Codex 自身默认；bridge 不限制枚举，以保持对未来档位的兼容。
@@ -98,6 +99,48 @@ allow root 只是 bridge 的 cwd 准入边界，不替代 Codex sandbox。
 - `approval_policy`：传给 app-server 的策略。当前建议 `never`，因为飞书审批卡尚未接线。
 
 默认值是 `workspace-write` + `never`。
+
+`[codex.backend]` 是带 `mode` 的严格表。默认/生成配置使用：
+
+```toml
+[codex.backend]
+mode = "spawned_stdio"
+binary = "codex"
+# codex_home = "/absolute/private/codex-home"
+```
+
+可选的本地协议 sidecar 使用：
+
+```toml
+[codex.backend]
+mode = "protocol_sidecar"
+node_binary = "node"
+sidecar_entrypoint = "/opt/lark-codex-bridge/codex-sidecar/index.cjs"
+# codex_binary = "/absolute/path/to/exact/codex" # optional override
+# codex_home = "/absolute/private/codex-home"
+# codex_arguments = []
+```
+
+`protocol_sidecar` 只接受精确 Codex 0.149.0/0.151.0，要求七个 v1 capability 完全匹配，
+没有运行中 fallback。省略 `codex_binary` 时使用 sidecar package-lock 精确固定的 Codex
+0.151.0；显式
+字段是用于另一份已审核 0.149.0/0.151.0 binary 的 override。`node_binary` 和显式
+`codex_binary` 可使用 `PATH` 中的命令名；带路径分隔符的相对 `node_binary` / `codex_binary`
+以及相对 `sidecar_entrypoint` / `codex_home` 都按配置文件目录解析。`codex_home` 必须是
+已存在目录。`codex_arguments` 最多 8 个非空值，每个最多 1,024 字节，只用于
+受审查 wrapper 的非 secret 前置参数。
+
+配置文件不开放 frame、pending、握手或 shutdown 调参：当前固定为 33,554,432-byte frame、
+448 pending、15 秒 bootstrap 和 5 秒 process grace。启动前用与配置相同的路径检查：
+
+```bash
+lark-codex-bridge codex sidecar-probe \
+  --entrypoint /opt/lark-codex-bridge/codex-sidecar/index.cjs
+```
+
+`external_endpoint` 是另一个显式模式，但普通 mutation-driven `run` 仍对它 fail closed；配置与
+边界见 [External Codex endpoint admission gate](../external-codex-endpoint-gate.md)。不同 mode
+的字段不能混用，未知字段会拒绝加载。
 
 ## paths
 
@@ -128,5 +171,6 @@ lark-codex-bridge lark auth register
 
 1. 停止 bridge；
 2. 备份数据库和配置；
-3. 执行 `lark auth check`、`codex probe` 和 `lark probe`；
+3. 执行 `lark auth check`、`lark probe`，并按 backend 执行 `codex probe` 或
+   `codex sidecar-probe`；
 4. 重新启动。

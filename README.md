@@ -15,7 +15,8 @@
   长驻 supervisor、thread 复用、`codex probe` 和门控的真实 Codex smoke；另含显式
   spawned/external backend 配置、外部端点认证/精确版本/只读能力准入门禁，以及不拥有
   服务端进程的有界只读 WebSocket transport、持久化跨 epoch 恢复，以及尚未接入普通
-  `run` 链路的共享写入/queue/单审批处理者协调器；
+  `run` 链路的共享写入/queue/单审批处理者协调器；另有显式 `protocol_sidecar` 后端，
+  通过受监督的本地 wire 支持精确 Codex 0.149.0/0.151.0 adapter；
 - Rust 原生飞书/Lark 凭证登记、OpenAPI、WebSocket transport、事件归一化，
   以及可灰度启用、受 Rust 监督的官方 Node SDK 入站 sidecar；
   `lark probe` 和门控的真实 Lark smoke；
@@ -47,8 +48,10 @@ Codex 0.149.0 Unix-socket listener 的原始 WebSocket 握手 RFC/双 Unix 平�
 
 ## 最小试用
 
-前提：本机已安装并登录当前精确支持的 `codex-cli 0.146.0` 或 `0.149.0`，飞书/Lark 应用机器人已创建并
-加入目标会话。首次运行不再需要手写 TOML、手动查询 `open_id` 或预先创建工作区。
+前提：默认 `spawned_stdio` 后端要求本机已安装并登录精确的 `codex-cli 0.146.0` 或
+`0.149.0`；可选 `protocol_sidecar` 后端要求 Node 20+ 和精确的 `0.149.0` 或 `0.151.0`。
+飞书/Lark 应用机器人需已创建并加入目标会话。首次运行不再需要手写 TOML、手动查询
+`open_id` 或预先创建工作区。
 
 直接启动常驻桥接器，按提示完成扫码授权即可：
 
@@ -126,7 +129,42 @@ cargo run --locked -- codex probe
 
 `codex probe` 会真实启动 `codex app-server --listen stdio://` 并完成 initialize
 握手，输出单个 JSON 对象，只包含 supported version、initialize user agent、
-platform family/OS 和 epoch；不包含 Codex home、账户身份、token 或环境变量。
+platform family/OS、epoch、backend、wire protocol/version 和 capability 名称；不包含
+Codex home、账户身份、token 或环境变量。它检查默认的 native stdio 路径。
+
+### Codex protocol sidecar（可选）
+
+要使用稳定本地 wire，把 sidecar 依赖安装在构建/部署阶段并先运行检查；生产启动不会执行
+`npm install`：
+
+```bash
+npm ci --ignore-scripts --prefix codex-sidecar
+npm run verify --prefix codex-sidecar
+cargo run --locked -- codex sidecar-probe \
+  --entrypoint "$PWD/codex-sidecar/index.cjs"
+```
+
+`sidecar-probe` 会完成 15 秒有界 bootstrap、精确版本/adapter 校验和 Codex initialize，
+输出单个脱敏 JSON 对象，并回收 sidecar/Codex 进程树。省略 `--codex-binary` 会检查 lockfile
+固定的 Codex 0.151.0；部署覆盖为已审核的精确 0.149.0/0.151.0 binary 时才传该参数。
+非默认 Node、Codex home 或 wrapper
+参数分别使用 `--node-binary`、`--codex-home` 和可重复的 `--codex-argument`。
+
+probe 通过后才能在配置中显式选择；`sidecar_entrypoint` 建议使用绝对路径：
+
+```toml
+[codex.backend]
+mode = "protocol_sidecar"
+node_binary = "node"
+sidecar_entrypoint = "/opt/lark-codex-bridge/codex-sidecar/index.cjs"
+# codex_binary = "/absolute/path/to/exact/codex" # optional override
+# codex_home = "/absolute/private/codex-home"
+# codex_arguments = []
+```
+
+该模式只接受精确 `0.149.0` 或 `0.151.0`，运行中不会回退到 native stdio 或 external
+endpoint。握手字段、七个 capability、容量、不重放和进程树语义见
+[`docs/codex-sidecar-wire-v1.md`](docs/codex-sidecar-wire-v1.md)。
 
 真实端到端 smoke 需要已认证的 Codex 账户，并按环境变量门控：
 
@@ -361,8 +399,9 @@ JSON 转义、Unicode 与闭合 fence 开销均计入，超限时 fence-safe 截
 
 持久 outbox 从本功能起只写 payload v2；升级后的 reader 同时严格读取 v1/v2。历史 v1
 `reply_text` 始终保持纯文本载体，不会因内容像 Markdown 而改型；历史终态 Card 的备用正文
-会先经过当前净化器再成为 `post`。数据库 `PRAGMA user_version=6` 是显式降级栅栏：升级前应
-停掉旧进程并备份数据库，升级后不得再用只认识 payload v1/schema v5 的旧二进制打开同一库。
+会先经过当前净化器再成为 `post`。Markdown outbox 降级栅栏在 schema v7 引入；当前二进制
+会把数据库迁移到 `PRAGMA user_version=10`。升级前应停掉旧进程并备份数据库，升级后不得再
+用只认识较早 schema 或 payload v1 的旧二进制打开同一库。
 确定未生效的终态 Card PATCH 在永久拒绝（或同样确定未生效的限流重试耗尽）后，会把同一个
 确定性 outbox 行原子转换成 standalone Markdown post；响应丢失、畸形或其他
 `uncertain_delivery` 绝不会触发备用发送。非幂等 POST 收到 HTTP 5xx 时，即使服务器返回了

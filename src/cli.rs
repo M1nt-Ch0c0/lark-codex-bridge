@@ -9,7 +9,8 @@ use tokio::time::{sleep, timeout};
 use crate::{
     codex::{
         process::CodexProcessConfig,
-        supervisor::{AppServerSupervisor, SupervisorHandle, SupervisorState},
+        sidecar::CodexSidecarConfig,
+        supervisor::{AppServerSupervisor, ProtocolInfo, SupervisorHandle, SupervisorState},
     },
     lark::{
         api::{BotInfo, LarkApi},
@@ -104,6 +105,21 @@ pub enum CodexCommand {
         #[arg(long, default_value = "codex")]
         binary: PathBuf,
     },
+    /// Start the stable local-wire adapter and print its negotiated upstream
+    /// version, protocol version, and capabilities without exposing paths.
+    SidecarProbe {
+        #[arg(long, default_value = "node")]
+        node_binary: PathBuf,
+        #[arg(long, default_value = "codex-sidecar/index.cjs")]
+        entrypoint: PathBuf,
+        /// Override the exact pinned Codex package used by the sidecar.
+        #[arg(long)]
+        codex_binary: Option<PathBuf>,
+        #[arg(long)]
+        codex_home: Option<PathBuf>,
+        #[arg(long = "codex-argument", action = ArgAction::Append)]
+        codex_arguments: Vec<String>,
+    },
     /// Print the fail-closed persisted-thread adoption capability as JSON.
     AdoptionStatus,
 }
@@ -114,6 +130,23 @@ impl fmt::Debug for CodexCommand {
             Self::Probe { binary } => formatter
                 .debug_struct("Probe")
                 .field("binary_bytes", &binary.as_os_str().len())
+                .finish(),
+            Self::SidecarProbe {
+                node_binary,
+                entrypoint,
+                codex_binary,
+                codex_home,
+                codex_arguments,
+            } => formatter
+                .debug_struct("SidecarProbe")
+                .field("node_binary_bytes", &node_binary.as_os_str().len())
+                .field("entrypoint_bytes", &entrypoint.as_os_str().len())
+                .field(
+                    "codex_binary_bytes",
+                    &codex_binary.as_ref().map(|binary| binary.as_os_str().len()),
+                )
+                .field("codex_home_configured", &codex_home.is_some())
+                .field("codex_argument_count", &codex_arguments.len())
                 .finish(),
             Self::AdoptionStatus => formatter.write_str("AdoptionStatus"),
         }
@@ -214,6 +247,25 @@ pub async fn run_with(cli: Cli) -> Result<()> {
             command: CodexCommand::Probe { binary },
         } => probe_codex(binary).await,
         Command::Codex {
+            command:
+                CodexCommand::SidecarProbe {
+                    node_binary,
+                    entrypoint,
+                    codex_binary,
+                    codex_home,
+                    codex_arguments,
+                },
+        } => {
+            probe_codex_sidecar(
+                node_binary,
+                entrypoint,
+                codex_binary,
+                codex_home,
+                codex_arguments,
+            )
+            .await
+        }
+        Command::Codex {
             command: CodexCommand::AdoptionStatus,
         } => report_thread_adoption_status(),
         Command::Lark {
@@ -297,6 +349,10 @@ struct ProbeReport {
     platform_family: String,
     platform_os: String,
     epoch: u64,
+    backend: String,
+    wire_protocol: String,
+    wire_version: Option<u32>,
+    capabilities: Vec<String>,
 }
 
 async fn probe_codex(binary: PathBuf) -> Result<()> {
@@ -304,10 +360,34 @@ async fn probe_codex(binary: PathBuf) -> Result<()> {
         binary,
         codex_home: None,
     };
-    let mut handle = AppServerSupervisor::start(config)
+    let handle = AppServerSupervisor::start(config)
         .await
         .context("unable to start the Codex supervisor")?;
+    probe_supervisor(handle).await
+}
 
+async fn probe_codex_sidecar(
+    node_binary: PathBuf,
+    entrypoint: PathBuf,
+    codex_binary: Option<PathBuf>,
+    codex_home: Option<PathBuf>,
+    codex_arguments: Vec<String>,
+) -> Result<()> {
+    let config = CodexSidecarConfig {
+        node_binary,
+        entrypoint,
+        codex_binary,
+        codex_home,
+        codex_arguments,
+        ..CodexSidecarConfig::default()
+    };
+    let handle = AppServerSupervisor::start_sidecar(config)
+        .await
+        .context("unable to start the Codex protocol sidecar supervisor")?;
+    probe_supervisor(handle).await
+}
+
+async fn probe_supervisor(mut handle: SupervisorHandle) -> Result<()> {
     let probe = timeout(PROBE_TIMEOUT, wait_for_probe(&mut handle)).await;
     // Always stop the supervisor first so no app-server child outlives the probe.
     handle
@@ -321,13 +401,29 @@ async fn probe_codex(binary: PathBuf) -> Result<()> {
             epoch,
             version,
             peer,
+            protocol,
         } => {
+            let (wire_version, capabilities) = match &protocol {
+                ProtocolInfo::NativeStdio => (None, Vec::new()),
+                ProtocolInfo::SidecarV1 {
+                    version,
+                    capabilities,
+                    ..
+                } => (
+                    Some(*version),
+                    capabilities.iter().map(ToString::to_string).collect(),
+                ),
+            };
             let report = ProbeReport {
                 supported_version: version.to_string(),
                 initialize_user_agent: peer.user_agent,
                 platform_family: peer.platform_family,
                 platform_os: peer.platform_os,
                 epoch,
+                backend: protocol.backend_label().to_owned(),
+                wire_protocol: protocol.wire_label().to_owned(),
+                wire_version,
+                capabilities,
             };
             let line = serde_json::to_string(&report).context("unable to encode probe report")?;
             println!("{line}");

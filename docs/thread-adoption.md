@@ -34,7 +34,7 @@ thread ID. The reserved cursor and selector inputs are byte-bounded and their
 `Debug` representations disclose lengths only. Candidate result count and wire
 budgets are reserved in `src/limits.rs`; no result is emitted while disabled.
 
-## Negative interoperability observation
+## Negative interoperability observations
 
 On 2026-08-23, a two-process experiment used exact `codex-cli 0.149.0` and an
 isolated temporary profile:
@@ -50,7 +50,25 @@ version. The bridge's `AppServerClient::release_thread` is also only a local
 route/projection release and makes no remote ownership claim. There is no
 positive sequential-handoff end-to-end result to report.
 
-Because the supported version set has no typed, verified remote release
+On 2026-08-31, the same bounded ownership check was repeated with exact
+`codex-cli 0.151.0`, an isolated synthetic profile, and a local scripted model
+provider. Both the stable and experimental generated method sets exposed
+`thread/unsubscribe` as the only method matching release, unsubscribe, close,
+or writer ownership. App-server A created one completed persisted turn and held
+the writer. App-server B received the redacted active-writer conflict before A
+unsubscribed, immediately afterward, and again after a five-second bound. Only
+after A exited cleanly could B resume the same thread and read its completed
+history. The temporary profile was then removed. No existing profile,
+credential, thread identifier, message, path, or model output was used as
+evidence.
+
+The [rolling App Server documentation](https://developers.openai.com/codex/app-server)
+describes unsubscribe as removing that connection's subscription; a thread
+with no subscribers and no activity may be unloaded after a 30-minute grace.
+Eventual inactivity-based unload is neither an atomic writer transfer nor a
+release acknowledgement, so it cannot make a bounded sequential handoff safe.
+
+Because the exact 0.149.0 and 0.151.0 supported versions have no typed, verified remote release
 operation, the bridge applies the conservative decision to the whole feature.
 An active-writer conflict remains a refusal, never a takeover signal.
 

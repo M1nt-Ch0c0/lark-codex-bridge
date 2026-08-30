@@ -39,6 +39,11 @@ The tagged enum rejects spawn-only fields in external mode and external-only
 fields in spawned mode during deserialization. Unknown fields are errors. There
 is no `auto` mode and no external-to-spawn fallback.
 
+The enum also has a separately owned `protocol_sidecar` mode. Its Node/Codex
+fields cannot be mixed with either mode above, and it has no live fallback to
+them. See [Codex protocol sidecar wire v1](codex-sidecar-wire-v1.md) for its
+implemented configuration and probe contract.
+
 `observe_shared` admits only the original fail-closed list/read observation
 surface. Exact 0.149.0 also promotes `resume_shared` for #30's socket-only
 recovery actor; that profile enables the experimental API bit during

@@ -80,6 +80,7 @@ fake sink/pump，而无需复制完整 startup。
 
 - `deny_unknown_fields` 保持；
 - 配置错误为静态分类；
-- 相对 runtime path 只相对 config 文件；
+- 只有配置加载器明确列出的 runtime path 才相对 config 文件解析；Codex protocol sidecar
+  的 entrypoint/home 与带路径分隔符的命令路径也按配置目录解析；
 - 默认 sandbox 不应因新增功能放宽；
 - 配置 migration 必须显式、可备份、可回滚，不能在解析失败时猜测。

@@ -4,18 +4,30 @@
 
 ```bash
 lark-codex-bridge --version
-lark-codex-bridge codex probe
 lark-codex-bridge lark auth check
 lark-codex-bridge lark probe
 ```
 
-三个检查分别验证：
+再按配置的 Codex backend 二选一：
+
+```bash
+# [codex.backend].mode = "spawned_stdio"
+lark-codex-bridge codex probe
+
+# [codex.backend].mode = "protocol_sidecar"
+lark-codex-bridge codex sidecar-probe \
+  --entrypoint /opt/lark-codex-bridge/codex-sidecar/index.cjs
+```
+
+这些检查分别验证：
 
 - bridge 二进制可执行；
-- Codex 版本、app-server 启动和 initialize 握手；
+- 所选 Codex backend 的精确版本、app-server 启动和 initialize 握手；
 - 飞书凭证、bot 身份、WebSocket endpoint 以及 ping/pong。
 
 probe 输出只包含脱敏结构字段，不包含 secret、token、完整 endpoint 或用户正文。
+`sidecar-probe` 还输出 backend=`protocol_sidecar`、wire=`codex-sidecar-wire`、wire version 1
+和七个 capability。它不会自动读取 `config.toml`，非默认路径和参数必须与部署配置显式保持一致。
 
 ## 启动
 

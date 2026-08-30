@@ -35,7 +35,7 @@ Lark。两者分离，避免网络失败改变回复语义。
 - 创建进度卡；
 - 更新进度卡；
 - finalize 进度卡；
-- 发送独立文本终答；
+- 发送独立 Markdown `post` 终答；
 - 发送拒绝/失败通知。
 
 每行有确定性 idempotency key，后继不能越过失败前驱。
@@ -49,8 +49,14 @@ Lark。两者分离，避免网络失败改变回复语义。
 
 ## 内容处理
 
+- 无进度卡的当前独立终答持久化为 payload v2 `reply_markdown_post`，通过 Lark
+  `msg_type=post`/`tag=md` 发送；它不是 text-only reply；
+- 进度创建、更新和终态使用同一条 Card 2.0 `interactive` 消息，正文为 `tag=markdown`；
+- 拒绝、过载、失败和中断等短通知仍使用纯文本；
+- 历史 payload v1 `reply_text` 保持原来的纯文本载体，不根据 Markdown 标点升级类型；
+- post 与 Card 2.0 分别经过载体专用的 Markdown 净化、wire-aware 上限和确定性分片/截断；
 - 邮箱样式文本中的 `@` 会被审计掩码，npm scope、版本和 @mention 不受影响；
-- 回复按 Unicode 字符数确定性分片；
+- standalone post 同时按 Unicode 标量数和最终序列化 wire bytes 确定性分片；
 - 超过总预算时带明确截断标记；
 - Debug 只记录 part 数量和字符数。
 

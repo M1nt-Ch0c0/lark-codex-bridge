@@ -1,7 +1,7 @@
 use assert_cmd::cargo::cargo_bin_cmd;
 use clap::Parser;
 use lark_codex_bridge::{
-    cli::{Cli, LogFormat},
+    cli::{Cli, CodexCommand, Command as CliCommand, LogFormat},
     codex::wire::SUPPORTED_CODEX_VERSIONS,
     runtime::adoption::ThreadAdoptionGate,
 };
@@ -176,6 +176,26 @@ fn parsed_cli_debug_redacts_secrets_ids_and_absolute_paths() {
     .expect("parse codex command");
     assert!(!format!("{codex:?}").contains("/sensitive/customer"));
 
+    let sidecar = Cli::try_parse_from([
+        "lark-codex-bridge",
+        "codex",
+        "sidecar-probe",
+        "--node-binary",
+        "/sensitive/customer/node",
+        "--entrypoint",
+        "/sensitive/customer/sidecar.cjs",
+        "--codex-binary",
+        "/sensitive/customer/codex",
+        "--codex-home",
+        "/sensitive/customer/home",
+        "--codex-argument",
+        "sensitive-wrapper-argument",
+    ])
+    .expect("parse sidecar probe command");
+    let sidecar_debug = format!("{sidecar:?}");
+    assert!(!sidecar_debug.contains("/sensitive/customer"));
+    assert!(!sidecar_debug.contains("sensitive-wrapper-argument"));
+
     let run = Cli::try_parse_from([
         "lark-codex-bridge",
         "run",
@@ -186,6 +206,39 @@ fn parsed_cli_debug_redacts_secrets_ids_and_absolute_paths() {
     let run_debug = format!("{run:?}");
     assert!(run_debug.contains("config_configured"));
     assert!(!run_debug.contains("/sensitive/customer"));
+}
+
+#[test]
+fn sidecar_probe_uses_the_pinned_package_unless_a_binary_is_explicit() {
+    let pinned = Cli::try_parse_from(["lark-codex-bridge", "codex", "sidecar-probe"])
+        .expect("parse pinned sidecar probe");
+    assert!(matches!(
+        pinned.command,
+        CliCommand::Codex {
+            command: CodexCommand::SidecarProbe {
+                codex_binary: None,
+                ..
+            }
+        }
+    ));
+
+    let overridden = Cli::try_parse_from([
+        "lark-codex-bridge",
+        "codex",
+        "sidecar-probe",
+        "--codex-binary",
+        "reviewed-codex",
+    ])
+    .expect("parse overridden sidecar probe");
+    assert!(matches!(
+        overridden.command,
+        CliCommand::Codex {
+            command: CodexCommand::SidecarProbe {
+                codex_binary: Some(ref binary),
+                ..
+            }
+        } if binary == std::path::Path::new("reviewed-codex")
+    ));
 }
 
 #[test]

@@ -1,6 +1,6 @@
 mod fakecodex;
 
-use std::{sync::Arc, time::Duration};
+use std::{io, sync::Arc, time::Duration};
 
 use lark_codex_bridge::codex::{
     process::{CodexProcessConfig, ProcessError},
@@ -11,6 +11,17 @@ use lark_codex_bridge::codex::{
 use semver::Version;
 
 use fakecodex::{FakeFactory, FakeOutcome, next_state, test_settings};
+
+struct PanickingFactory;
+
+impl lark_codex_bridge::codex::supervisor::ProcessFactory for PanickingFactory {
+    fn spawn<'a>(
+        &'a self,
+        _config: &'a CodexProcessConfig,
+    ) -> lark_codex_bridge::codex::supervisor::SpawnFuture<'a> {
+        panic!("injected process factory panic before its first result")
+    }
+}
 
 #[tokio::test]
 async fn restart_increments_epoch_and_invalidates_the_previous_client() {
@@ -58,6 +69,94 @@ async fn restart_increments_epoch_and_invalidates_the_previous_client() {
     );
     assert_eq!(factory.spawn_count(), 2);
     handle.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn cleanup_failure_fences_replacement_epoch() {
+    let (first, first_control) = FakeFactory::ready_with_terminate_error(io::ErrorKind::TimedOut);
+    let (second, _second_control) = FakeFactory::ready();
+    let factory = Arc::new(FakeFactory::new([first, second]));
+    let mut handle = AppServerSupervisor::start_with_factory(
+        CodexProcessConfig::default(),
+        factory.clone(),
+        test_settings(),
+    )
+    .await
+    .expect("supervisor starts");
+
+    assert!(matches!(
+        next_state(&mut handle).await,
+        SupervisorState::Ready { epoch: 1, .. }
+    ));
+    first_control.unexpected_exit();
+
+    let SupervisorState::Degraded { reason } = next_state(&mut handle).await else {
+        panic!("failed process cleanup must fence replacement");
+    };
+    assert_eq!(
+        reason,
+        "Codex process cleanup failed; replacement is fenced until bridge restart"
+    );
+    assert_eq!(first_control.terminate_calls(), vec![Duration::ZERO]);
+    tokio::task::yield_now().await;
+    assert_eq!(factory.spawn_count(), 1);
+    assert!(matches!(handle.client(), Err(SupervisorError::NotReady)));
+    assert_eq!(
+        handle.shutdown().await,
+        Err(SupervisorError::CleanupFailed),
+        "a fenced cleanup failure must remain visible to the owner"
+    );
+}
+
+#[tokio::test]
+async fn cancelling_public_startup_stops_the_detached_supervisor_task() {
+    let (first, first_gate) =
+        FakeFactory::gated_error(ProcessError::Wait(io::Error::from(io::ErrorKind::TimedOut)));
+    let (second, second_gate) =
+        FakeFactory::gated_error(ProcessError::Wait(io::Error::from(io::ErrorKind::TimedOut)));
+    let factory = Arc::new(FakeFactory::new([first, second]));
+    let startup = tokio::spawn({
+        let factory = Arc::clone(&factory);
+        async move {
+            AppServerSupervisor::start_with_factory(
+                CodexProcessConfig::default(),
+                factory,
+                test_settings(),
+            )
+            .await
+        }
+    });
+
+    first_gate.wait_started().await;
+    startup.abort();
+    assert!(
+        matches!(startup.await, Err(error) if error.is_cancelled()),
+        "the public startup future must be cancelled before it returns a handle"
+    );
+    first_gate.release();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), second_gate.wait_started())
+            .await
+            .is_err(),
+        "startup cancellation must not leave a detached retry loop"
+    );
+    assert_eq!(factory.spawn_count(), 1);
+}
+
+#[tokio::test]
+async fn startup_reports_task_failure_if_the_supervisor_exits_before_its_first_state() {
+    let result = tokio::time::timeout(
+        Duration::from_millis(250),
+        AppServerSupervisor::start_with_factory(
+            CodexProcessConfig::default(),
+            Arc::new(PanickingFactory),
+            test_settings(),
+        ),
+    )
+    .await
+    .expect("startup must not hang after the supervisor task fails");
+
+    assert!(matches!(result, Err(SupervisorError::TaskFailed)));
 }
 
 #[tokio::test]
@@ -122,4 +221,24 @@ async fn shutdown_uses_the_configured_grace_period_before_process_termination() 
     ));
     handle.shutdown().await.expect("shutdown");
     assert_eq!(control.terminate_calls(), vec![Duration::from_millis(7)]);
+}
+
+#[tokio::test]
+async fn shutdown_propagates_process_cleanup_failure() {
+    let (outcome, control) = FakeFactory::ready_with_terminate_error(io::ErrorKind::TimedOut);
+    let factory = Arc::new(FakeFactory::new([outcome]));
+    let mut handle = AppServerSupervisor::start_with_factory(
+        CodexProcessConfig::default(),
+        factory,
+        SupervisorSettings::new(Duration::from_millis(9), |_, _| Duration::ZERO),
+    )
+    .await
+    .expect("supervisor starts");
+    assert!(matches!(
+        next_state(&mut handle).await,
+        SupervisorState::Ready { .. }
+    ));
+
+    assert_eq!(handle.shutdown().await, Err(SupervisorError::CleanupFailed));
+    assert_eq!(control.terminate_calls(), vec![Duration::from_millis(9)]);
 }

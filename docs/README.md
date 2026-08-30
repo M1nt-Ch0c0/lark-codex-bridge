@@ -41,6 +41,8 @@
 | Attachment cache | [architecture/attachments.md](architecture/attachments.md) |
 | 测试与变更验收 | [architecture/testing.md](architecture/testing.md) |
 
+协议 ADR：[Codex protocol sidecar wire v1](codex-sidecar-wire-v1.md)。
+
 ## 文档状态约定
 
 - **已实现**：生产装配路径已调用并有自动化测试。

@@ -31,6 +31,28 @@ codex --version
 
 probe 超时或 app-server 退出时，先单独修复 Codex 环境，不要同时排查 Lark。
 
+## Codex protocol sidecar probe 失败
+
+选择 `[codex.backend].mode = "protocol_sidecar"` 时，不要用 native `codex probe` 代替实际路径：
+
+```bash
+lark-codex-bridge codex sidecar-probe \
+  --entrypoint /opt/lark-codex-bridge/codex-sidecar/index.cjs
+```
+
+部署覆盖 pinned Codex 或使用非默认 Node、Codex home、wrapper 参数时，同步传入
+`--codex-binary`、`--node-binary`、`--codex-home` 和可重复的 `--codex-argument`。检查
+Node 20+、entrypoint 是否存在、`codex_home` 是否为已有
+目录，以及版本输出是否精确为 `codex-cli 0.149.0` 或 `codex-cli 0.151.0`。sidecar bootstrap
+在 15 秒内必须完成 hello/configure、七个 capability 精确匹配、版本 probe 和 Codex child
+启动；缺失/额外 capability、其他版本和畸形帧都会 fail closed。
+
+sidecar stderr 只给出 `codex_sidecar_failure code=<静态分类>`。不要为排障打印 configure frame、
+Codex stderr、用户正文或完整路径。`protocol_sidecar` 失败不会自动切换到 native；修复后重新
+运行 probe，再完整重启 bridge。版本 probe 超时、probe I/O 和进程资源压力会进入有界退避；
+无效配置、缺失的 pinned artifact、确定性启动/版本/协议错误会永久 fail closed。若显示进程树
+cleanup 失败，supervisor 会禁止创建替代 epoch，必须先确认残留进程已清理再重启 bridge。
+
 ## run 报告 Codex supervisor degraded
 
 `Codex supervisor degraded` 表示 Codex supervisor 已进入本次进程内不可恢复的 terminal 状态。
@@ -43,15 +65,21 @@ probe 超时或 app-server 退出时，先单独修复 Codex 环境，不要同�
   拒绝并写入静态内部提示，避免消息无限等待。运行时 terminal 通知不会携带具体 reason，也不会
   把它写入 tracing 或用户提示；运维应停止当前进程、用下面的 probe 复核并修复后再启动。
 
-执行以下命令复核同一原因：
+按当前 backend 执行对应命令复核同一原因：
 
 ```bash
+# spawned_stdio
 lark-codex-bridge codex probe
+
+# protocol_sidecar（参数必须与配置一致）
+lark-codex-bridge codex sidecar-probe \
+  --entrypoint /opt/lark-codex-bridge/codex-sidecar/index.cjs
 ```
 
-如果原因是 unsupported version，只安装 `SUPPORTED_CODEX_VERSIONS` 中列出的精确版本，或先按
-Schema/契约升级流程评审并提升新版本；不要仅因本机版本号更高就绕过门禁。若旧版 bridge 在
-运行期 degraded 后没有拒绝新消息，应先停止并升级，避免消息停留在 `received`。
+如果原因是 unsupported version，native backend 只安装 `SUPPORTED_CODEX_VERSIONS` 中列出的
+0.146.0/0.149.0；protocol sidecar 只安装其独立精确列表 0.149.0/0.151.0。其他版本必须先按
+Schema/adapter 契约升级流程评审，不能仅因本机版本号更高就绕过门禁。若旧版 bridge 在运行期
+degraded 后没有拒绝新消息，应先停止并升级，避免消息停留在 `received`。
 
 ## Lark auth 失败
 
