@@ -2,6 +2,7 @@ use assert_cmd::cargo::cargo_bin_cmd;
 use clap::Parser;
 use lark_codex_bridge::{
     cli::{Cli, LogFormat},
+    codex::wire::SUPPORTED_CODEX_VERSIONS,
     runtime::adoption::ThreadAdoptionGate,
 };
 use predicates::prelude::*;
@@ -91,6 +92,60 @@ fn probe_reports_a_missing_codex_binary_without_panicking() {
         .failure()
         .stderr(predicate::str::contains("unable to run Codex binary"))
         .stderr(predicate::str::contains("panicked").not());
+}
+
+#[cfg(unix)]
+#[test]
+fn run_and_probe_report_the_same_unsupported_version_reason_before_runtime_ready() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let binary = temp.path().join("unsupported-codex");
+    std::fs::write(&binary, b"#!/bin/sh\nprintf 'codex-cli 0.148.0\\n'\n")
+        .expect("write fake Codex");
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))
+        .expect("make fake Codex executable");
+    let encoded_binary = serde_json::to_string(&binary.to_string_lossy())
+        .expect("encode fake Codex path as a TOML string");
+    let config = temp.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "owners = [\"ou_owner_cli_fail_closed\"]\n\n[codex.backend]\nmode = \"spawned_stdio\"\nbinary = {encoded_binary}\n"
+        ),
+    )
+    .expect("write runtime config");
+    let expected = format!(
+        "Codex 0.148.0 is unsupported; expected an exact reviewed version ({})",
+        SUPPORTED_CODEX_VERSIONS.join(", ")
+    );
+
+    let run = cargo_bin_cmd!("lark-codex-bridge")
+        .env("LARK_APP_ID", "cli_app_fail_closed")
+        .env("LARK_APP_SECRET", "test-secret")
+        .env("LARK_TENANT", "feishu")
+        .env_remove("RUST_LOG")
+        .args(["-v", "run", "--config"])
+        .arg(&config)
+        .output()
+        .expect("run bridge with unsupported Codex");
+    let probe = cargo_bin_cmd!("lark-codex-bridge")
+        .env_remove("RUST_LOG")
+        .args(["-v", "codex", "probe", "--binary"])
+        .arg(&binary)
+        .output()
+        .expect("probe unsupported Codex");
+    let run_stderr = String::from_utf8_lossy(&run.stderr);
+    let probe_stderr = String::from_utf8_lossy(&probe.stderr);
+
+    assert!(!run.status.success());
+    assert!(!probe.status.success());
+    assert!(run.stdout.is_empty());
+    assert!(probe.stdout.is_empty());
+    assert!(run_stderr.contains(&expected));
+    assert!(probe_stderr.contains(&expected));
+    assert!(!run_stderr.contains("bridge runtime ready"));
+    assert!(!run_stderr.contains(&*binary.to_string_lossy()));
 }
 
 #[test]

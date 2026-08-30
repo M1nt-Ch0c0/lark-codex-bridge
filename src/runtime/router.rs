@@ -23,6 +23,7 @@ use crate::limits::{
     ROUTER_ACTIVE_TURN_HARD_LIMIT, ROUTER_COMMAND_BYTE_BUDGET, ROUTER_COMMAND_CAPACITY,
     ROUTER_CONTROL_BYTE_BUDGET, ROUTER_CONTROL_CAPACITY, ROUTER_RETRY_BYTE_BUDGET,
     ROUTER_RETRY_CAPACITY, ROUTER_SCOPE_ACTOR_HARD_LIMIT, STORE_INBOUND_SCOPE_MAX_BYTES,
+    SUPERVISOR_SHUTDOWN_GRACE,
 };
 use crate::runtime::attachments::AttachmentCache;
 use crate::runtime::context::ContextRegistry;
@@ -55,6 +56,64 @@ pub struct RouterSettings {
     pub(crate) pending_media_ttl: Duration,
     pub(crate) pending_media_max_count: usize,
     pub(crate) pending_media_max_metadata_bytes: usize,
+    #[cfg(test)]
+    startup_gate: Option<Arc<RouterStartupGate>>,
+}
+
+#[cfg(test)]
+struct RouterStartupGate {
+    reached: tokio::sync::Barrier,
+    release: tokio::sync::Notify,
+    cleanup_reached: tokio::sync::Barrier,
+    cleanup_release: tokio::sync::Notify,
+    cleanup_finished: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl RouterStartupGate {
+    fn new() -> Self {
+        Self {
+            reached: tokio::sync::Barrier::new(2),
+            release: tokio::sync::Notify::new(),
+            cleanup_reached: tokio::sync::Barrier::new(2),
+            cleanup_release: tokio::sync::Notify::new(),
+            cleanup_finished: tokio::sync::Notify::new(),
+        }
+    }
+
+    async fn pause_before_terminal_check(&self) {
+        self.reached.wait().await;
+        self.release.notified().await;
+    }
+
+    async fn wait_until_reached(&self) {
+        self.reached.wait().await;
+    }
+
+    fn release(&self) {
+        self.release.notify_one();
+    }
+
+    async fn pause_during_cleanup(&self) {
+        self.cleanup_reached.wait().await;
+        self.cleanup_release.notified().await;
+    }
+
+    async fn wait_until_cleanup_reached(&self) {
+        self.cleanup_reached.wait().await;
+    }
+
+    fn release_cleanup(&self) {
+        self.cleanup_release.notify_one();
+    }
+
+    fn finish_cleanup(&self) {
+        self.cleanup_finished.notify_one();
+    }
+
+    async fn wait_until_cleanup_finished(&self) {
+        self.cleanup_finished.notified().await;
+    }
 }
 
 impl RouterSettings {
@@ -78,6 +137,8 @@ impl RouterSettings {
             pending_media_ttl: PENDING_MEDIA_TTL,
             pending_media_max_count: PENDING_MEDIA_MAX_COUNT,
             pending_media_max_metadata_bytes: PENDING_MEDIA_MAX_METADATA_BYTES,
+            #[cfg(test)]
+            startup_gate: None,
         }
     }
 
@@ -150,8 +211,8 @@ impl fmt::Debug for RouterSettings {
             ApprovalPolicy::Named(_) => "named",
             ApprovalPolicy::Granular { .. } => "granular",
         };
-        formatter
-            .debug_struct("RouterSettings")
+        let mut settings = formatter.debug_struct("RouterSettings");
+        settings
             .field(
                 "default_workspace_configured",
                 &self.default_workspace.is_some(),
@@ -173,13 +234,15 @@ impl fmt::Debug for RouterSettings {
             .field(
                 "pending_media_max_metadata_bytes",
                 &self.pending_media_max_metadata_bytes,
-            )
-            .finish()
+            );
+        #[cfg(test)]
+        settings.field("startup_gate_configured", &self.startup_gate.is_some());
+        settings.finish()
     }
 }
 
-/// Static route failure classifications safe to expose at process boundaries.
-#[derive(Debug, thiserror::Error)]
+/// Route failure classifications safe to expose at process boundaries.
+#[derive(thiserror::Error)]
 pub enum RouteError {
     #[error("scope router settings are invalid")]
     InvalidSettings,
@@ -193,10 +256,31 @@ pub enum RouteError {
     ReplySink,
     #[error("the app-server supervisor failed")]
     Supervisor,
+    /// A permanent supervisor failure observed at the atomic ownership
+    /// handoff into the router. The reason is displayed only by the CLI;
+    /// [`fmt::Debug`] remains content-free.
+    #[error("{reason}")]
+    CodexUnavailable { reason: String },
     #[error("scope actor routing is not available")]
     ActorUnavailable,
     #[error("attachment cache cleanup failed")]
     Attachment,
+}
+
+impl fmt::Debug for RouteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidSettings => "InvalidSettings",
+            Self::Capacity => "Capacity",
+            Self::Closed => "Closed",
+            Self::Store => "Store",
+            Self::ReplySink => "ReplySink",
+            Self::Supervisor => "Supervisor",
+            Self::CodexUnavailable { .. } => "CodexUnavailable",
+            Self::ActorUnavailable => "ActorUnavailable",
+            Self::Attachment => "Attachment",
+        })
+    }
 }
 
 impl From<StoreError> for RouteError {
@@ -383,25 +467,45 @@ impl Router {
         }
         let (sender, receiver) = mpsc::channel(ROUTER_COMMAND_CAPACITY);
         let (control_sender, control_receiver) = mpsc::channel(ROUTER_CONTROL_CAPACITY);
+        let (startup_sender, startup_receiver) = oneshot::channel();
         let snapshot = Arc::new(RwLock::new(RouterSnapshot::default()));
         let task_snapshot = Arc::clone(&snapshot);
         let active_turn_capacity = settings.active_turn_permits;
+        let startup_cleanup_timeout = settings
+            .shutdown_cleanup_timeout
+            .saturating_mul(2)
+            .saturating_add(SUPERVISOR_SHUTDOWN_GRACE);
+        let startup_cancel = CancellationToken::new();
         let active_turns = Arc::new(Semaphore::new(active_turn_capacity));
-        let task = tokio::spawn(run_router(
-            receiver,
-            control_receiver,
-            store,
-            tenant,
-            policy,
-            settings,
-            Arc::clone(&active_turns),
-            supervisor,
-            sink,
-            attachments,
-            contexts,
-            quote_resolver,
-            task_snapshot,
-        ));
+        let mut task = RouterStartupGuard::new(
+            tokio::spawn(run_router(
+                receiver,
+                control_receiver,
+                startup_sender,
+                startup_cancel.clone(),
+                store,
+                tenant,
+                policy,
+                settings,
+                Arc::clone(&active_turns),
+                supervisor,
+                sink,
+                attachments,
+                contexts,
+                quote_resolver,
+                task_snapshot,
+            )),
+            startup_cancel,
+            startup_cleanup_timeout,
+        );
+        let Ok(startup) = startup_receiver.await else {
+            let _ = task.join().await;
+            return Err(RouteError::Supervisor);
+        };
+        if let Err(error) = startup {
+            let _ = task.join().await;
+            return Err(error.into_route_error());
+        }
         Ok(RouterHandle {
             sender,
             control_sender,
@@ -410,7 +514,7 @@ impl Router {
             snapshot,
             active_turns,
             active_turn_capacity,
-            task: Some(task),
+            task: Some(task.into_inner()),
         })
     }
 }
@@ -638,10 +742,88 @@ struct RouteFailure {
     retryable: bool,
 }
 
+#[derive(Clone)]
+enum RouterStartupError {
+    Supervisor,
+    CodexUnavailable { reason: String },
+}
+
+struct RouterStartupGuard {
+    task: Option<JoinHandle<Result<(), RouteError>>>,
+    cancel: Option<CancellationToken>,
+    cleanup_timeout: Duration,
+}
+
+impl RouterStartupGuard {
+    fn new(
+        task: JoinHandle<Result<(), RouteError>>,
+        cancel: CancellationToken,
+        cleanup_timeout: Duration,
+    ) -> Self {
+        Self {
+            task: Some(task),
+            cancel: Some(cancel),
+            cleanup_timeout,
+        }
+    }
+
+    async fn join(&mut self) -> Result<Result<(), RouteError>, tokio::task::JoinError> {
+        let result = self
+            .task
+            .as_mut()
+            .expect("router startup task remains owned until handoff")
+            .await;
+        drop(self.task.take());
+        drop(self.cancel.take());
+        result
+    }
+
+    fn into_inner(mut self) -> JoinHandle<Result<(), RouteError>> {
+        drop(self.cancel.take());
+        self.task
+            .take()
+            .expect("router startup task transfers exactly once")
+    }
+}
+
+impl Drop for RouterStartupGuard {
+    fn drop(&mut self) {
+        let Some(cancel) = self.cancel.take() else {
+            return;
+        };
+        cancel.cancel();
+        let Some(mut task) = self.task.take() else {
+            return;
+        };
+        let cleanup_timeout = self.cleanup_timeout;
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            task.abort();
+            return;
+        };
+        drop(runtime.spawn(async move {
+            if timeout(cleanup_timeout, &mut task).await.is_err() {
+                task.abort();
+                let _ = task.await;
+            }
+        }));
+    }
+}
+
+impl RouterStartupError {
+    fn into_route_error(self) -> RouteError {
+        match self {
+            Self::Supervisor => RouteError::Supervisor,
+            Self::CodexUnavailable { reason } => RouteError::CodexUnavailable { reason },
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_router(
     mut receiver: mpsc::Receiver<RouterCommand>,
     mut control_receiver: mpsc::Receiver<RouterControl>,
+    startup_sender: oneshot::Sender<Result<(), RouterStartupError>>,
+    startup_cancel: CancellationToken,
     store: StoreHandle,
     tenant: TenantNamespace,
     policy: AccessPolicy,
@@ -677,9 +859,74 @@ async fn run_router(
         contexts.as_ref(),
         settings.asr.clone(),
     );
+    #[cfg(test)]
+    let cancelled_before_ack = if let Some(gate) = &settings.startup_gate {
+        tokio::select! {
+            biased;
+            () = startup_cancel.cancelled() => true,
+            () = gate.pause_before_terminal_check() => startup_cancel.is_cancelled(),
+        }
+    } else {
+        startup_cancel.is_cancelled()
+    };
+    #[cfg(not(test))]
+    let cancelled_before_ack = startup_cancel.is_cancelled();
+    if cancelled_before_ack || startup_cancel.is_cancelled() {
+        drop(startup_sender);
+        #[cfg(test)]
+        if let Some(gate) = &settings.startup_gate {
+            gate.pause_during_cleanup().await;
+        }
+        cleanup_router_startup(
+            tool_task,
+            stale_sweep_task,
+            supervisor,
+            attachments.as_deref(),
+            settings.shutdown_cleanup_timeout,
+        )
+        .await;
+        #[cfg(test)]
+        if let Some(gate) = &settings.startup_gate {
+            gate.finish_cleanup();
+        }
+        return Ok(());
+    }
+    let startup_error = match supervisor.state() {
+        SupervisorState::Degraded { reason } => {
+            Some(RouterStartupError::CodexUnavailable { reason })
+        }
+        SupervisorState::Stopped => Some(RouterStartupError::Supervisor),
+        SupervisorState::Starting { .. }
+        | SupervisorState::Ready { .. }
+        | SupervisorState::Backoff { .. } => None,
+    };
+    if let Some(error) = startup_error {
+        let _ = startup_sender.send(Err(error.clone()));
+        cleanup_router_startup(
+            tool_task,
+            stale_sweep_task,
+            supervisor,
+            attachments.as_deref(),
+            settings.shutdown_cleanup_timeout,
+        )
+        .await;
+        return Err(error.into_route_error());
+    }
+    if startup_sender.send(Ok(())).is_err() {
+        cleanup_router_startup(
+            tool_task,
+            stale_sweep_task,
+            supervisor,
+            attachments.as_deref(),
+            settings.shutdown_cleanup_timeout,
+        )
+        .await;
+        return Ok(());
+    }
     loop {
         tokio::select! {
             biased;
+            () = startup_cancel.cancelled() => break,
             control = control_receiver.recv() => {
                 let Some(control) = control else { break };
                 match control {
@@ -716,7 +963,11 @@ async fn run_router(
                         task.stop(settings.shutdown_cleanup_timeout).await;
                     }
                     supervisor_open = false;
-                    supervisor_tx.send_replace(SupervisorAccess { epoch: 0, client: None });
+                    supervisor_tx.send_replace(SupervisorAccess {
+                        epoch: 0,
+                        client: None,
+                        terminal: true,
+                    });
                 }
             }
             _ = retry_tick.tick(), if !retries.is_empty() => {
@@ -819,6 +1070,21 @@ async fn run_router(
     supervisor.shutdown().await?;
     reconcile_terminal_attachments(attachments.as_deref()).await?;
     Ok(())
+}
+
+async fn cleanup_router_startup(
+    tool_task: Option<ContextToolTask>,
+    stale_sweep_task: Option<StaleSweepTask>,
+    supervisor: SupervisorHandle,
+    attachments: Option<&AttachmentCache>,
+    cleanup_timeout: Duration,
+) {
+    if let Some(task) = tool_task {
+        task.stop(cleanup_timeout).await;
+    }
+    finish_stale_sweep(stale_sweep_task).await;
+    let _ = supervisor.shutdown().await;
+    let _ = reconcile_terminal_attachments(attachments).await;
 }
 
 type StaleSweepTask = JoinHandle<(
@@ -999,6 +1265,24 @@ async fn route_one(
                 })
             });
     }
+    let supervisor_terminal = supervisor.borrow().terminal;
+    if supervisor_terminal {
+        return reject_with_notice(
+            store,
+            sink.as_ref(),
+            &key,
+            &queued.event,
+            InboundRejectionKind::Internal,
+        )
+        .await
+        .map_err(|error| {
+            Box::new(RouteFailure {
+                error,
+                event: queued,
+                retryable: true,
+            })
+        });
+    }
     let scope_key = queued.event.scope.to_string();
     if !actors.contains_key(&scope_key) {
         if actors.len() >= settings.max_scope_actors {
@@ -1125,15 +1409,16 @@ async fn reject_with_notice(
 }
 
 fn supervisor_access(supervisor: &SupervisorHandle) -> SupervisorAccess {
-    let epoch = match supervisor.state() {
+    let (epoch, terminal) = match supervisor.state() {
         SupervisorState::Starting { epoch }
         | SupervisorState::Ready { epoch, .. }
-        | SupervisorState::Backoff { epoch, .. } => epoch,
-        SupervisorState::Degraded { .. } | SupervisorState::Stopped => 0,
+        | SupervisorState::Backoff { epoch, .. } => (epoch, false),
+        SupervisorState::Degraded { .. } | SupervisorState::Stopped => (0, true),
     };
     SupervisorAccess {
         epoch,
         client: supervisor.client().ok(),
+        terminal,
     }
 }
 
@@ -1178,7 +1463,52 @@ fn update_runtime_snapshot(
 mod tests {
     use super::*;
     use crate::lark::api::ChatMode;
+    use crate::lark::config::TenantBrand;
+    use crate::lark::credentials::LarkCredentials;
     use crate::lark::normalize::{InboundEvent, ScopeKey};
+    use futures_util::future::BoxFuture;
+    use secrecy::SecretString;
+
+    struct StartupSink;
+
+    impl DurableReplySink for StartupSink {
+        fn rejection_notice(
+            &self,
+            _event: &InboundEvent,
+            _reason: InboundRejectionKind,
+        ) -> Result<crate::store::NewOutboxRow, ReplySinkError> {
+            Err(ReplySinkError::Unavailable)
+        }
+
+        fn finalize(
+            &self,
+            _turn: crate::runtime::scope::TurnFinalization,
+        ) -> BoxFuture<'static, Result<(), ReplySinkError>> {
+            Box::pin(async { Err(ReplySinkError::Unavailable) })
+        }
+    }
+
+    fn startup_config() -> BridgeConfig {
+        let workspace = std::env::current_dir().expect("current workspace");
+        BridgeConfig {
+            owners: vec!["owner-router-startup".to_owned()],
+            default_workspace: Some(workspace.clone()),
+            workspace: crate::config::WorkspacePolicy {
+                allow_roots: vec![workspace],
+                ..crate::config::WorkspacePolicy::default()
+            },
+            ..BridgeConfig::default()
+        }
+    }
+
+    fn startup_tenant() -> TenantNamespace {
+        let credentials = LarkCredentials::new(
+            "cli_router_startup".to_owned(),
+            SecretString::from("secret".to_owned()),
+            TenantBrand::Feishu,
+        );
+        TenantNamespace::from_credentials(&credentials)
+    }
 
     fn handle(sender: mpsc::Sender<RouterCommand>, byte_budget: usize) -> RouterHandle {
         let (control_sender, _control_receiver) = mpsc::channel(1);
@@ -1253,5 +1583,90 @@ mod tests {
 
         assert!(matches!(error, RouteError::Closed));
         assert_eq!(event.expect("retained event").event.event_id, "closed");
+    }
+
+    #[tokio::test]
+    async fn startup_ack_observes_terminal_transition_after_router_task_spawn() {
+        let config = startup_config();
+        let policy = AccessPolicy::from_config(&config).expect("startup policy");
+        let mut settings = RouterSettings::from_config(&config);
+        let gate = Arc::new(RouterStartupGate::new());
+        settings.startup_gate = Some(Arc::clone(&gate));
+        let (supervisor, state, _stopped) =
+            SupervisorHandle::test_state_channel(SupervisorState::Starting { epoch: 2 });
+        let store = StoreHandle::open_in_memory().await.expect("store");
+        let startup = tokio::spawn(Router::start(
+            store.clone(),
+            startup_tenant(),
+            policy,
+            settings,
+            supervisor,
+            Arc::new(StartupSink),
+        ));
+
+        gate.wait_until_reached().await;
+        let reason = "permanent failure after router task spawn".to_owned();
+        state.send_replace(SupervisorState::Degraded {
+            reason: reason.clone(),
+        });
+        gate.release();
+
+        let result = timeout(Duration::from_secs(2), startup)
+            .await
+            .expect("router startup acknowledgement")
+            .expect("router startup task");
+        let Err(RouteError::CodexUnavailable {
+            reason: observed_reason,
+        }) = result
+        else {
+            panic!("terminal transition before the startup ack must fail closed");
+        };
+        assert_eq!(observed_reason, reason);
+        store.shutdown().await.expect("store shutdown");
+    }
+
+    #[tokio::test]
+    async fn cancelling_startup_before_ack_joins_router_cleanup_and_stops_supervisor() {
+        let config = startup_config();
+        let policy = AccessPolicy::from_config(&config).expect("startup policy");
+        let mut settings = RouterSettings::from_config(&config);
+        let gate = Arc::new(RouterStartupGate::new());
+        settings.startup_gate = Some(Arc::clone(&gate));
+        let (supervisor, _state, mut stopped) =
+            SupervisorHandle::test_state_channel(SupervisorState::Starting { epoch: 2 });
+        let store = StoreHandle::open_in_memory().await.expect("store");
+        let startup = tokio::spawn(Router::start(
+            store.clone(),
+            startup_tenant(),
+            policy,
+            settings,
+            supervisor,
+            Arc::new(StartupSink),
+        ));
+
+        gate.wait_until_reached().await;
+        startup.abort();
+        let Err(cancelled) = startup.await else {
+            panic!("startup caller must remain pending before the ack");
+        };
+        assert!(cancelled.is_cancelled());
+        timeout(Duration::from_secs(2), gate.wait_until_cleanup_reached())
+            .await
+            .expect("router task enters cooperative startup cleanup");
+        assert!(
+            timeout(Duration::from_millis(25), &mut stopped)
+                .await
+                .is_err(),
+            "supervisor remains owned while injected cleanup is pending"
+        );
+        gate.release_cleanup();
+        timeout(Duration::from_secs(2), gate.wait_until_cleanup_finished())
+            .await
+            .expect("router task completes cooperative startup cleanup");
+        timeout(Duration::from_secs(2), stopped)
+            .await
+            .expect("supervisor observes router-task cancellation")
+            .expect("test supervisor exits cleanly");
+        store.shutdown().await.expect("store shutdown");
     }
 }

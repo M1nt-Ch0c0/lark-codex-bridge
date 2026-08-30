@@ -10,7 +10,8 @@ use bytes::Bytes;
 use fs2::FileExt;
 use futures_util::{FutureExt, future::BoxFuture};
 use lark_codex_bridge::codex::process::{CodexProcessConfig, ProcessError};
-use lark_codex_bridge::codex::supervisor::AppServerSupervisor;
+use lark_codex_bridge::codex::supervisor::{AppServerSupervisor, SupervisorSettings};
+use lark_codex_bridge::codex::wire::SUPPORTED_CODEX_VERSIONS;
 use lark_codex_bridge::config::{AsrSection, BridgeConfig, WorkspacePolicy};
 use lark_codex_bridge::lark::api::{ChatMode, ResourceKind};
 use lark_codex_bridge::lark::bridge::QueuedInboundEvent;
@@ -686,6 +687,37 @@ async fn degraded_supervisor() -> lark_codex_bridge::codex::supervisor::Supervis
     .expect("supervisor task")
 }
 
+async fn backing_off_supervisor() -> lark_codex_bridge::codex::supervisor::SupervisorHandle {
+    AppServerSupervisor::start_with_factory(
+        CodexProcessConfig::default(),
+        Arc::new(FakeFactory::new([FakeOutcome::Error(
+            ProcessError::ProbeTimeout(Duration::from_millis(1)),
+        )])),
+        SupervisorSettings::new(Duration::ZERO, |_, _| Duration::from_secs(60)),
+    )
+    .await
+    .expect("backing-off supervisor")
+}
+
+async fn supervisor_degrading_after_ready_loss() -> (
+    lark_codex_bridge::codex::supervisor::SupervisorHandle,
+    fakecodex::FakeControl,
+    fakecodex::FakeSpawnGate,
+) {
+    let (ready, control) = FakeFactory::ready();
+    let (degraded, gate) = FakeFactory::gated_error(ProcessError::UnsupportedVersion {
+        found: Version::new(0, 145, 0),
+    });
+    let supervisor = AppServerSupervisor::start_with_factory(
+        CodexProcessConfig::default(),
+        Arc::new(FakeFactory::new([ready, degraded])),
+        SupervisorSettings::new(Duration::ZERO, |_, _| Duration::ZERO),
+    )
+    .await
+    .expect("ready supervisor before gated degradation");
+    (supervisor, control, gate)
+}
+
 async fn ready_supervisor() -> (
     lark_codex_bridge::codex::supervisor::SupervisorHandle,
     fakecodex::FakeControl,
@@ -916,7 +948,7 @@ async fn router_rejects_non_owner_with_one_atomic_durable_notice() {
     let namespace = TenantNamespace::from_credentials(&credentials);
     let store = StoreHandle::open_in_memory().await.expect("store");
     let sink = Arc::new(RecordingSink::default());
-    let supervisor = degraded_supervisor().await;
+    let supervisor = backing_off_supervisor().await;
     let router = Router::start(
         store.clone(),
         namespace.clone(),
@@ -962,7 +994,7 @@ async fn router_retries_a_transient_rejection_projection_without_losing_the_rece
         namespace.clone(),
         policy,
         settings,
-        degraded_supervisor().await,
+        backing_off_supervisor().await,
         sink.clone(),
     )
     .await
@@ -1005,7 +1037,7 @@ async fn router_retry_lane_enforces_its_count_bound() {
         namespace.clone(),
         policy,
         settings,
-        degraded_supervisor().await,
+        backing_off_supervisor().await,
         Arc::new(UnavailableRejectionSink),
     )
     .await
@@ -1053,7 +1085,7 @@ async fn router_retry_lane_enforces_its_aggregate_byte_bound() {
         namespace.clone(),
         policy,
         settings,
-        degraded_supervisor().await,
+        backing_off_supervisor().await,
         Arc::new(UnavailableRejectionSink),
     )
     .await
@@ -2326,7 +2358,7 @@ async fn group_media_flood_is_durably_ignored_without_actor_context_cache_or_asr
         namespace.clone(),
         policy,
         settings,
-        degraded_supervisor().await,
+        backing_off_supervisor().await,
         Arc::new(RecordingSink::default()),
         Arc::clone(&cache),
         Arc::clone(&contexts),
@@ -2398,7 +2430,7 @@ async fn pending_media_count_ttl_and_interrupt_bounds_clear_metadata() {
         namespace.clone(),
         policy,
         settings,
-        degraded_supervisor().await,
+        backing_off_supervisor().await,
         Arc::new(RecordingSink::default()),
     )
     .await
@@ -2810,7 +2842,7 @@ async fn pending_media_metadata_byte_bound_drops_an_oversize_descriptor() {
         namespace.clone(),
         policy,
         settings,
-        degraded_supervisor().await,
+        backing_off_supervisor().await,
         Arc::new(RecordingSink::default()),
     )
     .await
@@ -3645,7 +3677,7 @@ async fn permit_recheck_atomically_rejects_a_stale_event_before_any_rpc() {
     let namespace = TenantNamespace::from_credentials(&credentials());
     let store = StoreHandle::open_in_memory().await.expect("store");
     let sink = Arc::new(RecordingSink::default());
-    let supervisor = degraded_supervisor().await;
+    let supervisor = backing_off_supervisor().await;
     let router = Router::start(
         store.clone(),
         namespace.clone(),
@@ -3690,7 +3722,7 @@ async fn missing_default_workspace_is_a_durable_policy_rejection() {
     let namespace = TenantNamespace::from_credentials(&credentials());
     let store = StoreHandle::open_in_memory().await.expect("store");
     let sink = Arc::new(RecordingSink::default());
-    let supervisor = degraded_supervisor().await;
+    let supervisor = backing_off_supervisor().await;
     let router = Router::start(
         store.clone(),
         namespace.clone(),
@@ -3748,48 +3780,196 @@ async fn router_rejects_zero_and_hard_cap_runtime_settings() {
 }
 
 #[tokio::test]
-async fn shutdown_cancels_an_actor_waiting_for_a_supervisor_client() {
+async fn router_handoff_surfaces_a_terminal_reason_with_static_debug() {
     let config = validated_config();
     let policy = AccessPolicy::from_config(&config).expect("policy");
     let settings = RouterSettings::from_config(&config);
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let result = Router::start(
+        store.clone(),
+        TenantNamespace::from_credentials(&credentials()),
+        policy,
+        settings,
+        degraded_supervisor().await,
+        Arc::new(RecordingSink::default()),
+    )
+    .await;
+    let Err(RouteError::CodexUnavailable { reason }) = result else {
+        panic!("terminal supervisor must fail the router ownership handoff");
+    };
+    assert_eq!(
+        reason,
+        format!(
+            "Codex 0.145.0 is unsupported; expected an exact reviewed version ({})",
+            SUPPORTED_CODEX_VERSIONS.join(", ")
+        )
+    );
+    assert_eq!(
+        format!("{:?}", RouteError::CodexUnavailable { reason }),
+        "CodexUnavailable"
+    );
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn permanent_degradation_rejects_an_inbound_waiting_for_a_supervisor_client() {
+    let config = validated_config();
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config).with_test_timings(
+        Duration::from_millis(1),
+        Duration::from_secs(15 * 60),
+        Duration::from_millis(1),
+    );
     let namespace = TenantNamespace::from_credentials(&credentials());
     let store = StoreHandle::open_in_memory().await.expect("store");
-    let supervisor = degraded_supervisor().await;
+    let sink = Arc::new(RecordingSink::default());
+    let (supervisor, control, gate) = supervisor_degrading_after_ready_loss().await;
     let router = Router::start(
         store.clone(),
         namespace.clone(),
         policy,
         settings,
         supervisor,
-        Arc::new(RecordingSink::default()),
+        sink.clone(),
     )
     .await
     .expect("router");
+    control.unexpected_exit();
+    gate.wait_started().await;
     router
         .route(
             queued_registered(
                 &store,
                 &namespace,
-                event("event-shutdown", "owner-runtime-scope"),
+                event("event-supervisor-degraded", "owner-runtime-scope"),
             )
             .await,
         )
         .await
         .expect("route to waiting actor");
-    sleep(Duration::from_millis(700)).await;
-
-    timeout(Duration::from_millis(500), router.shutdown())
-        .await
-        .expect("router shutdown deadline")
-        .expect("router shutdown");
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if router
+                .scope_snapshot(&ScopeKey::Chat("chat-runtime-scope".to_owned()))
+                .await
+                .expect("snapshot")
+                .is_some_and(|snapshot| snapshot.state == ScopeState::WaitingPermit)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("actor waits while the replacement spawn is gated");
     assert_eq!(
         store
-            .inbound_state(&namespace, "event-shutdown")
+            .inbound_state(&namespace, "event-supervisor-degraded")
             .await
-            .expect("inbound state"),
+            .expect("inbound state before permanent degradation"),
         Some(InboundEventState::Received)
     );
+    gate.release();
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-supervisor-degraded"],
+        InboundEventState::Rejected,
+    )
+    .await;
+    assert_eq!(
+        *sink.rejections.lock().expect("rejections"),
+        vec![InboundRejectionKind::Internal]
+    );
+    assert_eq!(store.outbox_depth().await.expect("outbox").pending, 1);
+    router.shutdown().await.expect("router shutdown");
     store.shutdown().await.expect("store shutdown");
+}
+
+async fn assert_terminal_rejects_stale_client_before_claim(
+    event_id: &str,
+    active_thread: Option<&str>,
+    expected_method: &str,
+) {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config).with_test_timings(
+        Duration::from_millis(1),
+        Duration::from_secs(15 * 60),
+        Duration::from_millis(1),
+    );
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let inbound = event(event_id, "owner-runtime-scope");
+    if let Some(thread_id) = active_thread {
+        let fingerprint = policy.fingerprint(&workspace).expect("policy fingerprint");
+        store
+            .upsert_scope(&inbound.scope, &workspace, fingerprint.as_str())
+            .await
+            .expect("seed reusable scope");
+        store
+            .record_active_thread(&inbound.scope, thread_id)
+            .await
+            .expect("seed active thread");
+    }
+    let sink = Arc::new(RecordingSink::default());
+    let (supervisor, control, gate) = supervisor_degrading_after_ready_loss().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink.clone(),
+    )
+    .await
+    .expect("router");
+    router
+        .route(queued_registered(&store, &namespace, inbound).await)
+        .await
+        .expect("route event to ready epoch");
+    let request = control.next_request().await;
+    assert_eq!(request["method"], expected_method);
+
+    control.unexpected_exit();
+    gate.wait_started().await;
+    assert_eq!(
+        store
+            .inbound_state(&namespace, event_id)
+            .await
+            .expect("pre-claim inbound state"),
+        Some(InboundEventState::Received)
+    );
+    gate.release();
+    wait_for_inbound_states(&store, &namespace, &[event_id], InboundEventState::Rejected).await;
+    assert_eq!(
+        *sink.rejections.lock().expect("rejections"),
+        vec![InboundRejectionKind::Internal]
+    );
+    assert_eq!(store.outbox_depth().await.expect("outbox").pending, 1);
+    router.shutdown().await.expect("router shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn terminal_epoch_loss_during_thread_start_rejects_the_unclaimed_inbound() {
+    assert_terminal_rejects_stale_client_before_claim(
+        "event-terminal-during-thread-start",
+        None,
+        "thread/start",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn terminal_epoch_loss_during_thread_resume_rejects_the_unclaimed_inbound() {
+    assert_terminal_rejects_stale_client_before_claim(
+        "event-terminal-during-thread-resume",
+        Some("thread-terminal-resume"),
+        "thread/resume",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -5169,7 +5349,7 @@ async fn full_scope_mailbox_atomically_rejects_the_overflow_with_a_busy_notice()
         namespace.clone(),
         policy,
         settings,
-        degraded_supervisor().await,
+        backing_off_supervisor().await,
         sink.clone(),
     )
     .await
@@ -5241,7 +5421,7 @@ async fn router_command_byte_budget_refuses_an_oversized_retained_item() {
         namespace.clone(),
         policy,
         settings,
-        degraded_supervisor().await,
+        backing_off_supervisor().await,
         Arc::new(RecordingSink::default()),
     )
     .await
@@ -5356,7 +5536,7 @@ async fn busy_actor_registry_rejects_a_new_scope_without_evicting_live_work() {
         namespace.clone(),
         policy,
         settings,
-        degraded_supervisor().await,
+        backing_off_supervisor().await,
         sink.clone(),
     )
     .await

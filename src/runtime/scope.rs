@@ -14,7 +14,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::channel::MediaKind as ResourceKind;
-use crate::codex::client::{AppServerClient, AppServerEvent, ThreadId, TurnId, TurnOutcome};
+use crate::codex::client::{
+    AppServerClient, AppServerEvent, ClientError, ThreadId, TurnId, TurnOutcome,
+};
+use crate::codex::rpc::RpcError;
 use crate::codex::types::{
     SandboxMode, ThreadResumeParams, ThreadStartParams, TurnSandboxPolicy, TurnStartParams,
     TurnStatus, UserInput,
@@ -222,10 +225,27 @@ pub enum ScopeFailureKind {
     Capacity,
 }
 
+enum ThreadPreparationError {
+    Scope(ScopeFailureKind),
+    Client(ClientError),
+}
+
+impl ThreadPreparationError {
+    fn scope_kind(self) -> ScopeFailureKind {
+        match self {
+            Self::Scope(kind) => kind,
+            Self::Client(_) => ScopeFailureKind::Client,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct SupervisorAccess {
     pub(crate) epoch: u64,
     pub(crate) client: Option<Arc<AppServerClient>>,
+    /// True once no future client can become ready. This carries no failure
+    /// reason so local paths or secrets cannot cross into actor diagnostics.
+    pub(crate) terminal: bool,
 }
 
 impl fmt::Debug for SupervisorAccess {
@@ -234,6 +254,7 @@ impl fmt::Debug for SupervisorAccess {
             .debug_struct("SupervisorAccess")
             .field("epoch", &self.epoch)
             .field("ready", &self.client.is_some())
+            .field("terminal", &self.terminal)
             .finish()
     }
 }
@@ -903,11 +924,20 @@ async fn process_batch(
 ) -> Result<(), ScopeFailureKind> {
     let batch = deduplicate_batch(batch);
     tracing::debug!(batch_messages = batch.len(), "scope batch ready");
-    let _active_permit = tokio::select! {
-        biased;
-        () = shutdown.cancelled() => return Err(ScopeFailureKind::Supervisor),
-        permit = active_turns.acquire_owned() => {
-            permit.map_err(|_| ScopeFailureKind::Capacity)?
+    let _active_permit = loop {
+        if supervisor.borrow().terminal {
+            reject_terminal_batch(store, sink.as_ref(), &batch).await?;
+            return Ok(());
+        }
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return Err(ScopeFailureKind::Supervisor),
+            permit = Arc::clone(&active_turns).acquire_owned() => {
+                break permit.map_err(|_| ScopeFailureKind::Capacity)?;
+            }
+            changed = supervisor.changed() => {
+                changed.map_err(|_| ScopeFailureKind::Supervisor)?;
+            }
         }
     };
     let mut eligible = Vec::with_capacity(batch.len());
@@ -947,11 +977,20 @@ async fn process_batch(
             }
             Err(kind) => return Err(kind),
         };
-    let (turn_epoch, client) = wait_for_client(&mut supervisor, shutdown).await?;
+    let (turn_epoch, client) = match wait_for_client(&mut supervisor, shutdown).await {
+        Ok(ready) => ready,
+        Err(ScopeFailureKind::Supervisor) if supervisor.borrow().terminal => {
+            reject_terminal_batch(store, sink.as_ref(), &batch).await?;
+            return Ok(());
+        }
+        Err(kind) => return Err(kind),
+    };
     set_state(state, ScopeState::StartingTurn);
-    let thread_id = tokio::select! {
+    let thread_result = tokio::select! {
         biased;
-        () = shutdown.cancelled() => return Err(ScopeFailureKind::Supervisor),
+        () = shutdown.cancelled() => {
+            Err(ThreadPreparationError::Scope(ScopeFailureKind::Supervisor))
+        }
         result = ensure_thread(
             scope,
             store,
@@ -962,16 +1001,42 @@ async fn process_batch(
             &fingerprint,
             policy_changed,
             contexts.is_some(),
-        ) => {
-            result?
-        }
+        ) => result,
     };
-    let mut subscription = tokio::select! {
+    let thread_id = match thread_result {
+        Ok(thread_id) => thread_id,
+        Err(ThreadPreparationError::Client(error)) if thread_failure_ends_epoch(&error) => {
+            return settle_preclaim_epoch_loss(
+                &mut supervisor,
+                turn_epoch,
+                shutdown,
+                store,
+                sink.as_ref(),
+                &batch,
+            )
+            .await;
+        }
+        Err(error) => return Err(error.scope_kind()),
+    };
+    let subscription_result = tokio::select! {
         biased;
         () = shutdown.cancelled() => return Err(ScopeFailureKind::Supervisor),
-        result = client.subscribe(thread_id.as_str().into()) => {
-            result.map_err(|_| ScopeFailureKind::Client)?
+        result = client.subscribe(thread_id.as_str().into()) => result,
+    };
+    let mut subscription = match subscription_result {
+        Ok(subscription) => subscription,
+        Err(error) if subscription_failure_ends_epoch(&error) => {
+            return settle_preclaim_epoch_loss(
+                &mut supervisor,
+                turn_epoch,
+                shutdown,
+                store,
+                sink.as_ref(),
+                &batch,
+            )
+            .await;
         }
+        Err(_) => return Err(ScopeFailureKind::Client),
     };
     let client_message_id = Uuid::new_v4().to_string();
     let mut live_transcripts = HashMap::with_capacity(batch.len());
@@ -1639,6 +1704,64 @@ async fn reject_item(
     Ok(())
 }
 
+async fn reject_terminal_batch(
+    store: &StoreHandle,
+    sink: &dyn DurableReplySink,
+    batch: &[TurnInbound],
+) -> Result<(), ScopeFailureKind> {
+    for item in batch {
+        reject_item(store, sink, &item.inbound, InboundRejectionKind::Internal).await?;
+    }
+    Ok(())
+}
+
+fn thread_failure_ends_epoch(error: &ClientError) -> bool {
+    !error.turn_start_definitely_not_applied()
+        || matches!(
+            error,
+            ClientError::RouterClosed(_) | ClientError::RouterTaskFailed(_)
+        )
+}
+
+fn subscription_failure_ends_epoch(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::Rpc(RpcError::ConnectionLost(_))
+            | ClientError::RouterClosed(_)
+            | ClientError::RouterTaskFailed(_)
+    )
+}
+
+async fn settle_preclaim_epoch_loss(
+    supervisor: &mut watch::Receiver<SupervisorAccess>,
+    failed_epoch: u64,
+    shutdown: &CancellationToken,
+    store: &StoreHandle,
+    sink: &dyn DurableReplySink,
+    batch: &[TurnInbound],
+) -> Result<(), ScopeFailureKind> {
+    loop {
+        let access = supervisor.borrow().clone();
+        if access.terminal {
+            reject_terminal_batch(store, sink, batch).await?;
+            return Ok(());
+        }
+        if access.client.is_some() && access.epoch != failed_epoch {
+            // Preserve the existing replay contract for a transient restart.
+            // The batch was never claimed, so a later intake replay remains
+            // authoritative rather than retrying an uncertain thread RPC.
+            return Err(ScopeFailureKind::Client);
+        }
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return Err(ScopeFailureKind::Supervisor),
+            changed = supervisor.changed() => {
+                changed.map_err(|_| ScopeFailureKind::Supervisor)?;
+            }
+        }
+    }
+}
+
 async fn prepare_workspace(
     scope: &ScopeKey,
     store: &StoreHandle,
@@ -1688,6 +1811,9 @@ async fn wait_for_client(
         if let Some(client) = access.client {
             return Ok((access.epoch, client));
         }
+        if access.terminal {
+            return Err(ScopeFailureKind::Supervisor);
+        }
         tokio::select! {
             biased;
             () = shutdown.cancelled() => return Err(ScopeFailureKind::Supervisor),
@@ -1725,11 +1851,11 @@ async fn ensure_thread(
     fingerprint: &str,
     policy_changed: bool,
     context_tools: bool,
-) -> Result<String, ScopeFailureKind> {
+) -> Result<String, ThreadPreparationError> {
     if let Some(active) = store
         .active_thread(scope)
         .await
-        .map_err(|_| ScopeFailureKind::Store)?
+        .map_err(|_| ThreadPreparationError::Scope(ScopeFailureKind::Store))?
     {
         let required_version = if context_tools {
             CONTEXT_TOOLS_VERSION
@@ -1737,7 +1863,8 @@ async fn ensure_thread(
             0
         };
         if active.context_tools_version == required_version {
-            let rpc_cwd = revalidate_workspace(policy, cwd, fingerprint)?;
+            let rpc_cwd = revalidate_workspace(policy, cwd, fingerprint)
+                .map_err(ThreadPreparationError::Scope)?;
             let mut params = ThreadResumeParams::new(&active.codex_thread_id);
             params.overrides.cwd = Some(rpc_cwd);
             params.overrides.sandbox = Some(settings.sandbox);
@@ -1746,24 +1873,25 @@ async fn ensure_thread(
             let thread = client
                 .resume_thread(params)
                 .await
-                .map_err(|_| ScopeFailureKind::Client)?;
+                .map_err(ThreadPreparationError::Client)?;
             if policy_changed {
                 store
                     .upsert_scope(scope, cwd, fingerprint)
                     .await
-                    .map_err(|_| ScopeFailureKind::Store)?;
+                    .map_err(|_| ThreadPreparationError::Scope(ScopeFailureKind::Store))?;
             }
             return Ok(thread.id);
         }
         store
             .archive_active_thread(scope)
             .await
-            .map_err(|_| ScopeFailureKind::Store)?;
+            .map_err(|_| ThreadPreparationError::Scope(ScopeFailureKind::Store))?;
         let _ = client
             .release_thread(&ThreadId::from(active.codex_thread_id.as_str()))
             .await;
     }
-    let rpc_cwd = revalidate_workspace(policy, cwd, fingerprint)?;
+    let rpc_cwd =
+        revalidate_workspace(policy, cwd, fingerprint).map_err(ThreadPreparationError::Scope)?;
     let params = ThreadStartParams {
         cwd: Some(rpc_cwd),
         sandbox: Some(settings.sandbox),
@@ -1775,7 +1903,7 @@ async fn ensure_thread(
     let thread = client
         .start_thread(params)
         .await
-        .map_err(|_| ScopeFailureKind::Client)?;
+        .map_err(ThreadPreparationError::Client)?;
     store
         .record_active_thread_with_context_tools(
             scope,
@@ -1787,12 +1915,12 @@ async fn ensure_thread(
             },
         )
         .await
-        .map_err(|_| ScopeFailureKind::Store)?;
+        .map_err(|_| ThreadPreparationError::Scope(ScopeFailureKind::Store))?;
     if policy_changed {
         store
             .upsert_scope(scope, cwd, fingerprint)
             .await
-            .map_err(|_| ScopeFailureKind::Store)?;
+            .map_err(|_| ThreadPreparationError::Scope(ScopeFailureKind::Store))?;
     }
     Ok(thread.id)
 }
