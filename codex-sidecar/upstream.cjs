@@ -143,18 +143,25 @@ async function terminateChild(child, graceMs) {
   if (child.stdin && !child.stdin.destroyed) {
     child.stdin.end();
   }
-  const exited = once(child, "exit").then(() => true, () => true);
-  if (await waitUntilOrTimeout(exited, graceMs, false)) {
-    closeChildPipes(child);
-    return;
-  }
+  const exitWait = new AbortController();
+  const exited = once(child, "exit", { signal: exitWait.signal }).then(() => true, () => true);
   try {
-    child.kill("SIGKILL");
-  } catch {
-    // The outer Rust process-group/Job owner remains authoritative.
+    if (await waitUntilOrTimeout(exited, graceMs, false)) {
+      closeChildPipes(child);
+      return;
+    }
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // The outer Rust process-group/Job owner remains authoritative.
+    }
+    await waitUntilOrTimeout(exited, Math.min(graceMs, 1_000), false);
+    closeChildPipes(child);
+  } finally {
+    // A child that ignores SIGKILL must not retain the waiter's exit/error
+    // listeners after the hard cleanup bound expires.
+    exitWait.abort();
   }
-  await waitUntilOrTimeout(exited, Math.min(graceMs, 1_000), false);
-  closeChildPipes(child);
 }
 
 function closeChildPipes(child) {
