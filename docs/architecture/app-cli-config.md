@@ -37,7 +37,8 @@
 8. 启动 `AppServerSupervisor`；
 9. 启动 outbox sink/pump；
 10. 启动带附件的 `Router`；
-11. 进入 `drive_inbound`。
+11. 启动 attachment runtime reconcile actor；
+12. 进入 `drive_inbound`。
 
 后创建的组件依赖前面的组件。任何中间失败必须停止已创建组件，不能遗留 app-server 子进程
 或 store writer。
@@ -47,10 +48,11 @@
 生产退出顺序不是简单逆序：
 
 1. Lark transport 停止生产新事件；
-2. Router/ScopeActor 完成有限 finalization；
-3. outbox pump 停止；
-4. attachment cache 被 drop，释放实例锁；
-5. Store writer flush/stop。
+2. attachment runtime reconcile actor cancel 并有界 join；
+3. Router/ScopeActor 完成有限 finalization，并执行 terminal reconcile；
+4. outbox pump 停止；
+5. attachment cache 被 drop，释放实例锁；
+6. Store writer flush/stop。
 
 这个顺序保证 actor 在退出前仍能写 outbox，pump 在 actor 完成前仍可投递，store 最后关闭。
 

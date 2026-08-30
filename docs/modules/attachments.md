@@ -62,9 +62,15 @@ reconcile 使用可恢复目录迭代器，每次只处理有界批次：
 - 清理 stale lease；
 - 从上次游标继续，重复调用后收敛。
 
+启动装配先执行一个 fail-closed 批次。Router 成功启动后，runtime reconcile actor 会立即接续
+同一游标，逐批推进到 EOF，完成至少一轮目录扫描；此后每小时启动新一轮。每个批次仍只保留
+`reconcile_batch` 个候选，不会把全目录 collect 到内存。运行期单轮失败只记录告警并等待下次
+周期，不会终止 bridge；actor shutdown 使用 cancellation 和有界 join，超时 abort async waiter，
+已开始的 bounded pass 会由独立 Tokio task 安全收口；其中进入 blocking pool 的 mutation 继续持有
+owned cache/instance-lock guard 直到结束。
+
 ## 当前限制
 
 - 每消息资源数、单文件大小、单 turn 总字节均为编译时上限；
 - 最后一个附件下载后才可能发现 turn 总预算超限；
-- 启动装配当前只执行一个 reconcile 批次，极端目录需要后续 pass；
 - 故障文件系统上的单次阻塞 I/O 没有严格 wall-clock 上限。

@@ -11,8 +11,8 @@
 ## 锁层级
 
 1. OS advisory instance lock：阻止两个进程共用缓存；
-2. cache mutation mutex：串行 fetch/install/gc/reconcile 的破坏性对；
-3. reconcile iterator mutex：保护可恢复目录游标；
+2. reconcile call mutex：串行推进可恢复目录游标，外层调用不并发；
+3. cache mutation mutex：串行 fetch/install/gc/reconcile 的破坏性对；
 4. SQLite 单 writer：串行 row/lease 事务。
 
 持有顺序必须稳定，不能在 store 回调中反向获取 cache lock。
@@ -62,6 +62,18 @@ blocking 文件操作在 Tokio blocking pool 中执行，并携带 owned mutex g
 
 reconcile 不做一次性全目录 collect。`ReadDir` 游标每次消费有限条目后放回 cache，下一次调用
 继续。候选在真正修改前要重新验证，因为目录扫描和 apply 之间状态可能变化。
+
+生产 runtime 只持有一个 reconcile actor。它启动后立即连续调用有界 pass，直到
+`completed_cycle` 表示本轮看到 EOF，再等待一小时启动下一轮。手工/terminal reconcile 与 actor
+仍由同一个 reconcile call mutex 互斥；扫描阶段不持有 mutation mutex，apply 阶段才按既有顺序
+获取 mutation mutex 并访问 store，因此不会在 store 回调中反向取 cache lock。
+
+运行期 reconcile 错误是非致命的，失败轮等待下个周期重试。每个 bounded pass 由独立 Tokio task
+持有；退出先 cancel actor，并在固定 grace 内 join，取消 actor 只 detach 正在收口的 pass，不会
+abort 其 store/filesystem 顺序。terminal reconcile 通过同一个 reconcile call mutex 排在它之后。
+若 filesystem mutation 已进入 blocking pool，owned mutation mutex 和 OS instance-lock guard 会保留
+到该工作结束，所以异步取消不会暴露半完成状态。单次故障 filesystem I/O 的 wall-clock 仍不作
+硬保证。
 
 ## 扩展检查表
 

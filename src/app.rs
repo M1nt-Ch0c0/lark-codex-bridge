@@ -23,7 +23,10 @@ use crate::lark::credentials::{LarkCredentials, load_credentials};
 use crate::lark::http::LarkHttp;
 use crate::lark::token::TenantTokenProvider;
 use crate::outbox::{OutboxPump, OutboxPumpConfig, OutboxReplySink};
-use crate::runtime::attachments::{AttachmentCache, AttachmentLimits, ChannelResourceDownloader};
+use crate::runtime::attachments::{
+    AttachmentCache, AttachmentLimits, AttachmentReconcileConfig, AttachmentReconcileRuntime,
+    ChannelResourceDownloader,
+};
 use crate::runtime::context::ContextRegistry;
 use crate::runtime::intake::{DurableIntake, TenantNamespace};
 use crate::runtime::policy::AccessPolicy;
@@ -294,6 +297,10 @@ where
         stop_store_after_error(store).await;
         return Err(AppError::Router);
     };
+    let attachment_reconcile = AttachmentReconcileRuntime::start(
+        Arc::clone(&attachment_cache),
+        AttachmentReconcileConfig::default(),
+    );
     tracing::info!("bridge runtime ready");
 
     let summary = drive_inbound(&router, inbound, shutdown).await;
@@ -304,9 +311,11 @@ where
         "bridge shutdown started"
     );
 
-    // Stop producers first, then settle scope actors and their durable
-    // projections before stopping the delivery pump and store writer.
+    // Stop producers and periodic maintenance first, then settle scope actors
+    // and their durable projections before stopping the delivery pump and
+    // store writer. Router shutdown performs the final serialized reconcile.
     source.shutdown().await;
+    attachment_reconcile.shutdown().await;
     let router_result = router.shutdown().await;
     outbound.shutdown().await;
     drop(attachment_cache);
