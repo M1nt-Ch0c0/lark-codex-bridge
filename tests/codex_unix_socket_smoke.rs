@@ -175,8 +175,7 @@ async fn real_exact_binary_exposes_websocket_framing_and_safe_unix_socket_bounda
     drop(stale);
 
     let mut child = spawn_server(&binary, &primary_home, &socket_path)?;
-    wait_until_ready(&mut child, &socket_path).await?;
-    let live_metadata = secure_socket_metadata(&socket_path, parent.uid())?;
+    let live_metadata = wait_until_ready(&mut child, &socket_path, parent.uid()).await?;
     ensure!(
         (live_metadata.dev(), live_metadata.ino()) != (stale_metadata.dev(), stale_metadata.ino()),
         "exact app-server did not replace the stale socket inode"
@@ -197,8 +196,7 @@ async fn real_exact_binary_exposes_websocket_framing_and_safe_unix_socket_bounda
     );
 
     let mut recovered = spawn_server(&binary, &alternate_home, &socket_path)?;
-    wait_until_ready(&mut recovered, &socket_path).await?;
-    let recovered_metadata = secure_socket_metadata(&socket_path, parent.uid())?;
+    let recovered_metadata = wait_until_ready(&mut recovered, &socket_path, parent.uid()).await?;
     ensure!(
         (recovered_metadata.dev(), recovered_metadata.ino())
             != (crashed_metadata.dev(), crashed_metadata.ino()),
@@ -209,8 +207,8 @@ async fn real_exact_binary_exposes_websocket_framing_and_safe_unix_socket_bounda
     let graceful_cleanup = classify_graceful_cleanup(&socket_path, &recovered_metadata).await?;
     if graceful_cleanup == GracefulCleanup::Stale {
         let mut cleanup_recovery = spawn_server(&binary, &collision_home, &socket_path)?;
-        wait_until_ready(&mut cleanup_recovery, &socket_path).await?;
-        let cleanup_metadata = secure_socket_metadata(&socket_path, parent.uid())?;
+        let cleanup_metadata =
+            wait_until_ready(&mut cleanup_recovery, &socket_path, parent.uid()).await?;
         ensure!(
             (cleanup_metadata.dev(), cleanup_metadata.ino())
                 != (recovered_metadata.dev(), recovered_metadata.ino()),
@@ -334,19 +332,30 @@ async fn expect_start_refused(
     Ok(())
 }
 
-async fn wait_until_ready(child: &mut ChildGuard, socket_path: &Path) -> Result<()> {
+async fn wait_until_ready(
+    child: &mut ChildGuard,
+    socket_path: &Path,
+    expected_uid: u32,
+) -> Result<fs::Metadata> {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     loop {
         child.ensure_running()?;
-        if fs::symlink_metadata(socket_path).is_ok_and(|metadata| metadata.file_type().is_socket())
-            && UnixStream::connect(socket_path).await.is_ok()
-        {
-            return Ok(());
+        if let Ok(metadata) = secure_socket_metadata(socket_path, expected_uid) {
+            if UnixStream::connect(socket_path).await.is_ok() {
+                return Ok(metadata);
+            }
         }
-        ensure!(
-            Instant::now() < deadline,
-            "exact Unix listener did not become ready before the deadline"
-        );
+        if Instant::now() >= deadline {
+            // Preserve the precise type/owner/mode diagnostic when the socket
+            // exists but its asynchronous post-bind hardening never settles.
+            match secure_socket_metadata(socket_path, expected_uid) {
+                Ok(_) => bail!("exact Unix listener did not become ready before the deadline"),
+                Err(error) => {
+                    return Err(error)
+                        .context("exact Unix listener did not become ready before the deadline");
+                }
+            }
+        }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
