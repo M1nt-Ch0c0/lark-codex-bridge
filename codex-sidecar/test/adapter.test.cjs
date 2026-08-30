@@ -44,7 +44,7 @@ function isContractError(error) {
 for (const version of ["0.149.0", "0.151.0"]) {
   test(`${version} rejects unpromoted local fields and enum drift`, () => {
     const adapter = adapterForVersion(version);
-    for (const [method, params] of [
+    const invalid = [
       ["thread/list", { isPinned: true }],
       ["thread/list", { sortKey: "future_sort" }],
       ["thread/list", { sourceKinds: ["futureSource"] }],
@@ -58,7 +58,8 @@ for (const version of ["0.149.0", "0.151.0"]) {
       ["turn/start", { threadId: "thread-1", input: [], summary: "future" }],
       ["turn/start", { threadId: "thread-1", input: [], turnTrigger: "provider-only" }],
       ["turn/start", { threadId: "thread-1", input: [], toolOutput: { secret: true } }],
-    ]) {
+    ];
+    for (const [method, params] of invalid) {
       assert.throws(() => adapter.toUpstreamRequest(method, params), isContractError);
     }
   });
@@ -600,6 +601,41 @@ test("unreviewed provider notification methods are filtered rather than renamed"
   ]) {
     assert.equal(adapter.fromUpstreamNotification(method, { secret: "must-not-cross" }), null);
   }
+});
+
+test("inherited Object prototype names never become promoted methods", () => {
+  const adapter = adapterForVersion("0.151.0");
+  for (const method of ["constructor", "toString", "valueOf", "hasOwnProperty"]) {
+    assert.throws(
+      () => adapter.toUpstreamRequest(method, {}),
+      (error) => error instanceof SidecarError && error.code === "unsupported_method",
+    );
+    assert.equal(adapter.fromUpstreamNotification(method, { secret: "must-not-cross" }), null);
+    assert.equal(adapter.fromUpstreamServerRequest(method, { secret: "must-not-cross" }), null);
+    assert.throws(
+      () => adapter.toUpstreamServerResponse(method, {}, undefined),
+      (error) => error instanceof SidecarError && error.code === "unsupported_method",
+    );
+  }
+});
+
+test("record projections preserve __proto__ as ordinary data", () => {
+  const adapter = adapterForVersion("0.151.0");
+  const additionalContext = JSON.parse(
+    '{"__proto__":{"kind":"untrusted","value":"reviewed"}}',
+  );
+  const mapped = adapter.toUpstreamRequest("turn/steer", {
+    threadId: "thread-1",
+    expectedTurnId: "turn-1",
+    input: [],
+    additionalContext,
+  });
+  assert.equal(Object.hasOwn(mapped.params.additionalContext, "__proto__"), true);
+  assert.deepEqual(mapped.params.additionalContext.__proto__, {
+    kind: "untrusted",
+    value: "reviewed",
+  });
+  assert.equal(Object.getPrototypeOf(mapped.params.additionalContext), Object.prototype);
 });
 
 test("0.151 initialize opts out of every additive unreviewed notification", () => {

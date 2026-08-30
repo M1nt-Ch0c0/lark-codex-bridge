@@ -58,7 +58,7 @@ pub enum SidecarSpawnFailure {
 
 impl SidecarSpawnFailure {
     pub(crate) fn classify(error: &std::io::Error) -> Self {
-        if sidecar_spawn_failure_is_retryable(error) {
+        if spawn_failure_is_retryable(error) {
             Self::ResourceUnavailable
         } else {
             Self::Failed
@@ -71,7 +71,7 @@ impl SidecarSpawnFailure {
     }
 }
 
-fn sidecar_spawn_failure_is_retryable(error: &std::io::Error) -> bool {
+pub(crate) fn spawn_failure_is_retryable(error: &std::io::Error) -> bool {
     if matches!(
         error.kind(),
         std::io::ErrorKind::WouldBlock
@@ -81,11 +81,11 @@ fn sidecar_spawn_failure_is_retryable(error: &std::io::Error) -> bool {
     ) {
         return true;
     }
-    sidecar_spawn_raw_os_error_is_retryable(error.raw_os_error())
+    spawn_raw_os_error_is_retryable(error.raw_os_error())
 }
 
 #[cfg(unix)]
-fn sidecar_spawn_raw_os_error_is_retryable(code: Option<i32>) -> bool {
+fn spawn_raw_os_error_is_retryable(code: Option<i32>) -> bool {
     matches!(
         code,
         Some(libc::EAGAIN | libc::EMFILE | libc::ENFILE | libc::ENOMEM)
@@ -93,7 +93,7 @@ fn sidecar_spawn_raw_os_error_is_retryable(code: Option<i32>) -> bool {
 }
 
 #[cfg(not(unix))]
-const fn sidecar_spawn_raw_os_error_is_retryable(_code: Option<i32>) -> bool {
+const fn spawn_raw_os_error_is_retryable(_code: Option<i32>) -> bool {
     false
 }
 

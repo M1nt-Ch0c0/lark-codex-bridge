@@ -5,7 +5,9 @@
 //! exchange before transferring the remaining stable domain JSON-RPC stream to
 //! the existing transport and RPC actors.
 
-use std::{collections::BTreeSet, fmt, path::PathBuf, process::Stdio, time::Duration};
+use std::{
+    collections::BTreeSet, ffi::OsString, fmt, path::PathBuf, process::Stdio, time::Duration,
+};
 
 #[cfg(windows)]
 use process_wrap::tokio::JobObject;
@@ -52,6 +54,24 @@ pub const REQUIRED_SIDECAR_CAPABILITIES: &[&str] = &[
     "priority-control-lane",
     "stable-domain-jsonrpc",
 ];
+
+fn inherited_sidecar_environment() -> Vec<(&'static str, OsString)> {
+    let mut selected = Vec::new();
+    if let Some(value) = std::env::var_os("PATH") {
+        selected.push(("PATH", value));
+    }
+    #[cfg(unix)]
+    if let Some(value) = std::env::var_os("HOME") {
+        selected.push(("HOME", value));
+    }
+    #[cfg(windows)]
+    for name in ["PATHEXT", "SystemRoot", "USERPROFILE", "WINDIR"] {
+        if let Some(value) = std::env::var_os(name) {
+            selected.push((name, value));
+        }
+    }
+    selected
+}
 
 /// Process and bootstrap configuration. `Debug` never prints configured paths
 /// or adapter arguments.
@@ -333,7 +353,6 @@ pub async fn spawn_codex_sidecar(
 ) -> Result<CodexSidecarProcess, ProcessError> {
     config.validate()?;
     let mut command = Command::new(&config.node_binary);
-    let search_path = std::env::var_os("PATH");
     command
         .arg(&config.entrypoint)
         .stdin(Stdio::piped())
@@ -341,14 +360,8 @@ pub async fn spawn_codex_sidecar(
         .stderr(Stdio::piped())
         .env_clear()
         .env("NO_COLOR", "1");
-    if let Some(search_path) = search_path {
-        command.env("PATH", search_path);
-    }
-    #[cfg(windows)]
-    for name in ["PATHEXT", "SystemRoot", "WINDIR"] {
-        if let Some(value) = std::env::var_os(name) {
-            command.env(name, value);
-        }
+    for (name, value) in inherited_sidecar_environment() {
+        command.env(name, value);
     }
 
     let mut command = TokioCommandWrap::from(command);
@@ -394,7 +407,7 @@ pub async fn spawn_codex_sidecar(
         };
         write_frame(&mut stdin, &configure, config.max_frame_bytes).await?;
         let response: ConfigureResponse = read_frame(&mut stdout, config.max_frame_bytes).await?;
-        validate_configure_response(response, &id, config)
+        validate_configure_response(response, &id)
     })
     .await;
 
@@ -507,7 +520,6 @@ struct ConfigureData {
 fn validate_configure_response(
     response: ConfigureResponse,
     expected_id: &str,
-    config: &CodexSidecarConfig,
 ) -> Result<Version, ProcessError> {
     if response.v != CODEX_SIDECAR_VERSION
         || response.kind != "response"
@@ -539,9 +551,6 @@ fn validate_configure_response(
     }
     if !SUPPORTED_SIDECAR_CODEX_VERSIONS.contains(&data.upstream_version.as_str()) {
         return Err(ProcessError::UnsupportedSidecarVersion { found: version });
-    }
-    if config.max_frame_bytes > CODEX_SIDECAR_FRAME_BYTES {
-        return Err(ProcessError::InvalidSidecarConfig);
     }
     Ok(version)
 }
@@ -638,6 +647,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn inherited_environment_is_an_explicit_home_aware_allowlist() {
+        let inherited = inherited_sidecar_environment();
+        #[cfg(unix)]
+        let allowed = ["HOME", "PATH"];
+        #[cfg(windows)]
+        let allowed = ["PATH", "PATHEXT", "SystemRoot", "USERPROFILE", "WINDIR"];
+        #[cfg(not(any(unix, windows)))]
+        let allowed = ["PATH"];
+        assert!(
+            inherited.iter().all(|(name, _)| allowed.contains(name)),
+            "the sidecar environment must remain a fixed allowlist"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            inherited
+                .iter()
+                .find(|(name, _)| *name == "HOME")
+                .map(|(_, value)| value),
+            std::env::var_os("HOME").as_ref()
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            inherited
+                .iter()
+                .find(|(name, _)| *name == "USERPROFILE")
+                .map(|(_, value)| value),
+            std::env::var_os("USERPROFILE").as_ref()
+        );
+    }
+
     #[tokio::test]
     async fn spawn_error_redacts_the_configured_node_path_and_os_text() {
         let marker = format!("bridge-sensitive-node-path-{}", std::process::id());
@@ -707,7 +747,6 @@ mod tests {
 
     #[test]
     fn configure_failures_are_closed_typed_classifications() {
-        let config = CodexSidecarConfig::default();
         let retryable = ConfigureResponse {
             v: CODEX_SIDECAR_VERSION,
             kind: "response".to_owned(),
@@ -717,7 +756,7 @@ mod tests {
             error: Some(SidecarBootstrapFailure::VersionProbeTimeout),
         };
         assert!(matches!(
-            validate_configure_response(retryable, "configure-test", &config),
+            validate_configure_response(retryable, "configure-test"),
             Err(ProcessError::SidecarBootstrapRejected {
                 failure: SidecarBootstrapFailure::VersionProbeTimeout
             })

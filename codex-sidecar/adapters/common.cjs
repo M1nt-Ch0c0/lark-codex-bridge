@@ -19,24 +19,26 @@ class UnsupportedMethodError extends SidecarError {
 
 function projectorFor(projectors, method) {
   const projector = projectors[method];
-  if (typeof projector !== "function") {
+  if (!Object.hasOwn(projectors, method) || typeof projector !== "function") {
     throw new UnsupportedMethodError();
   }
   return projector;
+}
+
+function projectorMap(source) {
+  return Object.freeze(Object.assign(Object.create(null), source));
 }
 
 // Version modules own every promoted method and every version-specific
 // projection. This helper only validates envelopes and dispatches to those
 // explicit maps; there is deliberately no identity or catch-all path.
 function createAdapter(options) {
-  const requestProjectors = Object.freeze({ ...options.requestProjectors });
-  const responseProjectors = Object.freeze({ ...options.responseProjectors });
-  const notificationProjectors = Object.freeze({ ...options.notificationProjectors });
-  const serverRequestProjectors = Object.freeze({ ...options.serverRequestProjectors });
-  const serverResponseProjectors = Object.freeze({ ...options.serverResponseProjectors });
-  const localNotificationProjectors = Object.freeze({
-    ...options.localNotificationProjectors,
-  });
+  const requestProjectors = projectorMap(options.requestProjectors);
+  const responseProjectors = projectorMap(options.responseProjectors);
+  const notificationProjectors = projectorMap(options.notificationProjectors);
+  const serverRequestProjectors = projectorMap(options.serverRequestProjectors);
+  const serverResponseProjectors = projectorMap(options.serverResponseProjectors);
+  const localNotificationProjectors = projectorMap(options.localNotificationProjectors);
 
   return Object.freeze({
     upstreamVersion: options.upstreamVersion,
@@ -79,7 +81,7 @@ function createAdapter(options) {
     fromUpstreamNotification(method, params) {
       validateMethod(method);
       const projector = notificationProjectors[method];
-      if (typeof projector !== "function") {
+      if (!Object.hasOwn(notificationProjectors, method) || typeof projector !== "function") {
         // Unreviewed upstream notifications are filtered inside the sidecar.
         // Neither their provider payload nor their method name crosses Rust's
         // stable-domain boundary.
@@ -91,7 +93,7 @@ function createAdapter(options) {
     fromUpstreamServerRequest(method, params) {
       validateMethod(method);
       const projector = serverRequestProjectors[method];
-      if (typeof projector !== "function") {
+      if (!Object.hasOwn(serverRequestProjectors, method) || typeof projector !== "function") {
         return null;
       }
       const projected = projector(params);

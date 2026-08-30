@@ -15,6 +15,32 @@ const {
 
 const SIDECAR_ROOT = path.resolve(__dirname, "..");
 
+async function cleanupRunning(running) {
+  if (running.child.exitCode === null && running.child.signalCode === null) {
+    if (!running.child.stdin.destroyed && running.child.stdin.writable) {
+      running.child.stdin.end();
+    }
+    try {
+      await waitForExit(running.child, 1_000);
+    } catch {
+      running.child.kill("SIGKILL");
+      await waitForExit(running.child, 1_000).catch(() => {});
+    }
+  }
+  fs.rmSync(running.directory, { recursive: true, force: true });
+}
+
+async function waitForMarker(running, predicate, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (readMarker(running.marker).some(predicate)) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("timed out waiting for marker evidence");
+}
+
 async function receiveUntil(inbox, predicate, maximum = 12) {
   const observed = [];
   for (let index = 0; index < maximum; index += 1) {
@@ -304,7 +330,7 @@ async function expectSidecarFailure(running, code) {
 for (const version of ["0.149.0", "0.151.0"]) {
   test(`stable RPC, notifications, and reverse requests work through ${version}`, async (t) => {
     const running = await configureSidecar({ version });
-    t.after(() => fs.rmSync(running.directory, { recursive: true, force: true }));
+    t.after(() => cleanupRunning(running));
     assert.equal(running.hello.maxFrameBytes, 33_554_432);
     assert.equal(running.response.ok, true);
     assert.equal(running.response.data.upstreamVersion, version);
@@ -365,7 +391,7 @@ for (const version of ["0.149.0", "0.151.0"]) {
 
   test(`every promoted request round-trips through the ${version} process boundary`, async (t) => {
     const running = await configureSidecar({ version, mode: "parity" });
-    t.after(() => fs.rmSync(running.directory, { recursive: true, force: true }));
+    t.after(() => cleanupRunning(running));
     const exchanges = [
       ["initialize", { clientInfo: { name: "bridge", version: "test" } }],
       ["thread/start", {}],
@@ -430,12 +456,7 @@ for (const version of ["0.149.0", "0.151.0"]) {
 
   test(`every promoted reverse request round-trips through the ${version} process boundary`, async (t) => {
     const running = await configureSidecar({ version, mode: "reverse-parity" });
-    t.after(() => {
-      if (running.child.exitCode === null && running.child.signalCode === null) {
-        running.child.kill("SIGKILL");
-      }
-      fs.rmSync(running.directory, { recursive: true, force: true });
-    });
+    t.after(() => cleanupRunning(running));
     await initialize(running);
 
     const expected = expectedReverseRequests();
@@ -484,12 +505,7 @@ for (const version of ["0.149.0", "0.151.0"]) {
 
   test(`every promoted notification projects through the ${version} process boundary`, async (t) => {
     const running = await configureSidecar({ version, mode: "notification-parity" });
-    t.after(() => {
-      if (running.child.exitCode === null && running.child.signalCode === null) {
-        running.child.kill("SIGKILL");
-      }
-      fs.rmSync(running.directory, { recursive: true, force: true });
-    });
+    t.after(() => cleanupRunning(running));
     await initialize(running);
 
     const expected = expectedNotifications(version);
@@ -549,10 +565,13 @@ for (const version of ["0.149.0", "0.151.0"]) {
 
 test("pending capacity fails before write and never replays a mutation", async (t) => {
   const running = await configureSidecar({ mode: "hold", maxPending: 1 });
-  t.after(() => fs.rmSync(running.directory, { recursive: true, force: true }));
+  t.after(() => cleanupRunning(running));
   assert.equal(running.response.ok, true);
   send(running.child, { id: "first", method: "turn/start", params: { threadId: "thread", input: [] } });
-  await new Promise((resolve) => setTimeout(resolve, 100));
+  await waitForMarker(
+    running,
+    (entry) => entry.event === "request" && entry.method === "turn/start",
+  );
   send(running.child, { id: "second", method: "turn/start", params: { threadId: "thread", input: [] } });
   const rejected = await receiveUntil(running.stdout, (value) => value.id === "second");
   assert.equal(rejected.value.error.code, -32020);
@@ -567,7 +586,7 @@ test("pending capacity fails before write and never replays a mutation", async (
 
 test("pending capacity is shared by outbound and reverse correlations", async (t) => {
   const running = await configureSidecar({ mode: "hold-with-approval", maxPending: 2 });
-  t.after(() => fs.rmSync(running.directory, { recursive: true, force: true }));
+  t.after(() => cleanupRunning(running));
   send(running.child, {
     id: "outbound-held",
     method: "turn/start",
@@ -606,7 +625,7 @@ test("pending capacity is shared by outbound and reverse correlations", async (t
 
 test("explicit sidecar shutdown is correlated and bounded", async (t) => {
   const running = await configureSidecar();
-  t.after(() => fs.rmSync(running.directory, { recursive: true, force: true }));
+  t.after(() => cleanupRunning(running));
   send(running.child, { id: "shutdown-local", method: "sidecar/shutdown", params: {} });
   const response = await running.stdout.nextJson();
   assert.deepEqual(response, { id: "shutdown-local", result: {} });
@@ -617,7 +636,7 @@ test("explicit sidecar shutdown is correlated and bounded", async (t) => {
 
 test("sidecar shutdown rejects unknown params before acknowledging", async (t) => {
   const running = await configureSidecar();
-  t.after(() => fs.rmSync(running.directory, { recursive: true, force: true }));
+  t.after(() => cleanupRunning(running));
   send(running.child, {
     id: "shutdown-invalid-params",
     method: "sidecar/shutdown",
@@ -628,7 +647,7 @@ test("sidecar shutdown rejects unknown params before acknowledging", async (t) =
 
 test("sidecar shutdown rejects an active local correlation", async (t) => {
   const running = await configureSidecar({ mode: "hold" });
-  t.after(() => fs.rmSync(running.directory, { recursive: true, force: true }));
+  t.after(() => cleanupRunning(running));
   send(running.child, {
     id: "shutdown-active",
     method: "thread/list",
@@ -640,7 +659,7 @@ test("sidecar shutdown rejects an active local correlation", async (t) => {
 
 test("sidecar shutdown rejects a retired local correlation", async (t) => {
   const running = await configureSidecar();
-  t.after(() => fs.rmSync(running.directory, { recursive: true, force: true }));
+  t.after(() => cleanupRunning(running));
   send(running.child, { id: "shutdown-retired", method: "future/write", params: {} });
   assert.deepEqual(await running.stdout.nextJson(), {
     id: "shutdown-retired",
@@ -652,7 +671,7 @@ test("sidecar shutdown rejects a retired local correlation", async (t) => {
 
 test("sidecar shutdown rejects an active server-local correlation", async (t) => {
   const running = await configureSidecar({ mode: "reverse-parity" });
-  t.after(() => fs.rmSync(running.directory, { recursive: true, force: true }));
+  t.after(() => cleanupRunning(running));
   await initialize(running);
   const request = await running.stdout.nextJson();
   assert.equal(Object.hasOwn(request, "id"), true);
@@ -663,7 +682,7 @@ test("sidecar shutdown rejects an active server-local correlation", async (t) =>
 
 test("sidecar shutdown rejects a retired server-local correlation", async (t) => {
   const running = await configureSidecar({ mode: "reverse-parity" });
-  t.after(() => fs.rmSync(running.directory, { recursive: true, force: true }));
+  t.after(() => cleanupRunning(running));
   await initialize(running);
   const request = await running.stdout.nextJson();
   assert.equal(Object.hasOwn(request, "id"), true);

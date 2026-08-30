@@ -17,6 +17,43 @@ function delay(milliseconds) {
   });
 }
 
+function shutdownError() {
+  return new SidecarError("shutdown_requested", "sidecar shutdown was requested");
+}
+
+function parseVersionOutput(output) {
+  return (
+    SUPPORTED_UPSTREAM_VERSIONS.find(
+      (version) =>
+        output === `codex-cli ${version}` ||
+        output === `codex-cli ${version}\n` ||
+        output === `codex-cli ${version}\r\n`,
+    ) ?? null
+  );
+}
+
+async function raceWithAbort(promise, signal) {
+  if (signal === undefined) {
+    return { aborted: false, value: await promise };
+  }
+  if (signal.aborted) {
+    return { aborted: true, value: undefined };
+  }
+  let onAbort;
+  const aborted = new Promise((resolve) => {
+    onAbort = () => resolve({ aborted: true, value: undefined });
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([
+      promise.then((value) => ({ aborted: false, value })),
+      aborted,
+    ]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
 async function waitUntilOrTimeout(promise, milliseconds, timeoutValue) {
   let timer;
   try {
@@ -172,7 +209,10 @@ function closeChildPipes(child) {
   }
 }
 
-async function probeVersion(configuration) {
+async function probeVersion(configuration, signal) {
+  if (signal?.aborted) {
+    throw shutdownError();
+  }
   const selected = configuredCommand(configuration);
   const child = spawnSafe(
     selected.command,
@@ -208,10 +248,18 @@ async function probeVersion(configuration) {
     child.once("exit", (code, signal) => resolve({ code, signal }));
   });
 
-  const timed = await Promise.race([
-    Promise.all([stdout, stderr, exit]),
-    delay(VERSION_PROBE_TIMEOUT_MS).then(() => null),
-  ]);
+  const probe = await raceWithAbort(
+    Promise.race([
+      Promise.all([stdout, stderr, exit]),
+      delay(VERSION_PROBE_TIMEOUT_MS).then(() => null),
+    ]),
+    signal,
+  );
+  if (probe.aborted || signal?.aborted) {
+    await terminateChild(child, 100);
+    throw shutdownError();
+  }
+  const timed = probe.value;
   if (timed === null) {
     await terminateChild(child, 100);
     throw new SidecarError("version_probe_timeout", "Codex version probe timed out");
@@ -221,14 +269,13 @@ async function probeVersion(configuration) {
     throw new SidecarError("version_probe_failed", "Codex version probe failed");
   }
   const output = stdoutBytes.toString("utf8");
-  const match = /^codex-cli (0\.149\.0|0\.151\.0)(?:\r?\n)?$/u.exec(output);
-  if (match === null) {
+  const version = parseVersionOutput(output);
+  if (version === null) {
     throw new SidecarError(
       "unsupported_upstream_version",
       `Codex version is unsupported; expected ${SUPPORTED_UPSTREAM_VERSIONS.join(" or ")}`,
     );
   }
-  const version = match[1];
   const adapter = adapterForVersion(version);
   if (adapter === null) {
     throw new SidecarError("unsupported_upstream_version", "Codex version has no adapter");
@@ -236,7 +283,10 @@ async function probeVersion(configuration) {
   return { version, adapter, command: selected };
 }
 
-async function startAppServer(configuration, probed) {
+async function startAppServer(configuration, probed, signal) {
+  if (signal?.aborted) {
+    throw shutdownError();
+  }
   const child = spawnSafe(
     probed.command.command,
     [...probed.command.prefixArguments, "app-server", "--listen", "stdio://"],
@@ -246,10 +296,18 @@ async function startAppServer(configuration, probed) {
     },
     "upstream",
   );
-  const spawned = await Promise.race([
-    once(child, "spawn").then(() => ({ ok: true })),
-    once(child, "error").then(([error]) => ({ ok: false, error })),
-  ]);
+  const startup = await raceWithAbort(
+    Promise.race([
+      once(child, "spawn").then(() => ({ ok: true })),
+      once(child, "error").then(([error]) => ({ ok: false, error })),
+    ]),
+    signal,
+  );
+  if (startup.aborted || signal?.aborted) {
+    await terminateChild(child, 100);
+    throw shutdownError();
+  }
+  const spawned = startup.value;
   if (!spawned.ok) {
     throw new SidecarError(
       spawnFailureCode(spawned.error, "upstream"),
@@ -273,6 +331,7 @@ async function drainStderr(stream) {
 module.exports = {
   VERSION_OUTPUT_LIMIT,
   drainStderr,
+  parseVersionOutput,
   pinnedCodexCommand,
   probeVersion,
   safeEnvironment,

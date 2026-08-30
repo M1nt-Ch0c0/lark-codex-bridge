@@ -75,8 +75,9 @@ fn marker_events(marker: &Path) -> Vec<Value> {
         return Vec::new();
     };
     contents
-        .lines()
-        .map(|line| serde_json::from_str(line).expect("marker line must be valid JSON"))
+        .split_inclusive('\n')
+        .filter(|line| line.ends_with('\n'))
+        .map(|line| serde_json::from_str(line.trim_end()).expect("marker line must be valid JSON"))
         .collect()
 }
 

@@ -74,7 +74,7 @@ lark-codex-bridge.exe --version
 - 能访问对应租户的飞书或 Lark OpenAPI 与 WebSocket endpoint；
 - 本地时钟和系统证书正常。
 
-安装后先执行 Lark 检查，并按 Codex backend 二选一：
+安装后先执行 Lark 检查，并按普通 `run` 支持的本地 Codex backend 二选一：
 
 ```bash
 lark-codex-bridge lark auth check
@@ -87,6 +87,12 @@ lark-codex-bridge codex probe
 lark-codex-bridge codex sidecar-probe \
   --entrypoint /absolute/path/to/codex-sidecar/index.cjs
 ```
+
+`external_endpoint` 不在上述本地 backend 二选一中，也没有独立的 CLI probe。普通
+mutation-driven `run` 会对它 fail closed；开发或验收人员只能在仓库 checkout 中先
+运行 `cargo test --locked --test external_endpoint_gate`，再按
+[External Codex endpoint admission gate](../external-codex-endpoint-gate.md#verification) 以精确测试名
+显式运行真实 binary smoke。通过这些 admission 测试不会使普通 `run` 开放该模式。
 
 ## 5. 升级
 

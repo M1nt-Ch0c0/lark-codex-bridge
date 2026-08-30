@@ -172,5 +172,9 @@ lark-codex-bridge lark auth register
 1. 停止 bridge；
 2. 备份数据库和配置；
 3. 执行 `lark auth check`、`lark probe`，并按 backend 执行 `codex probe` 或
-   `codex sidecar-probe`；
+   `codex sidecar-probe`。`external_endpoint` 没有对应的 CLI probe；普通
+   mutation-driven `run` 会对它 fail closed。要验证该 admission gate，必须在仓库
+   checkout 中运行 `cargo test --locked --test external_endpoint_gate`，然后按
+   [Verification](../external-codex-endpoint-gate.md#verification) 以精确测试名显式运行真实
+   binary smoke；
 4. 重新启动。

@@ -9,6 +9,7 @@
 
 use std::{
     fs::{self, File, OpenOptions},
+    future::Future,
     io::{ErrorKind, Read, Write},
     os::unix::{
         fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink},
@@ -341,7 +342,10 @@ async fn wait_until_ready(
     loop {
         child.ensure_running()?;
         if let Ok(metadata) = secure_socket_metadata(socket_path, expected_uid) {
-            if UnixStream::connect(socket_path).await.is_ok() {
+            if matches!(
+                finish_before_deadline(deadline, UnixStream::connect(socket_path)).await,
+                Some(Ok(_))
+            ) {
                 return Ok(metadata);
             }
         }
@@ -358,6 +362,31 @@ async fn wait_until_ready(
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+async fn finish_before_deadline<F>(deadline: Instant, future: F) -> Option<F::Output>
+where
+    F: Future,
+{
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return None;
+    }
+    timeout(remaining, future).await.ok()
+}
+
+#[tokio::test]
+async fn startup_operation_cannot_cross_its_deadline() {
+    let bounded = timeout(
+        Duration::from_millis(100),
+        finish_before_deadline(
+            Instant::now() + Duration::from_millis(5),
+            std::future::pending::<()>(),
+        ),
+    )
+    .await
+    .expect("deadline helper did not return within its outer test bound");
+    assert!(bounded.is_none());
 }
 
 fn secure_socket_metadata(socket_path: &Path, expected_uid: u32) -> Result<fs::Metadata> {

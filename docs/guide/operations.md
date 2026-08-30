@@ -8,7 +8,7 @@ lark-codex-bridge lark auth check
 lark-codex-bridge lark probe
 ```
 
-再按配置的 Codex backend 二选一：
+再按普通 `run` 支持的本地 Codex backend 二选一：
 
 ```bash
 # [codex.backend].mode = "spawned_stdio"
@@ -19,10 +19,18 @@ lark-codex-bridge codex sidecar-probe \
   --entrypoint /opt/lark-codex-bridge/codex-sidecar/index.cjs
 ```
 
+`external_endpoint` 没有 CLI probe，且普通 mutation-driven `run` 会对它 fail closed。它的
+admission 检查是仓库验收流程：在 checkout 中运行
+`cargo test --locked --test external_endpoint_gate`，再按
+[External Codex endpoint admission gate](../external-codex-endpoint-gate.md#verification) 以精确测试名
+显式运行真实 binary smoke。该流程通过也不会使普通 `run` 开放 external 模式。
+
 这些检查分别验证：
 
 - bridge 二进制可执行；
-- 所选 Codex backend 的精确版本、app-server 启动和 initialize 握手；
+- 所选本地 Codex backend 的精确版本、app-server 启动和 initialize 握手；
+- 单独的 external admission gate 中的身份验证、精确版本、initialize 和只读
+  `thread/list` canary；
 - 飞书凭证、bot 身份、WebSocket endpoint 以及 ping/pong。
 
 probe 输出只包含脱敏结构字段，不包含 secret、token、完整 endpoint 或用户正文。

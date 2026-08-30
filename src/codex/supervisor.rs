@@ -23,7 +23,7 @@ use crate::{
         compat::WireAdapter,
         process::{
             CodexProcess, CodexProcessConfig, ProcessError, ProcessExit, SidecarBootstrapFailure,
-            spawn_app_server,
+            spawn_app_server, spawn_failure_is_retryable,
         },
         rpc::{ConnectionEpoch, RpcError, initialize_connection_with_dynamic_tools, spawn_rpc},
         sidecar::{CodexSidecarConfig, spawn_codex_sidecar},
@@ -870,32 +870,6 @@ fn permanent_sidecar_bootstrap_reason(failure: SidecarBootstrapFailure) -> Optio
         | SidecarBootstrapFailure::UpstreamSpawnUnavailable => return None,
     };
     Some(reason.to_owned())
-}
-
-fn spawn_failure_is_retryable(error: &std::io::Error) -> bool {
-    if matches!(
-        error.kind(),
-        std::io::ErrorKind::WouldBlock
-            | std::io::ErrorKind::Interrupted
-            | std::io::ErrorKind::TimedOut
-            | std::io::ErrorKind::OutOfMemory
-    ) {
-        return true;
-    }
-    spawn_raw_os_error_is_retryable(error.raw_os_error())
-}
-
-#[cfg(unix)]
-fn spawn_raw_os_error_is_retryable(code: Option<i32>) -> bool {
-    matches!(
-        code,
-        Some(libc::EAGAIN | libc::EMFILE | libc::ENFILE | libc::ENOMEM)
-    )
-}
-
-#[cfg(not(unix))]
-const fn spawn_raw_os_error_is_retryable(_code: Option<i32>) -> bool {
-    false
 }
 
 /// Classifies handshake failures; a server rejection indicates permanent

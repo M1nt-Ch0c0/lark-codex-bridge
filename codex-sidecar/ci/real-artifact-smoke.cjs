@@ -539,13 +539,15 @@ if (require.main === module) {
   if (process.argv.includes("--self-test")) {
     try {
       environmentSelfTest();
-    } catch {
+    } catch (error) {
       process.stderr.write("codex_sidecar_real_smoke_failure code=environment_self_test_failed\n");
+      process.stderr.write(`${error instanceof Error ? error.message : "unknown failure"}\n`);
       process.exitCode = 1;
     }
   } else {
-    main().catch(() => {
+    main().catch((error) => {
       process.stderr.write("codex_sidecar_real_smoke_failure code=smoke_failed\n");
+      process.stderr.write(`${error instanceof Error ? error.message : "unknown failure"}\n`);
       process.exitCode = 1;
     });
   }

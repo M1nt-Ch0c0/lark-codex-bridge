@@ -22,6 +22,7 @@ const RUNTIME_ENTRIES = [
   "upstream.cjs",
   "wire.cjs",
 ];
+const EXCLUDED_SOURCE_ENTRIES = ["ci", "test"];
 
 class ArtifactBuildFailure extends Error {
   constructor(code) {
@@ -64,6 +65,13 @@ function assertPinnedGraph() {
     installedNative.version !== `${EXPECTED_CODEX_VERSION}-${process.platform}-${process.arch}`
   ) {
     fail("unpinned_dependency_graph");
+  }
+}
+
+function assertSourceEntriesClassified() {
+  const classified = new Set([...RUNTIME_ENTRIES, ...EXCLUDED_SOURCE_ENTRIES]);
+  if (fs.readdirSync(ROOT).some((entry) => !classified.has(entry))) {
+    fail("unclassified_source_entry");
   }
 }
 
@@ -126,6 +134,54 @@ function validateSourceSymlinks(candidate) {
       validateSourceSymlinks(path.join(candidate, name));
     }
   }
+}
+
+function preserveMetadata(destination, metadata) {
+  if (process.platform !== "win32") {
+    fs.chmodSync(destination, metadata.mode & 0o777);
+  }
+  fs.utimesSync(destination, metadata.atime, metadata.mtime);
+}
+
+// Node 22+ preserves file symlinks when fs.cpSync is given dereference: true
+// and rewrites relative targets to absolute source paths. Materialize symlinked
+// files explicitly so an artifact can never retain a link back to the checkout.
+function copyRuntimeEntry(source, destination, sourceRoot = REAL_ROOT) {
+  const metadata = fs.lstatSync(source);
+  if (metadata.isSymbolicLink()) {
+    const resolved = fs.realpathSync(source);
+    const targetMetadata = fs.statSync(resolved);
+    if (targetMetadata.isDirectory()) {
+      fail("source_directory_symlink");
+    }
+    if (!targetMetadata.isFile()) {
+      fail("unsupported_runtime_entry");
+    }
+    if (!pathIsWithin(fs.realpathSync(sourceRoot), resolved)) {
+      fail("source_symlink_escape");
+    }
+    fs.copyFileSync(resolved, destination, fs.constants.COPYFILE_EXCL);
+    preserveMetadata(destination, targetMetadata);
+    return;
+  }
+  if (metadata.isDirectory()) {
+    fs.mkdirSync(destination, { mode: metadata.mode & 0o777 });
+    for (const name of fs.readdirSync(source).sort()) {
+      copyRuntimeEntry(
+        path.join(source, name),
+        path.join(destination, name),
+        sourceRoot,
+      );
+    }
+    preserveMetadata(destination, metadata);
+    return;
+  }
+  if (metadata.isFile()) {
+    fs.copyFileSync(source, destination, fs.constants.COPYFILE_EXCL);
+    preserveMetadata(destination, metadata);
+    return;
+  }
+  fail("unsupported_runtime_entry");
 }
 
 function pathIsWithin(root, candidate) {
@@ -192,6 +248,7 @@ function verifyCreatedOutsideSource(candidate, label, sourceRoot = REAL_ROOT) {
 }
 
 function main() {
+  assertSourceEntriesClassified();
   assertPinnedGraph();
 
   const stageRoot = requireAbsoluteOutsideSource(
@@ -216,13 +273,7 @@ function main() {
       fail("runtime_entry_missing");
     }
     validateSourceSymlinks(source);
-    fs.cpSync(source, destination, {
-      recursive: true,
-      force: false,
-      errorOnExist: true,
-      preserveTimestamps: true,
-      dereference: true,
-    });
+    copyRuntimeEntry(source, destination);
   }
 
   const manifest = {
@@ -281,6 +332,23 @@ function selfTest() {
       () => verifyCreatedOutsideSource(swapped, "stage", source),
       (error) => error instanceof ArtifactBuildFailure && error.code === "stage_inside_source",
     );
+
+    const runtimeSource = path.join(temporary, "runtime-source");
+    const runtimeDestination = path.join(temporary, "runtime-destination");
+    fs.mkdirSync(path.join(runtimeSource, "bin"), { recursive: true });
+    fs.writeFileSync(path.join(runtimeSource, "bin", "tool.cjs"), "safe\n", "utf8");
+    fs.symlinkSync("bin/tool.cjs", path.join(runtimeSource, "tool"));
+    copyRuntimeEntry(runtimeSource, runtimeDestination, runtimeSource);
+    assert.equal(fs.lstatSync(path.join(runtimeDestination, "tool")).isFile(), true);
+    assert.equal(fs.readFileSync(path.join(runtimeDestination, "tool"), "utf8"), "safe\n");
+
+    const escaped = path.join(runtimeSource, "escaped");
+    fs.symlinkSync(path.join(outside, "secret"), escaped);
+    fs.writeFileSync(path.join(outside, "secret"), "outside\n", "utf8");
+    assert.throws(
+      () => copyRuntimeEntry(escaped, path.join(temporary, "escaped-copy"), runtimeSource),
+      (error) => error instanceof ArtifactBuildFailure && error.code === "source_symlink_escape",
+    );
     process.stdout.write("codex_sidecar_artifact_path_self_test_ok\n");
   } finally {
     fs.rmSync(temporary, { recursive: true, force: true });
@@ -301,6 +369,7 @@ if (require.main === module) {
 
 module.exports = {
   ArtifactBuildFailure,
+  copyRuntimeEntry,
   pathIsWithin,
   prospectiveRealPath,
   requireAbsoluteOutsideSource,

@@ -210,7 +210,7 @@ class ProtocolSession {
     if (outcome.kind === "graceful") {
       try {
         await boundedWait(
-          this.toLocal.waitIdle(),
+          this.toLocal.end(),
           this.configuration.shutdownGraceMs,
           "local_shutdown_timeout",
         );
@@ -412,13 +412,13 @@ class ProtocolSession {
     switch (message.kind) {
       case "response":
       case "error":
-        this.#completeLocalRequest(message);
+        await this.#completeLocalRequest(message);
         break;
       case "notification":
-        this.#forwardUpstreamNotification(message);
+        await this.#forwardUpstreamNotification(message);
         break;
       case "request":
-        this.#forwardUpstreamServerRequest(message);
+        await this.#forwardUpstreamServerRequest(message);
         break;
       default:
         throw new SidecarError("invalid_rpc", "unknown upstream RPC frame");
@@ -443,14 +443,16 @@ class ProtocolSession {
     this.retiredLocalRequestIds.add(pending.localKey);
     const priority = responsePriority(pending.method);
     if (message.kind === "error") {
-      this.toLocal.enqueue(
+      return this.toLocal.enqueueWithBackpressure(
         rpcError(pending.localId, message.error.code, "upstream request failed"),
         priority,
       );
-      return;
     }
     const result = this.adapter.fromUpstreamResponse(pending.method, message.result);
-    this.toLocal.enqueue({ id: pending.localId, result }, priority);
+    return this.toLocal.enqueueWithBackpressure(
+      { id: pending.localId, result },
+      priority,
+    );
   }
 
   #forwardUpstreamNotification(message) {
@@ -502,13 +504,13 @@ class ProtocolSession {
     if (adapted.params !== undefined) {
       frame.params = adapted.params;
     }
-    this.toLocal.enqueue(
+    return this.toLocal.enqueueWithBackpressure(
       frame,
       CONTROL_NOTIFICATION_METHODS.has(adapted.method) ? "control" : "normal",
     );
   }
 
-  #forwardUpstreamServerRequest(message) {
+  async #forwardUpstreamServerRequest(message) {
     const upstreamKey = correlationKey(message.id);
     if (
       this.activeUpstreamServerIds.has(upstreamKey) ||
@@ -545,15 +547,26 @@ class ProtocolSession {
       method: adapted.method,
       timeout: null,
     };
-    pending.timeout = setTimeout(() => {
-      this.#expireServerRequest(localKey);
-    }, this.serverRequestTimeoutMs);
     this.pendingServerByLocal.set(localKey, pending);
     this.activeUpstreamServerIds.add(upstreamKey);
-    this.toLocal.enqueue(
-      { id: localId, method: adapted.method, params: adapted.params },
-      "control",
-    );
+    try {
+      const admission = await this.toLocal.enqueueWithBackpressure(
+        { id: localId, method: adapted.method, params: adapted.params },
+        "control",
+      );
+      await admission.completion;
+    } catch (error) {
+      if (this.pendingServerByLocal.get(localKey) === pending) {
+        this.pendingServerByLocal.delete(localKey);
+        this.activeUpstreamServerIds.delete(upstreamKey);
+      }
+      throw error;
+    }
+    if (!this.stopping && this.pendingServerByLocal.get(localKey) === pending) {
+      pending.timeout = setTimeout(() => {
+        this.#expireServerRequest(localKey);
+      }, this.serverRequestTimeoutMs);
+    }
   }
 
   #expireServerRequest(localKey) {

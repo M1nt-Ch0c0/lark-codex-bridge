@@ -116,11 +116,11 @@ function enumOf(values) {
 function recordOf(mapper) {
   return (value, label) => {
     const source = object(value, label);
-    const projected = {};
+    const projected = Object.create(null);
     for (const [key, entry] of Object.entries(source)) {
       projected[key] = mapper(entry, `${label}.${key}`);
     }
-    return projected;
+    return { ...projected };
   };
 }
 

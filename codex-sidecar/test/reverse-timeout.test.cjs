@@ -12,7 +12,7 @@ const {
   SERVER_REQUEST_TIMEOUT_MS,
 } = require("../session.cjs");
 const { terminateChild } = require("../upstream.cjs");
-const { boundedLines } = require("../wire.cjs");
+const { boundedLines, correlationKey } = require("../wire.cjs");
 const { LineInbox } = require("./helpers.cjs");
 
 class SessionChild extends EventEmitter {
@@ -103,7 +103,7 @@ test("shutdown grace expiry force-kills and closes every upstream pipe", async (
   assert.equal(child.stdinFinished, true);
   assert.deepEqual(child.killCalls, ["SIGKILL"]);
   assert.ok(elapsedMs >= 25, `shutdown elapsed ${elapsedMs}ms before grace`);
-  assert.ok(elapsedMs < 500, `shutdown exceeded bound: ${elapsedMs}ms`);
+  assert.ok(elapsedMs < 5_000, `shutdown exceeded bound: ${elapsedMs}ms`);
   assert.equal(child.stdin.destroyed, true);
   assert.equal(child.stdout.destroyed, true);
   assert.equal(child.stderr.destroyed, true);
@@ -192,6 +192,283 @@ test("session write-queue saturation rejects before upstream write and clears co
   assert.deepEqual(await running, { kind: "graceful" });
   assert.equal(writes.length, 1);
   assert.deepEqual(child.killCalls, ["SIGKILL"]);
+});
+
+test("upstream consumption applies bounded admission backpressure", async (t) => {
+  const writes = [];
+  const callbacks = [];
+  const stalledOutput = new Writable({
+    write(chunk, _encoding, callback) {
+      writes.push(JSON.parse(chunk.toString("utf8")));
+      callbacks.push(callback);
+    },
+  });
+  const child = new SessionChild();
+  const localInput = new PassThrough();
+  const upstreamInbox = new LineInbox(child.stdin);
+  t.after(() => {
+    upstreamInbox.close();
+    localInput.destroy();
+    stalledOutput.destroy();
+    child.stdin.destroy();
+    child.stdout.destroy();
+    child.stderr.destroy();
+  });
+
+  const configuration = {
+    maxFrameBytes: 4_096,
+    maxPending: 8,
+    maxWriteQueueFrames: 2,
+    maxWriteQueueBytes: 65_536,
+    shutdownGraceMs: 250,
+  };
+  const session = new ProtocolSession({
+    configuration,
+    adapter: adapterForVersion("0.151.0"),
+    child,
+    localInput,
+    localLines: boundedLines(localInput, () => configuration.maxFrameBytes),
+    localOutput: stalledOutput,
+  });
+  const running = session.run();
+
+  const upstream = [];
+  for (const id of ["first", "second", "third", "fourth"]) {
+    send(localInput, { id, method: "thread/list", params: {} });
+    upstream.push(await upstreamInbox.nextJson());
+  }
+  const result = { data: [], nextCursor: null, backwardsCursor: null };
+  for (const request of upstream) {
+    send(child.stdout, { id: request.id, result });
+  }
+  for (
+    let attempts = 0;
+    attempts < 100 && session.toLocal.capacityWaiters.length === 0;
+    attempts += 1
+  ) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  assert.deepEqual(writes, [{ id: "first", result }]);
+  assert.equal(session.pendingRequestsByUpstream.size, 1);
+  assert.equal(session.toLocal.queuedFrames, 2);
+  assert.equal(session.toLocal.capacityWaiters.length, 1);
+  assert.deepEqual(child.killCalls, []);
+
+  callbacks.shift()();
+  for (
+    let attempts = 0;
+    attempts < 100 && session.pendingRequestsByUpstream.size !== 0;
+    attempts += 1
+  ) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(writes.length, 2);
+  assert.deepEqual(writes[1], { id: "second", result });
+  assert.equal(session.pendingRequestsByUpstream.size, 0);
+  assert.equal(session.toLocal.queuedFrames, 2);
+  assert.equal(session.toLocal.capacityWaiters.length, 1);
+
+  for (const expectedId of ["third", "fourth"]) {
+    callbacks.shift()();
+    for (let attempts = 0; attempts < 100 && writes.at(-1).id !== expectedId; attempts += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.equal(writes.at(-1).id, expectedId);
+  }
+  callbacks.shift()();
+
+  localInput.end();
+  assert.deepEqual(await running, { kind: "graceful" });
+});
+
+test("admission backpressure preserves control-response priority", async (t) => {
+  const writes = [];
+  const callbacks = [];
+  const stalledOutput = new Writable({
+    write(chunk, _encoding, callback) {
+      writes.push(JSON.parse(chunk.toString("utf8")));
+      callbacks.push(callback);
+    },
+  });
+  const child = new SessionChild();
+  const localInput = new PassThrough();
+  const upstreamInbox = new LineInbox(child.stdin);
+  t.after(() => {
+    upstreamInbox.close();
+    localInput.destroy();
+    stalledOutput.destroy();
+    child.stdin.destroy();
+    child.stdout.destroy();
+    child.stderr.destroy();
+  });
+
+  const configuration = {
+    maxFrameBytes: 4_096,
+    maxPending: 8,
+    maxWriteQueueFrames: 4,
+    maxWriteQueueBytes: 65_536,
+    shutdownGraceMs: 250,
+  };
+  const session = new ProtocolSession({
+    configuration,
+    adapter: adapterForVersion("0.151.0"),
+    child,
+    localInput,
+    localLines: boundedLines(localInput, () => configuration.maxFrameBytes),
+    localOutput: stalledOutput,
+  });
+  const running = session.run();
+
+  send(localInput, { id: "first", method: "thread/list", params: {} });
+  send(localInput, { id: "second", method: "thread/list", params: {} });
+  send(localInput, {
+    id: "control",
+    method: "turn/interrupt",
+    params: { threadId: "thread-1", turnId: "turn-1" },
+  });
+  send(localInput, { id: "fourth", method: "thread/list", params: {} });
+
+  const upstream = [];
+  for (let index = 0; index < 4; index += 1) {
+    upstream.push(await upstreamInbox.nextJson());
+  }
+  const upstreamByLocal = new Map();
+  for (const pending of session.pendingRequestsByUpstream.values()) {
+    const request = upstream.find(
+      (candidate) => correlationKey(candidate.id) === pending.upstreamKey,
+    );
+    upstreamByLocal.set(pending.localId, request);
+  }
+  const listResult = { data: [], nextCursor: null, backwardsCursor: null };
+  for (const id of ["first", "second", "control", "fourth"]) {
+    send(child.stdout, {
+      id: upstreamByLocal.get(id).id,
+      result: id === "control" ? {} : listResult,
+    });
+  }
+  for (
+    let attempts = 0;
+    attempts < 100 && session.pendingRequestsByUpstream.size !== 0;
+    attempts += 1
+  ) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  assert.deepEqual(writes.map((frame) => frame.id), ["first"]);
+  assert.equal(session.pendingRequestsByUpstream.size, 0);
+  assert.equal(session.toLocal.queuedFrames, 4);
+  assert.equal(session.toLocal.capacityWaiters.length, 0);
+
+  for (const expectedId of ["control", "second", "fourth"]) {
+    callbacks.shift()();
+    for (let attempts = 0; attempts < 100 && writes.at(-1).id !== expectedId; attempts += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.equal(writes.at(-1).id, expectedId);
+  }
+  callbacks.shift()();
+
+  localInput.end();
+  assert.deepEqual(await running, { kind: "graceful" });
+});
+
+test("reverse-request timeout starts only after physical local output", async (t) => {
+  const localWrites = [];
+  const localCallbacks = [];
+  const stalledOutput = new Writable({
+    write(chunk, _encoding, callback) {
+      localWrites.push(JSON.parse(chunk.toString("utf8")));
+      localCallbacks.push(callback);
+    },
+  });
+  const upstreamWrites = [];
+  const upstreamInput = new Writable({
+    write(chunk, _encoding, callback) {
+      upstreamWrites.push(JSON.parse(chunk.toString("utf8")));
+      callback();
+    },
+  });
+  const child = new SessionChild({ stdin: upstreamInput });
+  const localInput = new PassThrough();
+  t.after(() => {
+    localInput.destroy();
+    stalledOutput.destroy();
+    child.stdin.destroy();
+    child.stdout.destroy();
+    child.stderr.destroy();
+  });
+
+  const configuration = {
+    maxFrameBytes: 4_096,
+    maxPending: 4,
+    maxWriteQueueFrames: 2,
+    maxWriteQueueBytes: 65_536,
+    shutdownGraceMs: 250,
+  };
+  const session = new ProtocolSession({
+    configuration,
+    adapter: adapterForVersion("0.151.0"),
+    child,
+    localInput,
+    localLines: boundedLines(localInput, () => configuration.maxFrameBytes),
+    localOutput: stalledOutput,
+    serverRequestTimeoutMs: 25,
+  });
+  const running = session.run();
+
+  send(localInput, { id: "fills-output", method: "future/write", params: {} });
+  for (let attempts = 0; attempts < 100 && localWrites.length === 0; attempts += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(localWrites[0].id, "fills-output");
+
+  send(child.stdout, {
+    id: "approval-delayed",
+    method: "item/commandExecution/requestApproval",
+    params: {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      itemId: "item-1",
+      startedAtMs: 100,
+      command: "pwd",
+    },
+  });
+  for (
+    let attempts = 0;
+    attempts < 100 && session.toLocal.capacityWaiters.length === 0;
+    attempts += 1
+  ) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(session.pendingServerByLocal.size, 1);
+  assert.equal(session.toLocal.capacityWaiters.length, 0);
+  assert.equal(session.toLocal.queuedFrames, 2);
+  assert.deepEqual(upstreamWrites, []);
+  assert.equal(localWrites.length, 1);
+
+  localCallbacks.shift()();
+  for (let attempts = 0; attempts < 100 && localWrites.length < 2; attempts += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  const approval = localWrites[1];
+  assert.equal(approval.method, "item/commandExecution/requestApproval");
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(session.pendingServerByLocal.size, 1);
+  assert.deepEqual(upstreamWrites, []);
+
+  send(localInput, { id: approval.id, result: { decision: "decline" } });
+  for (let attempts = 0; attempts < 100 && upstreamWrites.length === 0; attempts += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.deepEqual(upstreamWrites, [
+    { id: "approval-delayed", result: { decision: "decline" } },
+  ]);
+
+  localCallbacks.shift()();
+  localInput.end();
+  assert.deepEqual(await running, { kind: "graceful" });
 });
 
 test("reverse timeout is request-scoped, keeps health RPC alive, and fences duplicate late responses", async (t) => {

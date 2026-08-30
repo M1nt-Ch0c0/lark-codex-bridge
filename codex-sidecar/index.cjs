@@ -23,7 +23,7 @@ function safeCode(error) {
   return "sidecar_failed";
 }
 
-async function bootstrap(input, output) {
+async function bootstrap(input, output, signal) {
   let frameMaximum = HARD_MAX_FRAME_BYTES;
   const lines = boundedLines(input, () => frameMaximum)[Symbol.asyncIterator]();
   const bootstrapWrites = new PriorityWriteQueue(output, {
@@ -32,56 +32,70 @@ async function bootstrap(input, output) {
     maxBytes: HARD_MAX_FRAME_BYTES,
     onError: () => {},
   });
-  await bootstrapWrites.enqueue(helloFrame(), "control");
+  const cancellation = new SidecarError(
+    "shutdown_requested",
+    "sidecar shutdown was requested",
+  );
+  const onAbort = () => {
+    bootstrapWrites.abort(cancellation);
+    if (!input.destroyed) {
+      input.destroy();
+    }
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
+  if (signal?.aborted) {
+    onAbort();
+  }
 
   let configuration;
   let configureId = null;
-  try {
-    const first = await lines.next();
-    if (first.done) {
-      throw new SidecarError("configure_eof", "local input closed before configuration");
-    }
-    const decoded = parseJsonLine(first.value);
-    if (decoded && Object.hasOwn(decoded, "id")) {
-      try {
-        configureId = validateCorrelationId(decoded.id, "configure correlation");
-      } catch {
-        configureId = null;
-      }
-    }
-    configuration = validateConfigureFrame(decoded);
-    configureId = configuration.id;
-    frameMaximum = configuration.maxFrameBytes;
-  } catch (error) {
-    const code = safeCode(error);
-    if (configureId !== null) {
-      try {
-        await bootstrapWrites.enqueue(configureError(configureId, code), "control");
-      } catch {
-        // The static process exit classification remains authoritative.
-      }
-    }
-    throw error;
-  }
-
-  let probed;
   let child;
   try {
-    probed = await probeVersion(configuration);
-    child = await startAppServer(configuration, probed);
-  } catch (error) {
+    await bootstrapWrites.enqueue(helloFrame(), "control");
     try {
-      await bootstrapWrites.enqueue(
-        configureError(configuration.id, safeCode(error)),
-        "control",
-      );
-    } catch {
-      // Exit remains fail closed if the peer cannot receive diagnostics.
+      const first = await lines.next();
+      if (first.done) {
+        throw new SidecarError("configure_eof", "local input closed before configuration");
+      }
+      const decoded = parseJsonLine(first.value);
+      if (decoded && Object.hasOwn(decoded, "id")) {
+        try {
+          configureId = validateCorrelationId(decoded.id, "configure correlation");
+        } catch {
+          configureId = null;
+        }
+      }
+      configuration = validateConfigureFrame(decoded);
+      configureId = configuration.id;
+      frameMaximum = configuration.maxFrameBytes;
+    } catch (error) {
+      const code = safeCode(error);
+      if (configureId !== null) {
+        try {
+          await bootstrapWrites.enqueue(configureError(configureId, code), "control");
+        } catch {
+          // The static process exit classification remains authoritative.
+        }
+      }
+      throw error;
     }
-    throw error;
-  }
 
-  try {
+    let probed;
+    try {
+      probed = await probeVersion(configuration, signal);
+      child = await startAppServer(configuration, probed, signal);
+    } catch (error) {
+      try {
+        await bootstrapWrites.enqueue(
+          configureError(configuration.id, safeCode(error)),
+          "control",
+        );
+      } catch {
+        // Exit remains fail closed if the peer cannot receive diagnostics.
+      }
+      throw error;
+    }
+
     await bootstrapWrites.enqueue(
       configureResponse(configuration.id, {
         upstreamVersion: probed.version,
@@ -91,12 +105,16 @@ async function bootstrap(input, output) {
       "control",
     );
     await bootstrapWrites.waitIdle();
+    bootstrapWrites.release();
+    return { child, configuration, adapter: probed.adapter, lines };
   } catch (error) {
-    await terminateChild(child, configuration.shutdownGraceMs);
+    if (child !== undefined) {
+      await terminateChild(child, configuration?.shutdownGraceMs ?? 100);
+    }
     throw error;
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
   }
-
-  return { child, configuration, adapter: probed.adapter, lines };
 }
 
 async function main(options = {}) {
@@ -104,17 +122,20 @@ async function main(options = {}) {
   const output = options.output ?? process.stdout;
   let session = null;
   let pendingSignal = false;
+  const bootstrapAbort = new AbortController();
   const onSignal = () => {
     pendingSignal = true;
     if (session !== null) {
       session.requestShutdown();
+    } else {
+      bootstrapAbort.abort();
     }
   };
   process.once("SIGINT", onSignal);
   process.once("SIGTERM", onSignal);
 
   try {
-    const ready = await bootstrap(input, output);
+    const ready = await bootstrap(input, output, bootstrapAbort.signal);
     session = new ProtocolSession({
       configuration: ready.configuration,
       adapter: ready.adapter,
@@ -133,6 +154,9 @@ async function main(options = {}) {
     }
     return 0;
   } catch (error) {
+    if (pendingSignal) {
+      return 0;
+    }
     process.stderr.write(`codex_sidecar_failure code=${safeCode(error)}\n`);
     return 1;
   } finally {

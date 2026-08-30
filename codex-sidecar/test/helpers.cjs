@@ -128,11 +128,15 @@ async function waitForExit(child, timeoutMs = 5_000) {
     return { code: child.exitCode, signal: child.signalCode };
   }
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("timed out waiting for child exit")), timeoutMs);
-    child.once("exit", (code, signal) => {
+    const onExit = (code, signal) => {
       clearTimeout(timer);
       resolve({ code, signal });
-    });
+    };
+    const timer = setTimeout(() => {
+      child.removeListener("exit", onExit);
+      reject(new Error("timed out waiting for child exit"));
+    }, timeoutMs);
+    child.once("exit", onExit);
   });
 }
 

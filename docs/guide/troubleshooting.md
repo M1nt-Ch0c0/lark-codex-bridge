@@ -76,6 +76,13 @@ lark-codex-bridge codex sidecar-probe \
   --entrypoint /opt/lark-codex-bridge/codex-sidecar/index.cjs
 ```
 
+`external_endpoint` 不使用上述两个本地 probe，也不会进入普通 `run` 的 supervisor
+恢复流程；选择它时普通 mutation-driven `run` 会 fail closed。要独立复核 admission
+gate，在仓库 checkout 中运行 `cargo test --locked --test external_endpoint_gate`，然后按
+[External Codex endpoint admission gate](../external-codex-endpoint-gate.md#verification) 以精确测试名
+显式运行真实 binary smoke。不要尝试不存在的 external CLI probe，也不要把 admission
+测试通过视为普通 `run` 已支持该模式。
+
 如果原因是 unsupported version，native backend 只安装 `SUPPORTED_CODEX_VERSIONS` 中列出的
 0.146.0/0.149.0；protocol sidecar 只安装其独立精确列表 0.149.0/0.151.0。其他版本必须先按
 Schema/adapter 契约升级流程评审，不能仅因本机版本号更高就绕过门禁。若旧版 bridge 在运行期

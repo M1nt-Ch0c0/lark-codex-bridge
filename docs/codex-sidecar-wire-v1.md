@@ -547,12 +547,13 @@ the bridge is restarted; it is never treated as permission to overlap epochs.
 
 ## Redaction and launch data
 
-Rust clears the sidecar environment and restores only `NO_COLOR`, `PATH`, and
-the minimum required Windows process variables. The Node entrypoint is the one
-sidecar argument. Configured Codex path, optional home, and wrapper arguments
-are sent in the configure frame rather than the sidecar argv. Rust `Debug`
-output replaces every configured path and argument value with a marker or
-count.
+Rust clears the sidecar environment and restores only `NO_COLOR`, optional
+`PATH`, the current Unix `HOME` or Windows `USERPROFILE`, and the minimum
+required Windows process variables. Missing home variables are not invented.
+The Node entrypoint is the one sidecar argument. Configured Codex path,
+optional home, and wrapper arguments are sent in the configure frame rather
+than the sidecar argv. Rust `Debug` output replaces every configured path and
+argument value with a marker or count.
 
 The sidecar gives Codex a reviewed environment allowlist and may set
 `CODEX_HOME` only for that child. Provider stderr, raw errors, request bodies,

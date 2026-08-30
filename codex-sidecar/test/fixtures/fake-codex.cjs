@@ -20,22 +20,34 @@ function mark(event, details = {}) {
   }
 }
 
-if (process.argv.includes("--version")) {
-  if (mode === "malformed-version") {
-    process.stdout.write(` codex-cli ${version}\n`);
-  } else {
-    process.stdout.write(`codex-cli ${version}\n`);
+function shouldRunAppServer() {
+  if (process.argv.includes("--version")) {
+    if (mode === "hang-version") {
+      mark("version-probe", { pid: process.pid });
+      setInterval(() => {}, 60_000);
+      return false;
+    }
+    if (mode === "malformed-version") {
+      process.stdout.write(` codex-cli ${version}\n`);
+    } else {
+      process.stdout.write(`codex-cli ${version}\n`);
+    }
+    process.exitCode = 0;
+    return false;
   }
-  process.exitCode = 0;
-  return;
+  if (!process.argv.includes("app-server")) {
+    process.exitCode = 2;
+    return false;
+  }
+  return true;
 }
 
-if (!process.argv.includes("app-server")) {
-  process.exitCode = 2;
-  return;
+if (shouldRunAppServer()) {
+  runAppServer();
 }
 
-mark("start", { version, mode });
+function runAppServer() {
+  mark("start", { version, mode });
 
 if (mode === "eof") {
   setImmediate(() => process.exit(0));
@@ -488,4 +500,5 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
     mark("signal", { signal });
     process.exit(0);
   });
+}
 }

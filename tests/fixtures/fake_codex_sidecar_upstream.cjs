@@ -25,18 +25,25 @@ function mark(event, details = {}) {
   fs.appendFileSync(marker, `${JSON.stringify({ event, ...details })}\n`, "utf8");
 }
 
-if (process.argv.includes("--version")) {
-  process.stdout.write(`codex-cli ${version}\n`);
-  process.exitCode = 0;
-  return;
+function shouldRunAppServer() {
+  if (process.argv.includes("--version")) {
+    process.stdout.write(`codex-cli ${version}\n`);
+    process.exitCode = 0;
+    return false;
+  }
+  if (!process.argv.includes("app-server")) {
+    process.exitCode = 2;
+    return false;
+  }
+  return true;
 }
 
-if (!process.argv.includes("app-server")) {
-  process.exitCode = 2;
-  return;
+if (shouldRunAppServer()) {
+  runAppServer();
 }
 
-mark("start", { version, pid: process.pid });
+function runAppServer() {
+  mark("start", { version, pid: process.pid });
 
 function spawnDescendant() {
   const descendantToken = `bridge-sidecar-descendant:${process.pid}:${randomUUID()}`;
@@ -233,4 +240,5 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
     mark("signal", { signal });
     process.exit(0);
   });
+}
 }

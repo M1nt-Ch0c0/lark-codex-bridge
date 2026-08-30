@@ -4,15 +4,42 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const test = require("node:test");
 
-const { spawnFailureCode } = require("../upstream.cjs");
+const { SUPPORTED_UPSTREAM_VERSIONS } = require("../adapters/index.cjs");
+const { parseVersionOutput, spawnFailureCode } = require("../upstream.cjs");
 
 const {
   configureSidecar,
+  FIXTURE,
   readMarker,
   send,
   spawnSidecar,
+  temporaryMarker,
   waitForExit,
 } = require("./helpers.cjs");
+
+async function waitUntil(predicate, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const value = predicate();
+    if (value !== undefined && value !== false) {
+      return value;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("timed out waiting for test condition");
+}
+
+function processIsAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "ESRCH") {
+      return false;
+    }
+    throw error;
+  }
+}
 
 test("spawn classification separates resource pressure from deterministic launch failures", () => {
   for (const code of ["EAGAIN", "EMFILE", "ENFILE", "ENOMEM"]) {
@@ -38,6 +65,17 @@ test("version probing accepts only exact 0.149.0 and 0.151.0 output", async (t) 
     assert.equal(exit.code, 1);
     assert.match(await running.stderr.next(), new RegExp(`code=${options.expected}$`, "u"));
   }
+});
+
+test("exact version output parsing follows the reviewed adapter registry", () => {
+  for (const version of SUPPORTED_UPSTREAM_VERSIONS) {
+    assert.equal(parseVersionOutput(`codex-cli ${version}`), version);
+    assert.equal(parseVersionOutput(`codex-cli ${version}\n`), version);
+    assert.equal(parseVersionOutput(`codex-cli ${version}\r\n`), version);
+  }
+  assert.equal(parseVersionOutput("codex-cli 0.150.0\n"), null);
+  assert.equal(parseVersionOutput(" codex-cli 0.151.0\n"), null);
+  assert.equal(parseVersionOutput("codex-cli 0.151.0\nextra\n"), null);
 });
 
 test("active local correlation reuse fails the epoch and does not replay", async (t) => {
@@ -119,3 +157,76 @@ test("incompatible configure fails before any upstream process is started", asyn
   assert.equal(response.error, "invalid_configuration");
   assert.equal((await waitForExit(running.child)).code, 1);
 });
+
+test(
+  "SIGINT and SIGTERM cancel bootstrap before configure",
+  { skip: process.platform === "win32" },
+  async (t) => {
+    for (const signal of ["SIGINT", "SIGTERM"]) {
+      const running = spawnSidecar();
+      t.after(() => {
+        if (running.child.exitCode === null && running.child.signalCode === null) {
+          running.child.kill("SIGKILL");
+        }
+      });
+      assert.equal((await running.stdout.nextJson()).type, "hello");
+      running.child.kill(signal);
+      assert.deepEqual(await waitForExit(running.child, 2_000), {
+        code: 0,
+        signal: null,
+      });
+      assert.deepEqual(running.stderr.lines, []);
+    }
+  },
+);
+
+test(
+  "bootstrap signal terminates an in-flight version probe",
+  { skip: process.platform === "win32" },
+  async (t) => {
+    const temporary = temporaryMarker();
+    const running = spawnSidecar();
+    let probePid = null;
+    t.after(() => {
+      if (running.child.exitCode === null && running.child.signalCode === null) {
+        running.child.kill("SIGKILL");
+      }
+      if (probePid !== null && processIsAlive(probePid)) {
+        process.kill(probePid, "SIGKILL");
+      }
+      fs.rmSync(temporary.directory, { recursive: true, force: true });
+    });
+
+    assert.equal((await running.stdout.nextJson()).type, "hello");
+    send(running.child, {
+      v: 1,
+      type: "configure",
+      id: "configure-hanging-probe",
+      codexBinary: process.execPath,
+      codexHome: null,
+      codexArguments: [
+        FIXTURE,
+        "--fake-version=0.151.0",
+        "--fake-mode=hang-version",
+        `--fake-marker=${temporary.marker}`,
+      ],
+      maxFrameBytes: 33_554_432,
+      maxPending: 448,
+    });
+    probePid = await waitUntil(() => {
+      const event = readMarker(temporary.marker).find(
+        (entry) => entry.event === "version-probe",
+      );
+      return Number.isSafeInteger(event?.pid) ? event.pid : undefined;
+    });
+    assert.equal(processIsAlive(probePid), true);
+
+    running.child.kill("SIGTERM");
+    assert.deepEqual(await waitForExit(running.child, 2_000), {
+      code: 0,
+      signal: null,
+    });
+    await waitUntil(() => !processIsAlive(probePid));
+    assert.deepEqual(running.stderr.lines, []);
+  },
+);
