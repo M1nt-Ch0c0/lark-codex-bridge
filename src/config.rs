@@ -275,6 +275,27 @@ impl BridgeConfig {
         self.channel.node_binary = resolve_command_path(&parent, &self.channel.node_binary)?;
         self.channel.sidecar_entrypoint =
             resolve_relative_path(&parent, &self.channel.sidecar_entrypoint)?;
+        if let CodexBackendConfig::ProtocolSidecar {
+            node_binary,
+            sidecar_entrypoint,
+            codex_binary,
+            codex_home,
+            ..
+        } = &mut self.codex.backend
+        {
+            *node_binary = resolve_command_path(&parent, node_binary)
+                .map_err(|_| ConfigError::InvalidCodexBackend)?;
+            *sidecar_entrypoint = resolve_relative_path(&parent, sidecar_entrypoint)
+                .map_err(|_| ConfigError::InvalidCodexBackend)?;
+            if let Some(binary) = codex_binary {
+                *binary = resolve_command_path(&parent, binary)
+                    .map_err(|_| ConfigError::InvalidCodexBackend)?;
+            }
+            if let Some(home) = codex_home {
+                *home = resolve_relative_path(&parent, home)
+                    .map_err(|_| ConfigError::InvalidCodexBackend)?;
+            }
+        }
         Ok(())
     }
 }
@@ -474,6 +495,11 @@ impl CodexSection {
     #[must_use]
     pub fn process_config(&self) -> Option<CodexProcessConfig> {
         self.backend.spawned_process_config()
+    }
+
+    #[must_use]
+    pub fn sidecar_config(&self) -> Option<crate::codex::sidecar::CodexSidecarConfig> {
+        self.backend.protocol_sidecar_config()
     }
 }
 

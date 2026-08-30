@@ -188,7 +188,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: test
-      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2
+      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
         with:
           tool: cargo-nextest
       - run: cargo nextest run --all-targets --all-features --profile ci --locked -E 'not binary(channel_sidecar)'
@@ -212,6 +212,75 @@ jobs:
           cache-dependency-path: sidecar/package-lock.json
       - run: npm ci --ignore-scripts --prefix sidecar
       - run: npm run check --prefix sidecar
+
+  codex-protocol-sidecar:
+    name: Codex protocol sidecar (${{ matrix.os }}, Node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            node: "20"
+          - os: ubuntu-latest
+            node: "22"
+          - os: macos-latest
+            node: "22"
+          - os: windows-latest
+            node: "22"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: codex-sidecar/package-lock.json
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: codex-protocol-sidecar-${{ matrix.os }}-node-${{ matrix.node }}
+      - name: Install the exact sidecar dependency graph without lifecycle scripts
+        run: npm ci --ignore-scripts --prefix codex-sidecar
+      - name: Verify the sidecar lockfile remains immutable
+        run: git diff --exit-code -- codex-sidecar/package-lock.json
+      - name: Check and test the Node sidecar
+        run: npm run verify --prefix codex-sidecar
+      - name: Exercise the real lockfile-pinned Codex lifecycle
+        run: npm run ci:smoke --prefix codex-sidecar
+      - name: Build the self-contained platform sidecar artifact
+        id: build_sidecar
+        run: npm run ci:artifact --prefix codex-sidecar
+        env:
+          CODEX_SIDECAR_ARTIFACT_DIR: ${{ runner.temp }}/codex-sidecar-artifact-node-${{ matrix.node }}
+      - name: Upload the immutable platform sidecar artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: codex-sidecar-${{ runner.os }}-${{ runner.arch }}-node-${{ matrix.node }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/codex-sidecar-artifact-node-${{ matrix.node }}/codex-sidecar
+          if-no-files-found: error
+          include-hidden-files: true
+          compression-level: 0
+          retention-days: 7
+      - name: Download the platform artifact into an independent directory
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: codex-sidecar-${{ runner.os }}-${{ runner.arch }}-node-${{ matrix.node }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/codex-sidecar-download-node-${{ matrix.node }}
+      - name: Verify and exercise the downloaded artifact without npm or package downloads
+        run: node codex-sidecar/ci/real-artifact-smoke.cjs
+        env:
+          CODEX_SIDECAR_REQUIRE_ARTIFACT: "1"
+          CODEX_SIDECAR_RUNTIME_ROOT: ${{ runner.temp }}/codex-sidecar-download-node-${{ matrix.node }}
+          CODEX_SIDECAR_EXPECTED_MANIFEST_SHA256: ${{ steps.build_sidecar.outputs.manifest_sha256 }}
+      - name: Audit production Node dependencies
+        run: npm audit --omit=dev --audit-level=high --prefix codex-sidecar
+      - name: Exercise Rust-to-sidecar compatibility and lifecycle contracts
+        run: cargo test --locked --test codex_sidecar -- --test-threads=1
+        env:
+          CODEX_SIDECAR_TEST_REQUIRED: "1"
 
   docs:
     name: Docs (rustdoc)
@@ -271,7 +340,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: coverage
-      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2
+      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
         with:
           tool: cargo-llvm-cov
       - run: cargo llvm-cov --all-targets --locked --lcov --output-path lcov.info
@@ -292,7 +361,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2
+      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
         with:
           tool: cargo-audit
       - run: cargo audit --deny warnings
@@ -316,7 +385,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2
+      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
         with:
           tool: cargo-machete
       - run: cargo machete
@@ -329,7 +398,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: crate-ci/typos@8a48f81b6c64dcfea44b3633223084c4be58ac5f # v1.49.0
+      - uses: crate-ci/typos@8a48f81b6c64dcfea44b3633223084c4be58ac5f # v1.49.1
         with:
           config: .typos.toml
 
@@ -363,7 +432,7 @@ jobs:
           node-version: "22"
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2
+      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
         with:
           tool: cargo-nextest
       - name: Exercise portable Codex schema safety boundaries

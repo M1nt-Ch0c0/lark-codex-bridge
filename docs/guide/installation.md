@@ -62,18 +62,37 @@ lark-codex-bridge.exe --version
 
 ## 4. 运行依赖
 
-- Codex CLI 已安装并登录；
-- 当前 bridge 精确支持 `codex-cli 0.146.0` 和 `0.149.0`；
+- 默认 `spawned_stdio`：Codex CLI 已安装并登录，精确版本为 0.146.0 或 0.149.0；
+- 可选 `protocol_sidecar`：部署产物还必须包含 Node 20+，以及与当前平台和 CPU 匹配的
+  `codex-sidecar/` 自包含目录；也可显式覆盖为已审核的精确 0.149.0/0.151.0 binary。该目录
+  必须同时包含源码、lockfile、生产 `node_modules`、Codex 0.151.0 原生包和
+  `artifact-manifest.json`，不能用仓库里的源代码目录代替。CI 会在 Linux、macOS、Windows
+  上用真实 lockfile 依赖完成完整协议 smoke，再上传、下载独立的平台目录 artifact，由
+  checkout 中的可信校验器先核对 workflow 保存的 manifest SHA-256 和逐文件清单，再按
+  已认证清单恢复 GitHub artifact 丢失的 Unix 执行位，并在无 npm、无安装和无 package
+  下载的路径中重复 smoke；
 - 能访问对应租户的飞书或 Lark OpenAPI 与 WebSocket endpoint；
 - 本地时钟和系统证书正常。
 
-安装后建议立即执行：
+安装后先执行 Lark 检查，并按普通 `run` 支持的本地 Codex backend 二选一：
 
 ```bash
-lark-codex-bridge codex probe
 lark-codex-bridge lark auth check
 lark-codex-bridge lark probe
+
+# spawned_stdio
+lark-codex-bridge codex probe
+
+# protocol_sidecar（使用成功 CI workflow artifact，或未来 Release 中与平台/CPU 匹配的目录）
+lark-codex-bridge codex sidecar-probe \
+  --entrypoint /absolute/path/to/codex-sidecar/index.cjs
 ```
+
+`external_endpoint` 不在上述本地 backend 二选一中，也没有独立的 CLI probe。普通
+mutation-driven `run` 会对它 fail closed；开发或验收人员只能在仓库 checkout 中先
+运行 `cargo test --locked --test external_endpoint_gate`，再按
+[External Codex endpoint admission gate](../external-codex-endpoint-gate.md#verification) 以精确测试名
+显式运行真实 binary smoke。通过这些 admission 测试不会使普通 `run` 开放该模式。
 
 ## 5. 升级
 
@@ -81,7 +100,7 @@ lark-codex-bridge lark probe
 2. 备份配置、SQLite 数据库和附件缓存目录。
 3. 下载并校验新 Release。
 4. 原子替换旧二进制，保留旧文件直到新版本完成 probe。
-5. 重新执行两个 probe，再启动 bridge。
+5. 重新执行 Lark 检查和所选 backend 的 Codex probe，再启动 bridge。
 
 early alpha 期间不保证配置向后兼容。Release notes 如果要求迁移，应先按对应版本说明操作。
 

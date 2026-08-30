@@ -242,7 +242,11 @@ where
     // External observe-only transport exists, but this application path immediately constructs a
     // mutation-capable scope router. Until #30-#31 add reconciliation and shared-write fencing, an
     // explicitly external backend must fail closed and can never fall back to spawning.
-    let process_config = config.codex.process_config().ok_or(AppError::Supervisor)?;
+    let process_config = config.codex.process_config();
+    let sidecar_config = config.codex.sidecar_config();
+    if process_config.is_none() && sidecar_config.is_none() {
+        return Err(AppError::Supervisor);
+    }
     let database_path = config.paths.database.clone();
     let attachment_cache_path = config.paths.attachment_cache.clone();
     let tenant = TenantNamespace::from_credentials(&credentials);
@@ -278,7 +282,12 @@ where
         stop_store_after_error(store).await;
         return Err(AppError::Attachments);
     }
-    let Ok(supervisor) = AppServerSupervisor::start(process_config).await else {
+    let supervisor = match (process_config, sidecar_config) {
+        (Some(process), None) => AppServerSupervisor::start(process).await,
+        (None, Some(sidecar)) => AppServerSupervisor::start_sidecar(sidecar).await,
+        _ => Err(crate::codex::supervisor::SupervisorError::TaskFailed),
+    };
+    let Ok(supervisor) = supervisor else {
         drop(attachment_cache);
         stop_store_after_error(store).await;
         return Err(AppError::Supervisor);

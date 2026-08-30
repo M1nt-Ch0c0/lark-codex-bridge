@@ -11,6 +11,92 @@ use tokio::{
 use crate::codex::wire::is_supported_codex_version;
 use crate::limits::{MAX_VERSION_OUTPUT_BYTES, VERSION_PROBE_TIMEOUT};
 
+/// Static, content-free bootstrap failures emitted by the protocol sidecar.
+///
+/// Keeping this as a closed enum prevents a sidecar from turning provider or
+/// filesystem text into an operator-visible error. It also lets the supervisor
+/// distinguish retryable resource failures from deterministic configuration or
+/// compatibility failures without parsing prose.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SidecarBootstrapFailure {
+    InvalidConfiguration,
+    PinnedCodexMissing,
+    VersionProbeSpawnFailed,
+    VersionProbeSpawnUnavailable,
+    VersionProbeTimeout,
+    VersionProbeIo,
+    VersionProbeFailed,
+    VersionOutputTooLarge,
+    UnsupportedUpstreamVersion,
+    UpstreamSpawnFailed,
+    UpstreamSpawnUnavailable,
+    SidecarFailed,
+}
+
+impl SidecarBootstrapFailure {
+    #[must_use]
+    pub const fn is_retryable(self) -> bool {
+        matches!(
+            self,
+            Self::VersionProbeSpawnUnavailable
+                | Self::VersionProbeTimeout
+                | Self::VersionProbeIo
+                | Self::UpstreamSpawnUnavailable
+        )
+    }
+}
+
+/// Content-free classification for failure to start the local protocol
+/// sidecar itself. The originating path and operating-system error are
+/// deliberately discarded at the process boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SidecarSpawnFailure {
+    ResourceUnavailable,
+    Failed,
+}
+
+impl SidecarSpawnFailure {
+    pub(crate) fn classify(error: &std::io::Error) -> Self {
+        if spawn_failure_is_retryable(error) {
+            Self::ResourceUnavailable
+        } else {
+            Self::Failed
+        }
+    }
+
+    #[must_use]
+    pub const fn is_retryable(self) -> bool {
+        matches!(self, Self::ResourceUnavailable)
+    }
+}
+
+pub(crate) fn spawn_failure_is_retryable(error: &std::io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::OutOfMemory
+    ) {
+        return true;
+    }
+    spawn_raw_os_error_is_retryable(error.raw_os_error())
+}
+
+#[cfg(unix)]
+fn spawn_raw_os_error_is_retryable(code: Option<i32>) -> bool {
+    matches!(
+        code,
+        Some(libc::EAGAIN | libc::EMFILE | libc::ENFILE | libc::ENOMEM)
+    )
+}
+
+#[cfg(not(unix))]
+const fn spawn_raw_os_error_is_retryable(_code: Option<i32>) -> bool {
+    false
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub struct CodexProcessConfig {
     pub binary: PathBuf,
@@ -52,6 +138,8 @@ pub enum ProcessError {
         #[source]
         source: std::io::Error,
     },
+    #[error("unable to start Codex protocol sidecar")]
+    SidecarSpawn { failure: SidecarSpawnFailure },
     #[error("Codex version probe timed out after {0:?}")]
     ProbeTimeout(Duration),
     #[error("Codex version probe exited unsuccessfully (code: {code:?})")]
@@ -71,6 +159,20 @@ pub enum ProcessError {
     InvalidVersionOutput,
     #[error("Codex {found} is unsupported; expected an exact reviewed version")]
     UnsupportedVersion { found: Version },
+    #[error("Codex protocol sidecar configuration is invalid")]
+    InvalidSidecarConfig,
+    #[error("Codex protocol sidecar handshake timed out after {0:?}")]
+    SidecarHandshakeTimeout(Duration),
+    #[error("Codex protocol sidecar bootstrap I/O failed")]
+    SidecarBootstrapIo,
+    #[error("Codex protocol sidecar bootstrap process cleanup could not be confirmed")]
+    SidecarBootstrapCleanupFailed,
+    #[error("Codex protocol sidecar rejected bootstrap")]
+    SidecarBootstrapRejected { failure: SidecarBootstrapFailure },
+    #[error("Codex protocol sidecar violated its local wire contract")]
+    SidecarProtocol,
+    #[error("Codex {found} is unsupported by the configured protocol sidecar")]
+    UnsupportedSidecarVersion { found: Version },
     #[error("Codex app-server stdio was already transferred")]
     StdioAlreadyTaken,
     #[error("Codex app-server did not expose piped {0}")]
@@ -369,7 +471,7 @@ fn ensure_supported(version: Version) -> Result<Version, ProcessError> {
     }
 }
 
-fn process_exit(pid: u32, status: std::process::ExitStatus) -> ProcessExit {
+pub(crate) fn process_exit(pid: u32, status: std::process::ExitStatus) -> ProcessExit {
     ProcessExit {
         pid,
         success: status.success(),

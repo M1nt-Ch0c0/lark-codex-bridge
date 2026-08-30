@@ -36,6 +36,7 @@ use crate::{
         compat::{SharedWireProfile, WireAdapter},
         process::CodexProcessConfig,
         protocol::{InboundMessage, OutboundMessage, RequestId, decode_line, encode_line},
+        sidecar::CodexSidecarConfig,
         types::{ClientInfo, InitializeCapabilities, InitializeParams, ThreadListParams},
     },
     limits::{
@@ -56,6 +57,19 @@ pub enum CodexBackendConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         codex_home: Option<PathBuf>,
     },
+    ProtocolSidecar {
+        #[serde(default = "default_node_binary")]
+        node_binary: PathBuf,
+        #[serde(default = "default_codex_sidecar_entrypoint")]
+        sidecar_entrypoint: PathBuf,
+        /// Omit to use the sidecar package's exact pinned Codex release.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        codex_binary: Option<PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        codex_home: Option<PathBuf>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        codex_arguments: Vec<String>,
+    },
     ExternalEndpoint {
         endpoint: String,
         expected_codex_version: String,
@@ -66,6 +80,14 @@ pub enum CodexBackendConfig {
 
 fn default_codex_binary() -> PathBuf {
     PathBuf::from("codex")
+}
+
+fn default_node_binary() -> PathBuf {
+    PathBuf::from("node")
+}
+
+fn default_codex_sidecar_entrypoint() -> PathBuf {
+    PathBuf::from("codex-sidecar/index.cjs")
 }
 
 impl Default for CodexBackendConfig {
@@ -84,6 +106,19 @@ impl fmt::Debug for CodexBackendConfig {
                 .debug_struct("SpawnedStdio")
                 .field("binary", &"[configured]")
                 .field("codex_home", &codex_home.as_ref().map(|_| "[configured]"))
+                .finish(),
+            Self::ProtocolSidecar {
+                codex_binary,
+                codex_home,
+                codex_arguments,
+                ..
+            } => formatter
+                .debug_struct("ProtocolSidecar")
+                .field("node_binary", &"[configured]")
+                .field("sidecar_entrypoint", &"[configured]")
+                .field("codex_binary_configured", &codex_binary.is_some())
+                .field("codex_home", &codex_home.as_ref().map(|_| "[configured]"))
+                .field("codex_argument_count", &codex_arguments.len())
                 .finish(),
             Self::ExternalEndpoint {
                 expected_codex_version,
@@ -110,7 +145,30 @@ impl CodexBackendConfig {
                 binary: binary.clone(),
                 codex_home: codex_home.clone(),
             }),
-            Self::ExternalEndpoint { .. } => None,
+            Self::ProtocolSidecar { .. } | Self::ExternalEndpoint { .. } => None,
+        }
+    }
+
+    /// Returns stable local-wire process settings only for the explicitly
+    /// tagged sidecar backend.
+    #[must_use]
+    pub fn protocol_sidecar_config(&self) -> Option<CodexSidecarConfig> {
+        match self {
+            Self::ProtocolSidecar {
+                node_binary,
+                sidecar_entrypoint,
+                codex_binary,
+                codex_home,
+                codex_arguments,
+            } => Some(CodexSidecarConfig {
+                node_binary: node_binary.clone(),
+                entrypoint: sidecar_entrypoint.clone(),
+                codex_binary: codex_binary.clone(),
+                codex_home: codex_home.clone(),
+                codex_arguments: codex_arguments.clone(),
+                ..CodexSidecarConfig::default()
+            }),
+            Self::SpawnedStdio { .. } | Self::ExternalEndpoint { .. } => None,
         }
     }
 
@@ -122,7 +180,7 @@ impl CodexBackendConfig {
     /// source configuration.
     pub fn external_gate(&self) -> Result<Option<ExternalEndpointGate>, ExternalGateError> {
         match self {
-            Self::SpawnedStdio { .. } => Ok(None),
+            Self::SpawnedStdio { .. } | Self::ProtocolSidecar { .. } => Ok(None),
             Self::ExternalEndpoint {
                 endpoint,
                 expected_codex_version,
@@ -146,6 +204,14 @@ impl CodexBackendConfig {
     pub fn validate(&self) -> Result<(), ExternalGateError> {
         match self {
             Self::SpawnedStdio { .. } => Ok(()),
+            Self::ProtocolSidecar { .. } => self
+                .protocol_sidecar_config()
+                .ok_or(ExternalGateError::InvalidSidecarConfig)
+                .and_then(|config| {
+                    config
+                        .validate()
+                        .map_err(|_| ExternalGateError::InvalidSidecarConfig)
+                }),
             Self::ExternalEndpoint { .. } => self.external_gate().map(|_| ()),
         }
     }
@@ -245,6 +311,8 @@ pub struct ExternalGateReport {
 /// Static, redacted external admission failures.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum ExternalGateError {
+    #[error("Codex protocol sidecar configuration is invalid")]
+    InvalidSidecarConfig,
     #[error("external Codex endpoint configuration is invalid or unsafe")]
     InvalidEndpoint,
     #[error("external Codex expected version must be one exact promoted version")]

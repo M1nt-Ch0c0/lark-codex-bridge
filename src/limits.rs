@@ -10,9 +10,17 @@ pub const MAX_JSON_NESTING: usize = 128;
 pub const MAX_OUTBOUND_VALUE_WIRE_BYTES: usize = MAX_JSONL_LINE_BYTES / 32;
 pub const RPC_HIGH_CAPACITY: usize = 64;
 pub const RPC_NORMAL_CAPACITY: usize = 256;
+/// Normal-lane in-flight admission. It intentionally includes one high-lane
+/// quantum of headroom so a full normal command channel can continue draining
+/// while the independent high-priority lane retains its own 64 permits.
 pub const RPC_INFLIGHT_CAPACITY: usize = RPC_HIGH_CAPACITY + RPC_NORMAL_CAPACITY;
+/// Maximum simultaneous Rust-originated requests: 320 normal plus 64 high.
 pub const RPC_TOTAL_PENDING_CAPACITY: usize = RPC_INFLIGHT_CAPACITY + RPC_HIGH_CAPACITY;
+/// Maximum simultaneous Codex-originated reverse requests.
 pub const RPC_SERVER_REQUEST_CAPACITY: usize = RPC_HIGH_CAPACITY;
+/// Full duplex correlation bound across outgoing and reverse requests.
+pub const RPC_TOTAL_CORRELATION_CAPACITY: usize =
+    RPC_TOTAL_PENDING_CAPACITY + RPC_SERVER_REQUEST_CAPACITY;
 pub const EVENT_CAPACITY: usize = 1024;
 pub const RPC_RELIABLE_EVENT_CAPACITY: usize = RPC_SERVER_REQUEST_CAPACITY * 2;
 pub const THREAD_EVENT_CAPACITY: usize = 256;
@@ -205,6 +213,19 @@ pub const CHANNEL_SIDECAR_HANDLER_TIMEOUT: Duration = LARK_HANDLER_TIMEOUT;
 pub const CHANNEL_SIDECAR_ACK_GRACE: Duration = Duration::from_secs(5);
 /// Grace for a correlated shutdown response and clean child exit.
 pub const CHANNEL_SIDECAR_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// Maximum bytes before the newline of one Codex sidecar control or stable
+/// domain JSON-RPC frame. It intentionally matches the native app-server
+/// transport so selecting the sidecar cannot silently reduce payload support.
+pub const CODEX_SIDECAR_FRAME_BYTES: usize = MAX_JSONL_LINE_BYTES;
+/// Maximum concurrently correlated requests across both directions. The
+/// sidecar shares one pending map bound, so it must cover all 384 local
+/// requests plus the 64 reverse-request slots without crowding out approvals.
+pub const CODEX_SIDECAR_PENDING_CAPACITY: usize = RPC_TOTAL_CORRELATION_CAPACITY;
+/// Deadline for hello, configure, version probing, and upstream readiness.
+pub const CODEX_SIDECAR_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Grace for the sidecar and its owned Codex process tree to exit.
+pub const CODEX_SIDECAR_SHUTDOWN_GRACE: Duration = SUPERVISOR_SHUTDOWN_GRACE;
 
 /// Count bound of the single-writer store command channel. Every store
 /// request (reads included) travels this channel to the one blocking writer

@@ -5,6 +5,7 @@
 | 文件 | 职责 |
 | --- | --- |
 | `process.rs` | 版本探测、子进程 spawn、stdio 和退出 |
+| `sidecar.rs` | Codex protocol sidecar 的简单 v1 bootstrap 与进程树 ownership |
 | `transport.rs` | 有界 JSONL framing |
 | `rpc.rs` | request ID、pending map、双向 request/response |
 | `protocol.rs` / `types.rs` | wire DTO 和兼容解析 |
@@ -15,8 +16,9 @@
 
 ```text
 supervisor
-   └─ process ─ transport ─ rpc ─ client ─ typed events
-                         └──── protocol/types
+   ├─ process ──────────────┐
+   └─ sidecar ─ Codex child ├─ transport ─ rpc ─ client ─ typed events
+                            └──────────── protocol/types
 ```
 
 高层不能直接写 child stdin；所有 RPC 都通过唯一 `RpcPeer`/client 路由。
@@ -63,7 +65,9 @@ epoch 是跨重启隔离 token。所有 subscription、turn 和 approval 请求�
 ## 兼容策略
 
 - 版本输出严格；
-- 当前支持窗口有限；
+- native 与 sidecar 的精确支持窗口分别有限；
+- sidecar v1 bootstrap 只协商固定 hello/configure 字段、七个 capability、frame 和 pending；
+- sidecar 后端使用稳定 `WireAdapter::SidecarV1`，Rust supervisor epoch 不序列化到 sidecar wire；
 - open string enum 保留 unknown 值；
 - 未知 notification 可投影为 Unknown；
 - 关键字段缺失、顺序冲突或容量溢出时 fail closed。
@@ -71,11 +75,15 @@ epoch 是跨重启隔离 token。所有 subscription、turn 和 approval 请求�
 未来 Schema 生成代码必须位于 wire namespace，通过 mapper 转为稳定 domain type，不能直接覆盖
 `types.rs` 的核心模型。
 
+当前 sidecar wire 的实现字段与明确非目标见
+[Codex protocol sidecar wire v1](../codex-sidecar-wire-v1.md)。
+
 ## 推荐测试
 
 - `tests/transport.rs`：framing/进程；
 - `tests/rpc_duplex.rs`：RPC 双向语义；
 - `tests/client_flow.rs`：thread/turn/subscription；
 - `tests/supervisor.rs`：epoch/restart；
+- `src/codex/sidecar.rs` 单元测试与 `codex-sidecar/test/`：bootstrap、adapter、capacity、shutdown；
 - `tests/protocol_fixtures.rs`：wire compatibility；
 - `tests/codex_smoke.rs`：真实 app-server 门控。

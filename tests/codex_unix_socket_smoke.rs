@@ -9,6 +9,7 @@
 
 use std::{
     fs::{self, File, OpenOptions},
+    future::Future,
     io::{ErrorKind, Read, Write},
     os::unix::{
         fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink},
@@ -175,8 +176,7 @@ async fn real_exact_binary_exposes_websocket_framing_and_safe_unix_socket_bounda
     drop(stale);
 
     let mut child = spawn_server(&binary, &primary_home, &socket_path)?;
-    wait_until_ready(&mut child, &socket_path).await?;
-    let live_metadata = secure_socket_metadata(&socket_path, parent.uid())?;
+    let live_metadata = wait_until_ready(&mut child, &socket_path, parent.uid()).await?;
     ensure!(
         (live_metadata.dev(), live_metadata.ino()) != (stale_metadata.dev(), stale_metadata.ino()),
         "exact app-server did not replace the stale socket inode"
@@ -197,8 +197,7 @@ async fn real_exact_binary_exposes_websocket_framing_and_safe_unix_socket_bounda
     );
 
     let mut recovered = spawn_server(&binary, &alternate_home, &socket_path)?;
-    wait_until_ready(&mut recovered, &socket_path).await?;
-    let recovered_metadata = secure_socket_metadata(&socket_path, parent.uid())?;
+    let recovered_metadata = wait_until_ready(&mut recovered, &socket_path, parent.uid()).await?;
     ensure!(
         (recovered_metadata.dev(), recovered_metadata.ino())
             != (crashed_metadata.dev(), crashed_metadata.ino()),
@@ -209,8 +208,8 @@ async fn real_exact_binary_exposes_websocket_framing_and_safe_unix_socket_bounda
     let graceful_cleanup = classify_graceful_cleanup(&socket_path, &recovered_metadata).await?;
     if graceful_cleanup == GracefulCleanup::Stale {
         let mut cleanup_recovery = spawn_server(&binary, &collision_home, &socket_path)?;
-        wait_until_ready(&mut cleanup_recovery, &socket_path).await?;
-        let cleanup_metadata = secure_socket_metadata(&socket_path, parent.uid())?;
+        let cleanup_metadata =
+            wait_until_ready(&mut cleanup_recovery, &socket_path, parent.uid()).await?;
         ensure!(
             (cleanup_metadata.dev(), cleanup_metadata.ino())
                 != (recovered_metadata.dev(), recovered_metadata.ino()),
@@ -334,21 +333,60 @@ async fn expect_start_refused(
     Ok(())
 }
 
-async fn wait_until_ready(child: &mut ChildGuard, socket_path: &Path) -> Result<()> {
+async fn wait_until_ready(
+    child: &mut ChildGuard,
+    socket_path: &Path,
+    expected_uid: u32,
+) -> Result<fs::Metadata> {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     loop {
         child.ensure_running()?;
-        if fs::symlink_metadata(socket_path).is_ok_and(|metadata| metadata.file_type().is_socket())
-            && UnixStream::connect(socket_path).await.is_ok()
-        {
-            return Ok(());
+        if let Ok(metadata) = secure_socket_metadata(socket_path, expected_uid) {
+            if matches!(
+                finish_before_deadline(deadline, UnixStream::connect(socket_path)).await,
+                Some(Ok(_))
+            ) {
+                return Ok(metadata);
+            }
         }
-        ensure!(
-            Instant::now() < deadline,
-            "exact Unix listener did not become ready before the deadline"
-        );
+        if Instant::now() >= deadline {
+            // Preserve the precise type/owner/mode diagnostic when the socket
+            // exists but its asynchronous post-bind hardening never settles.
+            match secure_socket_metadata(socket_path, expected_uid) {
+                Ok(_) => bail!("exact Unix listener did not become ready before the deadline"),
+                Err(error) => {
+                    return Err(error)
+                        .context("exact Unix listener did not become ready before the deadline");
+                }
+            }
+        }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+async fn finish_before_deadline<F>(deadline: Instant, future: F) -> Option<F::Output>
+where
+    F: Future,
+{
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return None;
+    }
+    timeout(remaining, future).await.ok()
+}
+
+#[tokio::test]
+async fn startup_operation_cannot_cross_its_deadline() {
+    let bounded = timeout(
+        Duration::from_millis(100),
+        finish_before_deadline(
+            Instant::now() + Duration::from_millis(5),
+            std::future::pending::<()>(),
+        ),
+    )
+    .await
+    .expect("deadline helper did not return within its outer test bound");
+    assert!(bounded.is_none());
 }
 
 fn secure_socket_metadata(socket_path: &Path, expected_uid: u32) -> Result<fs::Metadata> {

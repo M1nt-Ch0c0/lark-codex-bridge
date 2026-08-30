@@ -222,6 +222,102 @@ fn full_config_round_trips_and_resolves_only_runtime_relative_paths() {
 }
 
 #[test]
+fn protocol_sidecar_defaults_to_the_pinned_package_and_resolves_runtime_paths() {
+    let temp = scratch();
+    let config_path = temp.path().join("config.toml");
+    let codex_home = temp.path().join("private-codex-home");
+    fs::create_dir(&codex_home).expect("Codex home fixture should exist");
+    fs::write(
+        &config_path,
+        r#"
+owners = ["ou_owner_sidecar_paths"]
+
+[codex.backend]
+mode = "protocol_sidecar"
+node_binary = "runtime/node"
+sidecar_entrypoint = "bundle/codex-sidecar/index.cjs"
+codex_home = "private-codex-home"
+"#,
+    )
+    .expect("sidecar config fixture should write");
+
+    let config = BridgeConfig::load(Some(&config_path)).expect("sidecar config should load");
+    let CodexBackendConfig::ProtocolSidecar {
+        node_binary,
+        sidecar_entrypoint,
+        codex_binary,
+        codex_home: configured_home,
+        codex_arguments,
+    } = &config.codex.backend
+    else {
+        panic!("explicit sidecar backend should remain selected");
+    };
+    assert_eq!(node_binary, &temp.path().join("runtime/node"));
+    assert_eq!(
+        sidecar_entrypoint,
+        &temp.path().join("bundle/codex-sidecar/index.cjs")
+    );
+    assert!(
+        codex_binary.is_none(),
+        "omitting the override must select the package-lock-pinned Codex"
+    );
+    assert_eq!(configured_home.as_deref(), Some(codex_home.as_path()));
+    assert!(codex_arguments.is_empty());
+
+    let process = config
+        .codex
+        .sidecar_config()
+        .expect("selected sidecar backend should expose process settings");
+    assert!(process.codex_binary.is_none());
+    assert!(config.codex.process_config().is_none());
+    assert!(
+        config
+            .codex
+            .backend
+            .external_gate()
+            .is_ok_and(|gate| gate.is_none())
+    );
+}
+
+#[test]
+fn protocol_sidecar_override_and_debug_output_are_strict_and_redacted() {
+    let parsed = toml::from_str::<BridgeConfig>(
+        r#"
+owners = ["ou_owner_sidecar_override"]
+
+[codex.backend]
+mode = "protocol_sidecar"
+node_binary = "SECRET_NODE"
+sidecar_entrypoint = "SECRET_ENTRYPOINT"
+codex_binary = "SECRET_CODEX"
+codex_arguments = ["SECRET_ARGUMENT"]
+"#,
+    )
+    .expect("explicit sidecar override should deserialize");
+    let rendered = format!("{:?}", parsed.codex.backend);
+    for secret in [
+        "SECRET_NODE",
+        "SECRET_ENTRYPOINT",
+        "SECRET_CODEX",
+        "SECRET_ARGUMENT",
+    ] {
+        assert!(!rendered.contains(secret));
+    }
+
+    let cross_mode = r#"
+owners = ["ou_owner_sidecar_cross_mode"]
+
+[codex.backend]
+mode = "protocol_sidecar"
+endpoint = "wss://endpoint.invalid/app-server"
+"#;
+    assert!(
+        toml::from_str::<BridgeConfig>(cross_mode).is_err(),
+        "a sidecar backend must not accept external-endpoint fields"
+    );
+}
+
+#[test]
 fn codex_effort_accepts_future_non_blank_values_and_rejects_blank_values() {
     let temp = scratch();
     let config_path = temp.path().join("config.toml");

@@ -470,6 +470,11 @@ impl SharedWireProfile {
 pub enum WireAdapter {
     V0_146_0,
     V0_149_0,
+    /// Stable bridge-domain protocol exposed by the supervised Codex sidecar.
+    ///
+    /// Unlike the native variants, this codec is not tied to an upstream Codex
+    /// release. Version-specific validation and mapping happen in the sidecar.
+    SidecarV1,
 }
 
 macro_rules! shared_outgoing_adapter {
@@ -478,6 +483,7 @@ macro_rules! shared_outgoing_adapter {
             match self {
                 Self::V0_149_0 => encode(shared_v0_149_0::$mapper(value)?, $contract),
                 Self::V0_146_0 => Err(CompatError::new($contract)),
+                Self::SidecarV1 => encode(value, $contract),
             }
         }
     };
@@ -489,6 +495,7 @@ macro_rules! shared_incoming_adapter {
             match self {
                 Self::V0_149_0 => shared_v0_149_0::$mapper(decode::<$wire>(value, $contract)?),
                 Self::V0_146_0 => Err(CompatError::new($contract)),
+                Self::SidecarV1 => decode(value, $contract),
             }
         }
     };
@@ -512,6 +519,7 @@ impl WireAdapter {
         match self {
             Self::V0_146_0 => "0.146.0",
             Self::V0_149_0 => "0.149.0",
+            Self::SidecarV1 => "sidecar-v1",
         }
     }
 
@@ -520,7 +528,7 @@ impl WireAdapter {
     /// partial shared profile.
     #[must_use]
     pub const fn supports_shared_profile(self, _profile: SharedWireProfile) -> bool {
-        matches!(self, Self::V0_149_0)
+        matches!(self, Self::V0_149_0 | Self::SidecarV1)
     }
 
     pub fn initialize_params(
@@ -530,6 +538,7 @@ impl WireAdapter {
         match self {
             Self::V0_146_0 => encode(v0_146_0::initialize_params(value)?, "initialize params"),
             Self::V0_149_0 => encode(v0_149_0::initialize_params(value)?, "initialize params"),
+            Self::SidecarV1 => encode(value, "initialize params"),
         }
     }
 
@@ -540,6 +549,7 @@ impl WireAdapter {
         match self {
             Self::V0_146_0 => v0_146_0::initialize_response(decode(value, "initialize response")?),
             Self::V0_149_0 => v0_149_0::initialize_response(decode(value, "initialize response")?),
+            Self::SidecarV1 => decode(value, "initialize response"),
         }
     }
 
@@ -556,6 +566,10 @@ impl WireAdapter {
                 validate_v0_149_thread_start_params(value)?;
                 encode(v0_149_0::thread_start_params(value)?, "thread/start params")
             }
+            Self::SidecarV1 => {
+                validate_v0_149_thread_start_params(value)?;
+                encode(value, "thread/start params")
+            }
         }
     }
 
@@ -570,6 +584,7 @@ impl WireAdapter {
             Self::V0_149_0 => {
                 v0_149_0::thread_start_response(decode(value, "thread/start response")?)
             }
+            Self::SidecarV1 => decode(value, "thread/start response"),
         }
     }
 
@@ -586,6 +601,10 @@ impl WireAdapter {
                 validate_v0_149_thread_list_params(value)?;
                 encode(v0_149_0::thread_list_params(value)?, "thread/list params")
             }
+            Self::SidecarV1 => {
+                validate_v0_149_thread_list_params(value)?;
+                encode(value, "thread/list params")
+            }
         }
     }
 
@@ -600,6 +619,7 @@ impl WireAdapter {
             Self::V0_149_0 => {
                 v0_149_0::thread_list_response(decode(value, "thread/list response")?)
             }
+            Self::SidecarV1 => decode(value, "thread/list response"),
         }
     }
 
@@ -610,6 +630,7 @@ impl WireAdapter {
         match self {
             Self::V0_146_0 => encode(v0_146_0::thread_read_params(value)?, "thread/read params"),
             Self::V0_149_0 => encode(v0_149_0::thread_read_params(value)?, "thread/read params"),
+            Self::SidecarV1 => encode(value, "thread/read params"),
         }
     }
 
@@ -624,6 +645,7 @@ impl WireAdapter {
             Self::V0_149_0 => {
                 v0_149_0::thread_read_response(decode(value, "thread/read response")?)
             }
+            Self::SidecarV1 => decode(value, "thread/read response"),
         }
     }
 
@@ -664,6 +686,14 @@ impl WireAdapter {
                 }
                 Ok(encoded)
             }
+            Self::SidecarV1 => {
+                validate_v0_149_approval(
+                    value.overrides.approval_policy.as_ref(),
+                    value.overrides.approvals_reviewer.as_deref(),
+                    "thread/resume params",
+                )?;
+                encode(value, "thread/resume params")
+            }
         }
     }
 
@@ -678,6 +708,7 @@ impl WireAdapter {
             Self::V0_149_0 => {
                 v0_149_0::thread_resume_response(decode(value, "thread/resume response")?)
             }
+            Self::SidecarV1 => decode(value, "thread/resume response"),
         }
     }
 
@@ -694,6 +725,10 @@ impl WireAdapter {
                 validate_v0_149_turn_start_params(value)?;
                 encode(v0_149_0::turn_start_params(value)?, "turn/start params")
             }
+            Self::SidecarV1 => {
+                validate_v0_149_turn_start_params(value)?;
+                encode(value, "turn/start params")
+            }
         }
     }
 
@@ -704,6 +739,7 @@ impl WireAdapter {
         match self {
             Self::V0_146_0 => v0_146_0::turn_start_response(decode(value, "turn/start response")?),
             Self::V0_149_0 => v0_149_0::turn_start_response(decode(value, "turn/start response")?),
+            Self::SidecarV1 => decode(value, "turn/start response"),
         }
     }
 
@@ -720,6 +756,7 @@ impl WireAdapter {
                 v0_149_0::turn_interrupt_params(value)?,
                 "turn/interrupt params",
             ),
+            Self::SidecarV1 => encode(value, "turn/interrupt params"),
         }
     }
 
@@ -734,6 +771,7 @@ impl WireAdapter {
             Self::V0_149_0 => {
                 v0_149_0::turn_interrupt_response(decode(value, "turn/interrupt response")?)
             }
+            Self::SidecarV1 => decode(value, "turn/interrupt response"),
         }
     }
 
@@ -748,6 +786,7 @@ impl WireAdapter {
             Self::V0_149_0 => {
                 v0_149_0::thread_started_notification(decode(value, "thread/started notification")?)
             }
+            Self::SidecarV1 => decode(value, "thread/started notification"),
         }
     }
 
@@ -762,6 +801,7 @@ impl WireAdapter {
             Self::V0_149_0 => {
                 v0_149_0::turn_started_notification(decode(value, "turn/started notification")?)
             }
+            Self::SidecarV1 => decode(value, "turn/started notification"),
         }
     }
 
@@ -776,6 +816,7 @@ impl WireAdapter {
             Self::V0_149_0 => {
                 v0_149_0::item_started_notification(decode(value, "item/started notification")?)
             }
+            Self::SidecarV1 => decode(value, "item/started notification"),
         }
     }
 
@@ -792,6 +833,7 @@ impl WireAdapter {
                 value,
                 "item/agentMessage/delta notification",
             )?),
+            Self::SidecarV1 => decode(value, "item/agentMessage/delta notification"),
         }
     }
 
@@ -808,6 +850,7 @@ impl WireAdapter {
                 value,
                 "item/commandExecution/outputDelta notification",
             )?),
+            Self::SidecarV1 => decode(value, "item/commandExecution/outputDelta notification"),
         }
     }
 
@@ -822,6 +865,7 @@ impl WireAdapter {
             Self::V0_149_0 => {
                 v0_149_0::item_completed_notification(decode(value, "item/completed notification")?)
             }
+            Self::SidecarV1 => decode(value, "item/completed notification"),
         }
     }
 
@@ -838,6 +882,7 @@ impl WireAdapter {
                 value,
                 "thread/tokenUsage/updated notification",
             )?),
+            Self::SidecarV1 => decode(value, "thread/tokenUsage/updated notification"),
         }
     }
 
@@ -848,6 +893,7 @@ impl WireAdapter {
         match self {
             Self::V0_146_0 => v0_146_0::error_notification(decode(value, "error notification")?),
             Self::V0_149_0 => v0_149_0::error_notification(decode(value, "error notification")?),
+            Self::SidecarV1 => decode(value, "error notification"),
         }
     }
 
@@ -862,6 +908,7 @@ impl WireAdapter {
             Self::V0_149_0 => {
                 v0_149_0::turn_completed_notification(decode(value, "turn/completed notification")?)
             }
+            Self::SidecarV1 => decode(value, "turn/completed notification"),
         }
     }
 
@@ -876,6 +923,7 @@ impl WireAdapter {
             Self::V0_149_0 => {
                 v0_149_0::dynamic_tool_call_params(decode(value, "item/tool/call params")?)
             }
+            Self::SidecarV1 => decode(value, "item/tool/call params"),
         }
     }
 
@@ -892,6 +940,7 @@ impl WireAdapter {
                 v0_149_0::dynamic_tool_call_response(value)?,
                 "item/tool/call response",
             ),
+            Self::SidecarV1 => encode(value, "item/tool/call response"),
         }
     }
 
@@ -976,6 +1025,13 @@ impl WireAdapter {
                 )
             }
             Self::V0_146_0 => Err(CompatError::new("thread/turns/list params")),
+            Self::SidecarV1 => {
+                validate_v0_149_shared_sort_direction(
+                    value.sort_direction.as_ref(),
+                    "thread/turns/list params",
+                )?;
+                encode(value, "thread/turns/list params")
+            }
         }
     }
     shared_incoming_adapter!(
@@ -1001,6 +1057,13 @@ impl WireAdapter {
                 )
             }
             Self::V0_146_0 => Err(CompatError::new("thread/items/list params")),
+            Self::SidecarV1 => {
+                validate_v0_149_shared_sort_direction(
+                    value.sort_direction.as_ref(),
+                    "thread/items/list params",
+                )?;
+                encode(value, "thread/items/list params")
+            }
         }
     }
     shared_incoming_adapter!(
@@ -1023,7 +1086,9 @@ impl WireAdapter {
         value: Value,
     ) -> Result<crate::codex::types::RemoteControlStatusChangedNotification, CompatError> {
         match self {
-            Self::V0_149_0 => decode(value, "remoteControl/status/changed notification"),
+            Self::V0_149_0 | Self::SidecarV1 => {
+                decode(value, "remoteControl/status/changed notification")
+            }
             Self::V0_146_0 => Err(CompatError::new(
                 "remoteControl/status/changed notification",
             )),
@@ -1035,7 +1100,7 @@ impl WireAdapter {
         value: Value,
     ) -> Result<crate::codex::types::ThreadGoalClearedNotification, CompatError> {
         match self {
-            Self::V0_149_0 => decode(value, "thread/goal/cleared notification"),
+            Self::V0_149_0 | Self::SidecarV1 => decode(value, "thread/goal/cleared notification"),
             Self::V0_146_0 => Err(CompatError::new("thread/goal/cleared notification")),
         }
     }
@@ -1259,4 +1324,63 @@ fn encode<T: Serialize>(value: T, contract: &'static str) -> Result<Value, Compa
 
 fn decode<T: DeserializeOwned>(value: Value, contract: &'static str) -> Result<T, CompatError> {
     serde_json::from_value(value).map_err(|_| CompatError::new(contract))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::codex::types::{
+        ApprovalPolicy, SortDirection, ThreadItemsListParams, ThreadListParams, ThreadResumeParams,
+        ThreadStartParams, ThreadTurnsListParams, TurnStartParams,
+    };
+
+    use super::WireAdapter;
+
+    const CURRENT_ADAPTERS: [WireAdapter; 2] = [WireAdapter::V0_149_0, WireAdapter::SidecarV1];
+
+    #[test]
+    fn sidecar_outgoing_validation_matches_the_promoted_native_contract() {
+        let pinned_filter = ThreadListParams {
+            is_pinned: Some(true),
+            ..ThreadListParams::default()
+        };
+        let invalid_start = ThreadStartParams {
+            approval_policy: Some(ApprovalPolicy::Named("future-policy".to_owned())),
+            ..ThreadStartParams::default()
+        };
+        let mut invalid_resume = ThreadResumeParams::new("thread");
+        invalid_resume.overrides.approvals_reviewer = Some("future-reviewer".to_owned());
+        let mut invalid_turn = TurnStartParams::new("thread", Vec::new());
+        invalid_turn.summary = Some("verbose-future-summary".to_owned());
+        let invalid_turns_page = ThreadTurnsListParams {
+            thread_id: "thread".to_owned(),
+            cursor: None,
+            limit: None,
+            sort_direction: Some(SortDirection::Unknown("sideways".to_owned())),
+            items_view: None,
+        };
+        let invalid_items_page = ThreadItemsListParams {
+            thread_id: "thread".to_owned(),
+            turn_id: None,
+            cursor: None,
+            limit: None,
+            sort_direction: Some(SortDirection::Unknown("sideways".to_owned())),
+        };
+
+        for adapter in CURRENT_ADAPTERS {
+            assert!(adapter.thread_list_params(&pinned_filter).is_err());
+            assert!(adapter.thread_start_params(&invalid_start).is_err());
+            assert!(adapter.thread_resume_params(&invalid_resume).is_err());
+            assert!(adapter.turn_start_params(&invalid_turn).is_err());
+            assert!(
+                adapter
+                    .thread_turns_list_params(&invalid_turns_page)
+                    .is_err()
+            );
+            assert!(
+                adapter
+                    .thread_items_list_params(&invalid_items_page)
+                    .is_err()
+            );
+        }
+    }
 }

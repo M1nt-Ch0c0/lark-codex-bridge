@@ -1,5 +1,6 @@
 /target/
 /sidecar/node_modules/
+/codex-sidecar/node_modules/
 /.env
 /.env.*
 /.lark-codex-bridge/

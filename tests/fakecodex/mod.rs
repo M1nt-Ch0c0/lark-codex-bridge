@@ -66,6 +66,7 @@ pub(crate) struct FakeControl {
     exit: Arc<Mutex<Option<oneshot::Sender<ProcessExit>>>>,
     hold: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     terminate_calls: Arc<Mutex<Vec<Duration>>>,
+    terminate_error: Arc<Mutex<Option<io::ErrorKind>>>,
     requests_tx: mpsc::Sender<Value>,
     requests_rx: Arc<AsyncMutex<mpsc::Receiver<Value>>>,
     outputs_tx: mpsc::Sender<Value>,
@@ -150,12 +151,22 @@ impl FakeFactory {
             exit: Arc::new(Mutex::new(None)),
             hold: Arc::new(Mutex::new(None)),
             terminate_calls: Arc::new(Mutex::new(Vec::new())),
+            terminate_error: Arc::new(Mutex::new(None)),
             requests_tx,
             requests_rx: Arc::new(AsyncMutex::new(requests_rx)),
             outputs_tx,
             outputs_rx: Arc::new(Mutex::new(Some(outputs_rx))),
         };
         (FakeOutcome::Ready(control.clone()), control)
+    }
+
+    pub(crate) fn ready_with_terminate_error(kind: io::ErrorKind) -> (FakeOutcome, FakeControl) {
+        let (outcome, control) = Self::ready();
+        *control
+            .terminate_error
+            .lock()
+            .expect("terminate error lock") = Some(kind);
+        (outcome, control)
     }
 
     pub(crate) fn gated_error(error: ProcessError) -> (FakeOutcome, FakeSpawnGate) {
@@ -208,6 +219,7 @@ struct FakeProcess {
     stdout: Option<DuplexStream>,
     stdin: Option<DuplexStream>,
     stderr: Option<DuplexStream>,
+    exit: Option<ProcessExit>,
 }
 
 impl FakeProcess {
@@ -235,6 +247,7 @@ impl FakeProcess {
             stdout: Some(transport_stdout),
             stdin: Some(transport_stdin),
             stderr: Some(transport_stderr),
+            exit: None,
         }
     }
 }
@@ -258,13 +271,19 @@ impl AppServerProcess for FakeProcess {
         &mut self,
     ) -> Pin<Box<dyn Future<Output = Result<ProcessExit, ProcessError>> + Send + '_>> {
         Box::pin(async move {
-            self.exit_rx
+            if let Some(exit) = self.exit {
+                return Ok(exit);
+            }
+            let exit = self
+                .exit_rx
                 .as_mut()
                 .expect("wait once")
                 .await
                 .map_err(|error| {
                     ProcessError::Wait(io::Error::new(io::ErrorKind::BrokenPipe, error))
-                })
+                })?;
+            self.exit = Some(exit);
+            Ok(exit)
         })
     }
 
@@ -277,13 +296,24 @@ impl AppServerProcess for FakeProcess {
             .lock()
             .expect("terminate lock")
             .push(grace);
+        let terminate_error = *self
+            .control
+            .terminate_error
+            .lock()
+            .expect("terminate error lock");
         Box::pin(async move {
-            self.control.signal_exit(ProcessExit {
-                pid: 42,
-                success: false,
-                code: None,
-                signal: Some(9),
-            });
+            if let Some(kind) = terminate_error {
+                return Err(ProcessError::Terminate(io::Error::from(kind)));
+            }
+            let should_signal = self.control.exit.lock().expect("exit lock").is_some();
+            if should_signal {
+                self.control.signal_exit(ProcessExit {
+                    pid: 42,
+                    success: false,
+                    code: None,
+                    signal: Some(9),
+                });
+            }
             self.wait().await
         })
     }

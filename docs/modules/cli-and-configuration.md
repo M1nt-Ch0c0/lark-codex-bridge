@@ -17,6 +17,8 @@ CLI 是唯一的主机侧用户入口，负责解析命令、输出脱敏 probe 
 ```text
 lark-codex-bridge run [--config <path>]
 lark-codex-bridge codex probe [--binary <path>]
+lark-codex-bridge codex sidecar-probe [--node-binary <path>] [--entrypoint <path>] [--codex-binary <path>]
+lark-codex-bridge codex adoption-status
 lark-codex-bridge lark auth register [--app-id <id> --tenant <feishu|lark>]
 lark-codex-bridge lark auth check
 lark-codex-bridge lark probe
@@ -26,9 +28,10 @@ lark-codex-bridge lark probe
 
 ## probe 输出契约
 
-三个 probe 都只输出单行 JSON：
+probe 与 auth check 都只输出单行 JSON：
 
-- Codex：受支持版本、initialize user agent、平台和 supervisor epoch；
+- Codex：受支持版本、initialize user agent、平台、supervisor epoch、backend、wire
+  protocol/version 和 capability；
 - auth check：tenant、bot 名称和 bot open_id；
 - Lark probe：tenant、bot 身份、endpoint host、ping interval 和耗时。
 
@@ -45,7 +48,8 @@ lark-codex-bridge lark probe
 
 1. 定位显式或默认配置文件；
 2. 解析 TOML；
-3. 以配置目录为基准解析运行路径；
+3. 以配置目录为基准解析数据库、附件、ASR、channel sidecar 和 Codex protocol sidecar
+   路径（裸命令名仍交给 `PATH`）；
 4. 校验 owner、allow roots 和默认工作区；
 5. 生成 `AccessPolicy`、`RouterSettings` 和 Codex 进程参数。
 
@@ -60,7 +64,8 @@ lark-codex-bridge lark probe
 
 ## 当前限制
 
-- 首次注册只保存应用凭证，不会自动生成 owner 和 runtime config；由 Issue #2 跟踪。
+- 无显式配置的首次 `run` onboarding 会登记/复用凭证、写 owner 和安全默认 runtime config；
+  已有配置或显式 `--config` 不会被覆盖。
 - 单 profile、单默认凭证文件。
 - 修改配置后必须重启。
 - chat 内命令只有 parser/metadata，尚未接入生产 handler。
