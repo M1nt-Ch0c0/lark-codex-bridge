@@ -11,6 +11,7 @@ const {
   ProtocolSession,
   SERVER_REQUEST_TIMEOUT_MS,
 } = require("../session.cjs");
+const { terminateChild } = require("../upstream.cjs");
 const { boundedLines } = require("../wire.cjs");
 const { LineInbox } = require("./helpers.cjs");
 
@@ -103,6 +104,28 @@ test("shutdown grace expiry force-kills and closes every upstream pipe", async (
   assert.deepEqual(child.killCalls, ["SIGKILL"]);
   assert.ok(elapsedMs >= 25, `shutdown elapsed ${elapsedMs}ms before grace`);
   assert.ok(elapsedMs < 500, `shutdown exceeded bound: ${elapsedMs}ms`);
+  assert.equal(child.stdin.destroyed, true);
+  assert.equal(child.stdout.destroyed, true);
+  assert.equal(child.stderr.destroyed, true);
+});
+
+test("terminateChild releases wait listeners when a child never exits", async (t) => {
+  const child = new SessionChild({ exitOnStdinFinish: false });
+  child.kill = (signal = "SIGTERM") => {
+    child.killCalls.push(signal);
+    return true;
+  };
+  t.after(() => {
+    child.stdin.destroy();
+    child.stdout.destroy();
+    child.stderr.destroy();
+  });
+
+  await terminateChild(child, 10);
+
+  assert.deepEqual(child.killCalls, ["SIGKILL"]);
+  assert.equal(child.listenerCount("exit"), 0);
+  assert.equal(child.listenerCount("error"), 0);
   assert.equal(child.stdin.destroyed, true);
   assert.equal(child.stdout.destroyed, true);
   assert.equal(child.stderr.destroyed, true);
