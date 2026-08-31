@@ -185,22 +185,26 @@ Unix-socket 上的原始 HTTP/WebSocket Upgrade、peer credential、路径碰撞
 清理策略的精确 binary smoke 见
 [`docs/codex-unix-websocket-contract.md`](docs/codex-unix-websocket-contract.md#committed-reproduction)。
 
-### Persisted thread adoption（当前禁用）
+### Persisted thread adoption（显式顺序交接）
 
-顺序接管既有 Codex thread 当前明确 fail closed。受支持的 app-server 契约可以用
-`thread/resume` 取得 writer，但没有经验证的、在 app-server 继续运行时释放该 writer 的操作；
-本地退订或丢弃 bridge route 不等于释放远端 ownership。因此 bridge 不列出候选、不调用
-`thread/resume`、不写 scope mapping，也不会以 idle 状态猜测 thread 已无人持有。
+Linux/macOS 上，`spawned_stdio` 与 bridge-owned `protocol_sidecar` 可以用一个不重启的
+独立 app-server 进程组顺序接管既有 Codex thread：`thread/resume` 成功后才原子写入
+mapping，`/release` 只有在 wrapper kill/wait 后以 signal-0 观察到进程组 `ESRCH`、确认
+整组为空才解除 mapping。受管 app-server/sidecar 不得 daemonize 或 `setsid` 逃逸该组；
+释放证明不覆盖故意逃逸的进程。本地退订、idle 状态或丢弃 route 都不算释放 ownership。
+Windows 的 Job child wait 不能证明 `ACTIVE_PROCESS_ZERO`，因此 adoption 在 capability gate
+和 production launcher 两层均 fail closed；这不影响普通 bridge backend。shared
+`external_endpoint` 也无法由 bridge 回收远端进程，继续 fail closed。
 
-`/threads`、`/adopt <selector> --handoff-complete` 和 `/release` 已保留为显式命令语法；当前
-slash handler 尚未接线，且任何未来 handler 都必须先通过零状态 capability gate。可用下面的
-只读诊断查看稳定分类（不读取 `CODEX_HOME`，也不启动 Codex）：
+owner 通过 `/threads`、`/adopt <selector> --handoff-complete` 和 `/release` 显式控制；
+active-writer conflict 不重试、不抢占、不 kill 其他客户端。下面的只读诊断输出本地可用后端
+和 external endpoint 拒绝分类，且不读取 `CODEX_HOME`、不启动 Codex：
 
 ```bash
 cargo run --locked -- codex adoption-status
 ```
 
-完整的负向互操作证据、生命周期规则和未来启用条件见
+完整的 dedicated ownership、恢复矩阵与真实 A→B→C sequential-handoff 证据见
 [`docs/thread-adoption.md`](docs/thread-adoption.md)。实时多客户端共享不属于该顺序交接方案，
 由 [Issue #8](https://github.com/M1nt-Ch0c0/lark-codex-bridge/issues/8) 单独研究。
 
@@ -400,7 +404,7 @@ JSON 转义、Unicode 与闭合 fence 开销均计入，超限时 fence-safe 截
 持久 outbox 从本功能起只写 payload v2；升级后的 reader 同时严格读取 v1/v2。历史 v1
 `reply_text` 始终保持纯文本载体，不会因内容像 Markdown 而改型；历史终态 Card 的备用正文
 会先经过当前净化器再成为 `post`。Markdown outbox 降级栅栏在 schema v7 引入；当前二进制
-会把数据库迁移到 `PRAGMA user_version=10`。升级前应停掉旧进程并备份数据库，升级后不得再
+会把数据库迁移到 `PRAGMA user_version=12`。升级前应停掉旧进程并备份数据库，升级后不得再
 用只认识较早 schema 或 payload v1 的旧二进制打开同一库。
 确定未生效的终态 Card PATCH 在永久拒绝（或同样确定未生效的限流重试耗尽）后，会把同一个
 确定性 outbox 行原子转换成 standalone Markdown post；响应丢失、畸形或其他

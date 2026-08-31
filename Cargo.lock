@@ -1047,6 +1047,7 @@ dependencies = [
  "futures-util",
  "image",
  "libc",
+ "nix",
  "predicates",
  "process-wrap",
  "prost",

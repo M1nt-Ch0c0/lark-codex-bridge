@@ -15,6 +15,12 @@ lease 状态。业务模块通过有界 request channel 访问，不能直接持
 - `Claimed`：已归属某个 turn；
 - terminal resolution：完成或带静态原因拒绝。
 
+控制回复和拒绝通知会把确定性的 outbox key 与 terminal inbound 状态原子记录。当前去重
+窗口由 `DEDUP_TTL` 限定（默认 7 天）：窗口内只要 inbound marker 或同 key 的 outbox 行
+仍存在，重复 webhook 都不会产生第二次发送。terminal inbound 与已发送/失败 outbox 都超过
+各自 retention、且两份证据都被清理后，极晚到达的同一 webhook 会按新事件处理；这里不承诺
+无限期 tombstone。`uncertain_delivery` 不参与自动清理，必须由运维人员显式处置。
+
 ### Thread
 
 - `Active`：当前 scope 使用；
@@ -64,6 +70,10 @@ lease 状态。业务模块通过有界 request channel 访问，不能直接持
 - 预装有界数量的 `Received`；
 - 校验/回收 terminal turn 和 attachment lease；
 - 启动先执行一个 attachment reconcile 批次，runtime actor 接续到 EOF 并周期复扫。
+
+outbox pump 同时拥有一个与传输连接独立的 retention task。它每次只提交一个有界批次；满批
+会让出执行权后继续，writer 短暂满载会按短周期重试。因此断连或单次网络发送阻塞不会阻止
+terminal inbound/outbox 释放容量。
 
 当前限制：没有后台周期性 `Received` 全量重扫；极端积压可能需要后续批次或重启推进。
 

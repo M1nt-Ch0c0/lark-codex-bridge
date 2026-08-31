@@ -9,6 +9,7 @@ use std::{
 };
 
 use semver::Version;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -47,6 +48,8 @@ const BASE_DELAYS: [Duration; 7] = [
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 const CLEANUP_FAILED_REASON: &str =
     "Codex process cleanup failed; replacement is fenced until bridge restart";
+const ONE_SHOT_START_FAILED_REASON: &str =
+    "Codex one-shot app-server failed before readiness; automatic restart is disabled";
 
 /// Object-safe stdio bundle transferred from a spawned app-server.
 pub struct ProcessStdio {
@@ -118,6 +121,11 @@ pub type SpawnFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Box<dyn AppServerProcess>, ProcessError>> + Send + 'a>>;
 
 /// Spawns supervised app-server children; faked in tests for determinism.
+///
+/// Implementations must bound probe/bootstrap internally. Once an attempt has
+/// begun, the supervisor lets this future resolve during shutdown so any
+/// returned process can pass through authoritative termination and any
+/// bootstrap cleanup uncertainty can be propagated.
 pub trait ProcessFactory: Send + Sync {
     fn spawn<'a>(&'a self, config: &'a CodexProcessConfig) -> SpawnFuture<'a>;
 }
@@ -152,6 +160,29 @@ pub struct PeerInfo {
     pub user_agent: String,
     pub platform_family: String,
     pub platform_os: String,
+}
+
+/// Opaque identity of the Codex profile reported by `initialize`.
+///
+/// Only cloning and equality comparison are exposed. The source path and its
+/// fingerprint are both withheld from formatting so operator output cannot
+/// disclose or correlate a local Codex home.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ProfileIdentity([u8; 32]);
+
+impl ProfileIdentity {
+    pub(crate) fn from_codex_home(codex_home: &std::path::Path) -> Self {
+        let mut digest = Sha256::new();
+        digest.update(b"lark-codex-bridge/codex-profile/v1\0");
+        digest.update(codex_home.as_os_str().as_encoded_bytes());
+        Self(digest.finalize().into())
+    }
+}
+
+impl fmt::Debug for ProfileIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ProfileIdentity([REDACTED])")
+    }
 }
 
 /// Sanitized protocol/backend facts for one ready epoch.
@@ -278,6 +309,18 @@ impl fmt::Debug for SupervisorSettings {
 /// Entry points for the app-server supervisor.
 pub struct AppServerSupervisor;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RestartPolicy {
+    Always,
+    Never,
+}
+
+#[derive(Clone)]
+struct ReadyEpochAccess {
+    client: Arc<AppServerClient>,
+    profile_identity: ProfileIdentity,
+}
+
 impl AppServerSupervisor {
     /// Starts a supervisor for the real installed Codex binary.
     ///
@@ -289,6 +332,27 @@ impl AppServerSupervisor {
     /// Returns an error if the supervisor task cannot be started.
     pub async fn start(config: CodexProcessConfig) -> Result<SupervisorHandle, SupervisorError> {
         Self::start_with_factory(
+            config,
+            Arc::new(CodexProcessFactory),
+            SupervisorSettings::default(),
+        )
+        .await
+    }
+
+    /// Starts one real installed Codex app-server epoch that is never
+    /// automatically replaced.
+    ///
+    /// The returned handle exclusively owns that epoch. If the child exits,
+    /// the supervisor confirms cleanup and stops instead of spawning another
+    /// process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the supervisor task cannot be started.
+    pub async fn start_once(
+        config: CodexProcessConfig,
+    ) -> Result<OneShotSupervisorHandle, SupervisorError> {
+        Self::start_once_with_factory(
             config,
             Arc::new(CodexProcessFactory),
             SupervisorSettings::default(),
@@ -315,6 +379,24 @@ impl AppServerSupervisor {
         .await
     }
 
+    /// Starts one stable-protocol sidecar epoch that is never automatically
+    /// replaced.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the supervisor task cannot be started.
+    pub async fn start_sidecar_once(
+        config: CodexSidecarConfig,
+    ) -> Result<OneShotSupervisorHandle, SupervisorError> {
+        let factory = Arc::new(CodexSidecarProcessFactory { config });
+        Self::start_once_with_factory(
+            CodexProcessConfig::default(),
+            factory,
+            SupervisorSettings::default(),
+        )
+        .await
+    }
+
     /// Starts a supervisor with an injected process factory and settings.
     ///
     /// # Errors
@@ -325,9 +407,38 @@ impl AppServerSupervisor {
         factory: Arc<dyn ProcessFactory>,
         settings: SupervisorSettings,
     ) -> Result<SupervisorHandle, SupervisorError> {
+        Self::start_with_factory_and_policy(config, factory, settings, RestartPolicy::Always).await
+    }
+
+    /// Starts one app-server epoch with an injected process factory and never
+    /// automatically replaces it.
+    ///
+    /// This entry point exists so ownership-domain lifecycle tests can use a
+    /// deterministic process while production callers use [`Self::start_once`]
+    /// or [`Self::start_sidecar_once`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the supervisor task cannot be started.
+    pub async fn start_once_with_factory(
+        config: CodexProcessConfig,
+        factory: Arc<dyn ProcessFactory>,
+        settings: SupervisorSettings,
+    ) -> Result<OneShotSupervisorHandle, SupervisorError> {
+        Self::start_with_factory_and_policy(config, factory, settings, RestartPolicy::Never)
+            .await
+            .map(OneShotSupervisorHandle::new)
+    }
+
+    async fn start_with_factory_and_policy(
+        config: CodexProcessConfig,
+        factory: Arc<dyn ProcessFactory>,
+        settings: SupervisorSettings,
+        restart_policy: RestartPolicy,
+    ) -> Result<SupervisorHandle, SupervisorError> {
         let (state_tx, mut state_rx) = watch::channel(SupervisorState::Starting { epoch: 0 });
         state_rx.borrow_and_update();
-        let client_slot: Arc<Mutex<Option<Arc<AppServerClient>>>> = Arc::new(Mutex::new(None));
+        let ready_slot: Arc<Mutex<Option<ReadyEpochAccess>>> = Arc::new(Mutex::new(None));
         let shutdown = CancellationToken::new();
         let mut startup_guard = SupervisorStartupGuard::new(shutdown.clone());
         let mut task = tokio::spawn(run_supervisor(
@@ -335,8 +446,9 @@ impl AppServerSupervisor {
             factory,
             settings,
             state_tx.clone(),
-            Arc::clone(&client_slot),
+            Arc::clone(&ready_slot),
             shutdown.clone(),
+            restart_policy,
         ));
 
         // Return only after the first epoch attempt concluded so callers never
@@ -358,7 +470,7 @@ impl AppServerSupervisor {
 
         Ok(SupervisorHandle {
             state: state_rx,
-            client_slot,
+            ready_slot,
             shutdown,
             task: Some(task),
         })
@@ -379,6 +491,70 @@ impl AppServerSupervisor {
         let jittered = base_millis * 3 / 4 + spread;
         let delay = Duration::from_millis(u64::try_from(jittered).unwrap_or(u64::MAX));
         delay.min(MAX_RETRY_DELAY)
+    }
+}
+
+/// Exclusive owner of one initialized app-server epoch with restart disabled.
+///
+/// The handle deliberately cannot be converted into the bridge's restarting
+/// [`SupervisorHandle`]. Dropping it requests cleanup; consuming
+/// [`OneShotSupervisorHandle::shutdown`] additionally waits for the process
+/// abstraction to confirm termination and reaping.
+pub struct OneShotSupervisorHandle {
+    inner: SupervisorHandle,
+}
+
+impl OneShotSupervisorHandle {
+    fn new(inner: SupervisorHandle) -> Self {
+        Self { inner }
+    }
+
+    /// Waits for the next lifecycle transition and returns the new state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SupervisorError::Stopped`] once the state channel has closed.
+    pub async fn changed(&mut self) -> Result<SupervisorState, SupervisorError> {
+        self.inner.changed().await
+    }
+
+    /// Returns the most recently published lifecycle state without waiting.
+    #[must_use]
+    pub fn state(&self) -> SupervisorState {
+        self.inner.state()
+    }
+
+    /// Returns the initialized client while the sole epoch remains ready.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SupervisorError::NotReady`] before readiness and after the
+    /// owned epoch exits.
+    pub fn client(&self) -> Result<Arc<AppServerClient>, SupervisorError> {
+        self.inner.client()
+    }
+
+    /// Returns the opaque profile identity reported by the sole ready epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SupervisorError::NotReady`] before readiness and after the
+    /// owned epoch exits.
+    pub fn profile_identity(&self) -> Result<ProfileIdentity, SupervisorError> {
+        self.inner.profile_identity()
+    }
+
+    /// Stops the sole epoch and waits until process cleanup and reaping are
+    /// confirmed by [`AppServerProcess::terminate`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SupervisorError::TaskFailed`] if the ownership task failed,
+    /// and [`SupervisorError::CleanupFailed`] when cleanup could not be
+    /// confirmed. In the latter case the caller must retain its ownership
+    /// fence.
+    pub async fn shutdown(self) -> Result<(), SupervisorError> {
+        self.inner.shutdown().await
     }
 }
 
@@ -422,7 +598,7 @@ impl Drop for SupervisorStartupGuard {
 /// Observation and shutdown handle for a running supervisor.
 pub struct SupervisorHandle {
     state: watch::Receiver<SupervisorState>,
-    client_slot: Arc<Mutex<Option<Arc<AppServerClient>>>>,
+    ready_slot: Arc<Mutex<Option<ReadyEpochAccess>>>,
     shutdown: CancellationToken,
     task: Option<JoinHandle<Result<(), SupervisorError>>>,
 }
@@ -438,7 +614,7 @@ impl SupervisorHandle {
     ) {
         let (state_tx, state) = watch::channel(initial);
         let (stopped_tx, stopped) = tokio::sync::oneshot::channel();
-        let client_slot = Arc::new(Mutex::new(None));
+        let ready_slot = Arc::new(Mutex::new(None));
         let shutdown = CancellationToken::new();
         let task_shutdown = shutdown.clone();
         let task = tokio::spawn(async move {
@@ -449,7 +625,7 @@ impl SupervisorHandle {
         (
             Self {
                 state,
-                client_slot,
+                ready_slot,
                 shutdown,
                 task: Some(task),
             },
@@ -488,10 +664,25 @@ impl SupervisorHandle {
     ///
     /// Returns [`SupervisorError::NotReady`] while no epoch is ready.
     pub fn client(&self) -> Result<Arc<AppServerClient>, SupervisorError> {
-        self.client_slot
+        self.ready_slot
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+            .map(|ready| ready.client)
+            .ok_or(SupervisorError::NotReady)
+    }
+
+    /// Returns the opaque profile identity for the current ready epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SupervisorError::NotReady`] while no epoch is ready.
+    pub fn profile_identity(&self) -> Result<ProfileIdentity, SupervisorError> {
+        self.ready_slot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .map(|ready| ready.profile_identity)
             .ok_or(SupervisorError::NotReady)
     }
 
@@ -523,6 +714,7 @@ impl Drop for SupervisorHandle {
 struct RunningEpoch {
     process: Box<dyn AppServerProcess>,
     client: Arc<AppServerClient>,
+    profile_identity: ProfileIdentity,
     version: Version,
     peer: PeerInfo,
     protocol: ProtocolInfo,
@@ -533,13 +725,22 @@ struct EpochStartError {
     permanent: Option<String>,
 }
 
+enum SpawnAttempt {
+    Process(Box<dyn AppServerProcess>),
+    Retry,
+    Stop(Result<(), SupervisorError>),
+}
+
 fn activate_ready_epoch(
     state_tx: &watch::Sender<SupervisorState>,
-    client_slot: &Mutex<Option<Arc<AppServerClient>>>,
+    ready_slot: &Mutex<Option<ReadyEpochAccess>>,
     epoch: u64,
     running: &RunningEpoch,
 ) {
-    *client_slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(running.client.clone());
+    *ready_slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(ReadyEpochAccess {
+        client: running.client.clone(),
+        profile_identity: running.profile_identity.clone(),
+    });
     publish(
         state_tx,
         SupervisorState::Ready {
@@ -556,11 +757,11 @@ async fn run_supervisor(
     factory: Arc<dyn ProcessFactory>,
     settings: SupervisorSettings,
     state_tx: watch::Sender<SupervisorState>,
-    client_slot: Arc<Mutex<Option<Arc<AppServerClient>>>>,
+    ready_slot: Arc<Mutex<Option<ReadyEpochAccess>>>,
     shutdown: CancellationToken,
+    restart_policy: RestartPolicy,
 ) -> Result<(), SupervisorError> {
-    let mut epoch = 0_u64;
-    let mut attempt = 0_u32;
+    let (mut epoch, mut attempt) = (0_u64, 0_u32);
     let mut outcome = Ok(());
     loop {
         if attempt > 0 {
@@ -589,46 +790,47 @@ async fn run_supervisor(
         // could replace it with Ready under the coalescing watch channel.
         tokio::task::yield_now().await;
 
-        let spawned = tokio::select! {
-            biased;
-            () = shutdown.cancelled() => break,
-            spawned = factory.spawn(&config) => spawned,
-        };
-        let process = match spawned {
-            Ok(process) => process,
-            Err(error) => {
-                if let Some(reason) = permanent_process_reason(&error) {
-                    publish(&state_tx, SupervisorState::Degraded { reason });
-                    shutdown.cancelled().await;
-                    break;
-                }
+        let process = match finish_spawn_attempt(
+            factory.as_ref(),
+            &config,
+            &settings,
+            &state_tx,
+            &shutdown,
+            restart_policy,
+        )
+        .await
+        {
+            SpawnAttempt::Process(process) => process,
+            SpawnAttempt::Retry => {
                 attempt = attempt.saturating_add(1);
                 continue;
+            }
+            SpawnAttempt::Stop(result) => {
+                outcome = result;
+                break;
             }
         };
 
         match connect_epoch(process, epoch, &shutdown).await {
             Ok(mut running) => {
                 attempt = 0;
-                activate_ready_epoch(&state_tx, &client_slot, epoch, &running);
-                let graceful = tokio::select! {
-                    biased;
-                    () = shutdown.cancelled() => true,
-                    _ = running.process.wait() => false,
-                };
-                *client_slot.lock().unwrap_or_else(PoisonError::into_inner) = None;
-                if let Err(error) = cleanup_running_epoch(
+                activate_ready_epoch(&state_tx, &ready_slot, epoch, &running);
+                let graceful = match finish_running_epoch(
                     &mut running,
                     settings.shutdown_grace(),
                     &state_tx,
+                    &ready_slot,
                     &shutdown,
                 )
                 .await
                 {
-                    outcome = Err(error);
-                    break;
-                }
-                if graceful {
+                    Ok(graceful) => graceful,
+                    Err(error) => {
+                        outcome = Err(error);
+                        break;
+                    }
+                };
+                if graceful || restart_policy == RestartPolicy::Never {
                     break;
                 }
                 attempt = attempt.saturating_add(1);
@@ -649,18 +851,135 @@ async fn run_supervisor(
                     outcome = Err(error);
                     break;
                 }
-                if let Some(reason) = permanent {
-                    publish(&state_tx, SupervisorState::Degraded { reason });
-                    shutdown.cancelled().await;
+                if stop_after_start_failure(permanent, restart_policy, &state_tx, &shutdown).await {
                     break;
                 }
                 attempt = attempt.saturating_add(1);
             }
         }
     }
-    *client_slot.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    *ready_slot.lock().unwrap_or_else(PoisonError::into_inner) = None;
     publish(&state_tx, SupervisorState::Stopped);
     outcome
+}
+
+async fn finish_spawn_attempt(
+    factory: &dyn ProcessFactory,
+    config: &CodexProcessConfig,
+    settings: &SupervisorSettings,
+    state_tx: &watch::Sender<SupervisorState>,
+    shutdown: &CancellationToken,
+    restart_policy: RestartPolicy,
+) -> SpawnAttempt {
+    // A production factory has bounded probe/bootstrap timeouts. Once a spawn
+    // attempt has started, let it finish instead of dropping its future on
+    // shutdown: a returned process can then be authoritatively terminated,
+    // while a bootstrap error preserves cleanup uncertainty from the factory.
+    let spawned = factory.spawn(config).await;
+    let mut process = match spawned {
+        Ok(process) => process,
+        Err(error) => {
+            if shutdown.is_cancelled()
+                || stop_after_start_failure(
+                    permanent_process_reason(&error),
+                    restart_policy,
+                    state_tx,
+                    shutdown,
+                )
+                .await
+            {
+                return SpawnAttempt::Stop(start_failure_outcome(&error));
+            }
+            return SpawnAttempt::Retry;
+        }
+    };
+    if !shutdown.is_cancelled() {
+        return SpawnAttempt::Process(process);
+    }
+    let result = cleanup_owned_process(
+        process.as_mut(),
+        settings.shutdown_grace(),
+        state_tx,
+        shutdown,
+    )
+    .await;
+    SpawnAttempt::Stop(result)
+}
+
+fn start_failure_outcome(error: &ProcessError) -> Result<(), SupervisorError> {
+    // Preserve an unconfirmed bootstrap cleanup through consuming shutdown so
+    // an adoption reservation is fenced, never terminalized as an ordinary
+    // acquisition refusal.
+    if matches!(
+        error,
+        ProcessError::ProcessTreeCleanupUnconfirmed | ProcessError::MissingProcessId
+    ) {
+        Err(SupervisorError::CleanupFailed)
+    } else {
+        Ok(())
+    }
+}
+
+async fn stop_after_start_failure(
+    permanent_reason: Option<String>,
+    restart_policy: RestartPolicy,
+    state_tx: &watch::Sender<SupervisorState>,
+    shutdown: &CancellationToken,
+) -> bool {
+    let reason = match permanent_reason {
+        Some(reason) => reason,
+        None if restart_policy == RestartPolicy::Never => ONE_SHOT_START_FAILED_REASON.to_owned(),
+        None => return false,
+    };
+    publish(state_tx, SupervisorState::Degraded { reason });
+    shutdown.cancelled().await;
+    true
+}
+
+async fn finish_running_epoch(
+    running: &mut RunningEpoch,
+    grace: Duration,
+    state_tx: &watch::Sender<SupervisorState>,
+    ready_slot: &Mutex<Option<ReadyEpochAccess>>,
+    shutdown: &CancellationToken,
+) -> Result<bool, SupervisorError> {
+    let graceful = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => true,
+        _ = running.process.wait() => false,
+    };
+    *ready_slot.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    if graceful {
+        cleanup_running_epoch(running, grace, state_tx, shutdown).await?;
+    } else {
+        cleanup_exited_running_epoch(running, grace, state_tx, shutdown).await?;
+    }
+    Ok(graceful)
+}
+
+async fn cleanup_exited_running_epoch(
+    running: &mut RunningEpoch,
+    grace: Duration,
+    state_tx: &watch::Sender<SupervisorState>,
+    shutdown: &CancellationToken,
+) -> Result<(), SupervisorError> {
+    // `wait` reaped the leader, so its numeric PID/PGID could be reused as soon
+    // as the old group becomes empty. Terminate and prove that ownership
+    // boundary immediately; waiting for transport actors first would leave a
+    // reuse window in which a later group-directed kill could hit an unrelated
+    // process. Once the process boundary is settled, finish the bounded client
+    // teardown before starting any replacement epoch.
+    let cleanup = running.process.terminate(Duration::ZERO).await;
+    if cleanup.is_err() {
+        publish_cleanup_failure(state_tx);
+    }
+    shutdown_running_client(running.client.as_ref(), grace).await;
+    if cleanup.is_ok() {
+        Ok(())
+    } else {
+        shutdown.cancelled().await;
+        Err(SupervisorError::CleanupFailed)
+    }
 }
 
 async fn cleanup_running_epoch(
@@ -672,9 +991,13 @@ async fn cleanup_running_epoch(
     // Fail the old epoch first so its writer closes app-server stdin. The
     // sidecar leader may exit before its upstream child, so process-tree
     // termination is still mandatory before a replacement can start.
-    let shutdown_bound = grace.saturating_mul(2);
-    let _ = tokio::time::timeout(shutdown_bound, running.client.shutdown()).await;
+    shutdown_running_client(running.client.as_ref(), grace).await;
     cleanup_owned_process(running.process.as_mut(), grace, state_tx, shutdown).await
+}
+
+async fn shutdown_running_client(client: &AppServerClient, grace: Duration) {
+    let shutdown_bound = grace.saturating_mul(2);
+    let _ = tokio::time::timeout(shutdown_bound, client.shutdown()).await;
 }
 
 async fn cleanup_owned_process(
@@ -686,14 +1009,18 @@ async fn cleanup_owned_process(
     if process.terminate(grace).await.is_ok() {
         return Ok(());
     }
+    publish_cleanup_failure(state_tx);
+    shutdown.cancelled().await;
+    Err(SupervisorError::CleanupFailed)
+}
+
+fn publish_cleanup_failure(state_tx: &watch::Sender<SupervisorState>) {
     publish(
         state_tx,
         SupervisorState::Degraded {
             reason: CLEANUP_FAILED_REASON.to_owned(),
         },
     );
-    shutdown.cancelled().await;
-    Err(SupervisorError::CleanupFailed)
 }
 
 fn publish(state_tx: &watch::Sender<SupervisorState>, state: SupervisorState) {
@@ -777,11 +1104,13 @@ async fn connect_epoch(
             });
         }
     };
+    let profile_identity = ProfileIdentity::from_codex_home(&initialize.codex_home);
     let peer = PeerInfo::from(&initialize);
     let client = Arc::new(AppServerClient::spawn(connection, wire));
     Ok(RunningEpoch {
         process,
         client,
+        profile_identity,
         version,
         peer,
         protocol,
@@ -822,7 +1151,9 @@ fn permanent_process_reason(error: &ProcessError) -> Option<String> {
         ProcessError::SidecarProtocol => {
             Some("Codex protocol sidecar negotiation failed closed".to_owned())
         }
-        ProcessError::SidecarBootstrapCleanupFailed => Some(CLEANUP_FAILED_REASON.to_owned()),
+        ProcessError::ProcessTreeCleanupUnconfirmed | ProcessError::MissingProcessId => {
+            Some(CLEANUP_FAILED_REASON.to_owned())
+        }
         ProcessError::UnsupportedSidecarVersion { found } => {
             Some(format!("Codex {found} has no reviewed sidecar adapter"))
         }
@@ -832,9 +1163,7 @@ fn permanent_process_reason(error: &ProcessError) -> Option<String> {
         | ProcessError::ProbeIo { .. }
         | ProcessError::Wait(_)
         | ProcessError::Terminate(_) => None,
-        ProcessError::StdioAlreadyTaken
-        | ProcessError::StdioUnavailable(_)
-        | ProcessError::MissingProcessId => {
+        ProcessError::StdioAlreadyTaken | ProcessError::StdioUnavailable(_) => {
             Some("Codex app-server process contract is unavailable".to_owned())
         }
     }
@@ -882,7 +1211,10 @@ fn permanent_rpc_reason(error: &RpcError) -> Option<String> {
                  check the exact Codex version and local configuration"
             ))
         }
-        RpcError::Server { .. } | RpcError::Timeout { .. } | RpcError::ConnectionLost(_) => None,
+        RpcError::Server { .. }
+        | RpcError::Timeout { .. }
+        | RpcError::ConnectionLost(_)
+        | RpcError::ThreadResumeActiveWriter => None,
         RpcError::AlreadyInitialized
         | RpcError::Serialize { .. }
         | RpcError::Deserialize { .. }
@@ -897,6 +1229,19 @@ fn permanent_rpc_reason(error: &RpcError) -> Option<String> {
 #[cfg(test)]
 mod classification_tests {
     use super::*;
+
+    #[test]
+    fn profile_identity_supports_only_redacted_equality() {
+        let first =
+            ProfileIdentity::from_codex_home(std::path::Path::new("/sensitive/profile/one"));
+        let same = ProfileIdentity::from_codex_home(std::path::Path::new("/sensitive/profile/one"));
+        let other =
+            ProfileIdentity::from_codex_home(std::path::Path::new("/sensitive/profile/two"));
+
+        assert_eq!(first, same);
+        assert_ne!(first, other);
+        assert_eq!(format!("{first:?}"), "ProfileIdentity([REDACTED])");
+    }
 
     #[test]
     fn bootstrap_failure_classification_is_typed_and_fail_closed() {

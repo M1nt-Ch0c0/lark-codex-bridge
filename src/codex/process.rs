@@ -1,11 +1,20 @@
 use std::{fmt, path::PathBuf, process::Stdio, time::Duration};
 
+#[cfg(unix)]
+use nix::{errno::Errno, sys::signal::killpg, unistd::Pid};
+#[cfg(windows)]
+use process_wrap::tokio::JobObject;
+#[cfg(unix)]
+use process_wrap::tokio::ProcessGroup;
+use process_wrap::tokio::{KillOnDrop, TokioChildWrapper, TokioCommandWrap};
 use semver::Version;
 use thiserror::Error;
+#[cfg(unix)]
+use tokio::time::sleep_until;
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
-    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
-    time::timeout,
+    process::{ChildStderr, ChildStdin, ChildStdout, Command},
+    time::{Instant, timeout, timeout_at},
 };
 
 use crate::codex::wire::is_supported_codex_version;
@@ -165,8 +174,8 @@ pub enum ProcessError {
     SidecarHandshakeTimeout(Duration),
     #[error("Codex protocol sidecar bootstrap I/O failed")]
     SidecarBootstrapIo,
-    #[error("Codex protocol sidecar bootstrap process cleanup could not be confirmed")]
-    SidecarBootstrapCleanupFailed,
+    #[error("Codex owned process-tree cleanup could not be confirmed")]
+    ProcessTreeCleanupUnconfirmed,
     #[error("Codex protocol sidecar rejected bootstrap")]
     SidecarBootstrapRejected { failure: SidecarBootstrapFailure },
     #[error("Codex protocol sidecar violated its local wire contract")]
@@ -193,14 +202,54 @@ pub struct ProcessExit {
     pub signal: Option<i32>,
 }
 
+#[cfg(unix)]
+const PROCESS_GROUP_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Waits until the owned POSIX process group no longer exists.
+///
+/// `process-wrap` waits for the leader, which is not sufficient evidence that
+/// every descendant has left the group. A signal-0 probe is side-effect free:
+/// only `ESRCH` proves absence. Success and `EPERM` both prove that the group
+/// still exists, while every other OS error fails closed.
+#[cfg(unix)]
+pub(crate) async fn wait_for_owned_process_group_empty(
+    leader_pid: u32,
+    deadline: Instant,
+) -> std::io::Result<()> {
+    let raw_pid = i32::try_from(leader_pid).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "owned process-group id is outside the platform range",
+        )
+    })?;
+    let process_group = Pid::from_raw(raw_pid);
+    loop {
+        match killpg(process_group, None) {
+            Err(Errno::ESRCH) => return Ok(()),
+            Ok(()) | Err(Errno::EPERM) => {}
+            Err(error) => return Err(std::io::Error::from(error)),
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "owned process group did not become empty within its bound",
+            ));
+        }
+        sleep_until((now + PROCESS_GROUP_POLL_INTERVAL).min(deadline)).await;
+    }
+}
+
 pub struct CodexProcess {
-    child: Child,
+    child: Box<dyn TokioChildWrapper>,
     version: Version,
     stdout: Option<ChildStdout>,
     stdin: Option<ChildStdin>,
     stderr: Option<ChildStderr>,
     exit: Option<ProcessExit>,
     pid: u32,
+    tree_reaped: bool,
 }
 
 impl CodexProcess {
@@ -251,7 +300,12 @@ impl CodexProcess {
         if let Some(exit) = self.exit {
             return Ok(exit);
         }
-        let status = self.child.wait().await.map_err(ProcessError::Wait)?;
+        let status = self
+            .child
+            .inner_mut()
+            .wait()
+            .await
+            .map_err(ProcessError::Wait)?;
         let exit = process_exit(self.pid, status);
         self.exit = Some(exit);
         Ok(exit)
@@ -266,21 +320,50 @@ impl CodexProcess {
     ///
     /// Returns an error if waiting for or killing the process fails.
     pub async fn terminate(&mut self, grace: Duration) -> Result<ProcessExit, ProcessError> {
-        if let Some(exit) = self.exit {
-            return Ok(exit);
+        if self.tree_reaped {
+            return self.exit.ok_or_else(|| {
+                ProcessError::Wait(std::io::Error::other(
+                    "Codex process tree was reaped without a leader status",
+                ))
+            });
         }
         drop(self.stdin.take());
+        drop(self.stdout.take());
+        drop(self.stderr.take());
 
-        if let Ok(result) = timeout(grace, self.wait()).await {
-            result
-        } else {
-            if let Err(source) = self.child.start_kill() {
-                return match self.child.try_wait().map_err(ProcessError::Wait)? {
-                    Some(status) => Ok(self.cache_exit(status)),
-                    None => Err(ProcessError::Terminate(source)),
-                };
+        if self.exit.is_none() {
+            let _ = timeout(grace, self.wait()).await;
+        }
+
+        // The leader may already be reaped while descendants still retain the
+        // process group or Job. Always kill and wait for the outer ownership
+        // boundary before reporting cleanup success. The wrapper wait and the
+        // direct POSIX group-empty proof share one absolute cleanup deadline;
+        // the latter never receives a second full grace interval.
+        let reap_bound = grace.max(Duration::from_secs(1));
+        let cleanup_deadline = Instant::now() + reap_bound;
+        let kill_error = self.child.start_kill().err();
+        match timeout_at(cleanup_deadline, Box::into_pin(self.child.wait())).await {
+            Ok(Ok(status)) => {
+                let exit = self.exit.unwrap_or_else(|| self.cache_exit(status));
+                self.exit = Some(exit);
+                #[cfg(unix)]
+                wait_for_owned_process_group_empty(self.pid, cleanup_deadline)
+                    .await
+                    .map_err(ProcessError::Terminate)?;
+                self.tree_reaped = true;
+                Ok(exit)
             }
-            self.wait().await
+            Ok(Err(source)) => Err(ProcessError::Wait(source)),
+            Err(_) => {
+                let _ = self.child.start_kill();
+                Err(ProcessError::Terminate(kill_error.unwrap_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "Codex app-server process tree did not exit within its bound",
+                    )
+                })))
+            }
         }
     }
 
@@ -288,6 +371,14 @@ impl CodexProcess {
         let exit = process_exit(self.pid, status);
         self.exit = Some(exit);
         exit
+    }
+}
+
+impl Drop for CodexProcess {
+    fn drop(&mut self) {
+        if !self.tree_reaped {
+            let _ = self.child.start_kill();
+        }
     }
 }
 
@@ -303,47 +394,76 @@ pub async fn probe_version(config: &CodexProcessConfig) -> Result<Version, Proce
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .stderr(Stdio::piped());
 
-    let mut child = command.spawn().map_err(|source| ProcessError::Spawn {
-        binary: config.binary.clone(),
-        source,
-    })?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or(ProcessError::StdioUnavailable("version stdout"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or(ProcessError::StdioUnavailable("version stderr"))?;
+    let mut child = owned_command(command)
+        .spawn()
+        .map_err(|source| ProcessError::Spawn {
+            binary: config.binary.clone(),
+            source,
+        })?;
+    let pid = child.inner().id();
+    let (stdout, stderr) = {
+        let inner = child.inner_mut();
+        (inner.stdout.take(), inner.stderr.take())
+    };
+    let Some(stdout) = stdout else {
+        cleanup_probe_process(&mut child, pid).await?;
+        return Err(ProcessError::StdioUnavailable("version stdout"));
+    };
+    let Some(stderr) = stderr else {
+        cleanup_probe_process(&mut child, pid).await?;
+        return Err(ProcessError::StdioUnavailable("version stderr"));
+    };
 
-    let collected = timeout(VERSION_PROBE_TIMEOUT, async {
-        tokio::join!(read_limited(stdout), read_limited(stderr), child.wait())
+    let probe_deadline = Instant::now() + VERSION_PROBE_TIMEOUT;
+    let collected = timeout_at(probe_deadline, async {
+        tokio::join!(
+            read_limited(stdout),
+            read_limited(stderr),
+            Box::into_pin(child.wait())
+        )
     })
     .await;
 
-    let (stdout, stderr, status) = if let Ok((stdout, stderr, status)) = collected {
-        (
-            stdout.map_err(|source| ProcessError::ProbeIo {
-                stream: "stdout",
-                source,
-            })?,
-            stderr.map_err(|source| ProcessError::ProbeIo {
-                stream: "stderr",
-                source,
-            })?,
-            status.map_err(|source| ProcessError::ProbeIo {
+    let (stdout, stderr, status) = match collected {
+        Ok((stdout, stderr, Ok(status))) => (stdout, stderr, status),
+        Ok((_, _, Err(source))) => {
+            cleanup_probe_process(&mut child, pid).await?;
+            return Err(ProcessError::ProbeIo {
                 stream: "process status",
                 source,
-            })?,
-        )
-    } else {
-        let _ = child.start_kill();
-        let _ = child.wait().await;
-        return Err(ProcessError::ProbeTimeout(VERSION_PROBE_TIMEOUT));
+            });
+        }
+        Err(_) => {
+            cleanup_probe_process(&mut child, pid).await?;
+            return Err(ProcessError::ProbeTimeout(VERSION_PROBE_TIMEOUT));
+        }
     };
+
+    #[cfg(unix)]
+    {
+        let Some(group_pid) = pid else {
+            cleanup_probe_process(&mut child, pid).await?;
+            return Err(ProcessError::ProcessTreeCleanupUnconfirmed);
+        };
+        if wait_for_owned_process_group_empty(group_pid, probe_deadline)
+            .await
+            .is_err()
+        {
+            cleanup_probe_process(&mut child, pid).await?;
+            return Err(ProcessError::ProbeTimeout(VERSION_PROBE_TIMEOUT));
+        }
+    }
+
+    let stdout = stdout.map_err(|source| ProcessError::ProbeIo {
+        stream: "stdout",
+        source,
+    })?;
+    let stderr = stderr.map_err(|source| ProcessError::ProbeIo {
+        stream: "stderr",
+        source,
+    })?;
 
     if stdout.too_long {
         return Err(ProcessError::VersionOutputTooLong {
@@ -379,17 +499,24 @@ pub async fn spawn_app_server(config: &CodexProcessConfig) -> Result<CodexProces
         .args(["app-server", "--listen", "stdio://"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .stderr(Stdio::piped());
 
+    let mut command = owned_command(command);
     let mut child = command.spawn().map_err(|source| ProcessError::Spawn {
         binary: config.binary.clone(),
         source,
     })?;
-    let pid = child.id().ok_or(ProcessError::MissingProcessId)?;
-    let stdout = child.stdout.take();
-    let stdin = child.stdin.take();
-    let stderr = child.stderr.take();
+    let Some(pid) = child.inner_mut().id() else {
+        let _ = child.start_kill();
+        let _ = timeout(VERSION_PROBE_TIMEOUT, Box::into_pin(child.wait())).await;
+        // Without the leader PID there is no process-group identity to probe.
+        // A wrapper wait therefore cannot prove that the owned tree is empty.
+        return Err(ProcessError::ProcessTreeCleanupUnconfirmed);
+    };
+    let (stdout, stdin, stderr) = {
+        let inner = child.inner_mut();
+        (inner.stdout.take(), inner.stdin.take(), inner.stderr.take())
+    };
 
     Ok(CodexProcess {
         child,
@@ -399,7 +526,45 @@ pub async fn spawn_app_server(config: &CodexProcessConfig) -> Result<CodexProces
         stderr,
         exit: None,
         pid,
+        tree_reaped: false,
     })
+}
+
+fn owned_command(command: Command) -> TokioCommandWrap {
+    let mut command = TokioCommandWrap::from(command);
+    command.wrap(KillOnDrop);
+    #[cfg(unix)]
+    command.wrap(ProcessGroup::leader());
+    #[cfg(windows)]
+    command.wrap(JobObject);
+    command
+}
+
+async fn cleanup_probe_process(
+    child: &mut Box<dyn TokioChildWrapper>,
+    pid: Option<u32>,
+) -> Result<(), ProcessError> {
+    let cleanup_deadline = Instant::now() + VERSION_PROBE_TIMEOUT;
+    let _ = child.start_kill();
+    if !matches!(
+        timeout_at(cleanup_deadline, Box::into_pin(child.wait())).await,
+        Ok(Ok(_))
+    ) {
+        let _ = child.start_kill();
+        return Err(ProcessError::ProcessTreeCleanupUnconfirmed);
+    }
+    #[cfg(unix)]
+    {
+        let pid = pid.ok_or(ProcessError::ProcessTreeCleanupUnconfirmed)?;
+        wait_for_owned_process_group_empty(pid, cleanup_deadline)
+            .await
+            .map_err(|_| ProcessError::ProcessTreeCleanupUnconfirmed)?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+    }
+    Ok(())
 }
 
 fn base_command(config: &CodexProcessConfig) -> Result<Command, ProcessError> {

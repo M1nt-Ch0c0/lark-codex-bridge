@@ -389,6 +389,54 @@ for (const version of ["0.149.0", "0.151.0"]) {
     );
   });
 
+  test(`thread/resume active-writer classification is exact and redacted through ${version}`, async (t) => {
+    const running = await configureSidecar({ version, mode: "active-writer-errors" });
+    t.after(() => cleanupRunning(running));
+    await initialize(running);
+
+    for (const [index, threadId] of [
+      "thread-conflict",
+      "thread-conflict-prefixed",
+    ].entries()) {
+      const id = `classified-${index}`;
+      send(running.child, { id, method: "thread/resume", params: { threadId } });
+      const response = await receiveUntil(running.stdout, (value) => value.id === id);
+      assert.deepEqual(response.value, {
+        id,
+        error: {
+          code: -32023,
+          message: "thread/resume active-writer conflict",
+        },
+      });
+      assert.equal(JSON.stringify(response.value).includes(threadId), false);
+    }
+
+    const genericCases = [
+      ["thread-generic", -32600],
+      ["thread-wrong-target", -32600],
+      ["thread-wrong-code", -32000],
+      ["thread-data", -32600],
+      ["thread-suffixed", -32600],
+      ["thread-reserved-spoof", -32023],
+    ];
+    for (const [index, [threadId, code]] of genericCases.entries()) {
+      const id = `generic-${index}`;
+      send(running.child, { id, method: "thread/resume", params: { threadId } });
+      const response = await receiveUntil(running.stdout, (value) => value.id === id);
+      assert.deepEqual(response.value, {
+        id,
+        error: { code, message: "upstream request failed" },
+      });
+      const rendered = JSON.stringify(response.value);
+      assert.equal(rendered.includes(threadId), false);
+      assert.equal(rendered.includes("another-thread"), false);
+      assert.equal(rendered.includes("unreviewed"), false);
+      assert.equal(rendered.includes("retry later"), false);
+    }
+
+    await shutdown(running, `shutdown-active-writer-${version}`);
+  });
+
   test(`every promoted request round-trips through the ${version} process boundary`, async (t) => {
     const running = await configureSidecar({ version, mode: "parity" });
     t.after(() => cleanupRunning(running));

@@ -44,6 +44,34 @@ impl ThreadStatus {
     }
 }
 
+/// Provenance of one durable scope-to-thread mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadOrigin {
+    /// The bridge created the Codex thread through its ordinary lifecycle.
+    BridgeCreated,
+    /// The bridge acquired an existing persisted thread through the adoption saga.
+    ExternallyAdopted,
+}
+
+impl ThreadOrigin {
+    /// Stable database representation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BridgeCreated => "bridge_created",
+            Self::ExternallyAdopted => "externally_adopted",
+        }
+    }
+
+    pub(crate) fn parse(text: &str) -> Option<Self> {
+        match text {
+            "bridge_created" => Some(Self::BridgeCreated),
+            "externally_adopted" => Some(Self::ExternallyAdopted),
+            _ => None,
+        }
+    }
+}
+
 /// Turn lifecycle states (design §7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnState {
@@ -129,6 +157,10 @@ pub struct ThreadRow {
     pub archived_ms: Option<i64>,
     /// Bridge context-tool contract installed when this thread was created.
     pub context_tools_version: u32,
+    /// Whether the bridge created or explicitly adopted this thread.
+    pub origin: ThreadOrigin,
+    /// Adoption saga generation for externally adopted mappings.
+    pub adoption_generation: Option<u64>,
 }
 
 impl std::fmt::Debug for ThreadRow {
@@ -141,6 +173,8 @@ impl std::fmt::Debug for ThreadRow {
             .field("created_ms", &self.created_ms)
             .field("archived_ms", &self.archived_ms)
             .field("context_tools_version", &self.context_tools_version)
+            .field("origin", &self.origin)
+            .field("adoption_generation", &self.adoption_generation)
             .finish_non_exhaustive()
     }
 }
@@ -344,7 +378,7 @@ impl StoreHandle {
         self.run_sized(request_size, move |connection| {
             let row = connection.query_row(
                 "SELECT scope_key, codex_thread_id, status, created_ms, archived_ms,
-                        context_tools_version
+                        context_tools_version, origin, adoption_generation
                  FROM threads WHERE scope_key = ?1 AND status = 'active'",
                 params![scope_key],
                 read_thread_row,
@@ -369,7 +403,7 @@ impl StoreHandle {
             let now = now_ms();
             let active = connection.query_row(
                 "SELECT scope_key, codex_thread_id, status, created_ms, archived_ms,
-                        context_tools_version
+                        context_tools_version, origin, adoption_generation
                  FROM threads WHERE scope_key = ?1 AND status = 'active'",
                 params![scope_key],
                 read_thread_row,
@@ -378,6 +412,11 @@ impl StoreHandle {
             else {
                 return Ok(None);
             };
+            if row.origin != ThreadOrigin::BridgeCreated {
+                return Err(StoreError::InvalidTransition {
+                    context: "archiving an externally adopted thread outside release finish",
+                });
+            }
             connection
                 .execute(
                     "UPDATE threads SET status = 'archived', archived_ms = ?3
@@ -664,8 +703,29 @@ fn ensure_recovery_capacity(
     Ok(())
 }
 
-fn read_thread_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadRow> {
+pub(crate) fn read_thread_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadRow> {
     let status: String = row.get(2)?;
+    let origin_value: String = row.get(6)?;
+    let origin = ThreadOrigin::parse(&origin_value).ok_or_else(|| {
+        rusqlite::Error::InvalidColumnType(6, "origin".to_owned(), rusqlite::types::Type::Text)
+    })?;
+    let adoption_generation = match row.get::<_, Option<i64>>(7)? {
+        None => None,
+        Some(generation) => Some(u64::try_from(generation).map_err(|_| {
+            rusqlite::Error::InvalidColumnType(
+                7,
+                "adoption_generation".to_owned(),
+                rusqlite::types::Type::Integer,
+            )
+        })?),
+    };
+    if (origin == ThreadOrigin::BridgeCreated) != adoption_generation.is_none() {
+        return Err(rusqlite::Error::InvalidColumnType(
+            7,
+            "adoption_generation".to_owned(),
+            rusqlite::types::Type::Integer,
+        ));
+    }
     Ok(ThreadRow {
         scope_key: row.get(0)?,
         codex_thread_id: row.get(1)?,
@@ -675,6 +735,8 @@ fn read_thread_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadRow> {
         created_ms: row.get(3)?,
         archived_ms: row.get(4)?,
         context_tools_version: row.get(5)?,
+        origin,
+        adoption_generation,
     })
 }
 

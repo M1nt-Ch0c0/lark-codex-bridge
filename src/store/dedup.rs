@@ -14,6 +14,7 @@ use std::collections::HashSet;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+use super::outbox::enforce_total_cap;
 use super::{StoreError, StoreHandle, now_ms, query_optional, request_bytes, sqlite_error};
 use crate::channel::{ConversationMode as ChatMode, MediaKind as ResourceKind};
 use crate::lark::bridge::RetainedInbound;
@@ -24,18 +25,28 @@ use crate::lark::normalize::{
 };
 use crate::limits::{
     ATTACHMENT_FILE_NAME_MAX_BYTES, ATTACHMENT_MIME_MAX_BYTES, DEDUP_SWEEP_BATCH,
-    OUTBOX_TERMINAL_MAX_BYTES, OUTBOX_TERMINAL_MAX_ROWS, STORE_INBOUND_BEGIN_MAX_KEY_BYTES,
-    STORE_INBOUND_BEGIN_MAX_KEYS, STORE_INBOUND_ID_MAX_BYTES, STORE_INBOUND_MAX_BYTES,
-    STORE_INBOUND_MAX_ROWS, STORE_INBOUND_MESSAGE_TYPE_MAX_BYTES, STORE_INBOUND_PAYLOAD_MAX_BYTES,
-    STORE_INBOUND_RECEIVED_MAX_BYTES, STORE_INBOUND_RECEIVED_MAX_ROWS,
-    STORE_INBOUND_RESOURCE_KEY_MAX_BYTES, STORE_INBOUND_RESOURCE_KEY_MAX_TOTAL_BYTES,
-    STORE_INBOUND_RESOURCE_MAX_COUNT, STORE_INBOUND_SCOPE_MAX_BYTES, STORE_INBOUND_TEXT_MAX_BYTES,
-    STORE_OUTBOX_MAX_QUEUED_BYTES, STORE_OUTBOX_MAX_ROWS, STORE_OUTBOX_PAYLOAD_MAX_BYTES,
-    STORE_RECOVERY_TURN_MAX_BYTES, STORE_RECOVERY_TURN_MAX_ROWS, STORE_REJECTION_REASON_MAX_BYTES,
+    STORE_INBOUND_BEGIN_MAX_KEY_BYTES, STORE_INBOUND_BEGIN_MAX_KEYS, STORE_INBOUND_ID_MAX_BYTES,
+    STORE_INBOUND_MAX_BYTES, STORE_INBOUND_MAX_ROWS, STORE_INBOUND_MESSAGE_TYPE_MAX_BYTES,
+    STORE_INBOUND_PAYLOAD_MAX_BYTES, STORE_INBOUND_RECEIVED_MAX_BYTES,
+    STORE_INBOUND_RECEIVED_MAX_ROWS, STORE_INBOUND_RESOURCE_KEY_MAX_BYTES,
+    STORE_INBOUND_RESOURCE_KEY_MAX_TOTAL_BYTES, STORE_INBOUND_RESOURCE_MAX_COUNT,
+    STORE_INBOUND_SCOPE_MAX_BYTES, STORE_INBOUND_TEXT_MAX_BYTES, STORE_OUTBOX_MAX_QUEUED_BYTES,
+    STORE_OUTBOX_MAX_ROWS, STORE_OUTBOX_PAYLOAD_MAX_BYTES, STORE_RECOVERY_TURN_MAX_BYTES,
+    STORE_RECOVERY_TURN_MAX_ROWS, STORE_REJECTION_REASON_MAX_BYTES,
 };
 use crate::runtime::intake::TenantNamespace;
 
 const INBOUND_PAYLOAD_VERSION: i64 = 1;
+const TENANT_NAMESPACE_HEX_BYTES: usize = 64;
+const INBOUND_REPLY_KEY_PREFIX: &str = "inbound:v1:";
+const INBOUND_REPLY_NOTICE_PREFIX: &str = "notice:";
+const INBOUND_REPLY_KEY_MAX_BYTES: usize = INBOUND_REPLY_KEY_PREFIX.len()
+    + TENANT_NAMESPACE_HEX_BYTES
+    + 1
+    + STORE_INBOUND_ID_MAX_BYTES
+    + 1
+    + INBOUND_REPLY_NOTICE_PREFIX.len()
+    + STORE_REJECTION_REASON_MAX_BYTES;
 
 /// Processing state of one registered inbound event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +134,33 @@ impl InboundKey {
     pub fn new(tenant: TenantNamespace, event_id: String) -> Self {
         Self { tenant, event_id }
     }
+
+    /// Derives the globally unique durable-outbox identity for this event's
+    /// bridge-control reply.
+    ///
+    /// The tenant namespace is already a one-way, credential-free digest.
+    /// Including it here mirrors the `(tenant, event_id)` inbox primary key so
+    /// two applications receiving the same provider event ID cannot reuse one
+    /// another's outbound effect.
+    #[must_use]
+    pub fn control_outbox_idempotency_key(&self) -> String {
+        self.outbox_idempotency_key("control")
+    }
+
+    /// Derives the globally unique durable-outbox identity for this event's
+    /// classified rejection notice.
+    #[must_use]
+    pub fn rejection_outbox_idempotency_key(&self, reason: InboundRejectionKind) -> String {
+        self.outbox_idempotency_key(&format!("notice:{}", reason.as_str()))
+    }
+
+    fn outbox_idempotency_key(&self, suffix: &str) -> String {
+        inbound_reply_outbox_key(&self.tenant.as_hex(), &self.event_id, suffix)
+    }
+}
+
+fn inbound_reply_outbox_key(tenant: &str, event_id: &str, suffix: &str) -> String {
+    format!("{INBOUND_REPLY_KEY_PREFIX}{tenant}:{event_id}:{suffix}")
 }
 
 /// Canonical inbound row claimed by a newly-created turn.
@@ -721,14 +759,15 @@ impl StoreHandle {
             let mut statement = connection
                 .prepare(
                     "SELECT event_id, message_id, scope_key, state, payload_version,
-                            payload_blob, payload_bytes, turn_row_id, rejection_reason
+                            payload_blob, payload_bytes, turn_row_id, rejection_reason,
+                            reply_outbox_key
                      FROM inbound_events
                      WHERE tenant = ?1 AND state = 'received'
                      ORDER BY first_seen_ms, event_id",
                 )
                 .map_err(|error| sqlite_error("preparing received recovery", &error))?;
             let stored = statement
-                .query_map(params![tenant], decode_stored_row)
+                .query_map(params![tenant], decode_stored_row_with_reply_effect)
                 .map_err(|error| sqlite_error("reading received recovery", &error))?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| sqlite_error("decoding received recovery", &error))?;
@@ -839,6 +878,132 @@ impl StoreHandle {
         .await
     }
 
+    /// Atomically enqueues a deterministic control reply and completes one
+    /// received row without creating a Codex turn.
+    ///
+    /// This is the settlement boundary for bridge-owned slash commands. The
+    /// inbound payload is erased in the same transaction that makes the reply
+    /// durable, so a crash cannot lose a command response after marking the
+    /// event complete. A marker-less legacy completion may backfill the exact
+    /// same idempotent outbox row once. Within the bounded dedup window, the
+    /// terminal inbound marker or same-key outbox row prevents recreation; an
+    /// extremely late webhook after both retention horizons is treated as new.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified error for an unknown/corrupt inbound row, a reply
+    /// whose scope or idempotency identity does not match, an already claimed
+    /// or rejected row, outbox capacity, or failed SQLite persistence.
+    #[allow(clippy::too_many_lines)]
+    pub async fn complete_received_and_enqueue_control_reply(
+        &self,
+        key: &InboundKey,
+        reply: super::NewOutboxRow,
+    ) -> Result<InboundDisposition, StoreError> {
+        let key = key.clone();
+        let request_size = request_bytes(&[
+            &key.tenant.as_hex(),
+            &key.event_id,
+            &reply.idempotency_key,
+            &reply.scope_key,
+            &reply.kind,
+            &reply.payload_json,
+        ]);
+        self.run_sized(request_size, move |connection| {
+            let transaction = connection
+                .transaction()
+                .map_err(|error| sqlite_error("starting control reply completion", &error))?;
+            let tenant = key.tenant.as_hex();
+            if reply.idempotency_key != key.control_outbox_idempotency_key()
+                || reply.kind != "control"
+                || reply.next_retry_ms != 0
+            {
+                return Err(StoreError::CorruptData {
+                    context: "validating a control reply identity",
+                });
+            }
+            let stored = read_inbound_row(&transaction, &tenant, &key.event_id)?.ok_or(
+                StoreError::NotFound {
+                    context: "completing an unknown control inbound row",
+                },
+            )?;
+            let recorded_effect = read_inbound_reply_effect(&transaction, &tenant, &key.event_id)?;
+            if reply.scope_key != stored.scope_key {
+                return Err(StoreError::CorruptData {
+                    context: "validating a control reply scope",
+                });
+            }
+            let disposition = match stored.state {
+                InboundEventState::Received => {
+                    if recorded_effect.is_some() {
+                        return Err(StoreError::CorruptData {
+                            context: "validating a received control reply effect marker",
+                        });
+                    }
+                    let _ = retained_from_stored(stored)?;
+                    enqueue_inbound_reply_in_transaction(&transaction, &reply)?;
+                    let changed = transaction
+                        .execute(
+                            "UPDATE inbound_events
+                             SET state = 'completed', payload_version = NULL,
+                                 payload_blob = NULL, payload_bytes = 0,
+                                 reply_outbox_key = ?3, updated_ms = ?4
+                             WHERE tenant = ?1 AND event_id = ?2
+                               AND state = 'received' AND turn_row_id IS NULL
+                               AND reply_outbox_key IS NULL",
+                            params![tenant, key.event_id, reply.idempotency_key, now_ms()],
+                        )
+                        .map_err(|error| {
+                            sqlite_error("completing a control inbound row", &error)
+                        })?;
+                    if changed != 1 {
+                        return Err(StoreError::CorruptData {
+                            context: "completing a concurrently changed control inbound row",
+                        });
+                    }
+                    InboundDisposition::Completed
+                }
+                InboundEventState::Completed if stored.turn_row_id.is_none() => {
+                    match recorded_effect {
+                        Some(recorded) if recorded == reply.idempotency_key => {
+                            let _ = validate_existing_inbound_reply(&transaction, &reply)?;
+                        }
+                        Some(_) => {
+                            return Err(StoreError::CorruptData {
+                                context: "validating a completed control reply effect marker",
+                            });
+                        }
+                        None => {
+                            enqueue_inbound_reply_in_transaction(&transaction, &reply)?;
+                            record_inbound_reply_effect(
+                                &transaction,
+                                &tenant,
+                                &key.event_id,
+                                &reply.idempotency_key,
+                            )?;
+                        }
+                    }
+                    InboundDisposition::AlreadyCompleted
+                }
+                InboundEventState::Accepted => {
+                    return Err(StoreError::InvalidTransition {
+                        context: "completing an already-claimed control inbound row",
+                    });
+                }
+                InboundEventState::Completed | InboundEventState::Rejected => {
+                    return Err(StoreError::InvalidTransition {
+                        context: "completing a terminal non-command inbound row as control",
+                    });
+                }
+            };
+            transaction
+                .commit()
+                .map_err(|error| sqlite_error("committing control reply completion", &error))?;
+            Ok(disposition)
+        })
+        .await
+    }
+
     /// Atomically enqueues a notice and rejects one currently received row.
     ///
     /// # Errors
@@ -865,11 +1030,20 @@ impl StoreHandle {
                 .transaction()
                 .map_err(|error| sqlite_error("starting rejection notice", &error))?;
             let tenant = key.tenant.as_hex();
+            if notice.idempotency_key != key.rejection_outbox_idempotency_key(reason)
+                || notice.kind != "notice"
+                || notice.next_retry_ms != 0
+            {
+                return Err(StoreError::CorruptData {
+                    context: "validating an inbound rejection notice identity",
+                });
+            }
             let stored = read_inbound_row(&transaction, &tenant, &key.event_id)?.ok_or(
                 StoreError::NotFound {
                     context: "rejecting an unknown inbound row",
                 },
             )?;
+            let recorded_effect = read_inbound_reply_effect(&transaction, &tenant, &key.event_id)?;
             let existing = terminal_disposition(&stored, reason)?;
             if notice.scope_key != stored.scope_key {
                 return Err(StoreError::CorruptData {
@@ -878,16 +1052,45 @@ impl StoreHandle {
             }
             if let Some(disposition) = existing {
                 if disposition == InboundDisposition::AlreadyRejected {
-                    enqueue_notice_in_transaction(&transaction, &notice)?;
-                    transaction.commit().map_err(|error| {
-                        sqlite_error("committing a backfilled rejection notice", &error)
-                    })?;
+                    match recorded_effect {
+                        Some(recorded) if recorded == notice.idempotency_key => {
+                            let _ = validate_existing_inbound_reply(&transaction, &notice)?;
+                        }
+                        Some(_) => {
+                            return Err(StoreError::CorruptData {
+                                context: "validating a rejected reply effect marker",
+                            });
+                        }
+                        None => {
+                            enqueue_inbound_reply_in_transaction(&transaction, &notice)?;
+                            record_inbound_reply_effect(
+                                &transaction,
+                                &tenant,
+                                &key.event_id,
+                                &notice.idempotency_key,
+                            )?;
+                            transaction.commit().map_err(|error| {
+                                sqlite_error("committing a backfilled rejection notice", &error)
+                            })?;
+                        }
+                    }
                 }
                 return Ok(disposition);
             }
+            if recorded_effect.is_some() {
+                return Err(StoreError::CorruptData {
+                    context: "validating a received rejection reply effect marker",
+                });
+            }
             let _ = retained_from_stored(stored)?;
-            enqueue_notice_in_transaction(&transaction, &notice)?;
+            enqueue_inbound_reply_in_transaction(&transaction, &notice)?;
             let disposition = reject_received_in_transaction(&transaction, &key, reason)?;
+            record_inbound_reply_effect(
+                &transaction,
+                &tenant,
+                &key.event_id,
+                &notice.idempotency_key,
+            )?;
             transaction
                 .commit()
                 .map_err(|error| sqlite_error("committing rejection notice", &error))?;
@@ -941,6 +1144,7 @@ struct StoredInbound {
     payload_bytes: i64,
     turn_row_id: Option<i64>,
     rejection_reason: Option<String>,
+    reply_outbox_key: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1591,13 +1795,73 @@ fn read_inbound_row(
     connection
         .query_row(
             "SELECT event_id, message_id, scope_key, state, payload_version,
-                    payload_blob, payload_bytes, turn_row_id, rejection_reason
+                    payload_blob, payload_bytes, turn_row_id, rejection_reason,
+                    reply_outbox_key
              FROM inbound_events WHERE tenant = ?1 AND event_id = ?2",
             params![tenant, event_id],
-            decode_stored_row,
+            decode_stored_row_with_reply_effect,
         )
         .optional()
         .map_err(|error| sqlite_error("reading an inbound row", &error))
+}
+
+fn read_inbound_reply_effect(
+    connection: &rusqlite::Connection,
+    tenant: &str,
+    event_id: &str,
+) -> Result<Option<String>, StoreError> {
+    connection
+        .query_row(
+            "SELECT reply_outbox_key FROM inbound_events
+             WHERE tenant = ?1 AND event_id = ?2",
+            params![tenant, event_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| sqlite_error("reading an inbound reply effect marker", &error))
+}
+
+fn record_inbound_reply_effect(
+    transaction: &rusqlite::Transaction<'_>,
+    tenant: &str,
+    event_id: &str,
+    idempotency_key: &str,
+) -> Result<(), StoreError> {
+    let logical_bytes: i64 = transaction
+        .query_row(
+            "SELECT COALESCE(SUM(
+                 LENGTH(CAST(tenant AS BLOB)) + LENGTH(CAST(event_id AS BLOB)) +
+                 LENGTH(CAST(message_id AS BLOB)) + LENGTH(CAST(scope_key AS BLOB)) +
+                 COALESCE(LENGTH(CAST(rejection_reason AS BLOB)), 0) +
+                 COALESCE(LENGTH(CAST(reply_outbox_key AS BLOB)), 0) + payload_bytes
+             ), 0)
+             FROM inbound_events",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| sqlite_error("checking inbound reply effect capacity", &error))?;
+    if u64::try_from(logical_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(u64::try_from(idempotency_key.len()).unwrap_or(u64::MAX))
+        > STORE_INBOUND_MAX_BYTES
+    {
+        return Err(StoreError::CapacityExceeded {
+            context: "recording an inbound reply effect marker",
+        });
+    }
+    let changed = transaction
+        .execute(
+            "UPDATE inbound_events
+             SET reply_outbox_key = ?3, updated_ms = ?4
+             WHERE tenant = ?1 AND event_id = ?2 AND reply_outbox_key IS NULL",
+            params![tenant, event_id, idempotency_key, now_ms()],
+        )
+        .map_err(|error| sqlite_error("recording an inbound reply effect marker", &error))?;
+    if changed != 1 {
+        return Err(StoreError::CorruptData {
+            context: "recording an inbound reply effect marker",
+        });
+    }
+    Ok(())
 }
 
 fn read_message_candidates(
@@ -1608,14 +1872,18 @@ fn read_message_candidates(
     let mut statement = connection
         .prepare(
             "SELECT event_id, message_id, scope_key, state, payload_version,
-                    payload_blob, payload_bytes, turn_row_id, rejection_reason
+                    payload_blob, payload_bytes, turn_row_id, rejection_reason,
+                    reply_outbox_key
              FROM inbound_events
              WHERE tenant = ?1 AND message_id = ?2 AND state != 'rejected'
              ORDER BY event_id",
         )
         .map_err(|error| sqlite_error("reading inbound message candidates", &error))?;
     statement
-        .query_map(params![tenant, message_id], decode_stored_row)
+        .query_map(
+            params![tenant, message_id],
+            decode_stored_row_with_reply_effect,
+        )
         .map_err(|error| sqlite_error("reading inbound message candidates", &error))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| sqlite_error("decoding inbound message candidates", &error))
@@ -1640,7 +1908,14 @@ fn decode_stored_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredInbound>
         payload_bytes: row.get(6)?,
         turn_row_id: row.get(7)?,
         rejection_reason: row.get(8)?,
+        reply_outbox_key: None,
     })
+}
+
+fn decode_stored_row_with_reply_effect(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredInbound> {
+    let mut stored = decode_stored_row(row)?;
+    stored.reply_outbox_key = row.get(9)?;
+    Ok(stored)
 }
 
 fn registration_from_stored(
@@ -1869,7 +2144,8 @@ fn ensure_inbound_capacity(
             "SELECT COUNT(*), COALESCE(SUM(
                  LENGTH(CAST(tenant AS BLOB)) + LENGTH(CAST(event_id AS BLOB)) +
                  LENGTH(CAST(message_id AS BLOB)) + LENGTH(CAST(scope_key AS BLOB)) +
-                 COALESCE(LENGTH(CAST(rejection_reason AS BLOB)), 0) + payload_bytes
+                 COALESCE(LENGTH(CAST(rejection_reason AS BLOB)), 0) +
+                 COALESCE(LENGTH(CAST(reply_outbox_key AS BLOB)), 0) + payload_bytes
              ), 0),
              COALESCE(SUM(CASE WHEN state = 'received' THEN 1 ELSE 0 END), 0),
              COALESCE(SUM(CASE WHEN state = 'received' THEN payload_bytes ELSE 0 END), 0)
@@ -1903,7 +2179,8 @@ fn validate_inbound_collection(connection: &rusqlite::Connection) -> Result<(), 
             "SELECT COUNT(*), COALESCE(SUM(
                  LENGTH(CAST(tenant AS BLOB)) + LENGTH(CAST(event_id AS BLOB)) +
                  LENGTH(CAST(message_id AS BLOB)) + LENGTH(CAST(scope_key AS BLOB)) +
-                 COALESCE(LENGTH(CAST(rejection_reason AS BLOB)), 0) + payload_bytes
+                 COALESCE(LENGTH(CAST(rejection_reason AS BLOB)), 0) +
+                 COALESCE(LENGTH(CAST(reply_outbox_key AS BLOB)), 0) + payload_bytes
              ), 0),
              COALESCE(SUM(CASE WHEN state = 'received' THEN 1 ELSE 0 END), 0),
              COALESCE(SUM(CASE WHEN state = 'received' THEN payload_bytes ELSE 0 END), 0)
@@ -1939,7 +2216,8 @@ fn validate_inbound_collection(connection: &rusqlite::Connection) -> Result<(), 
     let mut statement = connection
         .prepare(
             "SELECT tenant, event_id, message_id, scope_key, state, payload_version,
-                    payload_blob, payload_bytes, turn_row_id, rejection_reason
+                    payload_blob, payload_bytes, turn_row_id, rejection_reason,
+                    reply_outbox_key
              FROM inbound_events ORDER BY tenant, event_id",
         )
         .map_err(|error| sqlite_error("preparing inbound integrity scan", &error))?;
@@ -1966,6 +2244,7 @@ fn validate_inbound_collection(connection: &rusqlite::Connection) -> Result<(), 
                     payload_bytes: row.get(7)?,
                     turn_row_id: row.get(8)?,
                     rejection_reason: row.get(9)?,
+                    reply_outbox_key: row.get(10)?,
                 },
             ))
         })
@@ -2068,7 +2347,67 @@ fn validate_stored_inbound_row(
             }
         }
     }
+    validate_inbound_reply_effect(tenant, stored)
+}
+
+fn validate_inbound_reply_effect(tenant: &str, stored: &StoredInbound) -> Result<(), StoreError> {
+    let Some(recorded) = stored.reply_outbox_key.as_deref() else {
+        return Ok(());
+    };
+    if !is_tenant_namespace(tenant)
+        || recorded.is_empty()
+        || recorded.len() > INBOUND_REPLY_KEY_MAX_BYTES
+    {
+        return Err(StoreError::CorruptData {
+            context: "validating an inbound reply effect marker size",
+        });
+    }
+    let suffix = match (stored.state, stored.turn_row_id) {
+        (InboundEventState::Completed, None) if stored.rejection_reason.is_none() => {
+            "control".to_owned()
+        }
+        (InboundEventState::Rejected, None) => {
+            let reason = stored
+                .rejection_reason
+                .as_deref()
+                .ok_or(StoreError::CorruptData {
+                    context: "validating an inbound reply effect rejection reason",
+                })?;
+            if !is_classified_inbound_rejection(reason) {
+                return Err(StoreError::CorruptData {
+                    context: "validating an inbound reply effect rejection class",
+                });
+            }
+            format!("{INBOUND_REPLY_NOTICE_PREFIX}{reason}")
+        }
+        _ => {
+            return Err(StoreError::CorruptData {
+                context: "validating an inbound reply effect state association",
+            });
+        }
+    };
+    let expected = inbound_reply_outbox_key(tenant, &stored.event_id, &suffix);
+    if recorded != expected {
+        return Err(StoreError::CorruptData {
+            context: "validating an inbound reply effect identity",
+        });
+    }
     Ok(())
+}
+
+fn is_classified_inbound_rejection(reason: &str) -> bool {
+    matches!(
+        reason,
+        "overloaded"
+            | "not_owner"
+            | "not_sender"
+            | "not_group"
+            | "missing_mention"
+            | "owner_command_required"
+            | "policy"
+            | "stale"
+            | "internal"
+    )
 }
 
 fn validate_turn_association(
@@ -2207,7 +2546,7 @@ fn validate_nonempty_bounded(
 }
 
 fn is_tenant_namespace(value: &str) -> bool {
-    value.len() == 64
+    value.len() == TENANT_NAMESPACE_HEX_BYTES
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
@@ -2270,47 +2609,14 @@ fn reject_received_in_transaction(
 }
 
 #[allow(clippy::too_many_lines)]
-fn enqueue_notice_in_transaction(
+fn enqueue_inbound_reply_in_transaction(
     transaction: &rusqlite::Transaction<'_>,
     notice: &super::NewOutboxRow,
 ) -> Result<(), StoreError> {
-    if notice.payload_json.len() > STORE_OUTBOX_PAYLOAD_MAX_BYTES {
-        return Err(StoreError::PayloadTooLarge {
-            context: "enqueueing an inbound rejection notice",
-            limit: u64::try_from(STORE_OUTBOX_PAYLOAD_MAX_BYTES).unwrap_or(u64::MAX),
-        });
-    }
-    let existing: Option<(String, String, String, i64, i64)> = transaction
-        .query_row(
-            "SELECT scope_key, kind, payload_json, payload_bytes, next_retry_ms
-             FROM outbox WHERE idempotency_key = ?1",
-            params![notice.idempotency_key],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(|error| sqlite_error("checking a rejection notice key", &error))?;
-    let payload_bytes = u64::try_from(notice.payload_json.len()).unwrap_or(u64::MAX);
-    if let Some((scope_key, kind, payload_json, stored_bytes, next_retry_ms)) = existing {
-        if scope_key != notice.scope_key
-            || kind != notice.kind
-            || payload_json != notice.payload_json
-            || u64::try_from(stored_bytes).ok() != Some(payload_bytes)
-            || next_retry_ms != notice.next_retry_ms
-        {
-            return Err(StoreError::CorruptData {
-                context: "validating an inbound rejection notice idempotency key",
-            });
-        }
+    if validate_existing_inbound_reply(transaction, notice)? {
         return Ok(());
     }
+    let payload_bytes = u64::try_from(notice.payload_json.len()).unwrap_or(u64::MAX);
     let (count, bytes): (i64, i64) = transaction
         .query_row(
             "SELECT COUNT(*), COALESCE(SUM(payload_bytes), 0) FROM outbox
@@ -2329,32 +2635,54 @@ fn enqueue_notice_in_transaction(
             context: "enqueueing an inbound rejection notice",
         });
     }
-    // All-states hard cap (same bounds as `enforce_total_cap` in outbox.rs,
-    // but without the inline sweep): this rejection+notice transaction must
-    // stay atomic, so it cannot first sweep terminal rows. Over the cap the
-    // whole transaction fails closed — the notice insert and the inbound
-    // rejection both roll back, leaving the event `received` for the existing
-    // retry path. The bounds are the same constants `enqueue_one` uses.
-    let (total_rows, total_bytes): (i64, i64) = transaction
-        .query_row(
-            "SELECT COUNT(*), COALESCE(SUM(payload_bytes), 0) FROM outbox",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|error| sqlite_error("checking total rejection notice capacity", &error))?;
-    if u64::try_from(total_rows)
-        .unwrap_or(u64::MAX)
-        .saturating_add(1)
-        > OUTBOX_TERMINAL_MAX_ROWS
-        || u64::try_from(total_bytes)
-            .unwrap_or(u64::MAX)
-            .saturating_add(payload_bytes)
-            > OUTBOX_TERMINAL_MAX_BYTES
-    {
-        return Err(StoreError::CapacityExceeded {
+
+    enqueue_new_inbound_reply(transaction, notice, payload_bytes)
+}
+
+fn validate_existing_inbound_reply(
+    transaction: &rusqlite::Transaction<'_>,
+    notice: &super::NewOutboxRow,
+) -> Result<bool, StoreError> {
+    if notice.payload_json.len() > STORE_OUTBOX_PAYLOAD_MAX_BYTES {
+        return Err(StoreError::PayloadTooLarge {
             context: "enqueueing an inbound rejection notice",
+            limit: u64::try_from(STORE_OUTBOX_PAYLOAD_MAX_BYTES).unwrap_or(u64::MAX),
         });
     }
+    let existing: Option<(String, String, String, i64)> = transaction
+        .query_row(
+            "SELECT scope_key, kind, payload_json, payload_bytes
+             FROM outbox WHERE idempotency_key = ?1",
+            params![notice.idempotency_key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(|error| sqlite_error("checking a rejection notice key", &error))?;
+    let payload_bytes = u64::try_from(notice.payload_json.len()).unwrap_or(u64::MAX);
+    if let Some((scope_key, kind, payload_json, stored_bytes)) = existing {
+        if scope_key != notice.scope_key
+            || kind != notice.kind
+            || payload_json != notice.payload_json
+            || u64::try_from(stored_bytes).ok() != Some(payload_bytes)
+        {
+            return Err(StoreError::CorruptData {
+                context: "validating an inbound rejection notice idempotency key",
+            });
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn enqueue_new_inbound_reply(
+    transaction: &rusqlite::Transaction<'_>,
+    notice: &super::NewOutboxRow,
+    payload_bytes: u64,
+) -> Result<(), StoreError> {
+    // Reuse the ordinary enqueue all-state guard. Its one bounded terminal
+    // sweep executes inside this same SQLite transaction, so a later reply or
+    // inbound-marker failure rolls the deletions back together with the insert.
+    enforce_total_cap(transaction, payload_bytes)?;
     // Sequence watermark (same rule as `enqueue_one` in outbox.rs): a newly
     // enqueued notice must never be claimable before a row already parked for
     // retry. The notice's requested retry time is raised to the highest live

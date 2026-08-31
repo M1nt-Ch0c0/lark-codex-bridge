@@ -538,6 +538,46 @@ async fn shutdown_kills_a_descendant_left_outside_node_cleanup() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn failed_bootstrap_confirms_its_spawned_process_group_is_empty() {
+    let Some(node) = node_binary() else {
+        return;
+    };
+    let temp = TempDir::new().expect("temporary marker directory");
+    let marker = temp.path().join("bootstrap-events.jsonl");
+    let mut config = bootstrap_config(&node, "tests/fixtures/fake_sidecar_hanging_bootstrap.cjs");
+    config.codex_binary = Some(marker.clone());
+    config.handshake_timeout = Duration::from_millis(100);
+    config.shutdown_grace = Duration::from_secs(2);
+
+    let Err(error) = spawn_codex_sidecar(&config).await else {
+        panic!("the fixture never completes its configure response");
+    };
+    assert!(matches!(error, ProcessError::SidecarHandshakeTimeout(_)));
+
+    let descendant = marker_events(&marker)
+        .into_iter()
+        .find(|event| event["event"] == "descendant")
+        .expect("bootstrap fixture records its long-lived descendant PID");
+    let descendant_pid = descendant["pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .expect("descendant PID fits u32");
+    let descendant_token = descendant["token"]
+        .as_str()
+        .expect("descendant marker includes the unique argv token")
+        .to_owned();
+    let _cleanup = DescendantCleanup {
+        pid: descendant_pid,
+        token: descendant_token.clone(),
+    };
+    assert!(
+        !unix_process_matches(descendant_pid, &descendant_token),
+        "returning the original bootstrap error requires an empty owned group"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn cancelling_bootstrap_kills_the_owned_process_group() {
     let Some(node) = node_binary() else {
         return;

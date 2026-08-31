@@ -24,9 +24,9 @@ use crate::channel::{
 };
 use crate::lark::error::LarkError;
 use crate::limits::{
-    OUTBOX_POLL_INTERVAL, OUTBOX_RETRY_BASE, OUTBOX_RETRY_MAX, OUTBOX_SWEEP_BATCH,
-    OUTBOX_SWEEP_INTERVAL, OUTBOX_TERMINAL_RETENTION_MS, STORE_OUTBOX_CLAIM_MAX_BATCH,
-    STORE_OUTBOX_MAX_ATTEMPTS, STORE_RECEIPT_WRITE_ATTEMPTS,
+    DEDUP_SWEEP_BATCH, DEDUP_SWEEP_INTERVAL, DEDUP_TTL, OUTBOX_POLL_INTERVAL, OUTBOX_RETRY_BASE,
+    OUTBOX_RETRY_MAX, OUTBOX_SWEEP_BATCH, OUTBOX_SWEEP_INTERVAL, OUTBOX_TERMINAL_RETENTION_MS,
+    STORE_OUTBOX_CLAIM_MAX_BATCH, STORE_OUTBOX_MAX_ATTEMPTS, STORE_RECEIPT_WRITE_ATTEMPTS,
 };
 use crate::render::stabilize_streaming_markdown;
 use crate::store::{OutboxDepth, OutboxRow, OutboxState, StoreError, StoreHandle, now_ms};
@@ -165,6 +165,13 @@ enum SendFailure {
     DependencyUncertain,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweepOutcome {
+    Complete,
+    More,
+    RetrySoon,
+}
+
 /// Tunables for the outbox pump; defaults match the production limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutboxPumpConfig {
@@ -278,15 +285,18 @@ async fn run(
         }
         Err(error) => tracing::warn!(error = %error, "outbox startup recovery failed"),
     }
-    let sweep_interval_ms = i64::try_from(OUTBOX_SWEEP_INTERVAL.as_millis()).unwrap_or(i64::MAX);
-    let mut next_sweep_ms = 0_i64;
+    // Retention is independent of outbound connectivity. Running it in a
+    // sibling task prevents a disconnected transport or a slow network batch
+    // from blocking capacity recovery, while each store request remains one
+    // bounded writer operation.
+    let maintenance = tokio::spawn(run_maintenance(
+        store.clone(),
+        config.poll_interval,
+        shutdown.clone(),
+    ));
     loop {
         if shutdown.is_cancelled() {
             break;
-        }
-        if now_ms() >= next_sweep_ms {
-            sweep_terminal_rows(&store).await;
-            next_sweep_ms = now_ms().saturating_add(sweep_interval_ms);
         }
         if !wait_until_connected(&mut transport, &shutdown).await {
             break;
@@ -336,7 +346,68 @@ async fn run(
             break;
         }
     }
+    shutdown.cancel();
+    if let Err(error) = maintenance.await {
+        tracing::warn!(error = %error, "outbox maintenance task failed");
+    }
     tracing::info!("outbox pump stopped");
+}
+
+async fn run_maintenance(
+    store: StoreHandle,
+    retry_interval: Duration,
+    shutdown: CancellationToken,
+) {
+    let outbox_interval_ms = i64::try_from(OUTBOX_SWEEP_INTERVAL.as_millis()).unwrap_or(i64::MAX);
+    let inbound_interval_ms = i64::try_from(DEDUP_SWEEP_INTERVAL.as_millis()).unwrap_or(i64::MAX);
+    let retry_interval_ms =
+        i64::try_from(retry_interval.max(Duration::from_millis(1)).as_millis()).unwrap_or(i64::MAX);
+    let mut next_outbox_sweep_ms = 0_i64;
+    let mut next_inbound_sweep_ms = 0_i64;
+
+    loop {
+        if shutdown.is_cancelled() {
+            break;
+        }
+        let sweep_now_ms = now_ms();
+        if sweep_now_ms >= next_outbox_sweep_ms {
+            let outcome = sweep_terminal_outbox_rows(&store, sweep_now_ms).await;
+            next_outbox_sweep_ms =
+                next_sweep_ms(outcome, sweep_now_ms, outbox_interval_ms, retry_interval_ms);
+        }
+        if sweep_now_ms >= next_inbound_sweep_ms {
+            let outcome = sweep_terminal_inbound_rows(&store, sweep_now_ms).await;
+            next_inbound_sweep_ms = next_sweep_ms(
+                outcome,
+                sweep_now_ms,
+                inbound_interval_ms,
+                retry_interval_ms,
+            );
+        }
+
+        let next_due_ms = next_outbox_sweep_ms.min(next_inbound_sweep_ms);
+        let delay_ms = u64::try_from(next_due_ms.saturating_sub(now_ms())).unwrap_or(0);
+        if delay_ms == 0 {
+            // A full batch keeps maintenance due. Yield between batches so
+            // other writer callers can enqueue ahead of the next request.
+            tokio::task::yield_now().await;
+        } else if !sleep_or_shutdown(Duration::from_millis(delay_ms), &shutdown).await {
+            break;
+        }
+    }
+}
+
+const fn next_sweep_ms(
+    outcome: SweepOutcome,
+    sweep_now_ms: i64,
+    interval_ms: i64,
+    retry_interval_ms: i64,
+) -> i64 {
+    match outcome {
+        SweepOutcome::Complete => sweep_now_ms.saturating_add(interval_ms),
+        SweepOutcome::More => sweep_now_ms,
+        SweepOutcome::RetrySoon => sweep_now_ms.saturating_add(retry_interval_ms),
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -957,17 +1028,51 @@ async fn release_tail(store: &StoreHandle, tail: &[OutboxRow]) {
     );
 }
 
-/// One bounded, cancellation-aware terminal sweep. Failures are logged and
-/// dropped: a sweep that cannot run must never stall the send loop.
-async fn sweep_terminal_rows(store: &StoreHandle) {
-    let older_than_ms = now_ms().saturating_sub(OUTBOX_TERMINAL_RETENTION_MS);
+/// Runs one bounded outbox retention batch. The caller retries transient
+/// failures on the short pump cadence and continues full batches after a
+/// cooperative yield.
+async fn sweep_terminal_outbox_rows(store: &StoreHandle, sweep_now_ms: i64) -> SweepOutcome {
+    let older_than_ms = sweep_now_ms.saturating_sub(OUTBOX_TERMINAL_RETENTION_MS);
     match store
         .sweep_terminal_outbox(older_than_ms, OUTBOX_SWEEP_BATCH)
         .await
     {
-        Ok(0) => {}
-        Ok(deleted) => tracing::debug!(deleted, "swept terminal outbox rows"),
-        Err(error) => tracing::warn!(error = %error, "outbox terminal sweep failed"),
+        Ok(0) => SweepOutcome::Complete,
+        Ok(deleted) => {
+            tracing::debug!(deleted, "swept terminal outbox rows");
+            if deleted >= u64::from(OUTBOX_SWEEP_BATCH) {
+                SweepOutcome::More
+            } else {
+                SweepOutcome::Complete
+            }
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "outbox terminal sweep failed");
+            SweepOutcome::RetrySoon
+        }
+    }
+}
+
+/// Runs one bounded inbound retention batch. This is the production consumer
+/// of the dedup retention constants: without it, the hard row/byte bounds
+/// would eventually reject every new inbound event.
+async fn sweep_terminal_inbound_rows(store: &StoreHandle, sweep_now_ms: i64) -> SweepOutcome {
+    let retention_ms = i64::try_from(DEDUP_TTL.as_millis()).unwrap_or(i64::MAX);
+    let older_than_ms = sweep_now_ms.saturating_sub(retention_ms);
+    match store.sweep_inbound(older_than_ms, DEDUP_SWEEP_BATCH).await {
+        Ok(0) => SweepOutcome::Complete,
+        Ok(deleted) => {
+            tracing::debug!(deleted, "swept terminal inbound rows");
+            if deleted >= u64::from(DEDUP_SWEEP_BATCH) {
+                SweepOutcome::More
+            } else {
+                SweepOutcome::Complete
+            }
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "inbound terminal sweep failed");
+            SweepOutcome::RetrySoon
+        }
     }
 }
 
@@ -1041,8 +1146,49 @@ fn is_connected(transport: &watch::Receiver<ConnectionState>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::poll;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Poll;
+
+    struct UnexpectedDelivery;
+
+    impl OutboundDelivery for UnexpectedDelivery {
+        fn deliver(
+            &self,
+            _request: OutboundRequest,
+        ) -> futures_util::future::BoxFuture<
+            'static,
+            Result<crate::channel::DeliveryReceipt, DeliveryError>,
+        > {
+            Box::pin(async { panic!("disconnected maintenance must not send") })
+        }
+    }
+
+    struct BlockingDelivery {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl OutboundDelivery for BlockingDelivery {
+        fn deliver(
+            &self,
+            _request: OutboundRequest,
+        ) -> futures_util::future::BoxFuture<
+            'static,
+            Result<crate::channel::DeliveryReceipt, DeliveryError>,
+        > {
+            let entered = Arc::clone(&self.entered);
+            let release = Arc::clone(&self.release);
+            Box::pin(async move {
+                entered.notify_one();
+                release.notified().await;
+                Ok(crate::channel::DeliveryReceipt {
+                    message_id: "om_blocking_test".to_owned(),
+                })
+            })
+        }
+    }
 
     #[tokio::test]
     async fn receipt_write_retries_a_transient_failure_then_succeeds() {
@@ -1128,7 +1274,11 @@ mod tests {
             .await
             .expect("seed rows");
 
-        sweep_terminal_rows(&store).await;
+        let sweep_now_ms = now_ms();
+        assert_eq!(
+            sweep_terminal_outbox_rows(&store, sweep_now_ms).await,
+            SweepOutcome::Complete
+        );
 
         let depth = store.outbox_depth().await.expect("depth");
         assert_eq!(depth.pending, 1, "pending rows are never swept");
@@ -1145,5 +1295,430 @@ mod tests {
             .await
             .expect("sent count");
         assert_eq!(sent, 0, "the over-age terminal row is swept");
+    }
+
+    #[tokio::test]
+    async fn sweep_terminal_inbound_rows_prunes_only_expired_terminals() {
+        use crate::store::sqlite_error;
+
+        let store = StoreHandle::open_in_memory().await.expect("store");
+        let sweep_now_ms = now_ms();
+        let retention_ms = i64::try_from(DEDUP_TTL.as_millis()).expect("dedup TTL millis");
+        let expired_ms = sweep_now_ms.saturating_sub(retention_ms).saturating_sub(1);
+        store
+            .run(move |connection| {
+                connection
+                    .execute(
+                        "WITH RECURSIVE sequence(value) AS (
+                             VALUES(0)
+                             UNION ALL
+                             SELECT value + 1 FROM sequence WHERE value < ?2
+                         )
+                         INSERT INTO inbound_events
+                         (tenant, event_id, message_id, scope_key, state,
+                          first_seen_ms, updated_ms, rejection_reason)
+                         SELECT 'tenant', 'expired-' || value,
+                                'message-expired-' || value, 'im:expired',
+                                'completed', ?1, ?1, NULL
+                         FROM sequence",
+                        rusqlite::params![expired_ms, i64::from(DEDUP_SWEEP_BATCH)],
+                    )
+                    .map_err(|error| sqlite_error("seeding inbound sweep rows", &error))?;
+                connection
+                    .execute(
+                        "INSERT INTO inbound_events
+                         (tenant, event_id, message_id, scope_key, state,
+                          first_seen_ms, updated_ms, rejection_reason)
+                         VALUES
+                         ('tenant', 'fresh', 'message-fresh', 'im:fresh',
+                          'completed', ?1, ?1, NULL)",
+                        rusqlite::params![sweep_now_ms],
+                    )
+                    .map_err(|error| sqlite_error("seeding fresh inbound row", &error))?;
+                Ok(())
+            })
+            .await
+            .expect("seed inbound rows");
+
+        assert!(
+            matches!(
+                sweep_terminal_inbound_rows(&store, sweep_now_ms).await,
+                SweepOutcome::More
+            ),
+            "a full batch keeps maintenance due for a fair follow-up pass"
+        );
+        assert!(
+            matches!(
+                sweep_terminal_inbound_rows(&store, sweep_now_ms).await,
+                SweepOutcome::Complete
+            ),
+            "the final partial batch completes this retention pass"
+        );
+
+        let remaining: Vec<(String, String)> = store
+            .run(|connection| {
+                let mut statement = connection
+                    .prepare("SELECT event_id, state FROM inbound_events ORDER BY event_id")
+                    .map_err(|error| sqlite_error("preparing inbound sweep read", &error))?;
+                let rows = statement
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .map_err(|error| sqlite_error("reading inbound sweep rows", &error))?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| sqlite_error("decoding inbound sweep rows", &error))
+            })
+            .await
+            .expect("remaining inbound rows");
+        assert_eq!(
+            remaining,
+            vec![("fresh".to_owned(), "completed".to_owned())],
+            "terminal rows remain until they exceed the dedup TTL"
+        );
+    }
+
+    #[test]
+    fn sweep_failures_retry_on_the_short_pump_cadence() {
+        assert_eq!(
+            next_sweep_ms(SweepOutcome::RetrySoon, 10_000, 3_600_000, 250),
+            10_250,
+            "a transient writer failure must not defer capacity recovery for an hour"
+        );
+        assert_eq!(
+            next_sweep_ms(SweepOutcome::More, 10_000, 3_600_000, 250),
+            10_000,
+            "a full batch remains immediately due"
+        );
+    }
+
+    #[tokio::test]
+    async fn pump_drains_inbound_retention_while_transport_is_disconnected() {
+        use crate::store::sqlite_error;
+
+        let store = StoreHandle::open_in_memory().await.expect("store");
+        let sweep_now_ms = now_ms();
+        let retention_ms = i64::try_from(DEDUP_TTL.as_millis()).expect("dedup TTL millis");
+        let expired_ms = sweep_now_ms.saturating_sub(retention_ms).saturating_sub(1);
+        store
+            .run(move |connection| {
+                connection
+                    .execute(
+                        "WITH RECURSIVE sequence(value) AS (
+                             VALUES(0)
+                             UNION ALL
+                             SELECT value + 1 FROM sequence WHERE value < ?2
+                         )
+                         INSERT INTO inbound_events
+                         (tenant, event_id, message_id, scope_key, state,
+                          first_seen_ms, updated_ms, rejection_reason)
+                         SELECT 'tenant', 'scheduler-expired-' || value,
+                                'scheduler-message-' || value, 'im:expired',
+                                'completed', ?1, ?1, NULL
+                         FROM sequence",
+                        rusqlite::params![expired_ms, i64::from(DEDUP_SWEEP_BATCH)],
+                    )
+                    .map_err(|error| sqlite_error("seeding scheduled inbound sweep", &error))?;
+                connection
+                    .execute(
+                        "INSERT INTO inbound_events
+                         (tenant, event_id, message_id, scope_key, state,
+                          first_seen_ms, updated_ms, rejection_reason)
+                         VALUES
+                         ('tenant', 'scheduler-fresh', 'scheduler-message-fresh', 'im:fresh',
+                          'completed', ?1, ?1, NULL)",
+                        rusqlite::params![sweep_now_ms],
+                    )
+                    .map_err(|error| sqlite_error("seeding scheduled fresh row", &error))?;
+                Ok(())
+            })
+            .await
+            .expect("seed inbound rows");
+
+        let (_state, state_rx) = watch::channel(ConnectionState::Stopped);
+        let pump = OutboxPump::spawn(
+            store.clone(),
+            UnexpectedDelivery,
+            state_rx,
+            OutboxPumpConfig {
+                poll_interval: Duration::from_millis(5),
+                ..OutboxPumpConfig::default()
+            },
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let expired: i64 = store
+                    .run(|connection| {
+                        connection
+                            .query_row(
+                                "SELECT COUNT(*) FROM inbound_events
+                                 WHERE event_id LIKE 'scheduler-expired-%'",
+                                [],
+                                |row| row.get(0),
+                            )
+                            .map_err(|error| {
+                                sqlite_error("counting scheduled inbound sweep", &error)
+                            })
+                    })
+                    .await
+                    .expect("count expired rows");
+                if expired == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("disconnected maintenance must drain every expired batch");
+
+        tokio::time::timeout(Duration::from_secs(1), pump.shutdown())
+            .await
+            .expect("shutdown joins sleeping disconnected maintenance");
+        let fresh: i64 = store
+            .run(|connection| {
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM inbound_events
+                         WHERE event_id = 'scheduler-fresh'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| sqlite_error("checking scheduled fresh row", &error))
+            })
+            .await
+            .expect("fresh row count");
+        assert_eq!(fresh, 1, "retention must preserve fresh terminal rows");
+        store.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn maintenance_progresses_while_a_network_send_is_blocked() {
+        use crate::store::sqlite_error;
+
+        let store = StoreHandle::open_in_memory().await.expect("store");
+        let payload_json = OutboxOperation::ReplyText {
+            message_id: "om_network_gate".to_owned(),
+            thread_id: None,
+            text: "bounded".to_owned(),
+        }
+        .encode()
+        .expect("encode outbound operation");
+        store
+            .enqueue_outbox(crate::store::NewOutboxRow {
+                idempotency_key: "network-gate".to_owned(),
+                scope_key: "im:network-gate".to_owned(),
+                kind: "final".to_owned(),
+                payload_json,
+                next_retry_ms: 0,
+            })
+            .await
+            .expect("enqueue network gate");
+
+        let sweep_now_ms = now_ms();
+        let retention_ms = i64::try_from(DEDUP_TTL.as_millis()).expect("dedup TTL millis");
+        let expired_ms = sweep_now_ms.saturating_sub(retention_ms).saturating_sub(1);
+        let expired_count = usize::try_from(DEDUP_SWEEP_BATCH).expect("batch fits usize") * 16 + 1;
+        store
+            .run(move |connection| {
+                let mut statement = connection
+                    .prepare(
+                        "INSERT INTO inbound_events
+                         (tenant, event_id, message_id, scope_key, state,
+                          first_seen_ms, updated_ms, rejection_reason)
+                         VALUES ('tenant', ?1, ?2, 'im:expired',
+                                 'completed', ?3, ?3, NULL)",
+                    )
+                    .map_err(|error| sqlite_error("preparing network-gate sweep seed", &error))?;
+                for value in 0..expired_count {
+                    statement
+                        .execute(rusqlite::params![
+                            format!("network-expired-{value}"),
+                            format!("network-message-{value}"),
+                            expired_ms
+                        ])
+                        .map_err(|error| sqlite_error("seeding network-gate sweep row", &error))?;
+                }
+                Ok(())
+            })
+            .await
+            .expect("seed network-gate rows");
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (_state, state_rx) = watch::channel(ConnectionState::Connected);
+        let pump = OutboxPump::spawn(
+            store.clone(),
+            BlockingDelivery {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            },
+            state_rx,
+            OutboxPumpConfig {
+                poll_interval: Duration::from_millis(5),
+                claim_batch: 1,
+                ..OutboxPumpConfig::default()
+            },
+        );
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("network delivery becomes blocked");
+
+        let remaining_when_blocked: i64 = store
+            .run(|connection| {
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM inbound_events
+                         WHERE event_id LIKE 'network-expired-%'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| sqlite_error("counting network-gate rows", &error))
+            })
+            .await
+            .expect("count rows while delivery is blocked");
+        assert!(
+            remaining_when_blocked > 0,
+            "the send must be demonstrably blocked before catch-up completes"
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let remaining: i64 = store
+                    .run(|connection| {
+                        connection
+                            .query_row(
+                                "SELECT COUNT(*) FROM inbound_events
+                                 WHERE event_id LIKE 'network-expired-%'",
+                                [],
+                                |row| row.get(0),
+                            )
+                            .map_err(|error| sqlite_error("checking network-gate sweep", &error))
+                    })
+                    .await
+                    .expect("network-gate row count");
+                if remaining == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("maintenance must finish while the network future remains blocked");
+
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), pump.shutdown())
+            .await
+            .expect("shutdown joins delivery and maintenance tasks");
+        store.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn maintenance_retries_queue_full_on_the_short_cadence() {
+        use crate::store::sqlite_error;
+
+        let store = StoreHandle::open_in_memory().await.expect("store");
+        let sweep_now_ms = now_ms();
+        let retention_ms = i64::try_from(DEDUP_TTL.as_millis()).expect("dedup TTL millis");
+        let expired_ms = sweep_now_ms.saturating_sub(retention_ms).saturating_sub(1);
+        store
+            .run(move |connection| {
+                connection
+                    .execute(
+                        "INSERT INTO inbound_events
+                         (tenant, event_id, message_id, scope_key, state,
+                          first_seen_ms, updated_ms, rejection_reason)
+                         VALUES
+                         ('tenant', 'retry-expired', 'retry-message', 'im:expired',
+                          'completed', ?1, ?1, NULL)",
+                        rusqlite::params![expired_ms],
+                    )
+                    .map_err(|error| sqlite_error("seeding retry sweep row", &error))?;
+                Ok(())
+            })
+            .await
+            .expect("seed retry row");
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker_store = store.clone();
+        let blocker = tokio::spawn(async move {
+            blocker_store
+                .run(move |_connection| {
+                    let _ = entered_tx.send(());
+                    release_rx.recv().map_err(|_| StoreError::Closed)?;
+                    Ok(())
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), entered_rx)
+            .await
+            .expect("writer blocker starts")
+            .expect("writer blocker signal");
+
+        let mut queued = Vec::new();
+        for _ in 0..crate::limits::STORE_WRITER_CAPACITY {
+            let mut request = Box::pin(store.run(|_connection| Ok(())));
+            assert!(
+                matches!(poll!(request.as_mut()), Poll::Pending),
+                "every request fits until the bounded writer channel is full"
+            );
+            queued.push(request);
+        }
+
+        let (_state, state_rx) = watch::channel(ConnectionState::Stopped);
+        let pump = OutboxPump::spawn(
+            store.clone(),
+            UnexpectedDelivery,
+            state_rx,
+            OutboxPumpConfig {
+                poll_interval: Duration::from_millis(5),
+                ..OutboxPumpConfig::default()
+            },
+        );
+        // Both startup recovery and the first maintenance request encounter
+        // the full writer channel before it is released.
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        release_tx.send(()).expect("release writer");
+        drop(queued);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let expired: i64 = match store
+                    .run(|connection| {
+                        connection
+                            .query_row(
+                                "SELECT COUNT(*) FROM inbound_events
+                                 WHERE event_id = 'retry-expired'",
+                                [],
+                                |row| row.get(0),
+                            )
+                            .map_err(|error| sqlite_error("checking retry sweep row", &error))
+                    })
+                    .await
+                {
+                    Ok(expired) => expired,
+                    Err(StoreError::QueueFull) => {
+                        // The observation uses the same bounded writer queue
+                        // that this test deliberately saturated. Its own
+                        // transient backpressure is not a maintenance failure.
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        continue;
+                    }
+                    Err(error) => panic!("retry row count: {error}"),
+                };
+                if expired == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("QueueFull must retry without waiting for the hourly interval");
+
+        pump.shutdown().await;
+        blocker
+            .await
+            .expect("join blocker")
+            .expect("blocker result");
+        store.shutdown().await.expect("shutdown");
     }
 }

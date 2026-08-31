@@ -43,6 +43,10 @@ pub(crate) enum FakeOutcome {
         gate: FakeSpawnGate,
         error: ProcessError,
     },
+    GatedReady {
+        gate: FakeSpawnGate,
+        control: FakeControl,
+    },
 }
 
 #[derive(Clone)]
@@ -67,6 +71,7 @@ pub(crate) struct FakeControl {
     hold: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     terminate_calls: Arc<Mutex<Vec<Duration>>>,
     terminate_error: Arc<Mutex<Option<io::ErrorKind>>>,
+    lifecycle_events: Arc<Mutex<Vec<&'static str>>>,
     requests_tx: mpsc::Sender<Value>,
     requests_rx: Arc<AsyncMutex<mpsc::Receiver<Value>>>,
     outputs_tx: mpsc::Sender<Value>,
@@ -100,8 +105,35 @@ impl FakeControl {
         });
     }
 
+    /// Reports only the leader exit while a descendant keeps the fake stdio
+    /// pipes open. This models the process-group reuse window between reaping a
+    /// leader and shutting down the transport.
+    pub(crate) fn unexpected_leader_exit(&self) {
+        let sender = self
+            .exit
+            .lock()
+            .expect("exit lock")
+            .take()
+            .expect("process should still be running");
+        sender
+            .send(ProcessExit {
+                pid: 42,
+                success: false,
+                code: Some(1),
+                signal: None,
+            })
+            .expect("supervisor should still wait for process");
+    }
+
     pub(crate) fn terminate_calls(&self) -> Vec<Duration> {
         self.terminate_calls.lock().expect("terminate lock").clone()
+    }
+
+    pub(crate) fn lifecycle_events(&self) -> Vec<&'static str> {
+        self.lifecycle_events
+            .lock()
+            .expect("lifecycle events lock")
+            .clone()
     }
 
     pub(crate) async fn next_request(&self) -> Value {
@@ -152,6 +184,7 @@ impl FakeFactory {
             hold: Arc::new(Mutex::new(None)),
             terminate_calls: Arc::new(Mutex::new(Vec::new())),
             terminate_error: Arc::new(Mutex::new(None)),
+            lifecycle_events: Arc::new(Mutex::new(Vec::new())),
             requests_tx,
             requests_rx: Arc::new(AsyncMutex::new(requests_rx)),
             outputs_tx,
@@ -183,6 +216,25 @@ impl FakeFactory {
         )
     }
 
+    pub(crate) fn gated_ready() -> (FakeOutcome, FakeControl, FakeSpawnGate) {
+        let (ready, control) = Self::ready();
+        let FakeOutcome::Ready(ready_control) = ready else {
+            unreachable!("ready constructor always returns a ready outcome")
+        };
+        let gate = FakeSpawnGate {
+            started: Arc::new(Barrier::new(2)),
+            release: Arc::new(Notify::new()),
+        };
+        (
+            FakeOutcome::GatedReady {
+                gate: gate.clone(),
+                control: ready_control,
+            },
+            control,
+            gate,
+        )
+    }
+
     pub(crate) fn spawn_count(&self) -> usize {
         *self.spawns.lock().expect("spawn lock")
     }
@@ -207,6 +259,11 @@ impl ProcessFactory for FakeFactory {
                     gate.wait_started().await;
                     gate.release.notified().await;
                     Err(error)
+                }
+                FakeOutcome::GatedReady { gate, control } => {
+                    gate.wait_started().await;
+                    gate.release.notified().await;
+                    Ok(Box::new(FakeProcess::new(control)) as Box<dyn AppServerProcess>)
                 }
             }
         })
@@ -238,8 +295,17 @@ impl FakeProcess {
             .expect("outputs lock")
             .take()
             .expect("fake process takes outputs once");
+        let lifecycle_events = Arc::clone(&control.lifecycle_events);
         tokio::spawn(async move {
-            serve_fake(&mut app_stdout, app_stdin, requests, outputs, hold_rx).await;
+            serve_fake(
+                &mut app_stdout,
+                app_stdin,
+                requests,
+                outputs,
+                hold_rx,
+                lifecycle_events,
+            )
+            .await;
         });
         Self {
             control,
@@ -296,6 +362,11 @@ impl AppServerProcess for FakeProcess {
             .lock()
             .expect("terminate lock")
             .push(grace);
+        self.control
+            .lifecycle_events
+            .lock()
+            .expect("lifecycle events lock")
+            .push("terminate");
         let terminate_error = *self
             .control
             .terminate_error
@@ -325,6 +396,7 @@ async fn serve_fake(
     requests: mpsc::Sender<Value>,
     mut outputs: mpsc::Receiver<Value>,
     mut hold: oneshot::Receiver<()>,
+    lifecycle_events: Arc<Mutex<Vec<&'static str>>>,
 ) {
     let mut stdin = BufReader::new(stdin);
     initialize_fake(stdout, &mut stdin).await;
@@ -339,6 +411,10 @@ async fn serve_fake(
             result = stdin.read_line(&mut line) => {
                 let Ok(bytes) = result else { break };
                 if bytes == 0 {
+                    lifecycle_events
+                        .lock()
+                        .expect("lifecycle events lock")
+                        .push("client_shutdown");
                     break;
                 }
                 let request = serde_json::from_str(&line).expect("valid scripted request JSON");

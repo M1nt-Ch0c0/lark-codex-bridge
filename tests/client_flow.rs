@@ -3,11 +3,11 @@ use std::{sync::Arc, time::Duration};
 use lark_codex_bridge::{
     codex::{
         client::{
-            AppServerClient, AppServerEvent, ControlEvent, SubscriptionInvalidation, ThreadId,
-            ThreadSubscription, TurnId, TurnOutcome,
+            AppServerClient, AppServerEvent, ClientError, ControlEvent, SubscriptionInvalidation,
+            ThreadId, ThreadSubscription, TurnId, TurnOutcome,
         },
         compat::WireAdapter,
-        rpc::{ConnectionEpoch, RpcConnection, initialize_connection, spawn_rpc},
+        rpc::{ConnectionEpoch, RpcConnection, RpcError, initialize_connection, spawn_rpc},
         transport::spawn_stream_transport,
         types::{
             MessagePhase, ThreadItem, ThreadResumeParams, ThreadStartParams, TurnStartParams,
@@ -33,6 +33,14 @@ struct ClientHarness {
 }
 
 async fn client_harness(stdin_capacity: usize, epoch: u64) -> ClientHarness {
+    client_harness_with_wire(stdin_capacity, epoch, WireAdapter::V0_146_0).await
+}
+
+async fn client_harness_with_wire(
+    stdin_capacity: usize,
+    epoch: u64,
+    wire: WireAdapter,
+) -> ClientHarness {
     let (transport_stdout, app_stdout) = duplex(64 * 1024);
     let (transport_stdin, app_stdin) = duplex(stdin_capacity);
     let (transport_stderr, app_stderr) = duplex(64 * 1024);
@@ -49,6 +57,7 @@ async fn client_harness(stdin_capacity: usize, epoch: u64) -> ClientHarness {
         app_stdout,
         BufReader::new(app_stdin),
         app_stderr,
+        wire,
     )
     .await
 }
@@ -58,6 +67,7 @@ async fn initialize(
     mut app_stdout: DuplexStream,
     mut app_stdin: BufReader<DuplexStream>,
     app_stderr: DuplexStream,
+    wire: WireAdapter,
 ) -> ClientHarness {
     let handle = connection.handle.clone();
     let initialize = tokio::spawn(async move { initialize_connection(&handle).await });
@@ -86,7 +96,7 @@ async fn initialize(
         app_stdout,
         app_stdin,
         _app_stderr: app_stderr,
-        client: Arc::new(AppServerClient::spawn(connection, WireAdapter::V0_146_0)),
+        client: Arc::new(AppServerClient::spawn(connection, wire)),
     }
 }
 
@@ -139,6 +149,17 @@ async fn respond(writer: &mut DuplexStream, request: &Value, result: Value) {
         json!({
             "id": request.get("id").expect("request should contain an id"),
             "result": result
+        }),
+    )
+    .await;
+}
+
+async fn respond_error(writer: &mut DuplexStream, request: &Value, code: i64, message: &str) {
+    write_wire(
+        writer,
+        json!({
+            "id": request.get("id").expect("request should contain an id"),
+            "error": {"code": code, "message": message}
         }),
     )
     .await;
@@ -453,6 +474,117 @@ async fn resume_thread_uses_the_stable_resume_rpc_and_returns_the_resumed_thread
         .expect("thread/resume task should not panic")
         .expect("thread/resume should succeed");
     assert_eq!(resumed.id, "thread-resumed");
+
+    harness
+        .client
+        .shutdown()
+        .await
+        .expect("client should shut down cleanly");
+}
+
+#[tokio::test]
+async fn native_resume_active_writer_conflict_is_typed_without_retaining_the_thread_id() {
+    let mut harness = client_harness_with_wire(64 * 1024, 36, WireAdapter::V0_149_0).await;
+    let target = "thread-private-active-writer";
+    let client = Arc::clone(&harness.client);
+    let resume =
+        tokio::spawn(async move { client.resume_thread(ThreadResumeParams::new(target)).await });
+
+    let request = read_wire(&mut harness.app_stdin).await;
+    let raw_message =
+        format!("thread-store conflict: thread {target} already has an active writer");
+    respond_error(&mut harness.app_stdout, &request, -32600, &raw_message).await;
+
+    let result = resume.await.expect("thread/resume task should not panic");
+    let Err(error) = result else {
+        panic!("the active writer should reject thread/resume");
+    };
+    assert!(matches!(
+        &error,
+        ClientError::Rpc(RpcError::ThreadResumeActiveWriter)
+    ));
+    let rendered = format!("{error} {error:?}");
+    assert!(!rendered.contains(target));
+    assert!(!rendered.contains(&raw_message));
+
+    harness
+        .client
+        .shutdown()
+        .await
+        .expect("client should shut down cleanly");
+}
+
+#[tokio::test]
+async fn legacy_native_wire_has_no_thread_adoption_contract() {
+    let harness = client_harness_with_wire(64 * 1024, 39, WireAdapter::V0_146_0).await;
+    assert!(harness.client.thread_adoption_contract().is_none());
+    harness
+        .client
+        .shutdown()
+        .await
+        .expect("client should shut down cleanly");
+}
+
+#[tokio::test]
+async fn native_resume_unknown_invalid_request_remains_a_generic_server_error() {
+    let mut harness = client_harness_with_wire(64 * 1024, 37, WireAdapter::V0_149_0).await;
+    let target = "thread-private-generic-error";
+    let client = Arc::clone(&harness.client);
+    let resume =
+        tokio::spawn(async move { client.resume_thread(ThreadResumeParams::new(target)).await });
+
+    let request = read_wire(&mut harness.app_stdin).await;
+    respond_error(
+        &mut harness.app_stdout,
+        &request,
+        -32600,
+        "thread/resume was rejected for an unknown reason",
+    )
+    .await;
+
+    let result = resume.await.expect("thread/resume task should not panic");
+    let Err(error) = result else {
+        panic!("the invalid request should fail thread/resume");
+    };
+    assert!(matches!(
+        error,
+        ClientError::Rpc(RpcError::Server { code: -32600, .. })
+    ));
+
+    harness
+        .client
+        .shutdown()
+        .await
+        .expect("client should shut down cleanly");
+}
+
+#[tokio::test]
+async fn sidecar_resume_active_writer_code_maps_to_the_same_typed_error() {
+    let mut harness = client_harness_with_wire(64 * 1024, 38, WireAdapter::SidecarV1).await;
+    let client = Arc::clone(&harness.client);
+    let resume = tokio::spawn(async move {
+        client
+            .resume_thread(ThreadResumeParams::new("thread-sidecar-target"))
+            .await
+    });
+
+    let request = read_wire(&mut harness.app_stdin).await;
+    respond_error(
+        &mut harness.app_stdout,
+        &request,
+        -32023,
+        "thread/resume active-writer conflict",
+    )
+    .await;
+
+    let result = resume.await.expect("thread/resume task should not panic");
+    let Err(error) = result else {
+        panic!("the sidecar conflict should fail thread/resume");
+    };
+    assert!(matches!(
+        error,
+        ClientError::Rpc(RpcError::ThreadResumeActiveWriter)
+    ));
 
     harness
         .client

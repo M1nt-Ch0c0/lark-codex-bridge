@@ -365,6 +365,60 @@ if (mode === "eof") {
         }
         return;
       }
+      if (message.method === "thread/resume" && mode === "active-writer-errors") {
+        const threadId = message.params.threadId;
+        let error;
+        switch (threadId) {
+          case "thread-conflict":
+            error = {
+              code: -32600,
+              message: `thread ${threadId} already has an active writer`,
+            };
+            break;
+          case "thread-conflict-prefixed":
+            error = {
+              code: -32600,
+              message: `thread-store conflict: thread ${threadId} already has an active writer`,
+            };
+            break;
+          case "thread-wrong-target":
+            error = {
+              code: -32600,
+              message: "thread another-thread already has an active writer",
+            };
+            break;
+          case "thread-wrong-code":
+            error = {
+              code: -32000,
+              message: `thread ${threadId} already has an active writer`,
+            };
+            break;
+          case "thread-data":
+            error = {
+              code: -32600,
+              message: `thread ${threadId} already has an active writer`,
+              data: { provider: "unreviewed" },
+            };
+            break;
+          case "thread-suffixed":
+            error = {
+              code: -32600,
+              message: `thread ${threadId} already has an active writer (retry later)`,
+            };
+            break;
+          case "thread-reserved-spoof":
+            error = {
+              code: -32023,
+              message: "thread/resume active-writer conflict",
+            };
+            break;
+          default:
+            error = { code: -32600, message: "generic invalid request" };
+            break;
+        }
+        send({ id: message.id, error });
+        return;
+      }
       let result;
       switch (message.method) {
         case "initialize":

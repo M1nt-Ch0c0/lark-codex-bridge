@@ -10,6 +10,7 @@ use std::{
 
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
     task::JoinHandle,
@@ -31,10 +32,10 @@ use crate::{
     },
     limits::{
         CONTROL_RPC_TIMEOUT, EVENT_CAPACITY, HIGH_PRIORITY_BURST, INITIALIZE_TIMEOUT,
-        MAX_JSONL_LINE_BYTES, MAX_OUTBOUND_VALUE_WIRE_BYTES, RPC_BYTE_BUDGET, RPC_HIGH_BYTE_BUDGET,
-        RPC_HIGH_CAPACITY, RPC_INFLIGHT_CAPACITY, RPC_NORMAL_CAPACITY,
-        RPC_RELIABLE_EVENT_BYTE_BUDGET, RPC_RELIABLE_EVENT_CAPACITY, RPC_SERVER_REQUEST_CAPACITY,
-        RPC_TOTAL_PENDING_CAPACITY,
+        MAX_JSONL_LINE_BYTES, MAX_OUTBOUND_VALUE_WIRE_BYTES, ROUTING_ID_BYTE_LIMIT,
+        RPC_BYTE_BUDGET, RPC_HIGH_BYTE_BUDGET, RPC_HIGH_CAPACITY, RPC_INFLIGHT_CAPACITY,
+        RPC_NORMAL_CAPACITY, RPC_RELIABLE_EVENT_BYTE_BUDGET, RPC_RELIABLE_EVENT_CAPACITY,
+        RPC_SERVER_REQUEST_CAPACITY, RPC_TOTAL_PENDING_CAPACITY,
     },
 };
 
@@ -47,6 +48,11 @@ const INIT_FAILED: u8 = 3;
 const SERVER_REQUEST_ARMED: u8 = 0;
 const SERVER_REQUEST_ACTOR_OWNED: u8 = 1;
 const SERVER_REQUEST_RESOLVED: u8 = 2;
+const NATIVE_INVALID_REQUEST_CODE: i64 = -32_600;
+const SIDECAR_THREAD_RESUME_ACTIVE_WRITER_CODE: i64 = -32_023;
+const SIDECAR_THREAD_RESUME_ACTIVE_WRITER_MESSAGE: &str = "thread/resume active-writer conflict";
+const ACTIVE_WRITER_SUFFIX: &str = " already has an active writer";
+const ACTIVE_WRITER_PREFIXES: [&str; 2] = ["thread ", "thread-store conflict: thread "];
 
 /// Identifies one app-server connection. IDs from different epochs never correlate.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -218,13 +224,28 @@ impl fmt::Debug for RpcEvent {
 
 /// Safe RPC failures. Remote text and data are deliberately discarded.
 pub enum RpcError {
-    Timeout { method: &'static str },
-    Server { method: &'static str, code: i64 },
+    Timeout {
+        method: &'static str,
+    },
+    Server {
+        method: &'static str,
+        code: i64,
+    },
+    /// `thread/resume` was rejected because another app-server owns the writer.
+    ///
+    /// The provider message and thread identifier are intentionally discarded.
+    ThreadResumeActiveWriter,
     ConnectionLost(ConnectionEpoch),
     AlreadyInitialized,
-    Serialize { method: &'static str },
-    Deserialize { method: &'static str },
-    PayloadTooLarge { method: &'static str },
+    Serialize {
+        method: &'static str,
+    },
+    Deserialize {
+        method: &'static str,
+    },
+    PayloadTooLarge {
+        method: &'static str,
+    },
     UnknownServerRequest,
     RequestIdExhausted,
 }
@@ -273,6 +294,8 @@ impl fmt::Display for RpcError {
             Self::Server { method, code } => {
                 write!(formatter, "RPC {method} failed with server code {code}")
             }
+            Self::ThreadResumeActiveWriter => formatter
+                .write_str("RPC thread/resume failed because the thread has an active writer"),
             Self::ConnectionLost(epoch) => {
                 write!(formatter, "app-server connection {} was lost", epoch.get())
             }
@@ -291,6 +314,205 @@ impl fmt::Display for RpcError {
 }
 
 impl std::error::Error for RpcError {}
+
+#[derive(Clone, Copy)]
+enum ServerErrorClassifier {
+    Generic,
+    ThreadResume {
+        expected_thread_fingerprint: Option<[u8; 32]>,
+        wire: WireAdapter,
+    },
+}
+
+impl ServerErrorClassifier {
+    fn thread_resume(expected_thread_id: &str, wire: WireAdapter) -> Self {
+        Self::ThreadResume {
+            expected_thread_fingerprint: thread_id_fingerprint(expected_thread_id),
+            wire,
+        }
+    }
+
+    fn classify(self, method: &'static str, error: &RpcErrorObject) -> RpcError {
+        let is_active_writer = match self {
+            Self::Generic => false,
+            Self::ThreadResume {
+                expected_thread_fingerprint,
+                wire,
+            } => {
+                let has_reviewed_target = expected_thread_fingerprint.is_some();
+                error.data.is_none()
+                    && has_reviewed_target
+                    && match wire {
+                        WireAdapter::SidecarV1 => {
+                            error.code == SIDECAR_THREAD_RESUME_ACTIVE_WRITER_CODE
+                                && error.message == SIDECAR_THREAD_RESUME_ACTIVE_WRITER_MESSAGE
+                        }
+                        WireAdapter::V0_149_0 => {
+                            error.code == NATIVE_INVALID_REQUEST_CODE
+                                && native_active_writer_thread_id(&error.message)
+                                    .and_then(thread_id_fingerprint)
+                                    == expected_thread_fingerprint
+                        }
+                        WireAdapter::V0_146_0 => false,
+                    }
+            }
+        };
+        if is_active_writer {
+            RpcError::ThreadResumeActiveWriter
+        } else {
+            RpcError::Server {
+                method,
+                code: error.code,
+            }
+        }
+    }
+}
+
+fn thread_id_fingerprint(thread_id: &str) -> Option<[u8; 32]> {
+    if thread_id.is_empty() || thread_id.len() > ROUTING_ID_BYTE_LIMIT {
+        return None;
+    }
+    Some(Sha256::digest(thread_id.as_bytes()).into())
+}
+
+fn native_active_writer_thread_id(message: &str) -> Option<&str> {
+    ACTIVE_WRITER_PREFIXES.iter().copied().find_map(|prefix| {
+        let thread_id = message
+            .strip_prefix(prefix)?
+            .strip_suffix(ACTIVE_WRITER_SUFFIX)?;
+        thread_id_fingerprint(thread_id).map(|_| thread_id)
+    })
+}
+
+#[cfg(test)]
+mod server_error_classifier_tests {
+    use super::*;
+
+    const TARGET: &str = "thread-private-target";
+
+    fn error(code: i64, message: &str, data: Option<Value>) -> RpcErrorObject {
+        RpcErrorObject {
+            code,
+            message: message.to_owned(),
+            data,
+        }
+    }
+
+    fn classify_native(error: &RpcErrorObject) -> RpcError {
+        ServerErrorClassifier::thread_resume(TARGET, WireAdapter::V0_149_0)
+            .classify("thread/resume", error)
+    }
+
+    #[test]
+    fn native_active_writer_grammars_are_typed_and_redacted() {
+        for message in [
+            format!("thread {TARGET}{ACTIVE_WRITER_SUFFIX}"),
+            format!("thread-store conflict: thread {TARGET}{ACTIVE_WRITER_SUFFIX}"),
+        ] {
+            let classified = classify_native(&error(NATIVE_INVALID_REQUEST_CODE, &message, None));
+            assert!(matches!(classified, RpcError::ThreadResumeActiveWriter));
+            let rendered = format!("{classified} {classified:?}");
+            assert!(!rendered.contains(TARGET));
+            assert!(!rendered.contains("thread-store conflict"));
+        }
+    }
+
+    #[test]
+    fn native_active_writer_classification_fails_closed_on_near_matches() {
+        let cases = [
+            error(
+                -32_000,
+                &format!("thread {TARGET}{ACTIVE_WRITER_SUFFIX}"),
+                None,
+            ),
+            error(
+                NATIVE_INVALID_REQUEST_CODE,
+                &format!("thread another-target{ACTIVE_WRITER_SUFFIX}"),
+                None,
+            ),
+            error(
+                NATIVE_INVALID_REQUEST_CODE,
+                &format!("prefix thread {TARGET}{ACTIVE_WRITER_SUFFIX}"),
+                None,
+            ),
+            error(
+                NATIVE_INVALID_REQUEST_CODE,
+                &format!("thread {TARGET}{ACTIVE_WRITER_SUFFIX} suffix"),
+                None,
+            ),
+            error(
+                NATIVE_INVALID_REQUEST_CODE,
+                &format!("thread {TARGET}{ACTIVE_WRITER_SUFFIX}"),
+                Some(Value::Bool(true)),
+            ),
+        ];
+        for candidate in &cases {
+            assert!(matches!(
+                classify_native(candidate),
+                RpcError::Server { code, .. } if code == candidate.code
+            ));
+        }
+
+        let exact = error(
+            NATIVE_INVALID_REQUEST_CODE,
+            &format!("thread {TARGET}{ACTIVE_WRITER_SUFFIX}"),
+            None,
+        );
+        assert!(matches!(
+            ServerErrorClassifier::Generic.classify("thread/resume", &exact),
+            RpcError::Server {
+                code: NATIVE_INVALID_REQUEST_CODE,
+                ..
+            }
+        ));
+        assert!(matches!(
+            ServerErrorClassifier::thread_resume(TARGET, WireAdapter::V0_146_0)
+                .classify("thread/resume", &exact),
+            RpcError::Server {
+                code: NATIVE_INVALID_REQUEST_CODE,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn sidecar_classification_requires_the_reserved_content_free_contract() {
+        let sidecar_classifier =
+            ServerErrorClassifier::thread_resume(TARGET, WireAdapter::SidecarV1);
+        let classified = sidecar_classifier.classify(
+            "thread/resume",
+            &error(
+                SIDECAR_THREAD_RESUME_ACTIVE_WRITER_CODE,
+                SIDECAR_THREAD_RESUME_ACTIVE_WRITER_MESSAGE,
+                None,
+            ),
+        );
+        assert!(matches!(classified, RpcError::ThreadResumeActiveWriter));
+
+        for candidate in [
+            error(
+                NATIVE_INVALID_REQUEST_CODE,
+                &format!("thread {TARGET}{ACTIVE_WRITER_SUFFIX}"),
+                None,
+            ),
+            error(
+                SIDECAR_THREAD_RESUME_ACTIVE_WRITER_CODE,
+                "upstream request failed",
+                None,
+            ),
+            error(
+                SIDECAR_THREAD_RESUME_ACTIVE_WRITER_CODE,
+                SIDECAR_THREAD_RESUME_ACTIVE_WRITER_MESSAGE,
+                Some(Value::Bool(true)),
+            ),
+        ] {
+            assert!(matches!(
+                sidecar_classifier.classify("thread/resume", &candidate),
+                RpcError::Server { code, .. } if code == candidate.code
+            ));
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct RpcHandle {
@@ -328,9 +550,15 @@ impl RpcHandle {
         P: Serialize + ?Sized,
         R: DeserializeOwned,
     {
-        self.request_budgeted_with_priority(false, method, params, timeout)
-            .await
-            .map(BudgetedResponse::into_inner)
+        self.request_budgeted_with_priority(
+            false,
+            method,
+            params,
+            timeout,
+            ServerErrorClassifier::Generic,
+        )
+        .await
+        .map(BudgetedResponse::into_inner)
     }
 
     /// Sends a control request ahead of normal work.
@@ -349,9 +577,15 @@ impl RpcHandle {
         P: Serialize + ?Sized,
         R: DeserializeOwned,
     {
-        self.request_budgeted_with_priority(true, method, params, timeout)
-            .await
-            .map(BudgetedResponse::into_inner)
+        self.request_budgeted_with_priority(
+            true,
+            method,
+            params,
+            timeout,
+            ServerErrorClassifier::Generic,
+        )
+        .await
+        .map(BudgetedResponse::into_inner)
     }
 
     /// Returns a typed response while retaining its inbound memory budget.
@@ -370,8 +604,39 @@ impl RpcHandle {
         P: Serialize + ?Sized,
         R: DeserializeOwned,
     {
-        self.request_budgeted_with_priority(false, method, params, timeout)
-            .await
+        self.request_budgeted_with_priority(
+            false,
+            method,
+            params,
+            timeout,
+            ServerErrorClassifier::Generic,
+        )
+        .await
+    }
+
+    /// Sends `thread/resume` with its reviewed, content-free server-error classifier.
+    ///
+    /// The target is reduced to a fixed-size digest before the request is enqueued, so
+    /// neither the pending entry nor a returned [`RpcError`] retains the thread id.
+    pub(crate) async fn request_thread_resume_budgeted<P, R>(
+        &self,
+        params: &P,
+        expected_thread_id: &str,
+        wire: WireAdapter,
+        timeout: Duration,
+    ) -> Result<BudgetedResponse<R>, RpcError>
+    where
+        P: Serialize + ?Sized,
+        R: DeserializeOwned,
+    {
+        self.request_budgeted_with_priority(
+            false,
+            "thread/resume",
+            params,
+            timeout,
+            ServerErrorClassifier::thread_resume(expected_thread_id, wire),
+        )
+        .await
     }
 
     async fn request_budgeted_with_priority<P, R>(
@@ -380,6 +645,7 @@ impl RpcHandle {
         method: &'static str,
         params: &P,
         timeout: Duration,
+        server_error_classifier: ServerErrorClassifier,
     ) -> Result<BudgetedResponse<R>, RpcError>
     where
         P: Serialize + ?Sized,
@@ -415,6 +681,7 @@ impl RpcHandle {
             params,
             deadline,
             reply: reply_tx,
+            server_error_classifier,
             _inflight: inflight,
             _budget: budget,
         };
@@ -1295,10 +1562,8 @@ async fn handle_inbound(
         InboundMessage::ErrorResponse { id, error } => {
             drop(transport_budget);
             if let Some(entry) = take_pending(pending, &id, pending_count) {
-                let _ = entry.reply.send(Err(RpcError::Server {
-                    method: entry.method,
-                    code: error.code,
-                }));
+                let classified = entry.server_error_classifier.classify(entry.method, &error);
+                let _ = entry.reply.send(Err(classified));
             } else {
                 if policy.is_fail_closed_external() {
                     return false;
@@ -1392,6 +1657,7 @@ fn dispatch_command(
             params,
             deadline,
             reply,
+            server_error_classifier,
             _inflight: inflight_permit,
             _budget: budget_permit,
         } => {
@@ -1406,6 +1672,7 @@ fn dispatch_command(
                 method,
                 deadline,
                 reply,
+                server_error_classifier,
                 _inflight: inflight_permit,
             };
             if pending.insert(id.clone(), entry).is_some() {
@@ -1971,6 +2238,7 @@ enum RpcCommand {
         params: Value,
         deadline: Instant,
         reply: oneshot::Sender<Result<BudgetedResponse<Value>, RpcError>>,
+        server_error_classifier: ServerErrorClassifier,
         _inflight: OwnedSemaphorePermit,
         _budget: OwnedSemaphorePermit,
     },
@@ -2009,6 +2277,7 @@ struct PendingRequest {
     method: &'static str,
     deadline: Instant,
     reply: oneshot::Sender<Result<BudgetedResponse<Value>, RpcError>>,
+    server_error_classifier: ServerErrorClassifier,
     _inflight: OwnedSemaphorePermit,
 }
 

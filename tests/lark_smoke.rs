@@ -61,8 +61,8 @@ use lark_codex_bridge::runtime::quote::{LarkQuoteResolver, QuoteRequest, QuoteRe
 use lark_codex_bridge::runtime::router::{Router, RouterSettings};
 use lark_codex_bridge::runtime::scope::{DurableReplySink, ReplySinkError, TurnFinalization};
 use lark_codex_bridge::store::{
-    DedupOutcome, InboundEventState, InboundRejectionKind, NewOutboxRow, NewTurnRow, StoreHandle,
-    TurnState,
+    DedupOutcome, InboundEventState, InboundKey, InboundRejectionKind, NewOutboxRow, NewTurnRow,
+    StoreHandle, TurnState,
 };
 use secrecy::SecretString;
 use semver::Version;
@@ -471,11 +471,12 @@ struct SmokeSink;
 impl DurableReplySink for SmokeSink {
     fn rejection_notice(
         &self,
+        key: &InboundKey,
         event: &InboundEvent,
-        _reason: InboundRejectionKind,
+        reason: InboundRejectionKind,
     ) -> Result<NewOutboxRow, ReplySinkError> {
         Ok(NewOutboxRow {
-            idempotency_key: format!("{}:mobile-smoke-rejection", event.event_id),
+            idempotency_key: key.rejection_outbox_idempotency_key(reason),
             scope_key: event.scope.to_string(),
             kind: "notice".to_owned(),
             payload_json: "{\"text\":\"mobile smoke rejected\"}".to_owned(),

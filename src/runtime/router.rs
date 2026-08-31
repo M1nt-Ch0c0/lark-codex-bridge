@@ -13,6 +13,7 @@ use tokio::time::{MissedTickBehavior, interval, timeout};
 use tokio_util::sync::CancellationToken;
 
 use crate::codex::client::ControlEvent;
+use crate::codex::external::CodexBackendConfig;
 use crate::codex::supervisor::{SupervisorError, SupervisorHandle, SupervisorState};
 use crate::codex::types::{ApprovalPolicy, SandboxMode};
 use crate::config::{AsrSection, BridgeConfig};
@@ -25,14 +26,16 @@ use crate::limits::{
     ROUTER_RETRY_CAPACITY, ROUTER_SCOPE_ACTOR_HARD_LIMIT, STORE_INBOUND_SCOPE_MAX_BYTES,
     SUPERVISOR_SHUTDOWN_GRACE,
 };
+use crate::runtime::adoption_coordinator::ThreadAdoptionCoordinator;
 use crate::runtime::attachments::AttachmentCache;
+use crate::runtime::commands::{BridgeCommand, parse_command};
 use crate::runtime::context::ContextRegistry;
 use crate::runtime::intake::TenantNamespace;
 use crate::runtime::policy::AccessPolicy;
 use crate::runtime::quote::QuoteResolver;
 use crate::runtime::scope::{
     ActorRouteError, DurableReplySink, InterruptOutcome, ReplySinkError, ScopeActorHandle,
-    ScopeSnapshot, SupervisorAccess,
+    ScopeControl, ScopeSnapshot, SupervisorAccess,
 };
 use crate::runtime::tools::handle_server_request;
 use crate::store::{InboundKey, InboundRejectionKind, StoreError, StoreHandle};
@@ -56,6 +59,7 @@ pub struct RouterSettings {
     pub(crate) pending_media_ttl: Duration,
     pub(crate) pending_media_max_count: usize,
     pub(crate) pending_media_max_metadata_bytes: usize,
+    pub(crate) backend: CodexBackendConfig,
     #[cfg(test)]
     startup_gate: Option<Arc<RouterStartupGate>>,
 }
@@ -137,6 +141,7 @@ impl RouterSettings {
             pending_media_ttl: PENDING_MEDIA_TTL,
             pending_media_max_count: PENDING_MEDIA_MAX_COUNT,
             pending_media_max_metadata_bytes: PENDING_MEDIA_MAX_METADATA_BYTES,
+            backend: config.codex.backend.clone(),
             #[cfg(test)]
             startup_gate: None,
         }
@@ -234,7 +239,8 @@ impl fmt::Debug for RouterSettings {
             .field(
                 "pending_media_max_metadata_bytes",
                 &self.pending_media_max_metadata_bytes,
-            );
+            )
+            .field("backend", &self.backend);
         #[cfg(test)]
         settings.field("startup_gate_configured", &self.startup_gate.is_some());
         settings.finish()
@@ -256,6 +262,8 @@ pub enum RouteError {
     ReplySink,
     #[error("the app-server supervisor failed")]
     Supervisor,
+    #[error("persisted-thread ownership coordination failed")]
+    Adoption,
     /// A permanent supervisor failure observed at the atomic ownership
     /// handoff into the router. The reason is displayed only by the CLI;
     /// [`fmt::Debug`] remains content-free.
@@ -276,6 +284,7 @@ impl fmt::Debug for RouteError {
             Self::Store => "Store",
             Self::ReplySink => "ReplySink",
             Self::Supervisor => "Supervisor",
+            Self::Adoption => "Adoption",
             Self::CodexUnavailable { .. } => "CodexUnavailable",
             Self::ActorUnavailable => "ActorUnavailable",
             Self::Attachment => "Attachment",
@@ -477,6 +486,11 @@ impl Router {
             .saturating_add(SUPERVISOR_SHUTDOWN_GRACE);
         let startup_cancel = CancellationToken::new();
         let active_turns = Arc::new(Semaphore::new(active_turn_capacity));
+        let adoption = Arc::new(ThreadAdoptionCoordinator::new(
+            store.clone(),
+            settings.backend.clone(),
+            settings.max_scope_actors,
+        ));
         let mut task = RouterStartupGuard::new(
             tokio::spawn(run_router(
                 receiver,
@@ -493,6 +507,7 @@ impl Router {
                 attachments,
                 contexts,
                 quote_resolver,
+                adoption,
                 task_snapshot,
             )),
             startup_cancel,
@@ -745,6 +760,7 @@ struct RouteFailure {
 #[derive(Clone)]
 enum RouterStartupError {
     Supervisor,
+    Adoption,
     CodexUnavailable { reason: String },
 }
 
@@ -813,6 +829,7 @@ impl RouterStartupError {
     fn into_route_error(self) -> RouteError {
         match self {
             Self::Supervisor => RouteError::Supervisor,
+            Self::Adoption => RouteError::Adoption,
             Self::CodexUnavailable { reason } => RouteError::CodexUnavailable { reason },
         }
     }
@@ -834,6 +851,7 @@ async fn run_router(
     attachments: Option<Arc<AttachmentCache>>,
     contexts: Option<Arc<ContextRegistry>>,
     quote_resolver: Option<Arc<dyn QuoteResolver>>,
+    adoption: Arc<ThreadAdoptionCoordinator>,
     snapshot: Arc<RwLock<RouterSnapshot>>,
 ) -> Result<(), RouteError> {
     let (supervisor_tx, supervisor_rx) = watch::channel(supervisor_access(&supervisor));
@@ -859,6 +877,19 @@ async fn run_router(
         contexts.as_ref(),
         settings.asr.clone(),
     );
+    if adoption.startup_fence().await.is_err() {
+        let _ = startup_sender.send(Err(RouterStartupError::Adoption));
+        let _ = adoption.shutdown_fence_and_reap().await;
+        cleanup_router_startup(
+            tool_task,
+            stale_sweep_task,
+            supervisor,
+            attachments.as_deref(),
+            settings.shutdown_cleanup_timeout,
+        )
+        .await;
+        return Err(RouteError::Adoption);
+    }
     #[cfg(test)]
     let cancelled_before_ack = if let Some(gate) = &settings.startup_gate {
         tokio::select! {
@@ -877,6 +908,7 @@ async fn run_router(
         if let Some(gate) = &settings.startup_gate {
             gate.pause_during_cleanup().await;
         }
+        let _ = adoption.shutdown_fence_and_reap().await;
         cleanup_router_startup(
             tool_task,
             stale_sweep_task,
@@ -902,6 +934,7 @@ async fn run_router(
     };
     if let Some(error) = startup_error {
         let _ = startup_sender.send(Err(error.clone()));
+        let _ = adoption.shutdown_fence_and_reap().await;
         cleanup_router_startup(
             tool_task,
             stale_sweep_task,
@@ -913,6 +946,7 @@ async fn run_router(
         return Err(error.into_route_error());
     }
     if startup_sender.send(Ok(())).is_err() {
+        let _ = adoption.shutdown_fence_and_reap().await;
         cleanup_router_startup(
             tool_task,
             stale_sweep_task,
@@ -966,6 +1000,7 @@ async fn run_router(
                     supervisor_tx.send_replace(SupervisorAccess {
                         epoch: 0,
                         client: None,
+                        profile_identity: None,
                         terminal: true,
                     });
                 }
@@ -983,6 +1018,7 @@ async fn run_router(
                     attachments.as_ref(),
                     contexts.as_ref(),
                     quote_resolver.as_ref(),
+                    &adoption,
                     &mut actors,
                 ).await;
                 update_runtime_snapshot(
@@ -1025,6 +1061,7 @@ async fn run_router(
                             attachments.as_ref(),
                             contexts.as_ref(),
                             quote_resolver.as_ref(),
+                            &adoption,
                             &mut actors,
                             *event,
                         ).await {
@@ -1053,6 +1090,10 @@ async fn run_router(
                             task.stop(settings.shutdown_cleanup_timeout).await;
                         }
                         finish_stale_sweep(stale_sweep_task).await;
+                        let report = adoption.shutdown_fence_and_reap().await;
+                        if report.failures != 0 {
+                            tracing::warn!(failures = report.failures, "adopted ownership shutdown was not fully confirmed");
+                        }
                         supervisor.shutdown().await?;
                         reconcile_terminal_attachments(attachments.as_deref()).await?;
                         let _ = respond.send(());
@@ -1067,6 +1108,13 @@ async fn run_router(
         task.stop(settings.shutdown_cleanup_timeout).await;
     }
     finish_stale_sweep(stale_sweep_task).await;
+    let report = adoption.shutdown_fence_and_reap().await;
+    if report.failures != 0 {
+        tracing::warn!(
+            failures = report.failures,
+            "adopted ownership shutdown was not fully confirmed"
+        );
+    }
     supervisor.shutdown().await?;
     reconcile_terminal_attachments(attachments.as_deref()).await?;
     Ok(())
@@ -1190,6 +1238,7 @@ async fn retry_one(
     attachments: Option<&Arc<AttachmentCache>>,
     contexts: Option<&Arc<ContextRegistry>>,
     quote_resolver: Option<&Arc<dyn QuoteResolver>>,
+    adoption: &Arc<ThreadAdoptionCoordinator>,
     actors: &mut HashMap<String, ScopeActorHandle>,
 ) {
     let Some(mut retry) = retries.pop_front() else {
@@ -1206,6 +1255,7 @@ async fn retry_one(
         attachments,
         contexts,
         quote_resolver,
+        adoption,
         actors,
         retry.event,
     )
@@ -1235,6 +1285,7 @@ async fn route_one(
     attachments: Option<&Arc<AttachmentCache>>,
     contexts: Option<&Arc<ContextRegistry>>,
     quote_resolver: Option<&Arc<dyn QuoteResolver>>,
+    adoption: &Arc<ThreadAdoptionCoordinator>,
     actors: &mut HashMap<String, ScopeActorHandle>,
     queued: QueuedInboundEvent,
 ) -> Result<(), Box<RouteFailure>> {
@@ -1253,7 +1304,12 @@ async fn route_one(
                 })
             });
     }
-    let decision = policy.decide(&queued.event);
+    let control = adoption_control(&queued.event);
+    let decision = if control.is_some() {
+        policy.decide_command(&queued.event)
+    } else {
+        policy.decide(&queued.event)
+    };
     if let Some(kind) = decision.rejection_kind() {
         return reject_with_notice(store, sink.as_ref(), &key, &queued.event, kind)
             .await
@@ -1265,25 +1321,37 @@ async fn route_one(
                 })
             });
     }
-    let supervisor_terminal = supervisor.borrow().terminal;
-    if supervisor_terminal {
-        return reject_with_notice(
-            store,
-            sink.as_ref(),
-            &key,
-            &queued.event,
-            InboundRejectionKind::Internal,
-        )
-        .await
-        .map_err(|error| {
-            Box::new(RouteFailure {
-                error,
-                event: queued,
-                retryable: true,
-            })
-        });
-    }
     let scope_key = queued.event.scope.to_string();
+    if control.is_none() && supervisor.borrow().terminal {
+        let externally_adopted = match store.active_thread(&queued.event.scope).await {
+            Ok(active) => active
+                .is_some_and(|row| row.origin == crate::store::ThreadOrigin::ExternallyAdopted),
+            Err(_) => {
+                return Err(Box::new(RouteFailure {
+                    error: RouteError::Store,
+                    event: queued,
+                    retryable: true,
+                }));
+            }
+        };
+        if !externally_adopted {
+            return reject_with_notice(
+                store,
+                sink.as_ref(),
+                &key,
+                &queued.event,
+                InboundRejectionKind::Internal,
+            )
+            .await
+            .map_err(|error| {
+                Box::new(RouteFailure {
+                    error,
+                    event: queued,
+                    retryable: true,
+                })
+            });
+        }
+    }
     if !actors.contains_key(&scope_key) {
         if actors.len() >= settings.max_scope_actors {
             let idle = actors
@@ -1324,6 +1392,7 @@ async fn route_one(
                 attachments.map(Arc::clone),
                 contexts.map(Arc::clone),
                 quote_resolver.map(Arc::clone),
+                Arc::clone(adoption),
             ),
         );
     }
@@ -1334,7 +1403,10 @@ async fn route_one(
             retryable: false,
         }));
     };
-    let route = actor.try_route(key.clone(), queued);
+    let route = match control {
+        Some(control) => actor.try_route_control(key.clone(), queued, control),
+        None => actor.try_route(key.clone(), queued),
+    };
     match route {
         Ok(()) => {
             tracing::debug!(
@@ -1373,6 +1445,28 @@ fn is_conversation_media(message_type: &str) -> bool {
     matches!(message_type, "image" | "video" | "media" | "file" | "audio")
 }
 
+fn adoption_control(event: &crate::lark::normalize::InboundEvent) -> Option<ScopeControl> {
+    if event.message_type != "text" {
+        return None;
+    }
+    let trimmed = event.text.trim();
+    let name = trimmed
+        .split_once(char::is_whitespace)
+        .map_or(trimmed, |(name, _)| name);
+    if !matches!(name, "/threads" | "/adopt" | "/release") {
+        return None;
+    }
+    match parse_command(trimmed) {
+        Ok(Some(
+            command @ (BridgeCommand::Threads { .. }
+            | BridgeCommand::Adopt { .. }
+            | BridgeCommand::Release),
+        )) => Some(ScopeControl::Command(command)),
+        Err(error) => Some(ScopeControl::Malformed(error)),
+        Ok(None | Some(_)) => None,
+    }
+}
+
 fn enqueue_retry(
     retries: &mut VecDeque<RouterRetry>,
     budget: &Arc<Semaphore>,
@@ -1400,7 +1494,7 @@ async fn reject_with_notice(
     event: &crate::lark::normalize::InboundEvent,
     reason: InboundRejectionKind,
 ) -> Result<(), RouteError> {
-    let notice = sink.rejection_notice(event, reason)?;
+    let notice = sink.rejection_notice(key, event, reason)?;
     store
         .reject_received_and_enqueue_notice(key, reason, notice)
         .await?;
@@ -1418,6 +1512,7 @@ fn supervisor_access(supervisor: &SupervisorHandle) -> SupervisorAccess {
     SupervisorAccess {
         epoch,
         client: supervisor.client().ok(),
+        profile_identity: supervisor.profile_identity().ok(),
         terminal,
     }
 }
@@ -1474,6 +1569,7 @@ mod tests {
     impl DurableReplySink for StartupSink {
         fn rejection_notice(
             &self,
+            _key: &InboundKey,
             _event: &InboundEvent,
             _reason: InboundRejectionKind,
         ) -> Result<crate::store::NewOutboxRow, ReplySinkError> {
@@ -1552,6 +1648,39 @@ mod tests {
             },
             permit,
         )
+    }
+
+    #[tokio::test]
+    async fn only_adoption_slash_commands_are_intercepted() {
+        let mut event = queued("command-recognition").await.event;
+
+        for ordinary in ["/unknown value", "/new", "/new unexpected", "/help"] {
+            event.text = ordinary.to_owned();
+            assert!(
+                adoption_control(&event).is_none(),
+                "non-adoption slash text must remain ordinary input"
+            );
+        }
+
+        event.text = "/threads".to_owned();
+        assert!(matches!(
+            adoption_control(&event),
+            Some(ScopeControl::Command(BridgeCommand::Threads {
+                cursor: None
+            }))
+        ));
+        event.text = "/adopt selected-without-handoff".to_owned();
+        assert!(matches!(
+            adoption_control(&event),
+            Some(ScopeControl::Malformed(
+                crate::runtime::commands::CommandParseError::HandoffConfirmationRequired
+            ))
+        ));
+        event.text = "/release unexpected".to_owned();
+        assert!(matches!(
+            adoption_control(&event),
+            Some(ScopeControl::Malformed(_))
+        ));
     }
 
     #[tokio::test]

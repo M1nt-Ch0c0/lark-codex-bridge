@@ -10,9 +10,12 @@ use lark_codex_bridge::lark::normalize::{
     ScopeKey, TranscriptFailure,
 };
 use lark_codex_bridge::limits::{
-    OUTBOX_TERMINAL_MAX_ROWS, STORE_ATTACHMENT_LEASE_MAX_ROWS, STORE_OUTBOX_CLAIM_MAX_BYTES,
-    STORE_OUTBOX_MAX_QUEUED_BYTES, STORE_OUTBOX_PAYLOAD_MAX_BYTES, STORE_RECOVERY_TURN_MAX_BYTES,
-    STORE_RECOVERY_TURN_MAX_ROWS, STORE_REQUEST_MAX_BYTES, STORE_WRITER_BYTE_BUDGET,
+    OUTBOX_SWEEP_BATCH, OUTBOX_TERMINAL_MAX_ROWS, STORE_ATTACHMENT_LEASE_MAX_ROWS,
+    STORE_INBOUND_ID_MAX_BYTES, STORE_INBOUND_MAX_BYTES, STORE_INBOUND_MAX_ROWS,
+    STORE_INBOUND_RECEIVED_MAX_BYTES, STORE_INBOUND_RECEIVED_MAX_ROWS,
+    STORE_INBOUND_SCOPE_MAX_BYTES, STORE_OUTBOX_CLAIM_MAX_BYTES, STORE_OUTBOX_MAX_QUEUED_BYTES,
+    STORE_OUTBOX_PAYLOAD_MAX_BYTES, STORE_RECOVERY_TURN_MAX_BYTES, STORE_RECOVERY_TURN_MAX_ROWS,
+    STORE_REJECTION_REASON_MAX_BYTES, STORE_REQUEST_MAX_BYTES, STORE_WRITER_BYTE_BUDGET,
     STORE_WRITER_CAPACITY,
 };
 use lark_codex_bridge::runtime::intake::DurableIntake;
@@ -20,8 +23,8 @@ use lark_codex_bridge::runtime::intake::TenantNamespace;
 use lark_codex_bridge::store::{
     BeginTurnOutcome, DedupOutcome, InboundDisposition, InboundEventState, InboundKey,
     InboundRejectionKind, InboundTerminal, NewOutboxRow, NewTurnRow, OutboxEnqueue, OutboxState,
-    ResolveTurnOutcome, ScopeRow, StoreError, StoreHandle, ThreadRow, ThreadStatus, TurnResolution,
-    TurnRow, TurnState,
+    ResolveTurnOutcome, ScopeRow, StoreError, StoreHandle, ThreadOrigin, ThreadRow, ThreadStatus,
+    TurnResolution, TurnRow, TurnState,
 };
 use secrecy::SecretString;
 use tempfile::tempdir;
@@ -59,6 +62,34 @@ fn outbox(key: &str, payload: &str) -> NewOutboxRow {
     }
 }
 
+fn rejection_notice(key: &InboundKey, reason: InboundRejectionKind, payload: &str) -> NewOutboxRow {
+    let mut row = outbox(&key.rejection_outbox_idempotency_key(reason), payload);
+    "notice".clone_into(&mut row.kind);
+    row
+}
+
+fn seed_terminal_outbox_at_total_cap(path: &std::path::Path, updated_ms: i64) {
+    let mut connection = rusqlite::Connection::open(path).expect("raw seed connection");
+    let transaction = connection.transaction().expect("seed transaction");
+    {
+        let mut statement = transaction
+            .prepare(
+                "INSERT INTO outbox
+                 (idempotency_key, scope_key, kind, payload_json, payload_bytes,
+                  state, attempts, next_retry_ms, receipt_message_id, created_ms, updated_ms)
+                 VALUES (?1, 'im:oc_test', 'final', '', 0, 'sent', 1, 0, 'om_r', ?2, ?2)",
+            )
+            .expect("prepare terminal seed");
+        let cap = usize::try_from(OUTBOX_TERMINAL_MAX_ROWS).expect("row cap fits usize");
+        for index in 0..cap {
+            statement
+                .execute(rusqlite::params![format!("term:{index}"), updated_ms])
+                .expect("insert terminal row");
+        }
+    }
+    transaction.commit().expect("commit seed");
+}
+
 fn turn(message_id: &str, state: TurnState) -> NewTurnRow {
     NewTurnRow {
         scope_key: "im:oc_test".to_owned(),
@@ -94,10 +125,128 @@ fn assert_sqlite_files_exclude(path: &std::path::Path, sentinels: &[&str]) {
     }
 }
 
-fn downgrade_attachment_lease_schema_to_v5(connection: &rusqlite::Connection) {
+fn inbound_logical_bytes(connection: &rusqlite::Connection) -> u64 {
+    let bytes: i64 = connection
+        .query_row(
+            "SELECT COALESCE(SUM(
+                 LENGTH(CAST(tenant AS BLOB)) + LENGTH(CAST(event_id AS BLOB)) +
+                 LENGTH(CAST(message_id AS BLOB)) + LENGTH(CAST(scope_key AS BLOB)) +
+                 COALESCE(LENGTH(CAST(rejection_reason AS BLOB)), 0) +
+                 COALESCE(LENGTH(CAST(reply_outbox_key AS BLOB)), 0) + payload_bytes
+             ), 0)
+             FROM inbound_events",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read inbound logical bytes");
+    u64::try_from(bytes).expect("non-negative inbound logical bytes")
+}
+
+fn seed_inbound_logical_bytes_to(path: &std::path::Path, target_bytes: u64) {
+    const MIN_ROW_BYTES: usize = 1 + 8 + 1 + 1 + 1;
+    const MAX_ROW_BYTES: usize = STORE_INBOUND_ID_MAX_BYTES * 3
+        + STORE_INBOUND_SCOPE_MAX_BYTES
+        + STORE_REJECTION_REASON_MAX_BYTES;
+
+    let mut connection = rusqlite::Connection::open(path).expect("open inbound capacity seed");
+    let current_bytes = inbound_logical_bytes(&connection);
+    let mut remaining = usize::try_from(
+        target_bytes
+            .checked_sub(current_bytes)
+            .expect("capacity target covers existing inbound rows"),
+    )
+    .expect("remaining inbound capacity fits usize");
+    let transaction = connection
+        .transaction()
+        .expect("start inbound capacity seed");
+    let mut index = 0_u32;
+    while remaining != 0 {
+        let row_bytes = if remaining <= MAX_ROW_BYTES {
+            remaining
+        } else if remaining - MAX_ROW_BYTES < MIN_ROW_BYTES {
+            remaining - MIN_ROW_BYTES
+        } else {
+            MAX_ROW_BYTES
+        };
+        assert!(
+            (MIN_ROW_BYTES..=MAX_ROW_BYTES).contains(&row_bytes),
+            "capacity filler row must remain within field bounds"
+        );
+
+        let mut lengths = [1_usize, 8, 1, 1, 1];
+        let maxima = [
+            STORE_INBOUND_ID_MAX_BYTES,
+            STORE_INBOUND_ID_MAX_BYTES,
+            STORE_INBOUND_ID_MAX_BYTES,
+            STORE_INBOUND_SCOPE_MAX_BYTES,
+            STORE_REJECTION_REASON_MAX_BYTES,
+        ];
+        let mut extra = row_bytes - MIN_ROW_BYTES;
+        for (length, maximum) in lengths.iter_mut().zip(maxima) {
+            let added = extra.min(maximum - *length);
+            *length += added;
+            extra -= added;
+        }
+        assert_eq!(extra, 0, "capacity filler bytes fit bounded fields");
+
+        let tenant = "t".repeat(lengths[0]);
+        let prefix = format!("{index:08x}");
+        let event_id = format!("{prefix}{}", "e".repeat(lengths[1] - prefix.len()));
+        let message_id = "m".repeat(lengths[2]);
+        let scope_key = "s".repeat(lengths[3]);
+        let rejection_reason = "r".repeat(lengths[4]);
+        transaction
+            .execute(
+                "INSERT INTO inbound_events
+                 (tenant, event_id, message_id, scope_key, state,
+                  first_seen_ms, updated_ms, rejection_reason,
+                  payload_version, payload_blob, payload_bytes, turn_row_id,
+                  reply_outbox_key)
+                 VALUES (?1, ?2, ?3, ?4, 'rejected', 1, 1, ?5,
+                         NULL, NULL, 0, NULL, NULL)",
+                rusqlite::params![tenant, event_id, message_id, scope_key, rejection_reason],
+            )
+            .expect("insert bounded inbound capacity filler");
+        remaining -= row_bytes;
+        index += 1;
+    }
+    transaction.commit().expect("commit inbound capacity seed");
+    assert_eq!(inbound_logical_bytes(&connection), target_bytes);
+}
+
+fn downgrade_store_schema_to_v5(connection: &rusqlite::Connection) {
     connection
         .execute_batch(
             "PRAGMA foreign_keys = OFF;
+             DROP TRIGGER IF EXISTS inbound_events_v12_reply_effect_insert;
+             DROP TRIGGER IF EXISTS inbound_events_v12_reply_effect_update;
+             ALTER TABLE inbound_events DROP COLUMN reply_outbox_key;
+             DROP TRIGGER IF EXISTS threads_adoption_shape_insert;
+             DROP TRIGGER IF EXISTS threads_adoption_shape_update;
+             DROP INDEX IF EXISTS threads_one_active_thread_id;
+             DROP TABLE IF EXISTS thread_adoption_sagas;
+             DROP INDEX threads_one_active_per_scope;
+             ALTER TABLE threads RENAME TO threads_v11;
+             CREATE TABLE threads (
+                 scope_key TEXT NOT NULL,
+                 codex_thread_id TEXT NOT NULL,
+                 status TEXT NOT NULL CHECK (status IN ('active', 'archived')),
+                 created_ms INTEGER NOT NULL,
+                 archived_ms INTEGER,
+                 context_tools_version INTEGER NOT NULL DEFAULT 0
+                     CHECK (context_tools_version >= 0),
+                 PRIMARY KEY (scope_key, codex_thread_id)
+             );
+             CREATE UNIQUE INDEX threads_one_active_per_scope
+                 ON threads (scope_key) WHERE status = 'active';
+             INSERT INTO threads (
+                 scope_key, codex_thread_id, status, created_ms, archived_ms,
+                 context_tools_version
+             )
+             SELECT scope_key, codex_thread_id, status, created_ms, archived_ms,
+                    context_tools_version
+             FROM threads_v11;
+             DROP TABLE threads_v11;
              DROP INDEX attachment_leases_sha256;
              DROP INDEX attachment_leases_turn;
              ALTER TABLE attachment_leases RENAME TO attachment_leases_v7;
@@ -114,6 +263,55 @@ fn downgrade_attachment_lease_schema_to_v5(connection: &rusqlite::Connection) {
              DROP TABLE attachment_leases_v7;",
         )
         .expect("downgrade lease table to v5 shape");
+}
+
+fn downgrade_store_schema_to_v10(connection: &rusqlite::Connection) {
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP TRIGGER IF EXISTS inbound_events_v12_reply_effect_insert;
+             DROP TRIGGER IF EXISTS inbound_events_v12_reply_effect_update;
+             ALTER TABLE inbound_events DROP COLUMN reply_outbox_key;
+             DROP TRIGGER IF EXISTS threads_adoption_shape_insert;
+             DROP TRIGGER IF EXISTS threads_adoption_shape_update;
+             DROP INDEX IF EXISTS threads_one_active_thread_id;
+             DROP TABLE IF EXISTS thread_adoption_sagas;
+             DROP INDEX threads_one_active_per_scope;
+             ALTER TABLE threads RENAME TO threads_v11;
+             CREATE TABLE threads (
+                 scope_key TEXT NOT NULL,
+                 codex_thread_id TEXT NOT NULL,
+                 status TEXT NOT NULL CHECK (status IN ('active', 'archived')),
+                 created_ms INTEGER NOT NULL,
+                 archived_ms INTEGER,
+                 context_tools_version INTEGER NOT NULL DEFAULT 0
+                     CHECK (context_tools_version >= 0),
+                 PRIMARY KEY (scope_key, codex_thread_id)
+             );
+             CREATE UNIQUE INDEX threads_one_active_per_scope
+                 ON threads (scope_key) WHERE status = 'active';
+             INSERT INTO threads (
+                 scope_key, codex_thread_id, status, created_ms, archived_ms,
+                 context_tools_version
+             )
+             SELECT scope_key, codex_thread_id, status, created_ms, archived_ms,
+                    context_tools_version
+             FROM threads_v11;
+             DROP TABLE threads_v11;
+             PRAGMA user_version = 10;",
+        )
+        .expect("downgrade store to v10 shape");
+}
+
+fn downgrade_store_schema_to_v11(connection: &rusqlite::Connection) {
+    connection
+        .execute_batch(
+            "DROP TRIGGER IF EXISTS inbound_events_v12_reply_effect_insert;
+             DROP TRIGGER IF EXISTS inbound_events_v12_reply_effect_update;
+             ALTER TABLE inbound_events DROP COLUMN reply_outbox_key;
+             PRAGMA user_version = 11;",
+        )
+        .expect("downgrade store to v11 shape");
 }
 
 fn credentials_for(app_id: &str) -> LarkCredentials {
@@ -147,6 +345,38 @@ async fn seed_accepted_file_store(
     };
     store.shutdown().await.expect("shutdown seed store");
     (credentials, tenant, turn_row_id)
+}
+
+async fn seed_completed_control_file_store(
+    path: &std::path::Path,
+    app_id: &str,
+) -> (LarkCredentials, TenantNamespace, InboundKey) {
+    let credentials = credentials_for(app_id);
+    let tenant = TenantNamespace::from_credentials(&credentials);
+    let inbound = event("event-forged-control", "message-forged-control");
+    let key = InboundKey::new(tenant.clone(), inbound.event_id.clone());
+    let store = StoreHandle::open(path)
+        .await
+        .expect("open control seed store");
+    store
+        .register_inbound(&tenant, &inbound)
+        .await
+        .expect("register control seed");
+    store
+        .complete_received_and_enqueue_control_reply(
+            &key,
+            NewOutboxRow {
+                idempotency_key: key.control_outbox_idempotency_key(),
+                scope_key: inbound.scope.to_string(),
+                kind: "control".to_owned(),
+                payload_json: "control-seed".to_owned(),
+                next_retry_ms: 0,
+            },
+        )
+        .await
+        .expect("complete control seed");
+    store.shutdown().await.expect("shutdown control seed store");
+    (credentials, tenant, key)
 }
 
 async fn assert_forged_store_fails_recovery_and_skip(
@@ -281,7 +511,7 @@ async fn migration_two_persists_strict_inbound_payload_columns() {
     let temp = tempdir().expect("tempdir");
     let path = temp.path().join("store.sqlite");
     let store = StoreHandle::open(&path).await.expect("open");
-    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 10);
+    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 12);
     store.shutdown().await.expect("shutdown");
 
     let connection = rusqlite::Connection::open(&path).expect("inspect");
@@ -306,6 +536,7 @@ async fn migration_two_persists_strict_inbound_payload_columns() {
         "payload_blob",
         "payload_bytes",
         "turn_row_id",
+        "reply_outbox_key",
     ] {
         assert!(inbound_columns.contains(name), "missing {name}");
     }
@@ -317,6 +548,34 @@ async fn migration_two_persists_strict_inbound_payload_columns() {
         .collect::<Result<HashSet<_>, _>>()
         .expect("decode turn columns");
     assert!(turn_columns.contains("inbound_count"));
+}
+
+#[test]
+fn inbound_reply_effect_schema_bound_matches_rust_field_limits() {
+    let derived_max = "inbound:v1:".len()
+        + 64
+        + 1
+        + STORE_INBOUND_ID_MAX_BYTES
+        + 1
+        + "notice:".len()
+        + STORE_REJECTION_REASON_MAX_BYTES;
+    assert_eq!(derived_max, 4_308);
+    let migration = lark_codex_bridge::store::schema::MIGRATIONS
+        .iter()
+        .find(|migration| migration.version == 12)
+        .expect("v12 reply marker migration");
+    for limit in [
+        STORE_INBOUND_MAX_ROWS,
+        STORE_INBOUND_MAX_BYTES,
+        STORE_INBOUND_RECEIVED_MAX_ROWS,
+        STORE_INBOUND_RECEIVED_MAX_BYTES,
+    ] {
+        assert!(
+            migration.sql.contains(&limit.to_string()),
+            "v12 SQL must mirror logical collection limit {limit}"
+        );
+    }
+    assert!(migration.sql.contains("BETWEEN 1 AND 4308"));
 }
 
 #[tokio::test]
@@ -569,7 +828,7 @@ async fn v5_upgrade_scrubs_historical_plaintext_from_database_and_wal_pages() {
     let payload_bytes = i64::try_from(payload.len()).expect("payload length");
     {
         let connection = rusqlite::Connection::open(&path).expect("open legacy database");
-        downgrade_attachment_lease_schema_to_v5(&connection);
+        downgrade_store_schema_to_v5(&connection);
         connection
             .execute(
                 "UPDATE inbound_events
@@ -584,7 +843,7 @@ async fn v5_upgrade_scrubs_historical_plaintext_from_database_and_wal_pages() {
     }
 
     let store = StoreHandle::open(&path).await.expect("privacy migration");
-    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 10);
+    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 12);
     let recovered = store.recover_received(&tenant).await.expect("recover");
     assert!(matches!(
         recovered[0].event().parts.as_slice(),
@@ -603,7 +862,7 @@ async fn v5_upgrade_scrubs_historical_plaintext_from_database_and_wal_pages() {
     // already-sanitized v5 payload must be harmless and advance normally.
     {
         let connection = rusqlite::Connection::open(&path).expect("reopen scrubbed v5 database");
-        downgrade_attachment_lease_schema_to_v5(&connection);
+        downgrade_store_schema_to_v5(&connection);
         connection
             .pragma_update(None, "user_version", 5_u32)
             .expect("rewind privacy marker");
@@ -611,7 +870,7 @@ async fn v5_upgrade_scrubs_historical_plaintext_from_database_and_wal_pages() {
     let store = StoreHandle::open(&path)
         .await
         .expect("retry idempotent privacy migration");
-    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 10);
+    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 12);
     let recovered = store
         .recover_received(&tenant)
         .await
@@ -798,7 +1057,7 @@ async fn file_store_applies_pragmas_and_persists_every_typed_table() {
     assert!(pragmas.foreign_keys);
     assert_eq!(pragmas.busy_timeout_ms, 5_000);
     assert_eq!(pragmas.synchronous, 1);
-    assert_eq!(pragmas.user_version, 10);
+    assert_eq!(pragmas.user_version, 12);
     store
         .upsert_scope(&scope, temp.path(), "fp")
         .await
@@ -834,7 +1093,7 @@ async fn file_store_applies_pragmas_and_persists_every_typed_table() {
     store.shutdown().await.expect("shutdown");
 
     let store = StoreHandle::open(&path).await.expect("reopen");
-    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 10);
+    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 12);
     assert!(store.scope_row(&scope).await.expect("scope").is_some());
     assert_eq!(
         store
@@ -888,7 +1147,7 @@ async fn migration_seven_preserves_legacy_lease_as_one_unique_acquisition() {
     store.shutdown().await.expect("shutdown");
 
     let connection = rusqlite::Connection::open(&path).expect("legacy setup");
-    downgrade_attachment_lease_schema_to_v5(&connection);
+    downgrade_store_schema_to_v5(&connection);
     connection
         .pragma_update(None, "user_version", 5_u32)
         .expect("rewind schema version");
@@ -897,7 +1156,7 @@ async fn migration_seven_preserves_legacy_lease_as_one_unique_acquisition() {
     let store = StoreHandle::open(&path)
         .await
         .expect("migrate v5 through v8");
-    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 10);
+    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 12);
     let leases = store
         .attachment_leases("legacy-hash")
         .await
@@ -931,7 +1190,7 @@ async fn migration_seven_rejects_active_legacy_leases_over_the_runtime_cap() {
     store.shutdown().await.expect("shutdown current store");
 
     let mut connection = rusqlite::Connection::open(&path).expect("legacy setup");
-    downgrade_attachment_lease_schema_to_v5(&connection);
+    downgrade_store_schema_to_v5(&connection);
     let transaction = connection.transaction().expect("seed transaction");
     {
         let mut insert_attachment = transaction
@@ -1045,7 +1304,7 @@ async fn rejects_future_schema_versions_without_mutating_the_database() {
     {
         let connection = rusqlite::Connection::open(&path).expect("seed");
         connection
-            .pragma_update(None, "user_version", 11_u32)
+            .pragma_update(None, "user_version", 13_u32)
             .expect("version");
     }
     assert!(matches!(
@@ -1056,7 +1315,7 @@ async fn rejects_future_schema_versions_without_mutating_the_database() {
     let version: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .expect("version");
-    assert_eq!(version, 11);
+    assert_eq!(version, 13);
 }
 
 #[tokio::test]
@@ -1765,6 +2024,8 @@ fn durable_session_rows_redact_scope_and_workspace_values_from_debug() {
         created_ms: 2,
         archived_ms: None,
         context_tools_version: 0,
+        origin: ThreadOrigin::BridgeCreated,
+        adoption_generation: None,
     };
     let turn = TurnRow {
         id: 3,
@@ -2072,6 +2333,430 @@ async fn legal_legacy_v1_terminal_rows_migrate_prepare_and_sweep() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn v12_migration_marks_only_current_classified_no_turn_rejections() {
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("v12-reply-marker-selection.sqlite");
+    let credentials = credentials_for("cli_v12_reply_marker_selection");
+    let tenant = TenantNamespace::from_credentials(&credentials);
+    let store = StoreHandle::open(&path).await.expect("open current store");
+
+    let classified = event("classified-no-turn", "classified-no-turn-message");
+    let classified_key = InboundKey::new(tenant.clone(), classified.event_id.clone());
+    store
+        .register_inbound(&tenant, &classified)
+        .await
+        .expect("register classified rejection");
+    store
+        .reject_received_and_enqueue_notice(
+            &classified_key,
+            InboundRejectionKind::Policy,
+            rejection_notice(
+                &classified_key,
+                InboundRejectionKind::Policy,
+                "classified notice",
+            ),
+        )
+        .await
+        .expect("atomically reject classified event");
+    let expected_classified_marker =
+        classified_key.rejection_outbox_idempotency_key(InboundRejectionKind::Policy);
+
+    // The pre-v12 schema cannot distinguish the production atomic path above
+    // from this historical bare API. The migration deliberately marks both to
+    // prefer duplicate-send prevention over backfilling an ambiguous notice.
+    let bare_classified = event("bare-classified-no-turn", "bare-classified-no-turn-message");
+    let bare_classified_key = InboundKey::new(tenant.clone(), bare_classified.event_id.clone());
+    store
+        .register_inbound(&tenant, &bare_classified)
+        .await
+        .expect("register bare classified rejection");
+    store
+        .reject_received(&bare_classified_key, InboundRejectionKind::Policy)
+        .await
+        .expect("seed bare classified rejection");
+    let expected_bare_marker =
+        bare_classified_key.rejection_outbox_idempotency_key(InboundRejectionKind::Policy);
+
+    let linked = event("turn-linked-rejection", "turn-linked-rejection-message");
+    store
+        .register_inbound(&tenant, &linked)
+        .await
+        .expect("register turn-linked rejection");
+    let begun = store
+        .begin_turn_and_claim_inbound(
+            turn("v12-marker-linked-turn", TurnState::Starting),
+            &[InboundKey::new(tenant.clone(), linked.event_id.clone())],
+        )
+        .await
+        .expect("claim turn-linked rejection");
+    let BeginTurnOutcome::Started { turn_row_id, .. } = begun else {
+        panic!("turn-linked rejection starts a turn")
+    };
+    store
+        .resolve_turn_and_finish_inbound_batch(
+            turn_row_id,
+            TurnResolution::Failed,
+            InboundTerminal::Rejected,
+        )
+        .await
+        .expect("resolve turn-linked rejection");
+
+    let open_reason = event("open-reason-no-turn", "open-reason-no-turn-message");
+    let open_reason_key = InboundKey::new(tenant.clone(), open_reason.event_id.clone());
+    store
+        .register_inbound(&tenant, &open_reason)
+        .await
+        .expect("register open-reason rejection");
+    store
+        .reject_received(&open_reason_key, InboundRejectionKind::Policy)
+        .await
+        .expect("seed marker-less rejection");
+    store.shutdown().await.expect("shutdown current store");
+
+    {
+        let connection = rusqlite::Connection::open(&path).expect("open v11 fixture");
+        downgrade_store_schema_to_v11(&connection);
+        connection
+            .execute(
+                "UPDATE inbound_events SET rejection_reason = 'legacy_open_reason'
+                 WHERE event_id = 'open-reason-no-turn'",
+                [],
+            )
+            .expect("seed an open legacy rejection reason");
+        connection
+            .execute(
+                "INSERT INTO inbound_events
+                 (tenant, event_id, message_id, scope_key, state,
+                  first_seen_ms, updated_ms, rejection_reason,
+                  payload_version, payload_blob, payload_bytes, turn_row_id)
+                 VALUES
+                 ('legacy-tenant', 'legacy-classified-no-turn', 'legacy-message',
+                  'im:legacy', 'rejected', 1, 1, 'policy', NULL, NULL, 0, NULL)",
+                [],
+            )
+            .expect("seed a pre-namespace classified rejection");
+    }
+
+    let store = StoreHandle::open(&path).await.expect("migrate v11 store");
+    let _runtime = DurableIntake::prepare(store.clone(), &credentials)
+        .await
+        .expect("selected legacy terminal rows remain recoverable");
+    store.shutdown().await.expect("shutdown migrated store");
+
+    let connection = rusqlite::Connection::open(&path).expect("inspect v12 markers");
+    let marker = |event_id: &str| -> Option<String> {
+        connection
+            .query_row(
+                "SELECT reply_outbox_key FROM inbound_events WHERE event_id = ?1",
+                [event_id],
+                |row| row.get(0),
+            )
+            .expect("read migrated marker")
+    };
+    assert_eq!(
+        marker("classified-no-turn").as_deref(),
+        Some(expected_classified_marker.as_str())
+    );
+    assert_eq!(
+        marker("bare-classified-no-turn").as_deref(),
+        Some(expected_bare_marker.as_str())
+    );
+    assert_eq!(marker("turn-linked-rejection"), None);
+    assert_eq!(marker("open-reason-no-turn"), None);
+    assert_eq!(marker("legacy-classified-no-turn"), None);
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn v12_marker_projection_over_byte_cap_rolls_back_schema_and_data() {
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("v12-marker-cap-rollback.sqlite");
+    let tenant = tenant_namespace("cli_v12_marker_cap_rollback");
+    let store = StoreHandle::open(&path).await.expect("open current store");
+    store
+        .register_inbound(&tenant, &event("tenant-seed", "tenant-seed-message"))
+        .await
+        .expect("seed current tenant namespace");
+    store.shutdown().await.expect("shutdown current store");
+
+    let mut connection = rusqlite::Connection::open(&path).expect("open v11 capacity fixture");
+    let tenant: String = connection
+        .query_row(
+            "SELECT tenant FROM inbound_events WHERE event_id = 'tenant-seed'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read current tenant namespace");
+    downgrade_store_schema_to_v11(&connection);
+    connection
+        .execute("DELETE FROM inbound_events", [])
+        .expect("remove namespace seed");
+
+    let message_id = "m".repeat(STORE_INBOUND_ID_MAX_BYTES);
+    let scope_key = "s".repeat(STORE_INBOUND_SCOPE_MAX_BYTES);
+    let rejection_reason = "policy";
+    let base_row_bytes = tenant.len()
+        + STORE_INBOUND_ID_MAX_BYTES
+        + message_id.len()
+        + scope_key.len()
+        + rejection_reason.len();
+    let capacity = usize::try_from(STORE_INBOUND_MAX_BYTES).expect("capacity fits usize");
+    let row_count = capacity / base_row_bytes;
+    let marker_bytes = "inbound:v1:".len()
+        + tenant.len()
+        + 1
+        + STORE_INBOUND_ID_MAX_BYTES
+        + 1
+        + "notice:".len()
+        + rejection_reason.len();
+    assert!(base_row_bytes * row_count <= capacity);
+    assert!(capacity - base_row_bytes * row_count < base_row_bytes);
+    assert!((base_row_bytes + marker_bytes) * row_count > capacity);
+
+    let transaction = connection.transaction().expect("start capacity seed");
+    {
+        let mut insert = transaction
+            .prepare(
+                "INSERT INTO inbound_events
+                 (tenant, event_id, message_id, scope_key, state,
+                  first_seen_ms, updated_ms, rejection_reason,
+                  payload_version, payload_blob, payload_bytes, turn_row_id)
+                 VALUES (?1, ?2, ?3, ?4, 'rejected', 1, 1, ?5,
+                         NULL, NULL, 0, NULL)",
+            )
+            .expect("prepare capacity rows");
+        for index in 0..row_count {
+            let prefix = format!("{index:08x}");
+            let event_id = format!(
+                "{prefix}{}",
+                "e".repeat(STORE_INBOUND_ID_MAX_BYTES - prefix.len())
+            );
+            insert
+                .execute(rusqlite::params![
+                    tenant,
+                    event_id,
+                    message_id,
+                    scope_key,
+                    rejection_reason
+                ])
+                .expect("seed a bounded v11 rejection");
+        }
+    }
+    transaction.commit().expect("commit capacity fixture");
+    drop(connection);
+
+    assert!(matches!(
+        StoreHandle::open(&path).await,
+        Err(StoreError::Migration { version: 12, .. })
+    ));
+
+    let connection = rusqlite::Connection::open(&path).expect("inspect rolled-back migration");
+    let version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .expect("read preserved schema version");
+    assert_eq!(version, 11);
+    let inbound_columns = connection
+        .prepare("PRAGMA table_info(inbound_events)")
+        .expect("prepare inbound columns")
+        .query_map([], |row| row.get::<_, String>(1))
+        .expect("query inbound columns")
+        .collect::<Result<HashSet<_>, _>>()
+        .expect("decode inbound columns");
+    assert!(!inbound_columns.contains("reply_outbox_key"));
+    let guard_tables: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'inbound_reply_effect_v12_guard'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("inspect migration guard");
+    assert_eq!(guard_tables, 0);
+    let preserved_rows: i64 = connection
+        .query_row("SELECT COUNT(*) FROM inbound_events", [], |row| row.get(0))
+        .expect("count preserved v11 rows");
+    assert_eq!(
+        usize::try_from(preserved_rows).expect("non-negative preserved row count"),
+        row_count
+    );
+}
+
+#[tokio::test]
+async fn startup_rejects_reply_markers_with_illegal_association_identity_or_size() {
+    let temp = tempdir().expect("tempdir");
+
+    let association_path = temp.path().join("reply-marker-association.sqlite");
+    let (credentials, tenant, _) =
+        seed_accepted_file_store(&association_path, "cli_reply_marker_association").await;
+    let marker =
+        InboundKey::new(tenant.clone(), "event-forged".to_owned()).control_outbox_idempotency_key();
+    {
+        let connection =
+            rusqlite::Connection::open(&association_path).expect("open association fixture");
+        connection
+            .execute_batch(
+                "DROP TRIGGER inbound_events_v12_reply_effect_insert;
+                 DROP TRIGGER inbound_events_v12_reply_effect_update;",
+            )
+            .expect("disable reply marker guards");
+        connection
+            .execute(
+                "UPDATE inbound_events SET reply_outbox_key = ?1
+                 WHERE event_id = 'event-forged'",
+                [marker],
+            )
+            .expect("forge a turn-associated reply marker");
+    }
+    assert_forged_store_fails_recovery_and_skip(
+        &association_path,
+        &credentials,
+        &tenant,
+        "event-forged",
+    )
+    .await;
+
+    for (index, corruption) in ["identity", "size"].into_iter().enumerate() {
+        let path = temp
+            .path()
+            .join(format!("reply-marker-{corruption}.sqlite"));
+        let (credentials, tenant, key) =
+            seed_completed_control_file_store(&path, &format!("cli_reply_marker_{index}")).await;
+        let forged_marker = match corruption {
+            "identity" => format!("{}:forged", key.control_outbox_idempotency_key()),
+            "size" => "x".repeat(4_309),
+            _ => unreachable!(),
+        };
+        {
+            let connection = rusqlite::Connection::open(&path).expect("open marker fixture");
+            connection
+                .execute_batch(
+                    "DROP TRIGGER inbound_events_v12_reply_effect_insert;
+                     DROP TRIGGER inbound_events_v12_reply_effect_update;",
+                )
+                .expect("disable reply marker guards");
+            connection
+                .execute(
+                    "UPDATE inbound_events SET reply_outbox_key = ?1
+                     WHERE event_id = 'event-forged-control'",
+                    [forged_marker],
+                )
+                .expect("forge reply marker");
+        }
+        assert_forged_store_fails_recovery_and_skip(
+            &path,
+            &credentials,
+            &tenant,
+            "event-forged-control",
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn open_rejection_reason_cannot_carry_a_reply_effect_marker() {
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("reply-marker-open-reason.sqlite");
+    let credentials = credentials_for("cli_reply_marker_open_reason");
+    let tenant = TenantNamespace::from_credentials(&credentials);
+    let inbound = event("classified-rejection", "classified-rejection-message");
+    let key = InboundKey::new(tenant.clone(), inbound.event_id.clone());
+    let store = StoreHandle::open(&path).await.expect("open marker store");
+    store
+        .register_inbound(&tenant, &inbound)
+        .await
+        .expect("register classified rejection");
+    store
+        .reject_received_and_enqueue_notice(
+            &key,
+            InboundRejectionKind::Policy,
+            rejection_notice(&key, InboundRejectionKind::Policy, "policy notice"),
+        )
+        .await
+        .expect("seed classified rejection marker");
+    store.shutdown().await.expect("shutdown marker store");
+
+    let connection = rusqlite::Connection::open(&path).expect("open raw marker store");
+    let raw_tenant: String = connection
+        .query_row(
+            "SELECT tenant FROM inbound_events WHERE event_id = 'classified-rejection'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read tenant namespace");
+    assert!(
+        connection
+            .execute(
+                "UPDATE inbound_events SET reply_outbox_key = NULL
+                 WHERE event_id = 'classified-rejection'",
+                [],
+            )
+            .is_err(),
+        "an applied reply marker must be monotonic"
+    );
+    let open_reason = "legacy_open_reason";
+    let open_insert_marker =
+        format!("inbound:v1:{raw_tenant}:open-reason-insert:notice:{open_reason}");
+    assert!(
+        connection
+            .execute(
+                "INSERT INTO inbound_events
+                 (tenant, event_id, message_id, scope_key, state,
+                  first_seen_ms, updated_ms, rejection_reason,
+                  payload_version, payload_blob, payload_bytes, turn_row_id,
+                  reply_outbox_key)
+                 VALUES (?1, 'open-reason-insert', 'open-reason-message', 'im:oc_test',
+                         'rejected', 1, 1, ?2, NULL, NULL, 0, NULL, ?3)",
+                rusqlite::params![raw_tenant, open_reason, open_insert_marker],
+            )
+            .is_err(),
+        "the insert trigger must reject an unclassified marker"
+    );
+
+    let policy_marker = key.rejection_outbox_idempotency_key(InboundRejectionKind::Policy);
+    let open_update_marker = format!(
+        "{}{open_reason}",
+        policy_marker
+            .strip_suffix("policy")
+            .expect("classified suffix")
+    );
+    assert!(
+        connection
+            .execute(
+                "UPDATE inbound_events
+                 SET rejection_reason = ?1, reply_outbox_key = ?2
+                 WHERE event_id = 'classified-rejection'",
+                rusqlite::params![open_reason, open_update_marker],
+            )
+            .is_err(),
+        "the update trigger must reject an unclassified marker"
+    );
+    connection
+        .execute_batch(
+            "DROP TRIGGER inbound_events_v12_reply_effect_insert;
+             DROP TRIGGER inbound_events_v12_reply_effect_update;",
+        )
+        .expect("disable reply marker guards");
+    connection
+        .execute(
+            "UPDATE inbound_events
+             SET rejection_reason = ?1, reply_outbox_key = ?2
+             WHERE event_id = 'classified-rejection'",
+            rusqlite::params![open_reason, open_update_marker],
+        )
+        .expect("forge an exact but unclassified marker");
+    drop(connection);
+
+    assert_forged_store_fails_recovery_and_skip(
+        &path,
+        &credentials,
+        &tenant,
+        "classified-rejection",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn atomic_rejection_notice_validates_scope_and_duplicate_identity() {
     let store = StoreHandle::open_in_memory().await.expect("open");
     let tenant = tenant_namespace("cli_notice_identity");
@@ -2082,7 +2767,8 @@ async fn atomic_rejection_notice_validates_scope_and_duplicate_identity() {
         .await
         .expect("register success");
     let success_key = InboundKey::new(tenant.clone(), success.event_id.clone());
-    let success_notice = outbox("notice-success", "notice-body");
+    let success_notice =
+        rejection_notice(&success_key, InboundRejectionKind::Policy, "notice-body");
     assert_eq!(
         store
             .reject_received_and_enqueue_notice(
@@ -2113,7 +2799,7 @@ async fn atomic_rejection_notice_validates_scope_and_duplicate_identity() {
         .await
         .expect("register mismatch");
     let mismatch_key = InboundKey::new(tenant.clone(), mismatch.event_id.clone());
-    let mut wrong_scope = outbox("notice-wrong-scope", "body");
+    let mut wrong_scope = rejection_notice(&mismatch_key, InboundRejectionKind::Policy, "body");
     wrong_scope.scope_key = "im:another-chat".to_owned();
     assert!(matches!(
         store
@@ -2138,16 +2824,25 @@ async fn atomic_rejection_notice_validates_scope_and_duplicate_identity() {
         .register_inbound(&tenant, &conflict)
         .await
         .expect("register conflict");
+    let conflict_key = InboundKey::new(tenant.clone(), conflict.event_id.clone());
     store
-        .enqueue_outbox(outbox("notice-conflict", "original-body"))
+        .enqueue_outbox(rejection_notice(
+            &conflict_key,
+            InboundRejectionKind::Policy,
+            "original-body",
+        ))
         .await
         .expect("seed conflicting idempotency key");
     assert!(matches!(
         store
             .reject_received_and_enqueue_notice(
-                &InboundKey::new(tenant.clone(), conflict.event_id.clone()),
+                &conflict_key,
                 InboundRejectionKind::Policy,
-                outbox("notice-conflict", "different-body"),
+                rejection_notice(
+                    &conflict_key,
+                    InboundRejectionKind::Policy,
+                    "different-body",
+                ),
             )
             .await,
         Err(StoreError::CorruptData { .. })
@@ -2160,6 +2855,521 @@ async fn atomic_rejection_notice_validates_scope_and_duplicate_identity() {
         Some(InboundEventState::Received)
     );
     store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn atomic_control_reply_completes_inbound_and_enforces_deterministic_identity() {
+    let store = StoreHandle::open_in_memory().await.expect("open");
+    let tenant = tenant_namespace("cli_control_reply_identity");
+    let inbound = event("event-control-success", "message-control-success");
+    store
+        .register_inbound(&tenant, &inbound)
+        .await
+        .expect("register control");
+    let key = InboundKey::new(tenant.clone(), inbound.event_id.clone());
+    let reply = NewOutboxRow {
+        idempotency_key: key.control_outbox_idempotency_key(),
+        scope_key: inbound.scope.to_string(),
+        kind: "control".to_owned(),
+        payload_json: "deterministic-control-body".to_owned(),
+        next_retry_ms: 0,
+    };
+    assert_eq!(
+        store
+            .complete_received_and_enqueue_control_reply(&key, reply.clone())
+            .await
+            .expect("atomic control completion"),
+        InboundDisposition::Completed
+    );
+    assert_eq!(
+        store
+            .complete_received_and_enqueue_control_reply(&key, reply.clone())
+            .await
+            .expect("identical retry"),
+        InboundDisposition::AlreadyCompleted
+    );
+    assert_eq!(store.outbox_depth().await.expect("depth").pending, 1);
+    assert!(
+        store
+            .recover_received(&tenant)
+            .await
+            .expect("recover")
+            .is_empty()
+    );
+
+    let mut conflicting = reply;
+    conflicting.payload_json = "different-control-body".to_owned();
+    assert!(matches!(
+        store
+            .complete_received_and_enqueue_control_reply(&key, conflicting)
+            .await,
+        Err(StoreError::CorruptData { .. })
+    ));
+
+    let malformed = event("event-control-malformed", "message-control-malformed");
+    store
+        .register_inbound(&tenant, &malformed)
+        .await
+        .expect("register malformed");
+    let malformed_key = InboundKey::new(tenant.clone(), malformed.event_id.clone());
+    let wrong_identity = NewOutboxRow {
+        idempotency_key: "wrong:control".to_owned(),
+        scope_key: malformed.scope.to_string(),
+        kind: "control".to_owned(),
+        payload_json: "body".to_owned(),
+        next_retry_ms: 0,
+    };
+    assert!(matches!(
+        store
+            .complete_received_and_enqueue_control_reply(&malformed_key, wrong_identity)
+            .await,
+        Err(StoreError::CorruptData { .. })
+    ));
+    assert_eq!(
+        store
+            .inbound_state(&tenant, &malformed.event_id)
+            .await
+            .expect("malformed state"),
+        Some(InboundEventState::Received)
+    );
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn atomic_control_reply_replay_ignores_mutable_outbox_schedule() {
+    let store = StoreHandle::open_in_memory().await.expect("open");
+    let tenant = tenant_namespace("cli_control_reply_schedule_replay");
+    let inbound = event("event-control-schedule", "message-control-schedule");
+    store
+        .register_inbound(&tenant, &inbound)
+        .await
+        .expect("register control");
+
+    let mut watermark = outbox("control-replay-watermark", "older-pending-row");
+    watermark.next_retry_ms = 9_999_999_999_999;
+    store
+        .enqueue_outbox(watermark)
+        .await
+        .expect("seed retry watermark");
+
+    let key = InboundKey::new(tenant, inbound.event_id.clone());
+    let reply = NewOutboxRow {
+        idempotency_key: key.control_outbox_idempotency_key(),
+        scope_key: inbound.scope.to_string(),
+        kind: "control".to_owned(),
+        payload_json: "deterministic-scheduled-control-body".to_owned(),
+        next_retry_ms: 0,
+    };
+    assert_eq!(
+        store
+            .complete_received_and_enqueue_control_reply(&key, reply.clone())
+            .await
+            .expect("first completion raises the mutable retry schedule"),
+        InboundDisposition::Completed
+    );
+    assert_eq!(
+        store
+            .complete_received_and_enqueue_control_reply(&key, reply)
+            .await
+            .expect("replay validates only immutable outbox identity"),
+        InboundDisposition::AlreadyCompleted
+    );
+
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn inbound_reply_idempotency_is_isolated_by_tenant_namespace() {
+    let store = StoreHandle::open_in_memory().await.expect("open");
+    let tenant_a = tenant_namespace("cli_reply_namespace_a");
+    let tenant_b = tenant_namespace("cli_reply_namespace_b");
+
+    let control_a = event("shared-control-event", "message-control-a");
+    let control_b = event("shared-control-event", "message-control-b");
+    store
+        .register_inbound(&tenant_a, &control_a)
+        .await
+        .expect("register tenant A control");
+    store
+        .register_inbound(&tenant_b, &control_b)
+        .await
+        .expect("register tenant B control");
+    let control_key_a = InboundKey::new(tenant_a.clone(), control_a.event_id.clone());
+    let control_key_b = InboundKey::new(tenant_b.clone(), control_b.event_id.clone());
+    assert_ne!(
+        control_key_a.control_outbox_idempotency_key(),
+        control_key_b.control_outbox_idempotency_key()
+    );
+    for (key, event, payload) in [
+        (&control_key_a, &control_a, "tenant-a-control"),
+        (&control_key_b, &control_b, "tenant-b-control"),
+    ] {
+        store
+            .complete_received_and_enqueue_control_reply(
+                key,
+                NewOutboxRow {
+                    idempotency_key: key.control_outbox_idempotency_key(),
+                    scope_key: event.scope.to_string(),
+                    kind: "control".to_owned(),
+                    payload_json: payload.to_owned(),
+                    next_retry_ms: 0,
+                },
+            )
+            .await
+            .expect("tenant-scoped control completion");
+        assert_eq!(
+            store
+                .outbox_row_by_key(&key.control_outbox_idempotency_key())
+                .await
+                .expect("read tenant control row")
+                .expect("tenant control row exists")
+                .payload_json,
+            payload
+        );
+    }
+
+    let notice_a = event("shared-notice-event", "message-notice-a");
+    let notice_b = event("shared-notice-event", "message-notice-b");
+    store
+        .register_inbound(&tenant_a, &notice_a)
+        .await
+        .expect("register tenant A notice");
+    store
+        .register_inbound(&tenant_b, &notice_b)
+        .await
+        .expect("register tenant B notice");
+    let notice_key_a = InboundKey::new(tenant_a, notice_a.event_id.clone());
+    let notice_key_b = InboundKey::new(tenant_b, notice_b.event_id.clone());
+    assert_ne!(
+        notice_key_a.rejection_outbox_idempotency_key(InboundRejectionKind::Policy),
+        notice_key_b.rejection_outbox_idempotency_key(InboundRejectionKind::Policy)
+    );
+    for (key, payload) in [
+        (&notice_key_a, "tenant-a-notice"),
+        (&notice_key_b, "tenant-b-notice"),
+    ] {
+        store
+            .reject_received_and_enqueue_notice(
+                key,
+                InboundRejectionKind::Policy,
+                rejection_notice(key, InboundRejectionKind::Policy, payload),
+            )
+            .await
+            .expect("tenant-scoped notice rejection");
+        assert_eq!(
+            store
+                .outbox_row_by_key(
+                    &key.rejection_outbox_idempotency_key(InboundRejectionKind::Policy),
+                )
+                .await
+                .expect("read tenant notice row")
+                .expect("tenant notice row exists")
+                .payload_json,
+            payload
+        );
+    }
+
+    assert_eq!(store.outbox_depth().await.expect("depth").pending, 4);
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn terminal_inbound_effect_marker_prevents_resend_after_outbox_sweep() {
+    let store = StoreHandle::open_in_memory().await.expect("open");
+    let tenant = tenant_namespace("cli_reply_effect_sweep");
+
+    let control = event("swept-control-event", "swept-control-message");
+    store
+        .register_inbound(&tenant, &control)
+        .await
+        .expect("register control");
+    let control_key = InboundKey::new(tenant.clone(), control.event_id.clone());
+    let control_reply = NewOutboxRow {
+        idempotency_key: control_key.control_outbox_idempotency_key(),
+        scope_key: control.scope.to_string(),
+        kind: "control".to_owned(),
+        payload_json: "swept-control-body".to_owned(),
+        next_retry_ms: 0,
+    };
+    store
+        .complete_received_and_enqueue_control_reply(&control_key, control_reply.clone())
+        .await
+        .expect("complete control");
+
+    let notice_event = event("swept-notice-event", "swept-notice-message");
+    store
+        .register_inbound(&tenant, &notice_event)
+        .await
+        .expect("register notice");
+    let notice_key = InboundKey::new(tenant, notice_event.event_id);
+    let notice = rejection_notice(
+        &notice_key,
+        InboundRejectionKind::Policy,
+        "swept-notice-body",
+    );
+    store
+        .reject_received_and_enqueue_notice(
+            &notice_key,
+            InboundRejectionKind::Policy,
+            notice.clone(),
+        )
+        .await
+        .expect("reject with notice");
+
+    let claimed = store
+        .claim_outbox_batch(i64::MAX, 2)
+        .await
+        .expect("claim effects");
+    assert_eq!(claimed.len(), 2);
+    for row in claimed {
+        store
+            .complete_outbox(row.id, "sweep-proof-receipt")
+            .await
+            .expect("complete effect");
+    }
+    assert_eq!(
+        store
+            .sweep_terminal_outbox(i64::MAX, 2)
+            .await
+            .expect("sweep terminal effects"),
+        2
+    );
+    assert_eq!(store.outbox_depth().await.expect("empty depth").pending, 0);
+
+    assert_eq!(
+        store
+            .complete_received_and_enqueue_control_reply(&control_key, control_reply)
+            .await
+            .expect("replay completed control"),
+        InboundDisposition::AlreadyCompleted
+    );
+    assert_eq!(
+        store
+            .reject_received_and_enqueue_notice(&notice_key, InboundRejectionKind::Policy, notice,)
+            .await
+            .expect("replay rejected notice"),
+        InboundDisposition::AlreadyRejected
+    );
+    assert_eq!(
+        store
+            .outbox_depth()
+            .await
+            .expect("post-replay depth")
+            .pending,
+        0,
+        "terminal webhook replay must not recreate a swept outbound effect"
+    );
+    assert!(
+        store
+            .outbox_row_by_key(&control_key.control_outbox_idempotency_key())
+            .await
+            .expect("read swept control")
+            .is_none()
+    );
+    assert!(
+        store
+            .outbox_row_by_key(
+                &notice_key.rejection_outbox_idempotency_key(InboundRejectionKind::Policy),
+            )
+            .await
+            .expect("read swept notice")
+            .is_none()
+    );
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn reply_effect_dedup_ends_only_after_both_retention_witnesses_are_swept() {
+    for reply_kind in ["control", "notice"] {
+        let store = StoreHandle::open_in_memory().await.expect("open");
+        let tenant = tenant_namespace(&format!("cli_{reply_kind}_retention_boundary"));
+        let inbound = event(
+            &format!("{reply_kind}-retention-event"),
+            &format!("{reply_kind}-retention-message"),
+        );
+        let key = InboundKey::new(tenant.clone(), inbound.event_id.clone());
+        let reply = if reply_kind == "control" {
+            NewOutboxRow {
+                idempotency_key: key.control_outbox_idempotency_key(),
+                scope_key: inbound.scope.to_string(),
+                kind: "control".to_owned(),
+                payload_json: "retained-control-body".to_owned(),
+                next_retry_ms: 0,
+            }
+        } else {
+            rejection_notice(&key, InboundRejectionKind::Policy, "retained-notice-body")
+        };
+
+        store
+            .register_inbound(&tenant, &inbound)
+            .await
+            .expect("register first delivery");
+        if reply_kind == "control" {
+            store
+                .complete_received_and_enqueue_control_reply(&key, reply.clone())
+                .await
+                .expect("complete first control delivery");
+        } else {
+            store
+                .reject_received_and_enqueue_notice(
+                    &key,
+                    InboundRejectionKind::Policy,
+                    reply.clone(),
+                )
+                .await
+                .expect("complete first notice delivery");
+        }
+        let claimed = store
+            .claim_outbox_batch(i64::MAX, 1)
+            .await
+            .expect("claim first effect");
+        assert_eq!(claimed.len(), 1);
+        store
+            .complete_outbox(claimed[0].id, "retention-proof-receipt")
+            .await
+            .expect("complete first effect");
+
+        assert_eq!(
+            store
+                .sweep_inbound(i64::MAX, 1)
+                .await
+                .expect("sweep inbound witness"),
+            1
+        );
+        assert!(matches!(
+            store
+                .register_inbound(&tenant, &inbound)
+                .await
+                .expect("register while outbox witness remains"),
+            DedupOutcome::New(_)
+        ));
+        if reply_kind == "control" {
+            store
+                .complete_received_and_enqueue_control_reply(&key, reply.clone())
+                .await
+                .expect("reconcile control against retained outbox witness");
+        } else {
+            store
+                .reject_received_and_enqueue_notice(
+                    &key,
+                    InboundRejectionKind::Policy,
+                    reply.clone(),
+                )
+                .await
+                .expect("reconcile notice against retained outbox witness");
+        }
+        assert_eq!(
+            store
+                .outbox_depth()
+                .await
+                .expect("one-witness depth")
+                .pending,
+            0,
+            "the remaining same-key terminal outbox row prevents a second send"
+        );
+
+        assert_eq!(
+            store
+                .sweep_inbound(i64::MAX, 1)
+                .await
+                .expect("sweep renewed marker"),
+            1
+        );
+        assert_eq!(
+            store
+                .sweep_terminal_outbox(i64::MAX, 1)
+                .await
+                .expect("sweep outbox witness"),
+            1
+        );
+        assert!(matches!(
+            store
+                .register_inbound(&tenant, &inbound)
+                .await
+                .expect("register after both retention horizons"),
+            DedupOutcome::New(_)
+        ));
+        if reply_kind == "control" {
+            store
+                .complete_received_and_enqueue_control_reply(&key, reply)
+                .await
+                .expect("new control effect after the bounded dedup horizon");
+        } else {
+            store
+                .reject_received_and_enqueue_notice(&key, InboundRejectionKind::Policy, reply)
+                .await
+                .expect("new notice effect after the bounded dedup horizon");
+        }
+        assert_eq!(
+            store
+                .outbox_depth()
+                .await
+                .expect("post-horizon depth")
+                .pending,
+            1,
+            "after both witnesses expire, the ultra-late webhook is explicitly treated as new"
+        );
+        store.shutdown().await.expect("shutdown");
+    }
+}
+
+#[tokio::test]
+async fn v10_rejection_migration_prevents_resend_after_legacy_outbox_sweep() {
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("v10-rejection-effect.sqlite");
+    let tenant = tenant_namespace("cli_v10_rejection_effect");
+    let inbound = event("legacy-rejection-event", "legacy-rejection-message");
+    let key = InboundKey::new(tenant.clone(), inbound.event_id.clone());
+    let notice = rejection_notice(
+        &key,
+        InboundRejectionKind::Policy,
+        "legacy-rejection-notice",
+    );
+
+    let store = StoreHandle::open(&path).await.expect("open current store");
+    store
+        .register_inbound(&tenant, &inbound)
+        .await
+        .expect("register legacy rejection");
+    store
+        .reject_received_and_enqueue_notice(&key, InboundRejectionKind::Policy, notice.clone())
+        .await
+        .expect("seed atomic legacy rejection");
+    store.shutdown().await.expect("shutdown current store");
+
+    {
+        let connection = rusqlite::Connection::open(&path).expect("open v10 fixture");
+        downgrade_store_schema_to_v10(&connection);
+        connection
+            .execute("DELETE FROM outbox", [])
+            .expect("model a swept legacy notice");
+    }
+
+    let store = StoreHandle::open(&path)
+        .await
+        .expect("migrate v10 rejection");
+    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 12);
+    assert_eq!(
+        store
+            .reject_received_and_enqueue_notice(&key, InboundRejectionKind::Policy, notice)
+            .await
+            .expect("replay migrated legacy rejection"),
+        InboundDisposition::AlreadyRejected
+    );
+    assert_eq!(
+        store.outbox_depth().await.expect("depth").pending,
+        0,
+        "migration must preserve the already-applied legacy rejection effect"
+    );
+    assert!(
+        store
+            .outbox_row_by_key(&key.rejection_outbox_idempotency_key(InboundRejectionKind::Policy),)
+            .await
+            .expect("read replay key")
+            .is_none()
+    );
+    store.shutdown().await.expect("shutdown migrated store");
 }
 
 #[tokio::test]
@@ -2181,7 +3391,7 @@ async fn atomic_rejection_backfills_and_validates_a_bare_rejection_notice() {
     );
     assert_eq!(store.outbox_depth().await.expect("empty depth").pending, 0);
 
-    let notice = outbox("notice-backfill", "original-body");
+    let notice = rejection_notice(&key, InboundRejectionKind::Policy, "original-body");
     for _ in 0..2 {
         assert_eq!(
             store
@@ -2224,6 +3434,125 @@ async fn atomic_rejection_backfills_and_validates_a_bare_rejection_notice() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn terminal_reply_marker_backfill_enforces_inbound_byte_capacity_atomically() {
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("reply-marker-runtime-capacity.sqlite");
+    let tenant = tenant_namespace("cli_reply_marker_runtime_capacity");
+    let control = event("capacity-control-event", "capacity-control-message");
+    let rejection = event("capacity-rejection-event", "capacity-rejection-message");
+    let control_key = InboundKey::new(tenant.clone(), control.event_id.clone());
+    let rejection_key = InboundKey::new(tenant.clone(), rejection.event_id.clone());
+    let control_reply = NewOutboxRow {
+        idempotency_key: control_key.control_outbox_idempotency_key(),
+        scope_key: control.scope.to_string(),
+        kind: "control".to_owned(),
+        payload_json: "capacity-control-body".to_owned(),
+        next_retry_ms: 0,
+    };
+    let rejection_notice = rejection_notice(
+        &rejection_key,
+        InboundRejectionKind::Policy,
+        "capacity-rejection-body",
+    );
+
+    let store = StoreHandle::open(&path)
+        .await
+        .expect("open capacity fixture");
+    store
+        .register_inbound(&tenant, &control)
+        .await
+        .expect("register marker-less control");
+    store
+        .complete_received_without_turn(&control_key)
+        .await
+        .expect("complete marker-less control");
+    store
+        .register_inbound(&tenant, &rejection)
+        .await
+        .expect("register marker-less rejection");
+    store
+        .reject_received(&rejection_key, InboundRejectionKind::Policy)
+        .await
+        .expect("record marker-less rejection");
+    store.shutdown().await.expect("shutdown capacity fixture");
+
+    let boundary = STORE_INBOUND_MAX_BYTES
+        - u64::try_from(control_reply.idempotency_key.len()).expect("marker length fits u64");
+    seed_inbound_logical_bytes_to(&path, boundary);
+
+    let store = StoreHandle::open(&path)
+        .await
+        .expect("reopen bounded capacity fixture");
+    assert_eq!(
+        store
+            .complete_received_and_enqueue_control_reply(&control_key, control_reply.clone())
+            .await
+            .expect("backfill marker at the exact inbound byte cap"),
+        InboundDisposition::AlreadyCompleted
+    );
+    assert!(matches!(
+        store
+            .reject_received_and_enqueue_notice(
+                &rejection_key,
+                InboundRejectionKind::Policy,
+                rejection_notice.clone(),
+            )
+            .await,
+        Err(StoreError::CapacityExceeded {
+            context: "recording an inbound reply effect marker"
+        })
+    ));
+    assert!(
+        store
+            .outbox_row_by_key(&control_reply.idempotency_key)
+            .await
+            .expect("read committed control reply")
+            .is_some()
+    );
+    assert!(
+        store
+            .outbox_row_by_key(&rejection_notice.idempotency_key)
+            .await
+            .expect("read rolled-back rejection notice")
+            .is_none(),
+        "the over-cap marker failure must roll back its outbox insert"
+    );
+    store.shutdown().await.expect("shutdown bounded fixture");
+
+    let connection = rusqlite::Connection::open(&path).expect("inspect bounded fixture");
+    assert_eq!(
+        inbound_logical_bytes(&connection),
+        STORE_INBOUND_MAX_BYTES,
+        "the accepted marker may fill but never exceed the hard byte cap"
+    );
+    let control_marker: Option<String> = connection
+        .query_row(
+            "SELECT reply_outbox_key FROM inbound_events
+             WHERE event_id = ?1",
+            [&control.event_id],
+            |row| row.get(0),
+        )
+        .expect("read committed control marker");
+    assert_eq!(
+        control_marker.as_deref(),
+        Some(control_reply.idempotency_key.as_str())
+    );
+    let rejection_marker: Option<String> = connection
+        .query_row(
+            "SELECT reply_outbox_key FROM inbound_events
+             WHERE event_id = ?1",
+            [&rejection.event_id],
+            |row| row.get(0),
+        )
+        .expect("read rolled-back rejection marker");
+    assert_eq!(
+        rejection_marker, None,
+        "the over-cap transaction must leave its terminal row marker-less"
+    );
+}
+
+#[tokio::test]
 async fn atomic_rejection_notice_rolls_back_at_real_outbox_byte_capacity() {
     let store = StoreHandle::open_in_memory().await.expect("open");
     let payload = "x".repeat(STORE_OUTBOX_PAYLOAD_MAX_BYTES);
@@ -2241,12 +3570,13 @@ async fn atomic_rejection_notice_rolls_back_at_real_outbox_byte_capacity() {
         .register_inbound(&tenant, &inbound)
         .await
         .expect("register");
+    let key = InboundKey::new(tenant.clone(), inbound.event_id.clone());
     assert!(matches!(
         store
             .reject_received_and_enqueue_notice(
-                &InboundKey::new(tenant.clone(), inbound.event_id.clone()),
+                &key,
                 InboundRejectionKind::Overloaded,
-                outbox("capacity-overflow-notice", "x"),
+                rejection_notice(&key, InboundRejectionKind::Overloaded, "x"),
             )
             .await,
         Err(StoreError::CapacityExceeded { .. })
@@ -2284,14 +3614,11 @@ async fn rejection_notice_inherits_the_retry_watermark() {
         .register_inbound(&tenant, &inbound)
         .await
         .expect("register");
-    let notice = outbox("watermark-notice", "body");
+    let key = InboundKey::new(tenant, inbound.event_id);
+    let notice = rejection_notice(&key, InboundRejectionKind::Policy, "body");
     assert_eq!(
         store
-            .reject_received_and_enqueue_notice(
-                &InboundKey::new(tenant, inbound.event_id),
-                InboundRejectionKind::Policy,
-                notice.clone(),
-            )
+            .reject_received_and_enqueue_notice(&key, InboundRejectionKind::Policy, notice.clone(),)
             .await
             .expect("atomic reject+notice"),
         InboundDisposition::Rejected
@@ -2306,7 +3633,7 @@ async fn rejection_notice_inherits_the_retry_watermark() {
             .iter()
             .map(|row| row.idempotency_key.as_str())
             .collect::<Vec<_>>(),
-        vec!["watermark-first", "watermark-notice"],
+        vec!["watermark-first", notice.idempotency_key.as_str(),],
         "the parked row claims before the notice (global id order)"
     );
     let notice_row = claimed
@@ -2321,48 +3648,118 @@ async fn rejection_notice_inherits_the_retry_watermark() {
 }
 
 #[tokio::test]
-async fn rejection_notice_respects_the_all_states_total_hard_cap() {
+#[allow(clippy::too_many_lines)]
+async fn atomic_inbound_replies_sweep_expired_rows_at_the_all_states_cap() {
     let temp = tempdir().expect("tempdir");
-    let path = temp.path().join("notice-total-cap.sqlite");
-    // Open once to migrate the schema, then shut down so a raw connection can
-    // seed terminal rows putting the table exactly at the all-states hard cap.
+    for reply_kind in ["control", "notice"] {
+        let path = temp.path().join(format!("{reply_kind}-expired-cap.sqlite"));
+        let tenant = tenant_namespace(&format!("cli_{reply_kind}_expired_total_cap"));
+        let inbound = event(
+            &format!("event-{reply_kind}-expired-total-cap"),
+            &format!("message-{reply_kind}-expired-total-cap"),
+        );
+        let key = InboundKey::new(tenant.clone(), inbound.event_id.clone());
+        let reply = if reply_kind == "control" {
+            NewOutboxRow {
+                idempotency_key: key.control_outbox_idempotency_key(),
+                scope_key: inbound.scope.to_string(),
+                kind: "control".to_owned(),
+                payload_json: "control-capacity-reply".to_owned(),
+                next_retry_ms: 0,
+            }
+        } else {
+            rejection_notice(
+                &key,
+                InboundRejectionKind::Overloaded,
+                "notice-capacity-reply",
+            )
+        };
+
+        let seed_store = StoreHandle::open(&path).await.expect("open seed store");
+        seed_store
+            .register_inbound(&tenant, &inbound)
+            .await
+            .expect("register inbound before filling outbox");
+        seed_store.shutdown().await.expect("shutdown seed store");
+        seed_terminal_outbox_at_total_cap(&path, 1);
+
+        let store = StoreHandle::open(&path).await.expect("reopen capped store");
+        let disposition = if reply_kind == "control" {
+            store
+                .complete_received_and_enqueue_control_reply(&key, reply.clone())
+                .await
+                .expect("control reply sweeps expired terminal rows")
+        } else {
+            store
+                .reject_received_and_enqueue_notice(
+                    &key,
+                    InboundRejectionKind::Overloaded,
+                    reply.clone(),
+                )
+                .await
+                .expect("rejection notice sweeps expired terminal rows")
+        };
+        assert_eq!(
+            disposition,
+            if reply_kind == "control" {
+                InboundDisposition::Completed
+            } else {
+                InboundDisposition::Rejected
+            }
+        );
+        assert_eq!(store.outbox_depth().await.expect("depth").pending, 1);
+        assert!(
+            store
+                .outbox_row_by_key(&reply.idempotency_key)
+                .await
+                .expect("read atomic reply")
+                .is_some()
+        );
+        store.shutdown().await.expect("shutdown capped store");
+
+        let connection = rusqlite::Connection::open(&path).expect("inspect capped store");
+        let total_rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM outbox", [], |row| row.get(0))
+            .expect("count outbox rows");
+        assert_eq!(
+            u64::try_from(total_rows).expect("non-negative row count"),
+            OUTBOX_TERMINAL_MAX_ROWS - u64::from(OUTBOX_SWEEP_BATCH) + 1,
+            "one bounded inline sweep and one atomic reply remain"
+        );
+        let marker: Option<String> = connection
+            .query_row(
+                "SELECT reply_outbox_key FROM inbound_events
+                 WHERE event_id = ?1",
+                [&inbound.event_id],
+                |row| row.get(0),
+            )
+            .expect("read atomic reply marker");
+        assert_eq!(marker.as_deref(), Some(reply.idempotency_key.as_str()));
+    }
+}
+
+#[tokio::test]
+async fn atomic_rejection_rolls_back_when_the_all_states_cap_is_not_expired() {
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("notice-recent-total-cap.sqlite");
     let seed_store = StoreHandle::open(&path).await.expect("open seed store");
     seed_store.shutdown().await.expect("shutdown seed store");
-
-    let mut connection = rusqlite::Connection::open(&path).expect("raw seed connection");
-    let transaction = connection.transaction().expect("seed transaction");
-    {
-        let mut statement = transaction
-            .prepare(
-                "INSERT INTO outbox
-                 (idempotency_key, scope_key, kind, payload_json, payload_bytes,
-                  state, attempts, next_retry_ms, receipt_message_id, created_ms, updated_ms)
-                 VALUES (?1, 'im:oc_test', 'final', '', 0, 'sent', 1, 0, 'om_r', 1, 1)",
-            )
-            .expect("prepare terminal seed");
-        let cap = usize::try_from(OUTBOX_TERMINAL_MAX_ROWS).unwrap();
-        for index in 0..cap {
-            statement
-                .execute(rusqlite::params![format!("term:{index}")])
-                .expect("insert terminal row");
-        }
-    }
-    transaction.commit().expect("commit seed");
-    drop(connection);
+    seed_terminal_outbox_at_total_cap(&path, i64::MAX);
 
     let store = StoreHandle::open(&path).await.expect("reopen store");
-    let tenant = tenant_namespace("cli_notice_total_cap");
-    let inbound = event("event-notice-total-cap", "message-notice-total-cap");
+    let tenant = tenant_namespace("cli_notice_recent_total_cap");
+    let inbound = event("event-notice-recent-cap", "message-notice-recent-cap");
     store
         .register_inbound(&tenant, &inbound)
         .await
         .expect("register");
+    let key = InboundKey::new(tenant.clone(), inbound.event_id.clone());
     assert!(matches!(
         store
             .reject_received_and_enqueue_notice(
-                &InboundKey::new(tenant.clone(), inbound.event_id.clone()),
+                &key,
                 InboundRejectionKind::Overloaded,
-                outbox("total-cap-notice", "x"),
+                rejection_notice(&key, InboundRejectionKind::Overloaded, "x"),
             )
             .await,
         Err(StoreError::CapacityExceeded { .. })
@@ -2373,18 +3770,18 @@ async fn rejection_notice_respects_the_all_states_total_hard_cap() {
             .await
             .expect("state"),
         Some(InboundEventState::Received),
-        "the rejection must roll back, leaving the inbound row received"
+        "the rejection and any attempted sweep must roll back together"
     );
     assert_eq!(
-        store.recover_received(&tenant).await.expect("replay").len(),
+        store
+            .recover_received(&tenant)
+            .await
+            .expect("recovery")
+            .len(),
         1,
-        "the received row is retained for the existing retry path"
+        "startup recovery must still see the unsettled received event"
     );
-    assert_eq!(
-        store.outbox_depth().await.expect("depth").pending,
-        0,
-        "the notice must roll back, leaving no pending row"
-    );
+    assert_eq!(store.outbox_depth().await.expect("depth").pending, 0);
     store.shutdown().await.expect("shutdown");
 }
 
@@ -2403,7 +3800,7 @@ async fn atomic_rejection_notice_and_turn_claim_have_one_consistent_winner() {
         store.reject_received_and_enqueue_notice(
             &key,
             InboundRejectionKind::Policy,
-            outbox("race-notice", "body"),
+            rejection_notice(&key, InboundRejectionKind::Policy, "body"),
         ),
         store.begin_turn_and_claim_inbound(turn("race-turn", TurnState::Starting), &claim_keys)
     );
@@ -2471,7 +3868,7 @@ async fn reject_notice_rolls_back_and_rejection_is_idempotent() {
         .await
         .expect("register");
     let key = InboundKey::new(tenant.clone(), inbound.event_id.clone());
-    let mut notice = outbox("reject-notice", "");
+    let mut notice = rejection_notice(&key, InboundRejectionKind::Overloaded, "");
     notice.payload_json = "x".repeat(STORE_OUTBOX_PAYLOAD_MAX_BYTES + 1);
     assert!(matches!(
         store

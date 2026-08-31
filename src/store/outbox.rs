@@ -908,7 +908,7 @@ fn enqueue_one(
 /// oldest overage `sent`/`failed` rows (same SQL as
 /// [`StoreHandle::sweep_terminal_outbox`], clamped to [`OUTBOX_SWEEP_BATCH`]).
 /// Only if the cap would still be crossed does the enqueue fail closed.
-fn enforce_total_cap(
+pub(crate) fn enforce_total_cap(
     connection: &rusqlite::Connection,
     payload_bytes: u64,
 ) -> Result<(), StoreError> {

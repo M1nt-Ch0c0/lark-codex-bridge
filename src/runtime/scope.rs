@@ -1,7 +1,7 @@
 //! One-scope runtime contracts shared by the router and reply projector.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant as StdInstant, SystemTime, UNIX_EPOCH};
@@ -18,6 +18,7 @@ use crate::codex::client::{
     AppServerClient, AppServerEvent, ClientError, ThreadId, TurnId, TurnOutcome,
 };
 use crate::codex::rpc::RpcError;
+use crate::codex::supervisor::ProfileIdentity;
 use crate::codex::types::{
     SandboxMode, ThreadResumeParams, ThreadStartParams, TurnSandboxPolicy, TurnStartParams,
     TurnStatus, UserInput,
@@ -30,7 +31,13 @@ use crate::limits::{
     TURN_BATCH_MAX_MESSAGES, TURN_BATCH_TEXT_BYTE_BUDGET,
 };
 use crate::render::{ProjectedReply, ProjectorOutput, ReplyProjector};
+use crate::runtime::adoption::ThreadCandidatePage;
+use crate::runtime::adoption_coordinator::{
+    AdoptionResumeSettings, CandidateSelectionProof, ExplicitHandoff, ReleaseOutcome,
+    ThreadAdoptionCoordinator, ThreadAdoptionCoordinatorError,
+};
 use crate::runtime::attachments::{AttachError, AttachmentCache};
+use crate::runtime::commands::{BridgeCommand, CommandParseError};
 use crate::runtime::context::{
     ContextDraft, ContextId, ContextRegistry, PendingBinding, RevocationReason,
 };
@@ -40,7 +47,8 @@ use crate::runtime::router::RouterSettings;
 use crate::runtime::tools::{CONTEXT_TOOLS_VERSION, bridge_dynamic_tools};
 use crate::store::{
     BeginTurnOutcome, ClaimedInbound, InboundKey, InboundRejectionKind, InboundTerminal,
-    NewOutboxRow, NewTurnRow, StoreHandle, TurnResolution, TurnState,
+    NewOutboxRow, NewTurnRow, StoreHandle, ThreadAdoptionState, ThreadOrigin, TurnResolution,
+    TurnState,
 };
 
 /// Static, content-free failure from the durable reply projection boundary.
@@ -151,9 +159,29 @@ pub trait DurableReplySink: Send + Sync {
     /// Returns a static classification when the event cannot be projected.
     fn rejection_notice(
         &self,
+        key: &InboundKey,
         event: &InboundEvent,
         reason: InboundRejectionKind,
     ) -> Result<NewOutboxRow, ReplySinkError>;
+
+    /// Builds one deterministic bridge-control reply without performing I/O.
+    ///
+    /// The scope actor passes the returned row to the store's atomic
+    /// command-completion boundary. The default refusal keeps alternate and
+    /// test sinks source-compatible until they opt into visible commands.
+    ///
+    /// # Errors
+    ///
+    /// Returns a static projection classification when the event or bounded
+    /// reply cannot be represented as one deterministic outbox row.
+    fn control_reply(
+        &self,
+        _key: &InboundKey,
+        _event: &InboundEvent,
+        _text: &str,
+    ) -> Result<NewOutboxRow, ReplySinkError> {
+        Err(ReplySinkError::Invariant)
+    }
 
     /// Persists a progress-card snapshot. The default no-op keeps test and
     /// alternate sinks source-compatible; production overrides it with the
@@ -243,6 +271,7 @@ impl ThreadPreparationError {
 pub(crate) struct SupervisorAccess {
     pub(crate) epoch: u64,
     pub(crate) client: Option<Arc<AppServerClient>>,
+    pub(crate) profile_identity: Option<ProfileIdentity>,
     /// True once no future client can become ready. This carries no failure
     /// reason so local paths or secrets cannot cross into actor diagnostics.
     pub(crate) terminal: bool,
@@ -254,6 +283,7 @@ impl fmt::Debug for SupervisorAccess {
             .debug_struct("SupervisorAccess")
             .field("epoch", &self.epoch)
             .field("ready", &self.client.is_some())
+            .field("profile_ready", &self.profile_identity.is_some())
             .field("terminal", &self.terminal)
             .finish()
     }
@@ -494,8 +524,26 @@ struct TurnInbound {
     pending_media: Option<PendingMediaReservation>,
 }
 
+/// Parsed owner-only work that shares the scope actor's ordered mailbox with
+/// ordinary messages. Unknown slash-prefixed text never becomes this type.
+pub(crate) enum ScopeControl {
+    Command(BridgeCommand),
+    Malformed(CommandParseError),
+}
+
+struct ActorControl {
+    inbound: ActorInbound,
+    control: ScopeControl,
+}
+
 enum ScopeCommand {
     Inbound(Box<ActorInbound>),
+    Control(Box<ActorControl>),
+}
+
+enum DeferredScopeWork {
+    Prepared(Box<TurnInbound>),
+    Control(Box<ActorControl>),
 }
 
 pub(crate) struct ScopeActorHandle {
@@ -524,6 +572,7 @@ impl ScopeActorHandle {
         attachments: Option<Arc<AttachmentCache>>,
         contexts: Option<Arc<ContextRegistry>>,
         quote_resolver: Option<Arc<dyn QuoteResolver>>,
+        adoption: Arc<ThreadAdoptionCoordinator>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel(SCOPE_MAILBOX_CAPACITY);
         let state = Arc::new(RwLock::new(ScopeState::Idle));
@@ -544,6 +593,7 @@ impl ScopeActorHandle {
             attachments,
             contexts,
             quote_resolver,
+            adoption,
             task_state,
             task_active_turn,
             Arc::clone(&pending_media),
@@ -568,23 +618,51 @@ impl ScopeActorHandle {
         key: InboundKey,
         queued: QueuedInboundEvent,
     ) -> Result<(), ActorRouteError> {
+        self.try_route_kind(key, queued, None)
+    }
+
+    pub(crate) fn try_route_control(
+        &self,
+        key: InboundKey,
+        queued: QueuedInboundEvent,
+        control: ScopeControl,
+    ) -> Result<(), ActorRouteError> {
+        self.try_route_kind(key, queued, Some(control))
+    }
+
+    fn try_route_kind(
+        &self,
+        key: InboundKey,
+        queued: QueuedInboundEvent,
+        control: Option<ScopeControl>,
+    ) -> Result<(), ActorRouteError> {
         let Ok(bytes) = u32::try_from(queued.permit.num_permits()) else {
             return Err(ActorRouteError::Capacity(Box::new(queued)));
         };
         let Ok(permit) = self.budget.clone().try_acquire_many_owned(bytes) else {
             return Err(ActorRouteError::Capacity(Box::new(queued)));
         };
-        let command = ScopeCommand::Inbound(Box::new(ActorInbound {
+        let inbound = ActorInbound {
             key,
             queued,
             _mailbox_permit: permit,
-        }));
+        };
+        let command = match control {
+            Some(control) => ScopeCommand::Control(Box::new(ActorControl { inbound, control })),
+            None => ScopeCommand::Inbound(Box::new(inbound)),
+        };
         self.sender.try_send(command).map_err(|error| match error {
             mpsc::error::TrySendError::Full(ScopeCommand::Inbound(item)) => {
                 ActorRouteError::Capacity(Box::new(item.queued))
             }
+            mpsc::error::TrySendError::Full(ScopeCommand::Control(item)) => {
+                ActorRouteError::Capacity(Box::new(item.inbound.queued))
+            }
             mpsc::error::TrySendError::Closed(ScopeCommand::Inbound(item)) => {
                 ActorRouteError::Closed(Box::new(item.queued))
+            }
+            mpsc::error::TrySendError::Closed(ScopeCommand::Control(item)) => {
+                ActorRouteError::Closed(Box::new(item.inbound.queued))
             }
         })
     }
@@ -679,57 +757,106 @@ async fn run_scope_actor(
     attachments: Option<Arc<AttachmentCache>>,
     contexts: Option<Arc<ContextRegistry>>,
     quote_resolver: Option<Arc<dyn QuoteResolver>>,
+    adoption: Arc<ThreadAdoptionCoordinator>,
     state: Arc<RwLock<ScopeState>>,
     active_turn: Arc<RwLock<Option<ActiveTurn>>>,
     pending_media: Arc<Mutex<PendingMediaQueue>>,
     shutdown: CancellationToken,
 ) {
-    let mut deferred = None;
+    let mut deferred: Option<DeferredScopeWork> = None;
+    // A discovery proof is intentionally confined to this actor. Eviction,
+    // restart, or one ownership-changing attempt drops it permanently.
+    let mut candidate_proof: Option<CandidateSelectionProof> = None;
     'actor: loop {
-        let first = if let Some(deferred) = deferred.take() {
-            Some(deferred)
-        } else {
-            let next_expiry = pending_media
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .next_expiry();
-            let command = if let Some(next_expiry) = next_expiry {
-                tokio::select! {
-                    biased;
-                    () = shutdown.cancelled() => break,
-                    command = receiver.recv() => command,
-                    () = sleep_until(next_expiry) => {
-                        pending_media
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .expire(Instant::now());
+        let first = match deferred.take() {
+            Some(DeferredScopeWork::Prepared(first)) => Some(*first),
+            Some(DeferredScopeWork::Control(control)) => {
+                let result = process_control(
+                    &scope,
+                    *control,
+                    &store,
+                    &policy,
+                    &settings,
+                    &supervisor,
+                    sink.as_ref(),
+                    adoption.as_ref(),
+                    &pending_media,
+                    &mut candidate_proof,
+                    &shutdown,
+                )
+                .await;
+                if let Err(kind) = result {
+                    set_state(&state, ScopeState::Failed { kind });
+                } else {
+                    set_state(&state, ScopeState::Idle);
+                }
+                continue;
+            }
+            None => {
+                let next_expiry = pending_media
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .next_expiry();
+                let command = if let Some(next_expiry) = next_expiry {
+                    tokio::select! {
+                        biased;
+                        () = shutdown.cancelled() => break,
+                        command = receiver.recv() => command,
+                        () = sleep_until(next_expiry) => {
+                            pending_media
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .expire(Instant::now());
+                            continue;
+                        }
+                    }
+                } else {
+                    tokio::select! {
+                        biased;
+                        () = shutdown.cancelled() => break,
+                        command = receiver.recv() => command,
+                    }
+                };
+                match command {
+                    Some(ScopeCommand::Inbound(first)) => match prepare_inbound(
+                        *first,
+                        &store,
+                        &policy,
+                        &settings,
+                        sink.as_ref(),
+                        &pending_media,
+                    )
+                    .await
+                    {
+                        Ok(first) => first,
+                        Err(kind) => {
+                            set_state(&state, ScopeState::Failed { kind });
+                            continue;
+                        }
+                    },
+                    Some(ScopeCommand::Control(control)) => {
+                        let result = process_control(
+                            &scope,
+                            *control,
+                            &store,
+                            &policy,
+                            &settings,
+                            &supervisor,
+                            sink.as_ref(),
+                            adoption.as_ref(),
+                            &pending_media,
+                            &mut candidate_proof,
+                            &shutdown,
+                        )
+                        .await;
+                        if let Err(kind) = result {
+                            set_state(&state, ScopeState::Failed { kind });
+                        } else {
+                            set_state(&state, ScopeState::Idle);
+                        }
                         continue;
                     }
-                }
-            } else {
-                tokio::select! {
-                    biased;
-                    () = shutdown.cancelled() => break,
-                    command = receiver.recv() => command,
-                }
-            };
-            let Some(ScopeCommand::Inbound(first)) = command else {
-                break;
-            };
-            match prepare_inbound(
-                *first,
-                &store,
-                &policy,
-                &settings,
-                sink.as_ref(),
-                &pending_media,
-            )
-            .await
-            {
-                Ok(first) => first,
-                Err(kind) => {
-                    set_state(&state, ScopeState::Failed { kind });
-                    continue;
+                    None => break,
                 }
             }
         };
@@ -771,18 +898,25 @@ async fn run_scope_actor(
                                     }
                                 };
                                 if is_audio_event(&next.inbound.queued.event) {
-                                    deferred = Some(next);
+                                    deferred = Some(DeferredScopeWork::Prepared(Box::new(next)));
                                     break;
                                 }
                                 let next_bytes = next.inbound.queued.event.text.len();
                                 if text_bytes.saturating_add(next_bytes)
                                     > TURN_BATCH_TEXT_BYTE_BUDGET
                                 {
-                                    deferred = Some(next);
+                                    deferred = Some(DeferredScopeWork::Prepared(Box::new(next)));
                                     break;
                                 }
                                 text_bytes = text_bytes.saturating_add(next_bytes);
                                 batch.push(next);
+                            }
+                            Some(ScopeCommand::Control(control)) => {
+                                // Preserve mailbox order: the already assembled
+                                // ordinary batch finishes first, then the
+                                // command runs before any later message.
+                                deferred = Some(DeferredScopeWork::Control(control));
+                                break;
                             }
                             None => return,
                         }
@@ -802,6 +936,7 @@ async fn run_scope_actor(
                 attachments.as_deref(),
                 contexts.as_deref(),
                 quote_resolver.as_deref(),
+                adoption.as_ref(),
                 &state,
                 &active_turn,
                 &shutdown,
@@ -817,6 +952,378 @@ async fn run_scope_actor(
             }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_control(
+    scope: &ScopeKey,
+    control: ActorControl,
+    store: &StoreHandle,
+    policy: &AccessPolicy,
+    settings: &RouterSettings,
+    supervisor: &watch::Receiver<SupervisorAccess>,
+    sink: &dyn DurableReplySink,
+    adoption: &ThreadAdoptionCoordinator,
+    pending_media: &Arc<Mutex<PendingMediaQueue>>,
+    candidate_proof: &mut Option<CandidateSelectionProof>,
+    shutdown: &CancellationToken,
+) -> Result<(), ScopeFailureKind> {
+    if is_stale(&control.inbound.queued.event, settings.message_max_age) {
+        return reject_item(store, sink, &control.inbound, InboundRejectionKind::Stale).await;
+    }
+    if let Some(reason) = policy
+        .decide_command(&control.inbound.queued.event)
+        .rejection_kind()
+    {
+        return reject_item(store, sink, &control.inbound, reason).await;
+    }
+
+    let reply = match control.control {
+        ScopeControl::Malformed(error) => {
+            format!("Command rejected: {error}. Use /help for exact syntax.")
+        }
+        ScopeControl::Command(command) => {
+            execute_control(
+                scope,
+                command,
+                store,
+                policy,
+                settings,
+                supervisor,
+                adoption,
+                pending_media,
+                candidate_proof,
+            )
+            .await
+        }
+    };
+    let row = sink
+        .control_reply(&control.inbound.key, &control.inbound.queued.event, &reply)
+        .map_err(|_| ScopeFailureKind::Projection)?;
+    complete_control_reply(store, settings, &control.inbound.key, row, shutdown).await
+}
+
+async fn complete_control_reply(
+    store: &StoreHandle,
+    settings: &RouterSettings,
+    key: &InboundKey,
+    row: NewOutboxRow,
+    shutdown: &CancellationToken,
+) -> Result<(), ScopeFailureKind> {
+    loop {
+        match store
+            .complete_received_and_enqueue_control_reply(key, row.clone())
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(crate::store::StoreError::QueueFull) => {
+                tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => return Err(ScopeFailureKind::Supervisor),
+                    () = sleep(settings.finalization_retry) => {}
+                }
+            }
+            Err(_) => return Err(ScopeFailureKind::Store),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_control(
+    scope: &ScopeKey,
+    command: BridgeCommand,
+    store: &StoreHandle,
+    policy: &AccessPolicy,
+    settings: &RouterSettings,
+    supervisor: &watch::Receiver<SupervisorAccess>,
+    adoption: &ThreadAdoptionCoordinator,
+    pending_media: &Arc<Mutex<PendingMediaQueue>>,
+    candidate_proof: &mut Option<CandidateSelectionProof>,
+) -> String {
+    match command {
+        BridgeCommand::Threads { cursor } => {
+            execute_threads_control(scope, cursor, policy, supervisor, adoption, candidate_proof)
+                .await
+        }
+        BridgeCommand::Adopt { selector } => {
+            execute_adopt_control(
+                scope,
+                &selector,
+                store,
+                policy,
+                settings,
+                supervisor,
+                adoption,
+                pending_media,
+                candidate_proof,
+            )
+            .await
+        }
+        BridgeCommand::Release => {
+            execute_release_control(scope, policy, settings, supervisor, adoption).await
+        }
+        BridgeCommand::New
+        | BridgeCommand::Stop
+        | BridgeCommand::Status
+        | BridgeCommand::Cd { .. }
+        | BridgeCommand::Help => unreachable!("router admits only adoption controls"),
+    }
+}
+
+async fn execute_threads_control(
+    scope: &ScopeKey,
+    cursor: Option<String>,
+    policy: &AccessPolicy,
+    supervisor: &watch::Receiver<SupervisorAccess>,
+    adoption: &ThreadAdoptionCoordinator,
+    candidate_proof: &mut Option<CandidateSelectionProof>,
+) -> String {
+    let access = supervisor.borrow().clone();
+    let Some(client) = access.client else {
+        return "Thread discovery is unavailable because the shared app-server is not ready. Existing adopted ownership can still be released with /release."
+            .to_owned();
+    };
+    match adoption
+        .discover(scope, client.as_ref(), cursor, policy)
+        .await
+    {
+        Ok(discovery) => {
+            let reply = render_candidate_page(&discovery.page);
+            *candidate_proof = Some(discovery.proof);
+            reply
+        }
+        Err(error) => adoption_error_reply("Thread discovery", &error),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_adopt_control(
+    scope: &ScopeKey,
+    selector: &str,
+    store: &StoreHandle,
+    policy: &AccessPolicy,
+    settings: &RouterSettings,
+    supervisor: &watch::Receiver<SupervisorAccess>,
+    adoption: &ThreadAdoptionCoordinator,
+    pending_media: &Arc<Mutex<PendingMediaQueue>>,
+    candidate_proof: &mut Option<CandidateSelectionProof>,
+) -> String {
+    if exact_healthy_adoption(store, adoption, scope, selector).await {
+        clear_pending_media(pending_media);
+        return adoption_complete_reply();
+    }
+    let Some(proof) = candidate_proof.take() else {
+        return "Adoption requires a fresh one-page selection proof. Run /threads, then copy one exact /adopt command from that reply; no ownership mapping was changed."
+            .to_owned();
+    };
+    if prepare_workspace(scope, store, policy, settings)
+        .await
+        .is_err()
+    {
+        return "Adoption refused because this scope has no policy-valid workspace.".to_owned();
+    }
+    let access = supervisor.borrow().clone();
+    let Some(shared_client) = access.client else {
+        return "Adoption is unavailable because the shared app-server is not ready. The one-shot selection proof was consumed; run /threads again after recovery."
+            .to_owned();
+    };
+    let Some(shared_profile) = access.profile_identity else {
+        return "Adoption is unavailable because the shared app-server profile cannot be verified. The one-shot selection proof was consumed; run /threads again."
+            .to_owned();
+    };
+    match adoption
+        .adopt(
+            scope,
+            selector,
+            shared_client.as_ref(),
+            &shared_profile,
+            Some(proof),
+            policy,
+            adoption_resume_settings(settings),
+            ExplicitHandoff::Confirmed,
+        )
+        .await
+    {
+        Ok(_) => {
+            clear_pending_media(pending_media);
+            adoption_complete_reply()
+        }
+        Err(error) => adoption_error_reply("Adoption", &error),
+    }
+}
+
+async fn execute_release_control(
+    scope: &ScopeKey,
+    policy: &AccessPolicy,
+    settings: &RouterSettings,
+    supervisor: &watch::Receiver<SupervisorAccess>,
+    adoption: &ThreadAdoptionCoordinator,
+) -> String {
+    let released = match adoption.release(scope).await {
+        Ok(receipt) => Ok(receipt),
+        Err(
+            error @ (ThreadAdoptionCoordinatorError::DomainMissing
+            | ThreadAdoptionCoordinatorError::Fenced),
+        ) => {
+            let access = supervisor.borrow().clone();
+            let Some(shared_client) = access.client else {
+                return "Release recovery is unavailable because the shared app-server is not ready. The durable ownership state remains fenced; no fallback writer was opened."
+                    .to_owned();
+            };
+            let Some(shared_profile) = access.profile_identity else {
+                return adoption_error_reply("Release recovery", &error);
+            };
+            adoption
+                .recover_release(
+                    scope,
+                    shared_client.as_ref(),
+                    &shared_profile,
+                    None,
+                    policy,
+                    adoption_resume_settings(settings),
+                    ExplicitHandoff::Confirmed,
+                )
+                .await
+        }
+        Err(error) => Err(error),
+    };
+    match released {
+        Ok(receipt) => release_complete_reply(receipt.outcome).to_owned(),
+        Err(error) => adoption_error_reply("Release", &error),
+    }
+}
+
+fn release_complete_reply(outcome: ReleaseOutcome) -> &'static str {
+    match outcome {
+        ReleaseOutcome::AdoptedMappingReleased => {
+            "Release complete. The dedicated app-server process tree was confirmed reaped and the adopted mapping was removed; the persisted thread itself was not archived or deleted."
+        }
+        ReleaseOutcome::UncommittedAcquisitionCleaned => {
+            "Release recovery complete. The uncommitted acquisition was durably closed after confirmed cleanup; no adopted mapping was removed, and any pre-existing bridge mapping remains active."
+        }
+    }
+}
+
+async fn exact_healthy_adoption(
+    store: &StoreHandle,
+    adoption: &ThreadAdoptionCoordinator,
+    scope: &ScopeKey,
+    selector: &str,
+) -> bool {
+    let Ok(Some(mapping)) = store.active_thread(scope).await else {
+        return false;
+    };
+    if mapping.origin != ThreadOrigin::ExternallyAdopted || mapping.codex_thread_id != selector {
+        return false;
+    }
+    adoption
+        .route(scope)
+        .await
+        .is_ok_and(|route| route.thread_id == selector)
+}
+
+fn adoption_complete_reply() -> String {
+    "Adoption complete. This scope now uses the explicitly selected persisted thread through a dedicated non-restarting app-server owner. Keep every other client closed until /release confirms process-tree cleanup."
+        .to_owned()
+}
+
+fn adoption_resume_settings(settings: &RouterSettings) -> AdoptionResumeSettings {
+    AdoptionResumeSettings {
+        sandbox: settings.sandbox,
+        approval_policy: settings.approval_policy.clone(),
+        model: settings.model.clone(),
+    }
+}
+
+fn clear_pending_media(pending_media: &Arc<Mutex<PendingMediaQueue>>) {
+    pending_media
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+}
+
+fn adoption_error_reply(action: &str, error: &ThreadAdoptionCoordinatorError) -> String {
+    match error {
+        ThreadAdoptionCoordinatorError::ActiveWriterConflict if action.starts_with("Release") => {
+            format!(
+                "{action} refused: the persisted thread still has another active writer. The durable ownership state remains fenced; close the other Desktop/CLI/app-server owner, then retry /release explicitly."
+            )
+        }
+        ThreadAdoptionCoordinatorError::ActiveWriterConflict => {
+            format!(
+                "{action} refused: the selected persisted thread still has another active writer. No adopted mapping was committed. Finish handoff, close the other Desktop/CLI/app-server owner, then retry explicitly."
+            )
+        }
+        ThreadAdoptionCoordinatorError::Fenced | ThreadAdoptionCoordinatorError::DomainMissing => {
+            format!(
+                "{action} is fenced because this process cannot prove the exact dedicated owner. Keep other clients closed; no shared-client fallback or implicit ownership release was attempted."
+            )
+        }
+        ThreadAdoptionCoordinatorError::CleanupUnconfirmed => format!(
+            "{action} could not confirm process-tree cleanup. The adopted mapping remains fenced and active; do not open another writer."
+        ),
+        _ if action.starts_with("Release") => format!(
+            "{action} failed: {error}. The durable ownership state remains fenced; no shared-client fallback or implicit release was attempted."
+        ),
+        _ => format!("{action} failed: {error}."),
+    }
+}
+
+fn render_candidate_page(page: &ThreadCandidatePage) -> String {
+    const FOOTER_RESERVE: usize = 850;
+    let mut output = String::from(
+        "Persisted-thread candidates (read-only preflight; writer ownership is unverified):\n",
+    );
+    if page.candidates.is_empty() {
+        output.push_str("No eligible idle persisted threads were found.\n");
+    }
+    let mut omitted = 0_usize;
+    for candidate in &page.candidates {
+        let selector = json_display(&candidate.selector);
+        let title = json_display(&candidate.title);
+        let line = format!(
+            "/adopt {selector} --handoff-complete\n  workspace={} | source={} | title={} | updated={}\n",
+            candidate.workspace_alias, candidate.source, title, candidate.updated_at
+        );
+        if output
+            .chars()
+            .count()
+            .saturating_add(line.chars().count())
+            .saturating_add(FOOTER_RESERVE)
+            > REPLY_MESSAGE_MAX_CHARS
+        {
+            omitted = omitted.saturating_add(1);
+        } else {
+            output.push_str(&line);
+        }
+    }
+    if omitted != 0 {
+        let _ = writeln!(
+            output,
+            "{omitted} additional candidates omitted by reply bounds."
+        );
+    }
+    if let Some(cursor) = page.next_cursor.as_deref().filter(|cursor| {
+        !cursor.is_empty()
+            && !cursor.chars().any(char::is_control)
+            && !cursor.chars().any(char::is_whitespace)
+    }) {
+        output.push_str("Next page: /threads ");
+        output.push_str(cursor);
+        output.push('\n');
+    }
+    output.push_str(
+        "Before adoption, close every other Desktop, CLI, or app-server writer, then run /adopt <selector> --handoff-complete. Discovery alone does not acquire ownership.",
+    );
+    if output.chars().count() > REPLY_MESSAGE_MAX_CHARS {
+        return "Candidate results exceeded the safe reply bound. Narrow the page with its cursor and retry; discovery did not acquire ownership."
+            .to_owned();
+    }
+    output
+}
+
+fn json_display(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"[unavailable]\"".to_owned())
 }
 
 async fn prepare_inbound(
@@ -901,6 +1408,20 @@ fn is_audio_event(event: &InboundEvent) -> bool {
     event.message_type == "audio"
 }
 
+fn external_batch_uses_unsupported_features(batch: &[TurnInbound]) -> bool {
+    batch.iter().any(|item| {
+        let event = &item.inbound.queued.event;
+        item.pending_media.is_some()
+            || event.message_type != "text"
+            || event.reply_to_message_id.is_some()
+            || !event.resources.is_empty()
+            || event
+                .parts
+                .iter()
+                .any(|part| !matches!(part, MessagePart::Text { .. }))
+    })
+}
+
 fn clears_pending_media(text: &str) -> bool {
     matches!(text.trim(), "/cancel" | "/new" | "/stop")
 }
@@ -918,14 +1439,42 @@ async fn process_batch(
     attachments: Option<&AttachmentCache>,
     contexts: Option<&ContextRegistry>,
     quote_resolver: Option<&dyn QuoteResolver>,
+    adoption: &ThreadAdoptionCoordinator,
     state: &Arc<RwLock<ScopeState>>,
     active_turn: &RwLock<Option<ActiveTurn>>,
     shutdown: &CancellationToken,
 ) -> Result<(), ScopeFailureKind> {
     let batch = deduplicate_batch(batch);
     tracing::debug!(batch_messages = batch.len(), "scope batch ready");
+    let active_adoption = store
+        .active_thread_adoption(scope)
+        .await
+        .map_err(|_| ScopeFailureKind::Store)?;
+    let active_mapping = store
+        .active_thread(scope)
+        .await
+        .map_err(|_| ScopeFailureKind::Store)?;
+    let externally_adopted = match (&active_mapping, &active_adoption) {
+        (Some(mapping), Some(saga))
+            if mapping.origin == ThreadOrigin::ExternallyAdopted
+                && mapping.adoption_generation == Some(saga.generation)
+                && mapping.codex_thread_id == saga.codex_thread_id
+                && saga.state == ThreadAdoptionState::Owned =>
+        {
+            true
+        }
+        (Some(mapping), None) if mapping.origin == ThreadOrigin::ExternallyAdopted => {
+            reject_terminal_batch(store, sink.as_ref(), &batch).await?;
+            return Ok(());
+        }
+        (_, Some(_)) => {
+            reject_terminal_batch(store, sink.as_ref(), &batch).await?;
+            return Ok(());
+        }
+        _ => false,
+    };
     let _active_permit = loop {
-        if supervisor.borrow().terminal {
+        if !externally_adopted && supervisor.borrow().terminal {
             reject_terminal_batch(store, sink.as_ref(), &batch).await?;
             return Ok(());
         }
@@ -935,7 +1484,7 @@ async fn process_batch(
             permit = Arc::clone(&active_turns).acquire_owned() => {
                 break permit.map_err(|_| ScopeFailureKind::Capacity)?;
             }
-            changed = supervisor.changed() => {
+            changed = supervisor.changed(), if !externally_adopted => {
                 changed.map_err(|_| ScopeFailureKind::Supervisor)?;
             }
         }
@@ -977,46 +1526,77 @@ async fn process_batch(
             }
             Err(kind) => return Err(kind),
         };
-    let (turn_epoch, client) = match wait_for_client(&mut supervisor, shutdown).await {
-        Ok(ready) => ready,
-        Err(ScopeFailureKind::Supervisor) if supervisor.borrow().terminal => {
+    set_state(state, ScopeState::StartingTurn);
+    let (turn_epoch, client, thread_id) = if externally_adopted {
+        if external_batch_uses_unsupported_features(&batch) {
             reject_terminal_batch(store, sink.as_ref(), &batch).await?;
             return Ok(());
         }
-        Err(kind) => return Err(kind),
-    };
-    set_state(state, ScopeState::StartingTurn);
-    let thread_result = tokio::select! {
-        biased;
-        () = shutdown.cancelled() => {
-            Err(ThreadPreparationError::Scope(ScopeFailureKind::Supervisor))
+        if policy_changed {
+            let _ = adoption.fence_and_reap(scope).await;
+            reject_terminal_batch(store, sink.as_ref(), &batch).await?;
+            return Ok(());
         }
-        result = ensure_thread(
-            scope,
-            store,
-            policy,
-            settings,
-            &client,
-            &cwd,
-            &fingerprint,
-            policy_changed,
-            contexts.is_some(),
-        ) => result,
-    };
-    let thread_id = match thread_result {
-        Ok(thread_id) => thread_id,
-        Err(ThreadPreparationError::Client(error)) if thread_failure_ends_epoch(&error) => {
-            return settle_preclaim_epoch_loss(
-                &mut supervisor,
-                turn_epoch,
-                shutdown,
+        let Ok(route) = adoption.route(scope).await else {
+            let _ = adoption.fence_and_reap(scope).await;
+            reject_terminal_batch(store, sink.as_ref(), &batch).await?;
+            return Ok(());
+        };
+        let Some(mapping) = active_mapping.as_ref() else {
+            let _ = adoption.fence_and_reap(scope).await;
+            reject_terminal_batch(store, sink.as_ref(), &batch).await?;
+            return Ok(());
+        };
+        if route.thread_id != mapping.codex_thread_id
+            || Some(route.generation) != mapping.adoption_generation
+        {
+            let _ = adoption.fence_and_reap(scope).await;
+            reject_terminal_batch(store, sink.as_ref(), &batch).await?;
+            return Ok(());
+        }
+        (route.client.epoch().get(), route.client, route.thread_id)
+    } else {
+        let (turn_epoch, client) = match wait_for_client(&mut supervisor, shutdown).await {
+            Ok(ready) => ready,
+            Err(ScopeFailureKind::Supervisor) if supervisor.borrow().terminal => {
+                reject_terminal_batch(store, sink.as_ref(), &batch).await?;
+                return Ok(());
+            }
+            Err(kind) => return Err(kind),
+        };
+        let thread_result = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => {
+                Err(ThreadPreparationError::Scope(ScopeFailureKind::Supervisor))
+            }
+            result = ensure_thread(
+                scope,
                 store,
-                sink.as_ref(),
-                &batch,
-            )
-            .await;
-        }
-        Err(error) => return Err(error.scope_kind()),
+                policy,
+                settings,
+                &client,
+                &cwd,
+                &fingerprint,
+                policy_changed,
+                contexts.is_some(),
+            ) => result,
+        };
+        let thread_id = match thread_result {
+            Ok(thread_id) => thread_id,
+            Err(ThreadPreparationError::Client(error)) if thread_failure_ends_epoch(&error) => {
+                return settle_preclaim_epoch_loss(
+                    &mut supervisor,
+                    turn_epoch,
+                    shutdown,
+                    store,
+                    sink.as_ref(),
+                    &batch,
+                )
+                .await;
+            }
+            Err(error) => return Err(error.scope_kind()),
+        };
+        (turn_epoch, client, thread_id)
     };
     let subscription_result = tokio::select! {
         biased;
@@ -1025,6 +1605,11 @@ async fn process_batch(
     };
     let mut subscription = match subscription_result {
         Ok(subscription) => subscription,
+        Err(_) if externally_adopted => {
+            let _ = adoption.fence_and_reap(scope).await;
+            reject_terminal_batch(store, sink.as_ref(), &batch).await?;
+            return Ok(());
+        }
         Err(error) if subscription_failure_ends_epoch(&error) => {
             return settle_preclaim_epoch_loss(
                 &mut supervisor,
@@ -1037,6 +1622,20 @@ async fn process_batch(
             .await;
         }
         Err(_) => return Err(ScopeFailureKind::Client),
+    };
+    // Externally adopted threads intentionally expose only the first-stage
+    // plain-text path. They never inherit the shared server's dynamic context
+    // tools, attachment cache, or quote resolver.
+    let attachments = if externally_adopted {
+        None
+    } else {
+        attachments
+    };
+    let contexts = if externally_adopted { None } else { contexts };
+    let quote_resolver = if externally_adopted {
+        None
+    } else {
+        quote_resolver
     };
     let client_message_id = Uuid::new_v4().to_string();
     let mut live_transcripts = HashMap::with_capacity(batch.len());
@@ -1120,6 +1719,9 @@ async fn process_batch(
         }
     };
     let Ok(rpc_cwd) = revalidate_workspace(policy, &cwd, &fingerprint) else {
+        if externally_adopted {
+            let _ = adoption.fence_and_reap(scope).await;
+        }
         finalize_failed(
             store,
             sink.as_ref(),
@@ -1189,6 +1791,9 @@ async fn process_batch(
             // The request may have reached Codex even though the response was
             // lost. Restoring its implicit media would risk submitting the
             // same attachment association in a later turn.
+            if externally_adopted {
+                let _ = adoption.fence_and_reap(scope).await;
+            }
             commit_pending_media(&mut batch);
             finalize_uncertain_and_settle_attachments(
                 store,
@@ -1230,6 +1835,9 @@ async fn process_batch(
         .await
         .is_err()
     {
+        if externally_adopted {
+            let _ = adoption.fence_and_reap(scope).await;
+        }
         finalize_uncertain_and_settle_attachments(
             store,
             sink.as_ref(),
@@ -1323,6 +1931,9 @@ async fn process_batch(
     set_active_turn(active_turn, None)?;
     set_state(state, ScopeState::Finalizing { turn_row_id });
     let Some(outcome) = outcome else {
+        if externally_adopted {
+            let _ = adoption.fence_and_reap(scope).await;
+        }
         if let Some(lease) = context_lease.as_mut() {
             lease.reason = RevocationReason::Failed;
         }
@@ -1694,7 +2305,7 @@ async fn reject_item(
     reason: InboundRejectionKind,
 ) -> Result<(), ScopeFailureKind> {
     let notice = sink
-        .rejection_notice(&item.queued.event, reason)
+        .rejection_notice(&item.key, &item.queued.event, reason)
         .map_err(|_| ScopeFailureKind::Projection)?;
     store
         .reject_received_and_enqueue_notice(&item.key, reason, notice)
@@ -1832,6 +2443,12 @@ async fn release_thread_route(
     let Ok(Some(active)) = store.active_thread(scope).await else {
         return;
     };
+    if active.origin != ThreadOrigin::BridgeCreated {
+        // Actor eviction and router shutdown do not constitute an explicit
+        // adopted-owner release. The coordinator retains or fences that
+        // dedicated domain independently of actor residency.
+        return;
+    }
     let client = supervisor.borrow().client.clone();
     if let Some(client) = client {
         let _ = client
@@ -2165,9 +2782,201 @@ fn set_active_turn(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{path::PathBuf, time::Duration};
 
     use super::*;
+    use crate::{
+        config::BridgeConfig,
+        lark::{config::TenantBrand, credentials::LarkCredentials, normalize::InboundEvent},
+        runtime::{intake::TenantNamespace, policy::PlatformRoots},
+        store::{InboundEventState, ThreadAdoptionOutcome, ThreadAdoptionState},
+    };
+    use secrecy::SecretString;
+    use tempfile::TempDir;
+    use tokio::sync::Notify;
+
+    #[derive(Clone, Default)]
+    struct OrderedSink {
+        calls: Arc<Mutex<Vec<String>>>,
+        control_replies: Arc<Mutex<Vec<String>>>,
+        changed: Arc<Notify>,
+    }
+
+    impl OrderedSink {
+        fn record(&self, value: String) {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(value);
+            self.changed.notify_waiters();
+        }
+
+        fn snapshot(&self) -> Vec<String> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        fn control_replies(&self) -> Vec<String> {
+            self.control_replies
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        async fn wait_for(&self, count: usize) {
+            timeout(Duration::from_secs(2), async {
+                loop {
+                    let changed = self.changed.notified();
+                    if self.snapshot().len() >= count {
+                        break;
+                    }
+                    changed.await;
+                }
+            })
+            .await
+            .expect("ordered sink calls");
+        }
+    }
+
+    impl DurableReplySink for OrderedSink {
+        fn rejection_notice(
+            &self,
+            key: &InboundKey,
+            event: &InboundEvent,
+            reason: InboundRejectionKind,
+        ) -> Result<NewOutboxRow, ReplySinkError> {
+            self.record(format!("notice:{}", event.event_id));
+            Ok(NewOutboxRow {
+                idempotency_key: key.rejection_outbox_idempotency_key(reason),
+                scope_key: event.scope.to_string(),
+                kind: "notice".to_owned(),
+                payload_json: format!("notice:{}", reason.as_str()),
+                next_retry_ms: 0,
+            })
+        }
+
+        fn control_reply(
+            &self,
+            key: &InboundKey,
+            event: &InboundEvent,
+            text: &str,
+        ) -> Result<NewOutboxRow, ReplySinkError> {
+            self.control_replies
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(text.to_owned());
+            self.record(format!("control:{}", event.event_id));
+            Ok(NewOutboxRow {
+                idempotency_key: key.control_outbox_idempotency_key(),
+                scope_key: event.scope.to_string(),
+                kind: "control".to_owned(),
+                payload_json: "control".to_owned(),
+                next_retry_ms: 0,
+            })
+        }
+
+        fn finalize(
+            &self,
+            _turn: TurnFinalization,
+        ) -> BoxFuture<'static, Result<(), ReplySinkError>> {
+            Box::pin(async { Err(ReplySinkError::Invariant) })
+        }
+    }
+
+    struct ActorFixture {
+        _temporary: TempDir,
+        cwd: PathBuf,
+        policy: AccessPolicy,
+        settings: RouterSettings,
+        tenant: TenantNamespace,
+    }
+
+    fn actor_fixture() -> ActorFixture {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let home = temporary.path().join("home");
+        let cwd = home.join("workspace");
+        std::fs::create_dir_all(&cwd).expect("workspace");
+        let roots =
+            PlatformRoots::new(&home, Vec::new(), Vec::new(), Vec::new()).expect("platform roots");
+        let config = BridgeConfig {
+            owners: vec!["owner".to_owned()],
+            default_workspace: Some(cwd.clone()),
+            workspace: crate::config::WorkspacePolicy {
+                allow_roots: vec![cwd.clone()],
+                ..crate::config::WorkspacePolicy::default()
+            },
+            ..BridgeConfig::default()
+        };
+        let policy = AccessPolicy::with_platform_roots(&config, &roots).expect("policy");
+        let mut settings = RouterSettings::from_config(&config);
+        settings.debounce = Duration::from_millis(20);
+        let credentials = LarkCredentials::new(
+            "scope_actor_test".to_owned(),
+            SecretString::from("secret".to_owned()),
+            TenantBrand::Feishu,
+        );
+        ActorFixture {
+            _temporary: temporary,
+            cwd,
+            policy,
+            settings,
+            tenant: TenantNamespace::from_credentials(&credentials),
+        }
+    }
+
+    fn actor_event(scope: &ScopeKey, event_id: &str, text: &str) -> InboundEvent {
+        let (chat_id, thread_id) = match scope {
+            ScopeKey::Chat(chat_id) => (chat_id.clone(), None),
+            ScopeKey::Thread(chat_id, thread_id) => (chat_id.clone(), Some(thread_id.clone())),
+        };
+        InboundEvent {
+            event_id: event_id.to_owned(),
+            message_id: format!("message-{event_id}"),
+            chat_id,
+            sender_id: "owner".to_owned(),
+            chat_type: ChatMode::P2p,
+            thread_id,
+            root_id: None,
+            reply_to_message_id: None,
+            text: text.to_owned(),
+            mentions_bot: false,
+            mention_all: false,
+            sender_is_human: true,
+            mentions: Vec::new(),
+            parts: vec![MessagePart::Text {
+                text: text.to_owned(),
+            }],
+            resources: Vec::new(),
+            message_type: "text".to_owned(),
+            create_time_ms: i64::try_from(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis(),
+            )
+            .unwrap_or(i64::MAX),
+            scope: scope.clone(),
+        }
+    }
+
+    async fn queued_actor_event(
+        store: &StoreHandle,
+        tenant: &TenantNamespace,
+        event: InboundEvent,
+    ) -> (InboundKey, QueuedInboundEvent) {
+        store
+            .register_inbound(tenant, &event)
+            .await
+            .expect("register inbound");
+        let key = InboundKey::new(tenant.clone(), event.event_id.clone());
+        let permit = Arc::new(Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .expect("queued permit");
+        (key, QueuedInboundEvent::new(event, permit))
+    }
 
     fn pending_event(event_id: &str, key: &str) -> InboundEvent {
         InboundEvent {
@@ -2206,6 +3015,547 @@ mod tests {
             max_metadata_bytes,
             generation: 0,
         }
+    }
+
+    #[test]
+    fn rendered_adoption_command_round_trips_opaque_selector_without_injection() {
+        use crate::runtime::adoption::{CandidateOwnership, ThreadCandidate};
+        use crate::runtime::commands::parse_command;
+
+        let selector = r#"opaque selector | "/release" \\ suffix"#;
+        let page = ThreadCandidatePage {
+            candidates: vec![ThreadCandidate {
+                selector: selector.to_owned(),
+                title: "Safe title".to_owned(),
+                workspace_alias: "ws-0123456789abcdef01234567".to_owned(),
+                source: "cli",
+                updated_at: 42,
+                observable_state: "idle_preflight_only",
+                ownership: CandidateOwnership::Unverified,
+            }],
+            next_cursor: None,
+            ownership_note: "ownership unverified",
+        };
+
+        let rendered = render_candidate_page(&page);
+        let commands = rendered
+            .lines()
+            .filter(|line| line.starts_with("/adopt "))
+            .collect::<Vec<_>>();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            parse_command(commands[0]),
+            Ok(Some(BridgeCommand::Adopt {
+                selector: selector.to_owned()
+            }))
+        );
+        assert!(!rendered.lines().any(|line| line == "/release"));
+    }
+
+    #[tokio::test]
+    async fn control_arrival_ends_debounce_and_runs_after_the_ordinary_batch() {
+        let mut fixture = actor_fixture();
+        fixture.settings.debounce = Duration::from_millis(250);
+        let store = StoreHandle::open_in_memory().await.expect("store");
+        let scope = ScopeKey::Chat("serialized-control".to_owned());
+        let (_supervisor_tx, supervisor) = watch::channel(SupervisorAccess {
+            epoch: 0,
+            client: None,
+            profile_identity: None,
+            terminal: true,
+        });
+        let adoption = Arc::new(ThreadAdoptionCoordinator::new(
+            store.clone(),
+            fixture.settings.backend.clone(),
+            4,
+        ));
+        adoption.startup_fence().await.expect("startup fence");
+        let sink = OrderedSink::default();
+        let actor = ScopeActorHandle::spawn(
+            scope.clone(),
+            store.clone(),
+            fixture.policy,
+            fixture.settings,
+            supervisor,
+            Arc::new(Semaphore::new(1)),
+            Arc::new(sink.clone()),
+            None,
+            None,
+            None,
+            adoption,
+        );
+
+        let (ordinary_key, ordinary) = queued_actor_event(
+            &store,
+            &fixture.tenant,
+            actor_event(&scope, "ordinary-first", "ordinary message"),
+        )
+        .await;
+        assert!(actor.try_route(ordinary_key.clone(), ordinary).is_ok());
+        timeout(Duration::from_secs(1), async {
+            while actor.state() != ScopeState::Debouncing {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ordinary debounce");
+
+        let (control_key, control) = queued_actor_event(
+            &store,
+            &fixture.tenant,
+            actor_event(&scope, "control-second", "/threads"),
+        )
+        .await;
+        assert!(
+            actor
+                .try_route_control(
+                    control_key.clone(),
+                    control,
+                    ScopeControl::Command(BridgeCommand::Threads { cursor: None }),
+                )
+                .is_ok()
+        );
+
+        sink.wait_for(2).await;
+        assert_eq!(
+            sink.snapshot(),
+            ["notice:ordinary-first", "control:control-second"]
+        );
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let ordinary_state = store
+                    .inbound_state(&fixture.tenant, &ordinary_key.event_id)
+                    .await
+                    .expect("ordinary state");
+                let control_state = store
+                    .inbound_state(&fixture.tenant, &control_key.event_id)
+                    .await
+                    .expect("control state");
+                if ordinary_state == Some(InboundEventState::Rejected)
+                    && control_state == Some(InboundEventState::Completed)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("durable ordered settlement");
+        actor.shutdown().await;
+        store.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn adopted_mapping_never_waits_for_or_falls_back_to_the_shared_client() {
+        let mut fixture = actor_fixture();
+        fixture.settings.debounce = Duration::from_millis(1);
+        let store = StoreHandle::open_in_memory().await.expect("store");
+        let scope = ScopeKey::Chat("external-no-fallback".to_owned());
+        let fingerprint = fixture
+            .policy
+            .fingerprint(&fixture.cwd)
+            .expect("fingerprint");
+        store
+            .upsert_scope(&scope, &fixture.cwd, fingerprint.as_str())
+            .await
+            .expect("scope");
+        let reservation = store
+            .reserve_thread_adoption(&scope, "persisted-no-fallback")
+            .await
+            .expect("reserve adoption");
+        store
+            .commit_thread_adoption(&reservation, &fixture.cwd, fingerprint.as_str())
+            .await
+            .expect("commit adoption");
+
+        let adoption = Arc::new(ThreadAdoptionCoordinator::new(
+            store.clone(),
+            fixture.settings.backend.clone(),
+            4,
+        ));
+        adoption.startup_fence().await.expect("startup fence");
+        let (_supervisor_tx, supervisor) = watch::channel(SupervisorAccess {
+            epoch: 7,
+            client: None,
+            profile_identity: None,
+            // If the adopted branch accidentally enters `wait_for_client`, it
+            // will wait forever because this non-terminal channel never changes.
+            terminal: false,
+        });
+        let sink = OrderedSink::default();
+        let actor = ScopeActorHandle::spawn(
+            scope.clone(),
+            store.clone(),
+            fixture.policy,
+            fixture.settings,
+            supervisor,
+            Arc::new(Semaphore::new(1)),
+            Arc::new(sink.clone()),
+            None,
+            None,
+            None,
+            adoption,
+        );
+        let (key, ordinary) = queued_actor_event(
+            &store,
+            &fixture.tenant,
+            actor_event(&scope, "external-ordinary", "must not start a replacement"),
+        )
+        .await;
+        assert!(actor.try_route(key.clone(), ordinary).is_ok());
+
+        sink.wait_for(1).await;
+        timeout(Duration::from_secs(1), async {
+            while store
+                .inbound_state(&fixture.tenant, &key.event_id)
+                .await
+                .expect("inbound state")
+                != Some(InboundEventState::Rejected)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("external route fails closed without shared readiness");
+        actor.shutdown().await;
+
+        let mapping = store
+            .active_thread(&scope)
+            .await
+            .expect("active mapping")
+            .expect("actor shutdown preserves explicit mapping");
+        assert_eq!(mapping.origin, ThreadOrigin::ExternallyAdopted);
+        assert_eq!(mapping.codex_thread_id, "persisted-no-fallback");
+        let saga = store
+            .active_thread_adoption(&scope)
+            .await
+            .expect("active saga")
+            .expect("fenced saga");
+        assert_eq!(saga.state, ThreadAdoptionState::RecoveryRequired);
+        store.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn startup_fenced_precommit_adoptions_block_ordinary_routes_but_not_release_control() {
+        let mut fixture = actor_fixture();
+        fixture.settings.debounce = Duration::from_millis(1);
+        let store = StoreHandle::open_in_memory().await.expect("store");
+        let mapped_scope = ScopeKey::Chat("precommit-preserved-mapping".to_owned());
+        let unmapped_scope = ScopeKey::Chat("precommit-without-mapping".to_owned());
+        let fingerprint = fixture
+            .policy
+            .fingerprint(&fixture.cwd)
+            .expect("fingerprint");
+        for scope in [&mapped_scope, &unmapped_scope] {
+            store
+                .upsert_scope(scope, &fixture.cwd, fingerprint.as_str())
+                .await
+                .expect("scope");
+        }
+        store
+            .record_active_thread(&mapped_scope, "preserved-bridge-thread")
+            .await
+            .expect("preserved bridge mapping");
+        for (scope, target) in [
+            (&mapped_scope, "persisted-mapped-target"),
+            (&unmapped_scope, "persisted-unmapped-target"),
+        ] {
+            store
+                .reserve_thread_adoption(scope, target)
+                .await
+                .expect("reserve adoption");
+        }
+
+        let adoption = Arc::new(ThreadAdoptionCoordinator::new(
+            store.clone(),
+            fixture.settings.backend.clone(),
+            4,
+        ));
+        assert_eq!(adoption.startup_fence().await.expect("startup fence"), 2);
+        let (_supervisor_tx, supervisor) = watch::channel(SupervisorAccess {
+            epoch: 7,
+            client: None,
+            profile_identity: None,
+            // A regression into either ordinary mapping branch would wait
+            // forever for this deliberately non-terminal shared client.
+            terminal: false,
+        });
+        let sink = OrderedSink::default();
+        let active_turns = Arc::new(Semaphore::new(1));
+        let mapped_actor = ScopeActorHandle::spawn(
+            mapped_scope.clone(),
+            store.clone(),
+            fixture.policy.clone(),
+            fixture.settings.clone(),
+            supervisor.clone(),
+            Arc::clone(&active_turns),
+            Arc::new(sink.clone()),
+            None,
+            None,
+            None,
+            Arc::clone(&adoption),
+        );
+        let unmapped_actor = ScopeActorHandle::spawn(
+            unmapped_scope.clone(),
+            store.clone(),
+            fixture.policy,
+            fixture.settings,
+            supervisor,
+            active_turns,
+            Arc::new(sink.clone()),
+            None,
+            None,
+            None,
+            adoption,
+        );
+
+        let (mapped_key, mapped_ordinary) = queued_actor_event(
+            &store,
+            &fixture.tenant,
+            actor_event(
+                &mapped_scope,
+                "precommit-mapped-ordinary",
+                "must not resume the preserved mapping",
+            ),
+        )
+        .await;
+        assert!(
+            mapped_actor
+                .try_route(mapped_key.clone(), mapped_ordinary)
+                .is_ok()
+        );
+        let (release_key, release) = queued_actor_event(
+            &store,
+            &fixture.tenant,
+            actor_event(&mapped_scope, "precommit-release", "/release"),
+        )
+        .await;
+        assert!(
+            mapped_actor
+                .try_route_control(
+                    release_key.clone(),
+                    release,
+                    ScopeControl::Command(BridgeCommand::Release),
+                )
+                .is_ok()
+        );
+        let (unmapped_key, unmapped_ordinary) = queued_actor_event(
+            &store,
+            &fixture.tenant,
+            actor_event(
+                &unmapped_scope,
+                "precommit-unmapped-ordinary",
+                "must not start a replacement thread",
+            ),
+        )
+        .await;
+        assert!(
+            unmapped_actor
+                .try_route(unmapped_key.clone(), unmapped_ordinary)
+                .is_ok()
+        );
+
+        sink.wait_for(3).await;
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let mapped_state = store
+                    .inbound_state(&fixture.tenant, &mapped_key.event_id)
+                    .await
+                    .expect("mapped ordinary state");
+                let unmapped_state = store
+                    .inbound_state(&fixture.tenant, &unmapped_key.event_id)
+                    .await
+                    .expect("unmapped ordinary state");
+                let release_state = store
+                    .inbound_state(&fixture.tenant, &release_key.event_id)
+                    .await
+                    .expect("release state");
+                if mapped_state == Some(InboundEventState::Rejected)
+                    && unmapped_state == Some(InboundEventState::Rejected)
+                    && release_state == Some(InboundEventState::Completed)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fenced ordinary work and accessible release control settle");
+        let calls = sink.snapshot();
+        let mapped_notice = calls
+            .iter()
+            .position(|call| call == "notice:precommit-mapped-ordinary")
+            .expect("mapped rejection notice");
+        let release_reply = calls
+            .iter()
+            .position(|call| call == "control:precommit-release")
+            .expect("release control reply");
+        assert!(mapped_notice < release_reply, "scope mailbox order");
+
+        mapped_actor.shutdown().await;
+        unmapped_actor.shutdown().await;
+        let mapping = store
+            .active_thread(&mapped_scope)
+            .await
+            .expect("mapping")
+            .expect("preserved bridge mapping");
+        assert_eq!(mapping.origin, ThreadOrigin::BridgeCreated);
+        assert_eq!(mapping.codex_thread_id, "preserved-bridge-thread");
+        assert!(
+            store
+                .active_thread(&unmapped_scope)
+                .await
+                .expect("unmapped mapping")
+                .is_none()
+        );
+        for scope in [&mapped_scope, &unmapped_scope] {
+            let saga = store
+                .active_thread_adoption(scope)
+                .await
+                .expect("active saga")
+                .expect("recovery fence");
+            assert_eq!(saga.state, ThreadAdoptionState::RecoveryRequired);
+        }
+        store.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn terminal_precommit_cleanup_replays_release_control_with_accurate_atomic_reply() {
+        let mut fixture = actor_fixture();
+        fixture.settings.debounce = Duration::from_millis(1);
+        let store = StoreHandle::open_in_memory().await.expect("store");
+        let scope = ScopeKey::Chat("precommit-release-replay".to_owned());
+        let fingerprint = fixture
+            .policy
+            .fingerprint(&fixture.cwd)
+            .expect("fingerprint");
+        store
+            .upsert_scope(&scope, &fixture.cwd, fingerprint.as_str())
+            .await
+            .expect("scope");
+        store
+            .record_active_thread(&scope, "preserved-before-cleanup")
+            .await
+            .expect("preserved bridge mapping");
+        let reservation = store
+            .reserve_thread_adoption(&scope, "uncommitted-cleanup-target")
+            .await
+            .expect("reserve adoption");
+        let fenced = store
+            .fence_thread_adoption(&reservation)
+            .await
+            .expect("recovery fence");
+        // Model the crash gap precisely: the control is durably Received,
+        // cleanup commits, and the process dies before the atomic reply
+        // enqueue/Completed transition.
+        let (crash_key, crash_control) = queued_actor_event(
+            &store,
+            &fixture.tenant,
+            actor_event(&scope, "precommit-release-after-crash", "/release"),
+        )
+        .await;
+        store
+            .finish_thread_adoption_acquisition_failure(&fenced)
+            .await
+            .expect("durable cleanup before reply");
+
+        let adoption = Arc::new(ThreadAdoptionCoordinator::new(
+            store.clone(),
+            fixture.settings.backend.clone(),
+            4,
+        ));
+        assert_eq!(adoption.startup_fence().await.expect("startup fence"), 0);
+        let (_supervisor_tx, supervisor) = watch::channel(SupervisorAccess {
+            epoch: 7,
+            client: None,
+            profile_identity: None,
+            terminal: false,
+        });
+        let sink = OrderedSink::default();
+        let actor = ScopeActorHandle::spawn(
+            scope.clone(),
+            store.clone(),
+            fixture.policy,
+            fixture.settings,
+            supervisor,
+            Arc::new(Semaphore::new(1)),
+            Arc::new(sink.clone()),
+            None,
+            None,
+            None,
+            adoption,
+        );
+
+        assert!(
+            actor
+                .try_route_control(
+                    crash_key.clone(),
+                    crash_control,
+                    ScopeControl::Command(BridgeCommand::Release),
+                )
+                .is_ok()
+        );
+        let (retry_key, retry_control) = queued_actor_event(
+            &store,
+            &fixture.tenant,
+            actor_event(&scope, "precommit-release-retry", "/release"),
+        )
+        .await;
+        assert!(
+            actor
+                .try_route_control(
+                    retry_key.clone(),
+                    retry_control,
+                    ScopeControl::Command(BridgeCommand::Release),
+                )
+                .is_ok()
+        );
+        let keys = [crash_key, retry_key];
+
+        sink.wait_for(2).await;
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let mut completed = true;
+                for key in &keys {
+                    completed &= store
+                        .inbound_state(&fixture.tenant, &key.event_id)
+                        .await
+                        .expect("release state")
+                        == Some(InboundEventState::Completed);
+                }
+                if completed {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replayed release controls settle atomically");
+        let expected = "Release recovery complete. The uncommitted acquisition was durably closed after confirmed cleanup; no adopted mapping was removed, and any pre-existing bridge mapping remains active.";
+        assert_eq!(
+            sink.control_replies(),
+            [expected.to_owned(), expected.to_owned()]
+        );
+        assert_eq!(store.outbox_depth().await.expect("outbox").pending, 2);
+
+        actor.shutdown().await;
+        let mapping = store
+            .active_thread(&scope)
+            .await
+            .expect("mapping")
+            .expect("preserved bridge mapping");
+        assert_eq!(mapping.origin, ThreadOrigin::BridgeCreated);
+        assert_eq!(mapping.codex_thread_id, "preserved-before-cleanup");
+        let saga = store
+            .thread_adoption_saga(&scope)
+            .await
+            .expect("saga")
+            .expect("terminal saga");
+        assert_eq!(saga.state, ThreadAdoptionState::Terminal);
+        assert_eq!(saga.outcome, Some(ThreadAdoptionOutcome::AcquisitionFailed));
+        store.shutdown().await.expect("shutdown");
     }
 
     #[test]

@@ -65,6 +65,11 @@ pub const CONSUMED_NOTIFICATION_METHODS: &[&str] = &[
     "turn/completed",
 ];
 
+/// Opaque proof that this initialized client uses a reviewed wire contract
+/// with exact active-writer conflict semantics for persisted-thread adoption.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ThreadAdoptionContract(());
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ThreadId(Arc<str>);
 
@@ -490,6 +495,15 @@ impl AppServerClient {
         }
     }
 
+    /// Returns capability proof only for the exact reviewed adoption wires.
+    #[must_use]
+    pub const fn thread_adoption_contract(&self) -> Option<ThreadAdoptionContract> {
+        match self.wire {
+            WireAdapter::V0_149_0 | WireAdapter::SidecarV1 => Some(ThreadAdoptionContract(())),
+            WireAdapter::V0_146_0 => None,
+        }
+    }
+
     /// Lists Codex threads without binding any returned thread to bridge state.
     ///
     /// # Errors
@@ -573,12 +587,18 @@ impl AppServerClient {
     pub async fn resume_thread(&self, params: ThreadResumeParams) -> Result<Thread, ClientError> {
         self.ensure_thread_route(ThreadId::from(params.thread_id.as_str()))
             .await?;
-        let params = Self::encode_params("thread/resume", self.wire.thread_resume_params(&params))?;
+        let wire_params =
+            Self::encode_params("thread/resume", self.wire.thread_resume_params(&params))?;
         let mut guard =
             NonIdempotentGuard::new(self.cancellation.clone(), Arc::clone(&self.faulted));
         let result = match self
             .rpc
-            .request_budgeted::<_, Value>("thread/resume", &params, CONTROL_RPC_TIMEOUT)
+            .request_thread_resume_budgeted::<_, Value>(
+                &wire_params,
+                params.thread_id.as_str(),
+                self.wire,
+                CONTROL_RPC_TIMEOUT,
+            )
             .await
         {
             Ok(result) => result.try_map(|value| {
@@ -960,6 +980,7 @@ fn definitely_not_applied(error: &RpcError) -> bool {
             | RpcError::PayloadTooLarge { .. }
             | RpcError::RequestIdExhausted
             | RpcError::Server { .. }
+            | RpcError::ThreadResumeActiveWriter
     )
 }
 
