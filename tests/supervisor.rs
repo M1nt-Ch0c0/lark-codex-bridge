@@ -4,13 +4,23 @@ use std::{io, sync::Arc, time::Duration};
 
 use lark_codex_bridge::codex::{
     process::{CodexProcessConfig, ProcessError},
-    supervisor::{AppServerSupervisor, SupervisorError, SupervisorSettings, SupervisorState},
+    supervisor::{
+        AppServerSupervisor, OneShotSupervisorHandle, SupervisorError, SupervisorSettings,
+        SupervisorState,
+    },
     types::ThreadStartParams,
     wire::SUPPORTED_CODEX_VERSIONS,
 };
 use semver::Version;
 
 use fakecodex::{FakeFactory, FakeOutcome, next_state, test_settings};
+
+async fn next_one_shot_state(handle: &mut OneShotSupervisorHandle) -> SupervisorState {
+    tokio::time::timeout(Duration::from_secs(3), handle.changed())
+        .await
+        .expect("one-shot state transition timeout")
+        .expect("one-shot state watch should stay available")
+}
 
 struct PanickingFactory;
 
@@ -41,6 +51,10 @@ async fn restart_increments_epoch_and_invalidates_the_previous_client() {
         SupervisorState::Ready { epoch: 1, .. }
     ));
     let stale = handle.client().expect("ready client");
+    let shared_profile = handle
+        .profile_identity()
+        .expect("ready shared profile identity");
+    assert_eq!(format!("{shared_profile:?}"), "ProfileIdentity([REDACTED])");
     assert_eq!(stale.epoch().get(), 1);
     first_control.unexpected_exit();
 
@@ -109,6 +123,159 @@ async fn cleanup_failure_fences_replacement_epoch() {
 }
 
 #[tokio::test]
+async fn one_shot_unexpected_exit_never_restarts_and_confirms_cleanup() {
+    let (first, first_control) = FakeFactory::ready();
+    let (second, _second_control) = FakeFactory::ready();
+    let factory = Arc::new(FakeFactory::new([first, second]));
+    let mut handle = AppServerSupervisor::start_once_with_factory(
+        CodexProcessConfig::default(),
+        factory.clone(),
+        test_settings(),
+    )
+    .await
+    .expect("one-shot supervisor starts");
+
+    assert!(matches!(
+        next_one_shot_state(&mut handle).await,
+        SupervisorState::Ready { epoch: 1, .. }
+    ));
+    assert_eq!(
+        handle
+            .client()
+            .expect("initialized one-shot client")
+            .epoch()
+            .get(),
+        1
+    );
+    assert_eq!(
+        format!(
+            "{:?}",
+            handle
+                .profile_identity()
+                .expect("ready one-shot profile identity")
+        ),
+        "ProfileIdentity([REDACTED])"
+    );
+
+    first_control.unexpected_exit();
+    assert!(matches!(
+        next_one_shot_state(&mut handle).await,
+        SupervisorState::Stopped
+    ));
+    assert_eq!(
+        factory.spawn_count(),
+        1,
+        "one-shot ownership must not restart"
+    );
+    assert_eq!(first_control.terminate_calls(), vec![Duration::ZERO]);
+    assert!(matches!(handle.client(), Err(SupervisorError::NotReady)));
+    assert!(matches!(
+        handle.profile_identity(),
+        Err(SupervisorError::NotReady)
+    ));
+    handle
+        .shutdown()
+        .await
+        .expect("completed cleanup remains confirmed to the owner");
+}
+
+#[tokio::test]
+async fn unexpected_leader_exit_terminates_before_client_shutdown() {
+    let (outcome, control) = FakeFactory::ready();
+    let factory = Arc::new(FakeFactory::new([outcome]));
+    let mut handle = AppServerSupervisor::start_once_with_factory(
+        CodexProcessConfig::default(),
+        factory,
+        SupervisorSettings::new(Duration::from_millis(50), |_, _| Duration::ZERO),
+    )
+    .await
+    .expect("one-shot supervisor starts");
+    assert!(matches!(
+        next_one_shot_state(&mut handle).await,
+        SupervisorState::Ready { epoch: 1, .. }
+    ));
+
+    control.unexpected_leader_exit();
+    assert!(matches!(
+        next_one_shot_state(&mut handle).await,
+        SupervisorState::Stopped
+    ));
+    assert_eq!(control.terminate_calls(), vec![Duration::ZERO]);
+    assert_eq!(
+        control.lifecycle_events(),
+        vec!["terminate", "client_shutdown"],
+        "a reaped leader's numeric process-group identity must be settled before transport teardown"
+    );
+    handle.shutdown().await.expect("cleanup remains confirmed");
+}
+
+#[tokio::test]
+async fn one_shot_consuming_shutdown_waits_for_confirmed_cleanup() {
+    let (outcome, control) = FakeFactory::ready();
+    let factory = Arc::new(FakeFactory::new([outcome]));
+    let mut handle = AppServerSupervisor::start_once_with_factory(
+        CodexProcessConfig::default(),
+        factory,
+        SupervisorSettings::new(Duration::from_millis(11), |_, _| Duration::ZERO),
+    )
+    .await
+    .expect("one-shot supervisor starts");
+    assert!(matches!(
+        next_one_shot_state(&mut handle).await,
+        SupervisorState::Ready { epoch: 1, .. }
+    ));
+
+    handle
+        .shutdown()
+        .await
+        .expect("process abstraction confirms termination and reap");
+    assert_eq!(control.terminate_calls(), vec![Duration::from_millis(11)]);
+}
+
+#[tokio::test]
+async fn one_shot_consuming_shutdown_reports_unconfirmed_cleanup() {
+    let (outcome, control) = FakeFactory::ready_with_terminate_error(io::ErrorKind::TimedOut);
+    let factory = Arc::new(FakeFactory::new([outcome]));
+    let mut handle = AppServerSupervisor::start_once_with_factory(
+        CodexProcessConfig::default(),
+        factory.clone(),
+        SupervisorSettings::new(Duration::from_millis(13), |_, _| Duration::ZERO),
+    )
+    .await
+    .expect("one-shot supervisor starts");
+    assert!(matches!(
+        next_one_shot_state(&mut handle).await,
+        SupervisorState::Ready { epoch: 1, .. }
+    ));
+
+    assert_eq!(handle.shutdown().await, Err(SupervisorError::CleanupFailed));
+    assert_eq!(factory.spawn_count(), 1);
+    assert_eq!(control.terminate_calls(), vec![Duration::from_millis(13)]);
+}
+
+#[tokio::test]
+async fn one_shot_process_tree_cleanup_uncertainty_survives_consuming_shutdown() {
+    let factory = Arc::new(FakeFactory::new([FakeOutcome::Error(
+        ProcessError::ProcessTreeCleanupUnconfirmed,
+    )]));
+    let handle = AppServerSupervisor::start_once_with_factory(
+        CodexProcessConfig::default(),
+        factory.clone(),
+        test_settings(),
+    )
+    .await
+    .expect("the owner must receive the degraded one-shot handle");
+
+    assert!(matches!(
+        handle.state(),
+        SupervisorState::Degraded { ref reason }
+            if reason == "Codex process cleanup failed; replacement is fenced until bridge restart"
+    ));
+    assert_eq!(handle.shutdown().await, Err(SupervisorError::CleanupFailed));
+    assert_eq!(factory.spawn_count(), 1);
+}
+
+#[tokio::test]
 async fn cancelling_public_startup_stops_the_detached_supervisor_task() {
     let (first, first_gate) =
         FakeFactory::gated_error(ProcessError::Wait(io::Error::from(io::ErrorKind::TimedOut)));
@@ -140,6 +307,45 @@ async fn cancelling_public_startup_stops_the_detached_supervisor_task() {
             .is_err(),
         "startup cancellation must not leave a detached retry loop"
     );
+    assert_eq!(factory.spawn_count(), 1);
+}
+
+#[tokio::test]
+async fn cancelling_public_startup_reaps_a_process_returned_by_inflight_spawn() {
+    let (outcome, control, gate) = FakeFactory::gated_ready();
+    let factory = Arc::new(FakeFactory::new([outcome]));
+    let settings = test_settings();
+    let expected_grace = settings.shutdown_grace();
+    let startup = tokio::spawn({
+        let factory = Arc::clone(&factory);
+        async move {
+            AppServerSupervisor::start_with_factory(
+                CodexProcessConfig::default(),
+                factory,
+                settings,
+            )
+            .await
+        }
+    });
+
+    gate.wait_started().await;
+    startup.abort();
+    assert!(
+        matches!(startup.await, Err(error) if error.is_cancelled()),
+        "the public startup future must be cancelled before it returns a handle"
+    );
+    gate.release();
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if control.terminate_calls() == vec![expected_grace] {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the detached supervisor must reap the process after spawn completes");
     assert_eq!(factory.spawn_count(), 1);
 }
 

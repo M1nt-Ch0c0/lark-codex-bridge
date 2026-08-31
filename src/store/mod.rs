@@ -18,6 +18,7 @@
 //! Redaction: errors and `Debug` output carry static contexts, states, IDs,
 //! and sizes only — never message text, payload bodies, or secrets.
 
+mod adoption;
 mod attachments;
 mod dedup;
 mod external;
@@ -38,6 +39,9 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 
 use crate::limits::{STORE_REQUEST_MAX_BYTES, STORE_WRITER_BYTE_BUDGET};
 
+pub use adoption::{
+    ThreadAdoptionOutcome, ThreadAdoptionReleaseResult, ThreadAdoptionSaga, ThreadAdoptionState,
+};
 pub use attachments::{AttachmentLeaseRow, AttachmentRow};
 pub use dedup::{
     BeginTurnOutcome, ClaimedInbound, DedupOutcome, InboundDisposition, InboundEventState,
@@ -58,7 +62,9 @@ pub use external_write::{
     NewExternalApprovalClaim, NewExternalMutationIntent,
 };
 pub use outbox::{NewOutboxRow, OutboxDepth, OutboxEnqueue, OutboxRow, OutboxState};
-pub use sessions::{NewTurnRow, ScopeRow, ThreadRow, ThreadStatus, TurnRow, TurnState};
+pub use sessions::{
+    NewTurnRow, ScopeRow, ThreadOrigin, ThreadRow, ThreadStatus, TurnRow, TurnState,
+};
 use writer::StoreRequest;
 
 /// Store failures with classified, content-free contexts.

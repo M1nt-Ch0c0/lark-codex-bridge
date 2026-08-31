@@ -72,6 +72,11 @@ runtime 不能把旧 epoch 的请求或事件误归入新连接。
 
 - 普通 `run` 支持 owned `spawned_stdio` 和 `protocol_sidecar`；显式 shared external endpoint
   仍在 mutation-driven 装配路径 fail closed。
-- 外部 persisted thread 接管尚未实现（Issue #4）。
+- persisted thread 只在 Linux/macOS 允许 managed stdio/sidecar 的显式顺序交接；Unix
+  lifecycle 用 `waitid(WNOWAIT)` 保留 leader PID/PGID 身份，所有破坏性 group signal 都必须
+  发生在 exact leader wait/reap 之前；Unix 禁止调用 outer group wait，wait 后只允许以 signal-0
+  得到 process-group `ESRCH`；`ECHILD` 会立即 poison 身份并禁止后续 signal/wait。Windows Job child
+  wait 不等于 `ACTIVE_PROCESS_ZERO`，因此 adoption fail closed，但普通 backend 不受影响；
+  shared external endpoint 继续按 Issue #8 fail closed。
 - Schema 自动同步和兼容矩阵尚未实现（Issue #7）。
 - server request 的飞书 approve/deny UI 尚未实现；建议 approval policy 保持 `never`。

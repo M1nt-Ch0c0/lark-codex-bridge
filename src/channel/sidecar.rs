@@ -13,11 +13,11 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
-#[cfg(windows)]
-use process_wrap::tokio::JobObject;
 #[cfg(unix)]
 use process_wrap::tokio::ProcessGroup;
-use process_wrap::tokio::{KillOnDrop, TokioChildWrapper, TokioCommandWrap};
+#[cfg(windows)]
+use process_wrap::tokio::{JobObject, KillOnDrop};
+use process_wrap::tokio::{TokioChildWrapper, TokioCommandWrap};
 use secrecy::ExposeSecret as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -32,6 +32,14 @@ use uuid::Uuid;
 
 use super::wire::{PROTOCOL, REQUIRED_CAPABILITIES, VERSION};
 use super::{ConnectionState, InboundSource};
+use crate::codex::process::{
+    drop_or_forget_unreaped_child, record_wait_identity_loss, wait_owned_leader_or_job,
+};
+#[cfg(unix)]
+use crate::codex::process::{
+    try_wait_for_owned_leader_exit_without_reaping, wait_for_owned_leader_exit_without_reaping,
+    wait_for_owned_process_group_empty,
+};
 use crate::codex::supervisor::AppServerSupervisor;
 use crate::lark::bridge::InboundEventHandler;
 use crate::lark::credentials::LarkCredentials;
@@ -331,13 +339,30 @@ async fn supervise(
                     }
                 }
             }
-            Err(error) => {
+            Err(failure) => {
+                let ChildStartFailure {
+                    error,
+                    cleanup_unconfirmed,
+                } = failure;
                 if let Some(ready) = ready.take() {
                     let _ = ready.send(Err(error));
                     publish(
                         &state,
                         ConnectionState::Degraded {
-                            reason: "node_sidecar_startup_failed".to_owned(),
+                            reason: if cleanup_unconfirmed {
+                                "node_sidecar_cleanup_unconfirmed".to_owned()
+                            } else {
+                                "node_sidecar_startup_failed".to_owned()
+                            },
+                        },
+                    );
+                    return;
+                }
+                if cleanup_unconfirmed {
+                    publish(
+                        &state,
+                        ConnectionState::Degraded {
+                            reason: "node_sidecar_cleanup_unconfirmed".to_owned(),
                         },
                     );
                     return;
@@ -382,51 +407,172 @@ enum SessionEnd {
     Crashed {
         was_healthy: bool,
     },
-    /// A fatal provider failure was reported; supervision must not restart.
+    /// A fatal provider failure or unconfirmed cleanup fenced all restarts.
     Failed,
     Shutdown,
 }
 
 /// The sidecar is always the leader of an owned POSIX process group or, on
-/// Windows, an owned Job object. `start_kill` targets that whole ownership
-/// boundary, including non-exec wrapper descendants.
+/// Windows, an owned Job object. On POSIX the leader remains unreaped until the
+/// one authorized group signal has been sent, so its numeric PGID cannot be
+/// reused by another concurrently supervised process tree.
 struct OwnedChildGroup {
-    child: Box<dyn TokioChildWrapper>,
+    child: Option<Box<dyn TokioChildWrapper>>,
+    leader_pid: u32,
+    group_signal_authorized: bool,
+    identity_lost: bool,
+    cleanup_confirmed: bool,
 }
 
 impl OwnedChildGroup {
-    fn new(child: Box<dyn TokioChildWrapper>) -> Self {
-        Self { child }
+    fn new(child: Box<dyn TokioChildWrapper>) -> Result<Self, Box<dyn TokioChildWrapper>> {
+        let Some(leader_pid) = child.inner().id() else {
+            return Err(child);
+        };
+        Ok(Self {
+            child: Some(child),
+            leader_pid,
+            group_signal_authorized: true,
+            identity_lost: false,
+            cleanup_confirmed: false,
+        })
     }
 
     fn inner(&mut self) -> &mut tokio::process::Child {
-        self.child.inner_mut()
+        self.child
+            .as_mut()
+            .expect("owned sidecar child exists until cleanup")
+            .inner_mut()
     }
 
-    async fn wait_leader(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        self.child.inner_mut().wait().await
-    }
-
-    async fn terminate_and_reap(&mut self, grace: Duration) {
-        // This is deliberately attempted even after the leader has exited:
-        // descendants may still own the process group/Job and inherited pipes.
-        let _ = self.child.start_kill();
-        if timeout(grace, Box::into_pin(self.child.wait()))
-            .await
-            .is_err()
-        {
-            tracing::warn!("node sidecar process group did not reap within its bound");
-            let _ = self.child.start_kill();
-            let _ = timeout(grace, self.child.inner_mut().wait()).await;
+    async fn wait_leader(&mut self) -> std::io::Result<()> {
+        if self.identity_lost {
+            return Err(std::io::Error::other(
+                "owned node sidecar identity is no longer available",
+            ));
         }
+        #[cfg(unix)]
+        {
+            wait_for_owned_leader_exit_without_reaping(
+                self.leader_pid,
+                &mut self.group_signal_authorized,
+                &mut self.identity_lost,
+            )
+            .await
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows cleanup is keyed by the Job handle rather than this PID.
+            let _ = self.leader_pid;
+            self.child
+                .as_mut()
+                .expect("owned sidecar child exists until cleanup")
+                .inner_mut()
+                .wait()
+                .await
+                .map(|_| ())
+        }
+    }
+
+    async fn terminate_and_reap(&mut self, grace: Duration) -> bool {
+        let Some(child) = self.child.as_mut() else {
+            return self.cleanup_confirmed;
+        };
+        if self.identity_lost {
+            let child = self.child.take().expect("checked owned sidecar child");
+            drop_or_forget_unreaped_child(child, true);
+            tracing::warn!("node sidecar process identity was lost before cleanup");
+            return false;
+        }
+
+        let deadline = Instant::now() + grace.max(Duration::from_secs(1));
+        #[cfg(unix)]
+        {
+            if child.inner().id().is_none()
+                || try_wait_for_owned_leader_exit_without_reaping(
+                    self.leader_pid,
+                    &mut self.group_signal_authorized,
+                    &mut self.identity_lost,
+                )
+                .is_err()
+            {
+                self.group_signal_authorized = false;
+            }
+        }
+        if self.identity_lost {
+            let child = self.child.take().expect("checked owned sidecar child");
+            drop_or_forget_unreaped_child(child, true);
+            tracing::warn!("node sidecar process identity was lost before cleanup");
+            return false;
+        }
+        if self.group_signal_authorized {
+            let _ = child.start_kill();
+            // This is the sole destructive signal for this ownership epoch.
+            // All following Unix work is exact-leader reap plus passive proof.
+            self.group_signal_authorized = false;
+        }
+
+        let waited = timeout_at(deadline, wait_owned_leader_or_job(child)).await;
+        let confirmed = match waited {
+            Ok(Ok(_)) => {
+                #[cfg(unix)]
+                {
+                    wait_for_owned_process_group_empty(self.leader_pid, deadline)
+                        .await
+                        .is_ok()
+                }
+                #[cfg(not(unix))]
+                {
+                    true
+                }
+            }
+            Ok(Err(source)) => {
+                record_wait_identity_loss(
+                    &source,
+                    &mut self.group_signal_authorized,
+                    &mut self.identity_lost,
+                );
+                false
+            }
+            Err(_) => false,
+        };
+        let child = self.child.take().expect("checked owned sidecar child");
+        drop_or_forget_unreaped_child(child, self.identity_lost);
+        self.cleanup_confirmed = confirmed;
+        if !confirmed {
+            tracing::warn!("node sidecar process-tree cleanup was not confirmed within its bound");
+        }
+        confirmed
     }
 }
 
 impl Drop for OwnedChildGroup {
     fn drop(&mut self) {
-        // Synchronous group/Job termination is the last-resort guarantee when
-        // an owning async task is aborted or a public handle is dropped.
-        let _ = self.child.start_kill();
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        if !self.identity_lost && self.group_signal_authorized {
+            #[cfg(unix)]
+            {
+                if child.inner().id().is_none()
+                    || try_wait_for_owned_leader_exit_without_reaping(
+                        self.leader_pid,
+                        &mut self.group_signal_authorized,
+                        &mut self.identity_lost,
+                    )
+                    .is_err()
+                {
+                    self.group_signal_authorized = false;
+                }
+            }
+            if self.group_signal_authorized {
+                // Synchronous group/Job termination is the last-resort action
+                // when an owning async task is aborted or its handle is dropped.
+                let _ = child.start_kill();
+                self.group_signal_authorized = false;
+            }
+        }
+        drop_or_forget_unreaped_child(child, self.identity_lost);
     }
 }
 
@@ -469,13 +615,45 @@ struct ChildSession {
     healthy_uptime: Duration,
 }
 
+struct ChildStartFailure {
+    error: LarkError,
+    cleanup_unconfirmed: bool,
+}
+
+impl ChildStartFailure {
+    fn after_cleanup(error: LarkError, cleanup_confirmed: bool) -> Self {
+        if cleanup_confirmed {
+            Self {
+                error,
+                cleanup_unconfirmed: false,
+            }
+        } else {
+            Self {
+                error: LarkError::protocol(
+                    "node sidecar process-tree cleanup could not be confirmed",
+                ),
+                cleanup_unconfirmed: true,
+            }
+        }
+    }
+}
+
+impl From<LarkError> for ChildStartFailure {
+    fn from(error: LarkError) -> Self {
+        Self {
+            error,
+            cleanup_unconfirmed: false,
+        }
+    }
+}
+
 impl ChildSession {
     async fn start(
         config: &NodeSidecarConfig,
         credentials: &LarkCredentials,
         handler: InboundEventHandler,
         state: watch::Sender<ConnectionState>,
-    ) -> Result<Self, LarkError> {
+    ) -> Result<Self, ChildStartFailure> {
         let mut command = Command::new(&config.node_binary);
         let search_path = std::env::var_os("PATH");
         command
@@ -496,6 +674,7 @@ impl ChildSession {
             }
         }
         let mut command = TokioCommandWrap::from(command);
+        #[cfg(windows)]
         command.wrap(KillOnDrop);
         #[cfg(unix)]
         command.wrap(ProcessGroup::leader());
@@ -504,15 +683,25 @@ impl ChildSession {
         let child = command
             .spawn()
             .map_err(|_| LarkError::retryable("spawning the node sidecar"))?;
-        let mut child = OwnedChildGroup::new(child);
+        let mut child = match OwnedChildGroup::new(child) {
+            Ok(child) => child,
+            Err(child) => {
+                drop_or_forget_unreaped_child(child, true);
+                return Err(ChildStartFailure::after_cleanup(
+                    LarkError::protocol("node sidecar process id is unavailable"),
+                    false,
+                ));
+            }
+        };
         let (stdin, stdout, stderr_pipe) = {
             let inner = child.inner();
             (inner.stdin.take(), inner.stdout.take(), inner.stderr.take())
         };
         let (Some(stdin), Some(stdout), Some(stderr_pipe)) = (stdin, stdout, stderr_pipe) else {
-            child.terminate_and_reap(config.shutdown_grace).await;
-            return Err(LarkError::protocol(
-                "node sidecar standard streams are unavailable",
+            let cleanup_confirmed = child.terminate_and_reap(config.shutdown_grace).await;
+            return Err(ChildStartFailure::after_cleanup(
+                LarkError::protocol("node sidecar standard streams are unavailable"),
+                cleanup_confirmed,
             ));
         };
         let stdout = FramedRead::new(
@@ -549,8 +738,8 @@ impl ChildSession {
             healthy_uptime: config.healthy_uptime,
         };
         if let Err(error) = session.bootstrap(config, credentials).await {
-            session.cleanup_failed_bootstrap().await;
-            return Err(error);
+            let cleanup_confirmed = session.cleanup_failed_bootstrap().await;
+            return Err(ChildStartFailure::after_cleanup(error, cleanup_confirmed));
         }
         Ok(session)
     }
@@ -692,12 +881,13 @@ impl ChildSession {
         .map_err(|_| LarkError::retryable("waiting for initial node sidecar connection"))?
     }
 
-    async fn cleanup_failed_bootstrap(&mut self) {
+    async fn cleanup_failed_bootstrap(&mut self) -> bool {
         self.active_ids.clear();
         self.writer.abort();
         self.worker.abort();
-        self.child.terminate_and_reap(self.shutdown_grace).await;
+        let cleanup_confirmed = self.child.terminate_and_reap(self.shutdown_grace).await;
         self.stderr.abort();
+        cleanup_confirmed
     }
 
     async fn run(mut self, shutdown: &CancellationToken) -> SessionEnd {
@@ -771,16 +961,24 @@ impl ChildSession {
     }
 
     async fn crashed(&mut self, was_healthy: bool) -> SessionEnd {
-        self.child.terminate_and_reap(self.shutdown_grace).await;
+        let cleanup_confirmed = self.child.terminate_and_reap(self.shutdown_grace).await;
         self.abort_tasks();
-        SessionEnd::Crashed { was_healthy }
+        if cleanup_confirmed {
+            SessionEnd::Crashed { was_healthy }
+        } else {
+            self.publish_cleanup_failure();
+            SessionEnd::Failed
+        }
     }
 
     /// A permanent provider failure cannot succeed on restart: reap the
     /// process epoch and end supervision instead of entering backoff.
     async fn terminal(&mut self) -> SessionEnd {
-        self.child.terminate_and_reap(self.shutdown_grace).await;
+        let cleanup_confirmed = self.child.terminate_and_reap(self.shutdown_grace).await;
         self.abort_tasks();
+        if !cleanup_confirmed {
+            self.publish_cleanup_failure();
+        }
         SessionEnd::Failed
     }
 
@@ -822,9 +1020,23 @@ impl ChildSession {
             let _ = timeout_at(deadline, self.child.wait_leader()).await;
         }
         // Even a cleanly exited wrapper may have left descendants behind.
-        self.child.terminate_and_reap(self.shutdown_grace).await;
+        let cleanup_confirmed = self.child.terminate_and_reap(self.shutdown_grace).await;
         self.abort_tasks();
-        SessionEnd::Shutdown
+        if cleanup_confirmed {
+            SessionEnd::Shutdown
+        } else {
+            self.publish_cleanup_failure();
+            SessionEnd::Failed
+        }
+    }
+
+    fn publish_cleanup_failure(&self) {
+        publish(
+            &self.state,
+            ConnectionState::Degraded {
+                reason: "node_sidecar_cleanup_unconfirmed".to_owned(),
+            },
+        );
     }
 
     fn abort_tasks(&self) {

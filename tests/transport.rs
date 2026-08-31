@@ -17,7 +17,7 @@ use lark_codex_bridge::{
             TransportEvent, TransportEventReceiver, TransportHandle, spawn_stream_transport,
         },
     },
-    limits::{EVENT_CAPACITY, MAX_JSONL_LINE_BYTES, MAX_STDERR_LINE_BYTES},
+    limits::{EVENT_CAPACITY, MAX_JSONL_LINE_BYTES, MAX_STDERR_LINE_BYTES, VERSION_PROBE_TIMEOUT},
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -568,6 +568,100 @@ fn fake_app_server() -> (tempfile::TempDir, std::path::PathBuf) {
 }
 
 #[cfg(unix)]
+fn fake_process_tree_app_server() -> (tempfile::TempDir, std::path::PathBuf) {
+    let directory = tempfile::tempdir().expect("temporary directory should be created");
+    let binary = install_executable_fixture(directory.path(), "codex process tree fixture");
+    (directory, binary)
+}
+
+#[cfg(unix)]
+fn fake_process_tree_version_probe() -> (tempfile::TempDir, std::path::PathBuf) {
+    let directory = tempfile::tempdir().expect("temporary directory should be created");
+    let binary = install_executable_fixture(directory.path(), "codex version probe tree fixture");
+    (directory, binary)
+}
+
+#[cfg(unix)]
+fn fake_detached_process_tree_version_probe() -> (tempfile::TempDir, std::path::PathBuf) {
+    let directory = tempfile::tempdir().expect("temporary directory should be created");
+    let binary = install_executable_fixture(
+        directory.path(),
+        "codex version probe detached tree fixture",
+    );
+    (directory, binary)
+}
+
+#[cfg(unix)]
+fn unix_process_matches(pid: u32, token: &str) -> bool {
+    let output = std::process::Command::new("/bin/ps")
+        .args([
+            "-ww",
+            "-p",
+            &pid.to_string(),
+            "-o",
+            "stat=",
+            "-o",
+            "command=",
+        ])
+        .stderr(std::process::Stdio::null())
+        .output();
+    let Ok(output) = output else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let process = String::from_utf8_lossy(&output.stdout);
+    let mut fields = process.trim_start().splitn(2, char::is_whitespace);
+    let state = fields.next().unwrap_or_default();
+    let command = fields.next().unwrap_or_default().trim_start();
+    !state.starts_with('Z') && command.contains(token)
+}
+
+#[cfg(unix)]
+struct NativeDescendant {
+    pid: u32,
+    token: String,
+}
+
+#[cfg(unix)]
+struct NativeDescendantCleanup<'a>(&'a NativeDescendant);
+
+#[cfg(unix)]
+impl Drop for NativeDescendantCleanup<'_> {
+    fn drop(&mut self) {
+        if unix_process_matches(self.0.pid, &self.0.token) {
+            let _ = std::process::Command::new("/bin/kill")
+                .args(["-KILL", &self.0.pid.to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn read_descendant(path: &std::path::Path) -> NativeDescendant {
+    timeout(EVENT_TIMEOUT, async {
+        loop {
+            if let Ok(contents) = std::fs::read_to_string(path)
+                && let Some((pid, token)) = contents.trim_end().split_once('\t')
+                && let Ok(pid) = pid.parse()
+                && !token.is_empty()
+            {
+                return NativeDescendant {
+                    pid,
+                    token: token.to_owned(),
+                };
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("native app-server fixture should publish its descendant PID")
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn version_probe_executes_the_binary_directly_for_each_supported_version() {
     for (fixture_name, expected) in [
@@ -609,6 +703,60 @@ async fn version_probe_rejects_malformed_and_unsupported_versions() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn timed_out_version_probe_reaps_its_owned_process_group() {
+    let (directory, binary) = fake_process_tree_version_probe();
+    let marker = directory.path().join("version-descendant.pid");
+    let config = CodexProcessConfig {
+        binary,
+        codex_home: None,
+    };
+    let probe = tokio::spawn(async move { probe_version(&config).await });
+    let descendant = read_descendant(&marker).await;
+    let _cleanup = NativeDescendantCleanup(&descendant);
+
+    let result = timeout(VERSION_PROBE_TIMEOUT + EVENT_TIMEOUT, probe)
+        .await
+        .expect("version-probe timeout cleanup must remain bounded")
+        .expect("version-probe task must not fail");
+    assert!(matches!(
+        result,
+        Err(lark_codex_bridge::codex::process::ProcessError::ProbeTimeout(_))
+    ));
+    assert!(
+        !unix_process_matches(descendant.pid, &descendant.token),
+        "timed-out version probe must not leave its descendant alive"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn successful_version_probe_reaps_a_detached_descendant_before_returning() {
+    let (directory, binary) = fake_detached_process_tree_version_probe();
+    let marker = directory.path().join("version-detached-descendant.pid");
+    let config = CodexProcessConfig {
+        binary,
+        codex_home: None,
+    };
+
+    let version = timeout(
+        VERSION_PROBE_TIMEOUT + EVENT_TIMEOUT,
+        probe_version(&config),
+    )
+    .await
+    .expect("successful version-probe cleanup must remain bounded")
+    .expect("valid version output should succeed after owned-tree cleanup");
+    let descendant = read_descendant(&marker).await;
+    let _cleanup = NativeDescendantCleanup(&descendant);
+
+    assert_eq!(version, semver::Version::new(0, 149, 0));
+    assert!(
+        !unix_process_matches(descendant.pid, &descendant.token),
+        "successful version probe must not leave a detached descendant alive"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn app_server_stdio_is_transferred_once_and_shutdown_by_eof() {
     use lark_codex_bridge::codex::{process::spawn_app_server, transport::TransportExit};
 
@@ -634,6 +782,42 @@ async fn app_server_stdio_is_transferred_once_and_shutdown_by_eof() {
         .expect("app-server wait should succeed");
     assert!(exit.success);
     assert_eq!(exit.pid, process.id());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn native_app_server_termination_reaps_descendants_after_leader_exit() {
+    use lark_codex_bridge::codex::process::spawn_app_server;
+
+    let (directory, binary) = fake_process_tree_app_server();
+    let marker = directory.path().join("descendant.pid");
+    let mut process = spawn_app_server(&CodexProcessConfig {
+        binary,
+        codex_home: None,
+    })
+    .await
+    .expect("process-tree fake app-server should start");
+    let descendant = read_descendant(&marker).await;
+    let _cleanup = NativeDescendantCleanup(&descendant);
+
+    timeout(EVENT_TIMEOUT, process.wait_for_exit_without_reaping())
+        .await
+        .expect("fake app-server leader should exit")
+        .expect("non-reaping leader observation should succeed");
+    assert!(
+        unix_process_matches(descendant.pid, &descendant.token),
+        "fixture descendant must outlive its leader before cleanup"
+    );
+
+    let leader = process
+        .terminate(Duration::from_secs(2))
+        .await
+        .expect("native process-group termination must confirm full reap");
+    assert!(leader.success);
+    assert!(
+        !unix_process_matches(descendant.pid, &descendant.token),
+        "confirmed native cleanup must leave no live descendant"
+    );
 }
 
 #[cfg(unix)]

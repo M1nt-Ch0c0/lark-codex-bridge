@@ -12,7 +12,7 @@
     "lark-codex-protocol-sidecar": "index.cjs"
   },
   "scripts": {
-    "check": "node --check index.cjs && node --check wire.cjs && node --check priority-write-queue.cjs && node --check upstream.cjs && node --check session.cjs && node --check adapters/common.cjs && node --check adapters/domain.cjs && node --check adapters/index.cjs && node --check adapters/0.149.0.cjs && node --check adapters/0.151.0.cjs && node --check ci/build-artifact.cjs && node --check ci/real-artifact-smoke.cjs && node --check ci/run-tests.cjs && node ci/build-artifact.cjs --self-test && node ci/real-artifact-smoke.cjs --self-test",
+    "check": "node --check index.cjs && node --check wire.cjs && node --check priority-write-queue.cjs && node --check upstream.cjs && node --check session.cjs && node --check adapters/common.cjs && node --check adapters/domain.cjs && node --check adapters/index.cjs && node --check adapters/0.149.0.cjs && node --check adapters/0.151.0.cjs && node --check ci/build-artifact.cjs && node --check ci/real-artifact-smoke.cjs && node --check ci/run-tests.cjs && node --check ../scripts/thread-adoption-handoff-e2e.cjs && node ci/build-artifact.cjs --self-test && node ci/real-artifact-smoke.cjs --self-test && node ../scripts/thread-adoption-handoff-e2e.cjs --self-test",
     "ci:artifact": "node ci/build-artifact.cjs",
     "ci:smoke": "node ci/real-artifact-smoke.cjs",
     "test": "node ci/run-tests.cjs",

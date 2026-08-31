@@ -23,7 +23,10 @@ use crate::{
         transport::LarkTransport,
     },
     limits::PROBE_TIMEOUT,
-    runtime::adoption::{ThreadAdoptionAvailability, ThreadAdoptionGate},
+    runtime::adoption::{
+        THREAD_ADOPTION_SUPPORTED_PLATFORMS, ThreadAdoptionAvailability, ThreadAdoptionBackend,
+        ThreadAdoptionGate,
+    },
 };
 
 #[derive(Debug, Parser)]
@@ -307,16 +310,40 @@ struct ThreadAdoptionReport {
     available: bool,
     classification: ThreadAdoptionAvailability,
     guidance: &'static str,
+    release_authority: Option<&'static str>,
+    managed_backends: [&'static str; 2],
+    supported_platforms: &'static [&'static str],
+    external_endpoint: ThreadAdoptionExternalEndpointReport,
     requires_explicit_handoff: bool,
     shared_endpoint_issue: u8,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadAdoptionExternalEndpointReport {
+    available: bool,
+    classification: ThreadAdoptionAvailability,
+    guidance: &'static str,
+}
+
 fn report_thread_adoption_status() -> Result<()> {
-    let availability = ThreadAdoptionGate.availability();
+    let availability = ThreadAdoptionGate::managed_stdio().availability();
+    let external = ThreadAdoptionGate::external_endpoint().availability();
     let report = ThreadAdoptionReport {
         available: availability.is_available(),
         classification: availability,
         guidance: availability.guidance(),
+        release_authority: availability.release_authority(),
+        managed_backends: [
+            ThreadAdoptionBackend::ManagedStdio.code(),
+            ThreadAdoptionBackend::ManagedSidecar.code(),
+        ],
+        supported_platforms: THREAD_ADOPTION_SUPPORTED_PLATFORMS,
+        external_endpoint: ThreadAdoptionExternalEndpointReport {
+            available: external.is_available(),
+            classification: external,
+            guidance: external.guidance(),
+        },
         requires_explicit_handoff: true,
         shared_endpoint_issue: 8,
     };

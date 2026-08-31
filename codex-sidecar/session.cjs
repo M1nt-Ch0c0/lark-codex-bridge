@@ -15,6 +15,12 @@ const {
 const { drainStderr, terminateChild } = require("./upstream.cjs");
 
 const LOCAL_REQUEST_TIMEOUT_MS = 30_000;
+const ROUTING_ID_BYTE_LIMIT = 1_024;
+const UPSTREAM_INVALID_REQUEST_CODE = -32600;
+const THREAD_RESUME_ACTIVE_WRITER_CODE = -32023;
+const THREAD_RESUME_ACTIVE_WRITER_MESSAGE = "thread/resume active-writer conflict";
+const ACTIVE_WRITER_SUFFIX = " already has an active writer";
+const ACTIVE_WRITER_PREFIXES = ["thread ", "thread-store conflict: thread "];
 // The bridge handler path may spend 15s fetching from Lark, 30s in ffmpeg, and
 // 60s in ASR. Keep a separate reverse-request envelope with
 // queue/scheduling margin instead of applying the ordinary upstream RPC
@@ -85,6 +91,67 @@ class RetiredMappings {
 
 function rpcError(id, code, message) {
   return { id, error: { code, message } };
+}
+
+function threadIdFingerprint(value) {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    Buffer.byteLength(value, "utf8") > ROUTING_ID_BYTE_LIMIT
+  ) {
+    return null;
+  }
+  return crypto.createHash("sha256").update(value, "utf8").digest();
+}
+
+function activeWriterFingerprint(method, params) {
+  if (
+    method !== "thread/resume" ||
+    params === null ||
+    typeof params !== "object" ||
+    Array.isArray(params)
+  ) {
+    return null;
+  }
+  return threadIdFingerprint(params.threadId);
+}
+
+function activeWriterThreadId(message) {
+  for (const prefix of ACTIVE_WRITER_PREFIXES) {
+    if (message.startsWith(prefix) && message.endsWith(ACTIVE_WRITER_SUFFIX)) {
+      const threadId = message.slice(prefix.length, -ACTIVE_WRITER_SUFFIX.length);
+      if (threadIdFingerprint(threadId) !== null) {
+        return threadId;
+      }
+    }
+  }
+  return null;
+}
+
+function classifyUpstreamError(pending, error) {
+  const generic = { code: error.code, message: "upstream request failed" };
+  if (
+    pending.activeWriterFingerprint === null ||
+    error.code !== UPSTREAM_INVALID_REQUEST_CODE ||
+    (error.data !== undefined && error.data !== null)
+  ) {
+    return generic;
+  }
+  const threadId = activeWriterThreadId(error.message);
+  if (threadId === null) {
+    return generic;
+  }
+  const observedFingerprint = threadIdFingerprint(threadId);
+  if (
+    observedFingerprint === null ||
+    !crypto.timingSafeEqual(observedFingerprint, pending.activeWriterFingerprint)
+  ) {
+    return generic;
+  }
+  return {
+    code: THREAD_RESUME_ACTIVE_WRITER_CODE,
+    message: THREAD_RESUME_ACTIVE_WRITER_MESSAGE,
+  };
 }
 
 function responsePriority(method) {
@@ -339,6 +406,7 @@ class ProtocolSession {
       localKey,
       upstreamKey,
       method: message.method,
+      activeWriterFingerprint: activeWriterFingerprint(message.method, adapted.params),
       timeout: null,
     };
     pending.timeout = setTimeout(() => {
@@ -443,8 +511,9 @@ class ProtocolSession {
     this.retiredLocalRequestIds.add(pending.localKey);
     const priority = responsePriority(pending.method);
     if (message.kind === "error") {
+      const error = classifyUpstreamError(pending, message.error);
       return this.toLocal.enqueueWithBackpressure(
-        rpcError(pending.localId, message.error.code, "upstream request failed"),
+        rpcError(pending.localId, error.code, error.message),
         priority,
       );
     }

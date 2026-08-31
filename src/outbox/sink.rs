@@ -11,11 +11,14 @@ use futures_util::future::BoxFuture;
 
 use super::payload::OutboxOperation;
 use crate::lark::normalize::InboundEvent;
+use crate::limits::REPLY_MESSAGE_MAX_CHARS;
 use crate::render::{ProjectedReply, ReplyProjector, render_lark_markdown};
 use crate::runtime::scope::{
     DurableReplySink, ReplySinkError, TurnFinalization, TurnProgress, TurnSource,
 };
-use crate::store::{InboundRejectionKind, NewOutboxRow, StoreError, StoreHandle, TurnResolution};
+use crate::store::{
+    InboundKey, InboundRejectionKind, NewOutboxRow, StoreError, StoreHandle, TurnResolution,
+};
 
 /// Durable outbound boundary backed by the shared store.
 pub struct OutboxReplySink {
@@ -41,6 +44,7 @@ impl fmt::Debug for OutboxReplySink {
 impl DurableReplySink for OutboxReplySink {
     fn rejection_notice(
         &self,
+        key: &InboundKey,
         event: &InboundEvent,
         reason: InboundRejectionKind,
     ) -> Result<NewOutboxRow, ReplySinkError> {
@@ -51,9 +55,34 @@ impl DurableReplySink for OutboxReplySink {
         };
         let payload_json = operation.encode().map_err(|_| ReplySinkError::Invariant)?;
         Ok(NewOutboxRow {
-            idempotency_key: format!("{}:notice:{}", event.event_id, rejection_key(reason)),
+            idempotency_key: key.rejection_outbox_idempotency_key(reason),
             scope_key: event.scope.to_string(),
             kind: "notice".to_owned(),
+            payload_json,
+            next_retry_ms: 0,
+        })
+    }
+
+    fn control_reply(
+        &self,
+        key: &InboundKey,
+        event: &InboundEvent,
+        text: &str,
+    ) -> Result<NewOutboxRow, ReplySinkError> {
+        let char_count = text.chars().count();
+        if char_count == 0 || char_count > REPLY_MESSAGE_MAX_CHARS {
+            return Err(ReplySinkError::Invariant);
+        }
+        let operation = OutboxOperation::ReplyText {
+            message_id: event.message_id.clone(),
+            thread_id: event.thread_id.clone(),
+            text: text.to_owned(),
+        };
+        let payload_json = operation.encode().map_err(|_| ReplySinkError::Invariant)?;
+        Ok(NewOutboxRow {
+            idempotency_key: key.control_outbox_idempotency_key(),
+            scope_key: event.scope.to_string(),
+            kind: "control".to_owned(),
             payload_json,
             next_retry_ms: 0,
         })
@@ -306,8 +335,4 @@ fn rejection_text(reason: InboundRejectionKind) -> &'static str {
         InboundRejectionKind::Stale => "消息已过期，未处理",
         InboundRejectionKind::Internal => "处理该消息时发生内部错误",
     }
-}
-
-fn rejection_key(reason: InboundRejectionKind) -> &'static str {
-    reason.as_str()
 }

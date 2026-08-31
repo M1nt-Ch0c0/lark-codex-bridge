@@ -185,22 +185,26 @@ Unix-socket 上的原始 HTTP/WebSocket Upgrade、peer credential、路径碰撞
 清理策略的精确 binary smoke 见
 [`docs/codex-unix-websocket-contract.md`](docs/codex-unix-websocket-contract.md#committed-reproduction)。
 
-### Persisted thread adoption（当前禁用）
+### Persisted thread adoption（显式顺序交接）
 
-顺序接管既有 Codex thread 当前明确 fail closed。受支持的 app-server 契约可以用
-`thread/resume` 取得 writer，但没有经验证的、在 app-server 继续运行时释放该 writer 的操作；
-本地退订或丢弃 bridge route 不等于释放远端 ownership。因此 bridge 不列出候选、不调用
-`thread/resume`、不写 scope mapping，也不会以 idle 状态猜测 thread 已无人持有。
+Linux/macOS 上，`spawned_stdio` 与 bridge-owned `protocol_sidecar` 可以用一个不重启的
+独立 app-server 进程组顺序接管既有 Codex thread：`thread/resume` 成功后才原子写入
+mapping，`/release` 只有在 wrapper kill/wait 后以 signal-0 观察到进程组 `ESRCH`、确认
+整组为空才解除 mapping。受管 app-server/sidecar 不得 daemonize 或 `setsid` 逃逸该组；
+释放证明不覆盖故意逃逸的进程。本地退订、idle 状态或丢弃 route 都不算释放 ownership。
+Windows 的 Job child wait 不能证明 `ACTIVE_PROCESS_ZERO`，因此 adoption 在 capability gate
+和 production launcher 两层均 fail closed；这不影响普通 bridge backend。shared
+`external_endpoint` 也无法由 bridge 回收远端进程，继续 fail closed。
 
-`/threads`、`/adopt <selector> --handoff-complete` 和 `/release` 已保留为显式命令语法；当前
-slash handler 尚未接线，且任何未来 handler 都必须先通过零状态 capability gate。可用下面的
-只读诊断查看稳定分类（不读取 `CODEX_HOME`，也不启动 Codex）：
+owner 通过 `/threads`、`/adopt <selector> --handoff-complete` 和 `/release` 显式控制；
+active-writer conflict 不重试、不抢占、不 kill 其他客户端。下面的只读诊断输出本地可用后端
+和 external endpoint 拒绝分类，且不读取 `CODEX_HOME`、不启动 Codex：
 
 ```bash
 cargo run --locked -- codex adoption-status
 ```
 
-完整的负向互操作证据、生命周期规则和未来启用条件见
+完整的 dedicated ownership、恢复矩阵与真实 A→B→C sequential-handoff 证据见
 [`docs/thread-adoption.md`](docs/thread-adoption.md)。实时多客户端共享不属于该顺序交接方案，
 由 [Issue #8](https://github.com/M1nt-Ch0c0/lark-codex-bridge/issues/8) 单独研究。
 
@@ -239,7 +243,7 @@ LARK_MEDIA_E2E_GROUP_CHAT_ID=oc_… \
 
 1. 入站 payload 已带客户端识别文本时，原文只通过一次性的、与 event/message/part/resource 精确绑定的内存 handoff 进入 turn-scoped media grant；durable DTO、SQLite/WAL、outbox、checkpoint、`ContextSnapshot` / `TypedPart`、prompt 和 `Debug` 都不含原文。只有 `bridge_media.read` 会按 `max_transcript_bytes` 校验并返回它。进程在读取前重启时返回无内容的 `transcript_unavailable`，不会把已接受文本写盘或误降级到 sidecar；畸形或超限文本同样只保留 `invalid_transcript` / `transcript_too_large` 分类；
 2. 否则 `ffmpeg` 只向受监督的 pipe 输出 16 kHz mono PCM；Bridge 自己在专属私有根目录中、每次写入前检查硬字节上限并构造完整 canonical WAV，再跑本地 sidecar。子进程从不获得输出文件路径，不能用单次大写入或 sparse 文件绕过上限。Unix 目录/文件会在创建时显式设为并复核 `0700` / `0600`（不依赖 umask）；Windows 会在写入内容前设置并复核仅当前用户与 `SYSTEM` 的 protected DACL；
-3. `ffmpeg` 和 sidecar 都在完整的进程组（Windows 为 Job Object）中运行。正常完成、turn 中断、Bridge shutdown、超时或 future drop 都会终止残留子孙并等待回收；中断响应屏障保证 transcript/media 内容不会出现在成功的中断确认之后。每次媒体读取持有独立 lease token，同一 turn/hash 的重叠读取不会相互释放 GC 保护；
+3. `ffmpeg` 和 sidecar 都在完整的进程组（Windows 为 Job Object）中运行。Unix 先用 `waitid(WNOWAIT)` 保留 leader 的 PID/PGID，只在该身份仍受 Bridge 所有时发送一次 group signal，随后精确回收 leader 并以 signal-0 `ESRCH` 证明进程组为空；身份丢失或清理无法确认会让本次读取失败，不会对旧 PGID 重复发信号。正常完成、turn 中断、Bridge shutdown、超时或 future drop 都会终止残留子孙并等待回收；中断响应屏障保证 transcript/media 内容不会出现在成功的中断确认之后。每次媒体读取持有独立 lease token，同一 turn/hash 的重叠读取不会相互释放 GC 保护；
 4. `max_duration_ms` 可下调但绝不能超过 10 分钟；Bridge 在解码期间实施固定 PCM 投影的绝对硬上限，并在交给 sidecar 前验证 RIFF 声明长度、所有 chunk/padding、PCM 格式、唯一 data chunk、精确时长和完整文件边界，防止小型压缩输入膨胀或畸形 WAV；
 5. 异常退出残留目录会在启动时和运行期间定时做有界清理：即使随后禁用 sidecar，只要私有 ASR 根目录仍存在就会继续清理；禁用且根不存在时不会仅为 sweep 创建目录。进程内保留的目录迭代器跨 tick 续扫，每轮实际目录读取、metadata 与清理尝试都有硬上限，并能越过大量 hostile/fresh/symlink 项最终走到本轮目录末尾；重启只会安全地重置遍历进度。Bridge workspace 先原子隔离并用目录身份 claim 证明所有权，已知 `decoded.wav` 以 no-follow 方式擦除；未知文件绝不删除，失败状态保留供后续重试；
 6. 缺 sidecar、解码失败、空/畸形/超限/恢复后不可用的转写、过长音频、取消或私有目录失败都会返回稳定错误码（`sidecar_missing` / `unsupported_codec` / `empty_transcript` / `invalid_transcript` / `transcript_too_large` / `transcript_unavailable` / `too_long` / `oversize` / `sidecar_failed` / `cancelled` / `temporary_storage_failed`），不会静默丢 part。
@@ -400,7 +404,7 @@ JSON 转义、Unicode 与闭合 fence 开销均计入，超限时 fence-safe 截
 持久 outbox 从本功能起只写 payload v2；升级后的 reader 同时严格读取 v1/v2。历史 v1
 `reply_text` 始终保持纯文本载体，不会因内容像 Markdown 而改型；历史终态 Card 的备用正文
 会先经过当前净化器再成为 `post`。Markdown outbox 降级栅栏在 schema v7 引入；当前二进制
-会把数据库迁移到 `PRAGMA user_version=10`。升级前应停掉旧进程并备份数据库，升级后不得再
+会把数据库迁移到 `PRAGMA user_version=12`。升级前应停掉旧进程并备份数据库，升级后不得再
 用只认识较早 schema 或 payload v1 的旧二进制打开同一库。
 确定未生效的终态 Card PATCH 在永久拒绝（或同样确定未生效的限流重试耗尽）后，会把同一个
 确定性 outbox 行原子转换成 standalone Markdown post；响应丢失、畸形或其他

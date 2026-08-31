@@ -262,12 +262,13 @@ impl ResourceDownloader for RemovingWorkspaceDownloader {
 impl DurableReplySink for RecordingSink {
     fn rejection_notice(
         &self,
+        key: &InboundKey,
         event: &InboundEvent,
         reason: InboundRejectionKind,
     ) -> Result<NewOutboxRow, ReplySinkError> {
         self.rejections.lock().expect("rejection lock").push(reason);
         Ok(NewOutboxRow {
-            idempotency_key: format!("{}:rejection", event.event_id),
+            idempotency_key: key.rejection_outbox_idempotency_key(reason),
             scope_key: event.scope.to_string(),
             kind: "notice".to_owned(),
             payload_json: "{\"text\":\"rejected\"}".to_owned(),
@@ -297,11 +298,12 @@ impl DurableReplySink for RecordingSink {
 impl DurableReplySink for YieldingRecordingSink {
     fn rejection_notice(
         &self,
+        key: &InboundKey,
         event: &InboundEvent,
-        _reason: InboundRejectionKind,
+        reason: InboundRejectionKind,
     ) -> Result<NewOutboxRow, ReplySinkError> {
         Ok(NewOutboxRow {
-            idempotency_key: format!("{}:yielding-rejection", event.event_id),
+            idempotency_key: key.rejection_outbox_idempotency_key(reason),
             scope_key: event.scope.to_string(),
             kind: "notice".to_owned(),
             payload_json: "{\"text\":\"rejected\"}".to_owned(),
@@ -340,6 +342,7 @@ struct UnavailableRejectionSink;
 impl DurableReplySink for UnavailableRejectionSink {
     fn rejection_notice(
         &self,
+        _key: &InboundKey,
         _event: &InboundEvent,
         _reason: InboundRejectionKind,
     ) -> Result<NewOutboxRow, ReplySinkError> {
@@ -354,6 +357,7 @@ impl DurableReplySink for UnavailableRejectionSink {
 impl DurableReplySink for RetryOnceRejectionSink {
     fn rejection_notice(
         &self,
+        key: &InboundKey,
         event: &InboundEvent,
         reason: InboundRejectionKind,
     ) -> Result<NewOutboxRow, ReplySinkError> {
@@ -361,7 +365,7 @@ impl DurableReplySink for RetryOnceRejectionSink {
             return Err(ReplySinkError::Unavailable);
         }
         Ok(NewOutboxRow {
-            idempotency_key: format!("{}:retry:{reason:?}", event.event_id),
+            idempotency_key: key.rejection_outbox_idempotency_key(reason),
             scope_key: event.scope.to_string(),
             kind: "notice".to_owned(),
             payload_json: "{\"text\":\"rejected after retry\"}".to_owned(),
@@ -389,11 +393,12 @@ impl UnavailableSink {
 impl DurableReplySink for UnavailableSink {
     fn rejection_notice(
         &self,
+        key: &InboundKey,
         event: &InboundEvent,
-        _reason: InboundRejectionKind,
+        reason: InboundRejectionKind,
     ) -> Result<NewOutboxRow, ReplySinkError> {
         Ok(NewOutboxRow {
-            idempotency_key: format!("{}:rejection", event.event_id),
+            idempotency_key: key.rejection_outbox_idempotency_key(reason),
             scope_key: event.scope.to_string(),
             kind: "notice".to_owned(),
             payload_json: "{\"text\":\"rejected\"}".to_owned(),

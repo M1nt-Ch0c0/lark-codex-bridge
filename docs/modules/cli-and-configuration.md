@@ -26,6 +26,14 @@ lark-codex-bridge lark probe
 
 `run` 启动前台常驻进程。当前没有 host service、profile、migrate 或日志导出子命令。
 
+`codex adoption-status` 是纯静态、脱敏的 capability matrix：Linux/macOS 构建把
+`spawned_stdio` 和 `protocol_sidecar` 标记为
+`available_dedicated_process_ownership`；Windows 构建因缺少 Job
+`ACTIVE_PROCESS_ZERO` 证明而标记为 `unavailable_platform_process_tree_proof`。
+`external_endpoint` 始终标记为 `unavailable_shared_external_endpoint`。输出同时声明
+`supportedPlatforms: ["linux", "macos"]`。该命令不加载配置、不读取 `CODEX_HOME`、
+不启动进程，也不连接 endpoint。
+
 ## probe 输出契约
 
 probe 与 auth check 都只输出单行 JSON：

@@ -22,6 +22,12 @@ fn parses_the_eight_first_stage_commands() {
             selector: "t-candidate".to_owned()
         }))
     );
+    assert_eq!(
+        parse_command(r#"/adopt "selector with spaces" --handoff-complete"#),
+        Ok(Some(BridgeCommand::Adopt {
+            selector: "selector with spaces".to_owned()
+        }))
+    );
     assert_eq!(parse_command("/release"), Ok(Some(BridgeCommand::Release)));
     assert_eq!(
         parse_command("/cd ./workspace with spaces"),
@@ -66,6 +72,14 @@ fn recognized_commands_reject_invalid_arguments() {
     assert_eq!(
         parse_command("/adopt t-candidate --handoff-complete extra"),
         Err(CommandParseError::HandoffConfirmationRequired)
+    );
+    assert_eq!(
+        parse_command("/adopt selector with spaces --handoff-complete"),
+        Err(CommandParseError::InvalidSelector)
+    );
+    assert_eq!(
+        parse_command(r#"/adopt "unterminated --handoff-complete"#),
+        Err(CommandParseError::InvalidSelector)
     );
     assert_eq!(
         parse_command(&format!("/threads {}", "c".repeat(513))),

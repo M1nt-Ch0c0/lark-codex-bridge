@@ -485,6 +485,11 @@ The sidecar deliberately reduces error content:
 
 - an upstream request error preserves only its integer code and replaces the
   message with `upstream request failed`; upstream error data is not forwarded;
+- the sole method-specific exception is a reviewed `thread/resume` active-writer
+  rejection. Only exact `-32600` grammar for the matching, bounded request target
+  and absent/null error data maps to local code `-32023` with static message
+  `thread/resume active-writer conflict`. The pending sidecar state retains only a
+  SHA-256 target fingerprint, and every near-match remains a generic server error;
 - an error response from Rust to an upstream server request preserves only the
   integer code and uses `bridge rejected server request`;
 - an expired reverse request returns only code `-32022` and the static message
@@ -494,10 +499,11 @@ The sidecar deliberately reduces error content:
   stdout EOF, and child exit terminate the current sidecar session. The single
   reverse-timeout race described above is the only late-response exception.
 
-V1 does not put `determinacy`, `retryable`, `fatal`, or an epoch in an RPC error
-object. The Rust RPC/client and durable write layers remain responsible for
-distinguishing a pre-write rejection from an uncertain post-write connection
-loss. Documentation and callers must not infer a richer sidecar error contract.
+V1 does not put general `determinacy`, `retryable`, `fatal`, or an epoch in an RPC
+error object. Apart from the exact `-32023` method-specific classification above,
+the Rust RPC/client and durable write layers remain responsible for distinguishing
+a pre-write rejection from an uncertain post-write connection loss. Documentation
+and callers must not infer a richer sidecar error contract.
 
 ## No replay and Rust epochs
 
@@ -529,19 +535,26 @@ accepts a correlated `sidecar/shutdown` request and replies with `{}` before
 starting the same cleanup, but the Rust supervisor does not depend on that
 request for correctness.
 
-Rust then waits for the sidecar leader within the effective five-second process
-grace. If needed it targets the whole POSIX process group or Windows Job,
-performs another bounded wait, and reaps the leader. The shutdown path contains
-multiple bounded phases; five seconds is the configured per-process grace, not
-a promise that every supervisor shutdown completes within five wall-clock
-seconds. Process-tree ownership begins immediately after spawn: a bootstrap
-guard targets the full group/Job even if the supervisor cancels the factory
-future before configure completes.
+On POSIX, Rust observes unexpected leader exit with `waitid(WNOWAIT)`, retaining
+the leader PID as the process-group identity even after exit is observed. The
+graceful phase ends when that exit is observed or the effective five-second
+process grace elapses. With the identity still reserved, Rust targets the whole
+group before any wait/reap, then waits for and reaps the exact leader through
+the innermost Tokio child and performs the side-effect-free absence proof. It
+never invokes the outer POSIX wrapper's `waitpid(-pgid, ...)` after releasing
+the leader. An `ECHILD` observation poisons the identity immediately: no later
+signal, wait, or try-wait is allowed, and the stale Tokio handle is quarantined
+from its orphan reaper. Windows keeps the corresponding Job-object cleanup
+path. The shutdown path contains multiple bounded phases; five seconds is the
+configured per-process grace, not a promise that every supervisor shutdown
+completes within five wall-clock seconds. Process-tree ownership begins
+immediately after spawn: a bootstrap guard targets the full group/Job even if
+the supervisor cancels the factory future before configure completes.
 
 If the Codex child exits unexpectedly, the sidecar session fails. Rust clears
 the old client, terminates the owned tree, applies bounded supervisor backoff,
 and only then starts a new epoch. It never leaves a knowingly live descendant
-before spawning the replacement. A kill, wrapper wait, or bootstrap-cleanup
+before spawning the replacement. A kill, exact-leader wait, or bootstrap-cleanup
 failure enters a static terminal degraded state and fences replacement until
 the bridge is restarted; it is never treated as permission to overlap epochs.
 
@@ -593,7 +606,9 @@ Use `--node-binary`, optional `--codex-binary`, `--codex-home`, and repeated
 equivalents. Omitting `--codex-binary` tests the package-lock-pinned release.
 The probe starts the
 supervisor, completes bootstrap plus Codex initialize, prints one sanitized JSON
-object, and shuts down the whole owned process tree.
+object, and shuts down the owned Unix process group (or Windows Job object).
+The managed sidecar must not daemonize or deliberately escape that ownership
+boundary.
 
 ## Current limits and non-goals
 

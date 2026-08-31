@@ -3,7 +3,7 @@ use clap::Parser;
 use lark_codex_bridge::{
     cli::{Cli, CodexCommand, Command as CliCommand, LogFormat},
     codex::wire::SUPPORTED_CODEX_VERSIONS,
-    runtime::adoption::ThreadAdoptionGate,
+    runtime::adoption::{THREAD_ADOPTION_SUPPORTED_PLATFORMS, ThreadAdoptionGate},
 };
 use predicates::prelude::*;
 use serde_json::json;
@@ -30,7 +30,8 @@ fn version_matches_the_package_version() {
 
 #[test]
 fn adoption_status_is_machine_readable_and_fail_closed() {
-    let availability = ThreadAdoptionGate.availability();
+    let availability = ThreadAdoptionGate::managed_stdio().availability();
+    let external = ThreadAdoptionGate::external_endpoint().availability();
     let assertion = cargo_bin_cmd!("lark-codex-bridge")
         .args(["codex", "adoption-status"])
         .assert()
@@ -46,6 +47,14 @@ fn adoption_status_is_machine_readable_and_fail_closed() {
             "available": availability.is_available(),
             "classification": availability.code(),
             "guidance": availability.guidance(),
+            "releaseAuthority": availability.release_authority(),
+            "managedBackends": ["spawned_stdio", "protocol_sidecar"],
+            "supportedPlatforms": THREAD_ADOPTION_SUPPORTED_PLATFORMS,
+            "externalEndpoint": {
+                "available": external.is_available(),
+                "classification": external.code(),
+                "guidance": external.guidance(),
+            },
             "requiresExplicitHandoff": true,
             "sharedEndpointIssue": 8,
         })
@@ -74,8 +83,12 @@ fn adoption_status_does_not_spawn_codex_or_read_its_profile() {
             .args(["codex", "adoption-status"])
             .assert()
             .success()
+            .stdout(predicate::str::contains(format!(
+                "\"classification\":\"{}\"",
+                ThreadAdoptionGate::managed_stdio().availability().code()
+            )))
             .stdout(predicate::str::contains(
-                "\"classification\":\"unavailable_no_reliable_writer_release\"",
+                "\"classification\":\"unavailable_shared_external_endpoint\"",
             ));
     }
 }

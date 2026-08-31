@@ -695,9 +695,10 @@ mod tests {
     use crate::lark::normalize::{InboundEvent, ScopeKey};
     use crate::lark::token::TenantTokenProvider;
     use crate::lark::transport::TransportState;
+    use crate::runtime::intake::TenantNamespace;
     use crate::runtime::router::RouteError;
     use crate::runtime::scope::{DurableReplySink, ReplySinkError, TurnFinalization};
-    use crate::store::{InboundRejectionKind, NewOutboxRow, StoreHandle};
+    use crate::store::{InboundKey, InboundRejectionKind, NewOutboxRow, StoreHandle};
 
     struct FakeRouter {
         event_ids: Mutex<Vec<String>>,
@@ -833,6 +834,7 @@ mod tests {
     impl DurableReplySink for NoopSink {
         fn rejection_notice(
             &self,
+            _key: &InboundKey,
             _event: &InboundEvent,
             _reason: InboundRejectionKind,
         ) -> Result<NewOutboxRow, ReplySinkError> {
@@ -984,6 +986,10 @@ mod tests {
         );
         let endpoints = LarkEndpoints::for_tenant(TenantBrand::Feishu);
         let http = LarkHttp::new(endpoints).expect("http");
+        let inbound_key = InboundKey::new(
+            TenantNamespace::from_credentials(&credentials),
+            "factory".to_owned(),
+        );
         let tokens = TenantTokenProvider::new(http.clone(), credentials);
         let api = LarkApi::new(http, tokens);
         let (_transport, state) = watch::channel(TransportState::Connecting { attempt: 1 });
@@ -995,7 +1001,7 @@ mod tests {
         let event = queued("factory").await;
         let row = runtime
             .sink()
-            .rejection_notice(&event.event, InboundRejectionKind::Policy)
+            .rejection_notice(&inbound_key, &event.event, InboundRejectionKind::Policy)
             .expect("production sink");
         assert_eq!(row.kind, "notice");
         runtime.shutdown().await;

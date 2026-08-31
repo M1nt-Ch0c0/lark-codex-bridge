@@ -352,8 +352,12 @@ impl Drop for ChildGuard {
 #[derive(Debug)]
 enum OperatorResponse {
     Result(Value),
-    Rejected,
+    ActiveTurnConflict,
+    Rejected { code: Option<i64> },
 }
+
+const OPERATOR_ACTIVE_TURN_CONFLICT_CODE: i64 = -32_600;
+const OPERATOR_ACTIVE_TURN_CONFLICT_MESSAGE: &str = "thread already has an active or pending turn";
 
 #[tokio::test]
 #[ignore = "requires explicit exact Codex binary gate; missing configuration is a failure"]
@@ -735,20 +739,10 @@ async fn real_exact_binary_coordinates_two_clients_queue_exact_ids_and_one_appro
         }),
     );
     let (bridge_race, operator_race) = tokio::join!(bridge_race, operator_race);
-    let (race_turn, race_fenced) = match (bridge_race, operator_race?) {
-        (Ok(applied), OperatorResponse::Rejected) => {
+    let (race_turn, race_fenced, bridge_won) = match (bridge_race, operator_race?) {
+        (Ok(applied), OperatorResponse::ActiveTurnConflict) => {
             let turn_id = applied.result_id.context("bridge race omitted turn id")?;
-            race_coordinator
-                .as_ref()
-                .expect("coordinator present")
-                .interrupt_turn(
-                    source.clone(),
-                    "intent-race-interrupt",
-                    TurnInterruptParams::new(&thread_id, &turn_id),
-                )
-                .await
-                .context("bridge race winner interrupt failed")?;
-            (turn_id, false)
+            (turn_id, false, true)
         }
         (
             Err(
@@ -762,20 +756,37 @@ async fn real_exact_binary_coordinates_two_clients_queue_exact_ids_and_one_appro
                 .as_str()
                 .context("operator race omitted turn id")?
                 .to_owned();
-            operator_request(
-                &mut operator,
-                12,
-                "turn/interrupt",
-                json!({"threadId": thread_id, "turnId": turn_id}),
-            )
-            .await?;
-            (turn_id, error != ExternalWriteError::Conflict)
+            (turn_id, error != ExternalWriteError::Conflict, false)
         }
         (bridge, operator) => bail!(
             "two-client start race did not have one correlated or safely fenced winner: bridge={bridge:?} operator={operator:?}"
         ),
     };
+    // First prove that the winning turn reached the model provider. Request 7
+    // intentionally blocks until interruption; interrupting immediately after
+    // turn/start races Codex before it has opened that request and makes the
+    // request-count assertion scheduler-dependent on slower macOS runners.
     model_stub.wait_for_count(7).await?;
+    if bridge_won {
+        race_coordinator
+            .as_ref()
+            .expect("coordinator present")
+            .interrupt_turn(
+                source.clone(),
+                "intent-race-interrupt",
+                TurnInterruptParams::new(&thread_id, &race_turn),
+            )
+            .await
+            .context("bridge race winner interrupt failed")?;
+    } else {
+        operator_request(
+            &mut operator,
+            12,
+            "turn/interrupt",
+            json!({"threadId": thread_id, "turnId": race_turn}),
+        )
+        .await?;
+    }
     wait_operator_idle(&mut operator, 13, &thread_id).await?;
     let turns = operator_request(
         &mut operator,
@@ -945,7 +956,77 @@ async fn operator_request(
 ) -> Result<Value> {
     match operator_request_raw(socket, id, method, params).await? {
         OperatorResponse::Result(result) => Ok(result),
-        OperatorResponse::Rejected => bail!("operator {method} was rejected"),
+        OperatorResponse::ActiveTurnConflict => {
+            bail!("operator {method} hit the reviewed active-turn conflict")
+        }
+        OperatorResponse::Rejected { code } => {
+            bail!("operator {method} was rejected with code {code:?}")
+        }
+    }
+}
+
+fn classify_operator_rejection(error: &Value) -> OperatorResponse {
+    let code = error.get("code").and_then(Value::as_i64);
+    let reviewed_shape = error.as_object().is_some_and(|fields| {
+        (fields.len() == 2 || (fields.len() == 3 && fields.get("data").is_some_and(Value::is_null)))
+            && fields.get("code").and_then(Value::as_i64)
+                == Some(OPERATOR_ACTIVE_TURN_CONFLICT_CODE)
+            && fields.get("message").and_then(Value::as_str)
+                == Some(OPERATOR_ACTIVE_TURN_CONFLICT_MESSAGE)
+    });
+    if reviewed_shape {
+        OperatorResponse::ActiveTurnConflict
+    } else {
+        // Keep raw messages and data out of diagnostics: native error text can
+        // contain thread identifiers or other endpoint-owned context.
+        OperatorResponse::Rejected { code }
+    }
+}
+
+#[test]
+fn operator_rejection_classifier_accepts_only_the_reviewed_conflict() {
+    for error in [
+        json!({
+            "code": OPERATOR_ACTIVE_TURN_CONFLICT_CODE,
+            "message": OPERATOR_ACTIVE_TURN_CONFLICT_MESSAGE
+        }),
+        json!({
+            "code": OPERATOR_ACTIVE_TURN_CONFLICT_CODE,
+            "message": OPERATOR_ACTIVE_TURN_CONFLICT_MESSAGE,
+            "data": null
+        }),
+    ] {
+        assert!(matches!(
+            classify_operator_rejection(&error),
+            OperatorResponse::ActiveTurnConflict
+        ));
+    }
+
+    for error in [
+        json!({
+            "code": -32_602,
+            "message": OPERATOR_ACTIVE_TURN_CONFLICT_MESSAGE
+        }),
+        json!({
+            "code": OPERATOR_ACTIVE_TURN_CONFLICT_CODE,
+            "message": "invalid request"
+        }),
+        json!({
+            "code": OPERATOR_ACTIVE_TURN_CONFLICT_CODE,
+            "message": OPERATOR_ACTIVE_TURN_CONFLICT_MESSAGE,
+            "data": {"threadId": "must-not-be-accepted"}
+        }),
+        json!({
+            "code": OPERATOR_ACTIVE_TURN_CONFLICT_CODE,
+            "message": OPERATOR_ACTIVE_TURN_CONFLICT_MESSAGE,
+            "extra": true
+        }),
+        json!("malformed"),
+    ] {
+        assert!(matches!(
+            classify_operator_rejection(&error),
+            OperatorResponse::Rejected { .. }
+        ));
     }
 }
 
@@ -975,8 +1056,8 @@ async fn operator_request_raw(
             let value: Value = serde_json::from_str(&text)
                 .with_context(|| format!("operator {method} response was not JSON"))?;
             if value["id"] == id {
-                return if value.get("error").is_some() {
-                    Ok(OperatorResponse::Rejected)
+                return if let Some(error) = value.get("error") {
+                    Ok(classify_operator_rejection(error))
                 } else {
                     Ok(OperatorResponse::Result(
                         value

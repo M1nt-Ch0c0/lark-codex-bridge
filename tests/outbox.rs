@@ -20,17 +20,21 @@ use lark_codex_bridge::lark::http::LarkHttp;
 use lark_codex_bridge::lark::normalize::{InboundEvent, ScopeKey};
 use lark_codex_bridge::lark::token::TenantTokenProvider;
 use lark_codex_bridge::lark::transport::TransportState;
-use lark_codex_bridge::limits::{LARK_CARD_MARKDOWN_ELEMENT_MAX_BYTES, STORE_OUTBOX_MAX_ATTEMPTS};
+use lark_codex_bridge::limits::{
+    LARK_CARD_MARKDOWN_ELEMENT_MAX_BYTES, REPLY_MESSAGE_MAX_CHARS, STORE_OUTBOX_MAX_ATTEMPTS,
+};
 use lark_codex_bridge::outbox::{
     AppliedCertainty, DeliveryClass, OutboxError, OutboxOperation, OutboxPump, OutboxPumpConfig,
     OutboxReplySink, Retryability, classify_delivery, delivery_decision,
 };
 use lark_codex_bridge::render::{ProjectedReply, card_markdown_element_wire_len};
+use lark_codex_bridge::runtime::intake::TenantNamespace;
 use lark_codex_bridge::runtime::scope::{
-    DurableReplySink, TurnFinalization, TurnProgress, TurnSource,
+    DurableReplySink, ReplySinkError, TurnFinalization, TurnProgress, TurnSource,
 };
 use lark_codex_bridge::store::{
-    InboundRejectionKind, NewOutboxRow, OutboxEnqueue, OutboxState, StoreHandle, TurnResolution,
+    InboundKey, InboundRejectionKind, NewOutboxRow, OutboxEnqueue, OutboxState, StoreHandle,
+    TurnResolution,
 };
 use larkstub::{Handler, RecordedRequest, StubResponse, StubServer};
 use secrecy::SecretString;
@@ -254,6 +258,18 @@ fn inbound_event() -> InboundEvent {
         create_time_ms: 0,
         scope: ScopeKey::Chat("oc_chat".to_owned()),
     }
+}
+
+fn test_inbound_key(event: &InboundEvent) -> InboundKey {
+    let credentials = LarkCredentials::new(
+        "cli_outbox_test".to_owned(),
+        SecretString::from("outbox-test-secret"),
+        TenantBrand::Feishu,
+    );
+    InboundKey::new(
+        TenantNamespace::from_credentials(&credentials),
+        event.event_id.clone(),
+    )
 }
 
 async fn enqueue_reply(
@@ -1290,11 +1306,15 @@ async fn rejection_notice_is_deterministic() {
     let store = StoreHandle::open_in_memory().await.expect("store");
     let sink = OutboxReplySink::new(store.clone());
     let event = inbound_event();
+    let key = test_inbound_key(&event);
 
     let notice = sink
-        .rejection_notice(&event, InboundRejectionKind::Policy)
+        .rejection_notice(&key, &event, InboundRejectionKind::Policy)
         .expect("notice");
-    assert_eq!(notice.idempotency_key, "evt_1:notice:policy");
+    assert_eq!(
+        notice.idempotency_key,
+        key.rejection_outbox_idempotency_key(InboundRejectionKind::Policy)
+    );
     assert_eq!(notice.kind, "notice");
     let decoded = OutboxOperation::decode(&notice.payload_json).expect("decode");
     match decoded {
@@ -1306,6 +1326,36 @@ async fn rejection_notice_is_deterministic() {
         }
         _ => panic!("expected a text notice"),
     }
+}
+
+#[tokio::test]
+async fn control_reply_is_bounded_and_deterministic() {
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = OutboxReplySink::new(store.clone());
+    let event = inbound_event();
+    let key = test_inbound_key(&event);
+
+    let reply = sink
+        .control_reply(&key, &event, "ownership remains explicit")
+        .expect("control reply");
+    assert_eq!(reply.idempotency_key, key.control_outbox_idempotency_key());
+    assert_eq!(reply.kind, "control");
+    let decoded = OutboxOperation::decode(&reply.payload_json).expect("decode");
+    assert!(matches!(
+        decoded,
+        OutboxOperation::ReplyText { message_id, text, .. }
+            if message_id == "om_parent" && text == "ownership remains explicit"
+    ));
+    assert!(matches!(
+        sink.control_reply(&key, &event, ""),
+        Err(ReplySinkError::Invariant)
+    ));
+    sink.control_reply(&key, &event, &"x".repeat(REPLY_MESSAGE_MAX_CHARS))
+        .expect("exact reply character limit remains accepted");
+    assert!(matches!(
+        sink.control_reply(&key, &event, &"x".repeat(REPLY_MESSAGE_MAX_CHARS + 1),),
+        Err(ReplySinkError::Invariant)
+    ));
 }
 
 #[tokio::test]

@@ -87,6 +87,9 @@ pub enum CommandParseError {
     /// Adoption was requested without the exact explicit-handoff acknowledgement.
     #[error("/adopt requires the exact --handoff-complete acknowledgement")]
     HandoffConfirmationRequired,
+    /// The adoption selector is neither one token nor one JSON string.
+    #[error("/adopt selector must be one token or one JSON string")]
+    InvalidSelector,
 }
 
 /// Stable command metadata used to render `/help` and audit command drift.
@@ -221,19 +224,39 @@ pub fn parse_command(text: &str) -> Result<Option<BridgeCommand>, CommandParseEr
             Ok(Some(BridgeCommand::Threads { cursor }))
         }
         "/adopt" => {
-            let mut values = arguments.split_whitespace();
-            let Some(selector) = values.next() else {
+            let arguments = arguments.trim();
+            if arguments.is_empty() {
                 return Err(CommandParseError::MissingArgument { command: "/adopt" });
+            }
+            let Some(before_handoff) = arguments.strip_suffix("--handoff-complete") else {
+                return Err(CommandParseError::HandoffConfirmationRequired);
             };
+            if !before_handoff
+                .chars()
+                .last()
+                .is_some_and(char::is_whitespace)
+            {
+                return Err(CommandParseError::HandoffConfirmationRequired);
+            }
+            let selector_source = before_handoff.trim_end();
+            if selector_source.is_empty() {
+                return Err(CommandParseError::MissingArgument { command: "/adopt" });
+            }
+            let selector = if selector_source.starts_with('"') {
+                serde_json::from_str::<String>(selector_source)
+                    .map_err(|_| CommandParseError::InvalidSelector)?
+            } else if selector_source.chars().any(char::is_whitespace) {
+                return Err(CommandParseError::InvalidSelector);
+            } else {
+                selector_source.to_owned()
+            };
+            if selector.is_empty() || selector.bytes().any(|byte| byte.is_ascii_control()) {
+                return Err(CommandParseError::InvalidSelector);
+            }
             if selector.len() > THREAD_ADOPTION_SELECTOR_MAX_BYTES {
                 return Err(CommandParseError::TooLong);
             }
-            if values.next() != Some("--handoff-complete") || values.next().is_some() {
-                return Err(CommandParseError::HandoffConfirmationRequired);
-            }
-            Ok(Some(BridgeCommand::Adopt {
-                selector: selector.to_owned(),
-            }))
+            Ok(Some(BridgeCommand::Adopt { selector }))
         }
         _ => Ok(None),
     }

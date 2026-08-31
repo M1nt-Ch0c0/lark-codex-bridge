@@ -10,18 +10,25 @@ use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, SystemTime};
 
-#[cfg(windows)]
-use process_wrap::tokio::JobObject;
 #[cfg(unix)]
 use process_wrap::tokio::ProcessGroup;
-use process_wrap::tokio::{KillOnDrop, TokioChildWrapper, TokioCommandWrap};
+#[cfg(windows)]
+use process_wrap::tokio::{JobObject, KillOnDrop};
+use process_wrap::tokio::{TokioChildWrapper, TokioCommandWrap};
 use tempfile::{Builder as TempDirBuilder, TempDir};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::time::{Instant, sleep};
+use tokio::time::{Instant, sleep, timeout_at};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::codex::process::{
+    drop_or_forget_unreaped_child, record_wait_identity_loss, wait_owned_leader_or_job,
+};
+#[cfg(unix)]
+use crate::codex::process::{
+    try_wait_for_owned_leader_exit_without_reaping, wait_for_owned_process_group_empty,
+};
 use crate::config::AsrSection;
 use crate::lark::normalize::normalize_transcript;
 use crate::limits::{
@@ -42,6 +49,7 @@ pub(crate) const ASR_STALE_SWEEP_INTERVAL: Duration = Duration::from_secs(15 * 6
 const ASR_CLEANUP_ATTEMPTS: usize = 20;
 const ASR_CLEANUP_RETRY: Duration = Duration::from_millis(50);
 const ASR_PROCESS_POLL: Duration = Duration::from_millis(10);
+const ASR_PROCESS_CLEANUP_GRACE: Duration = Duration::from_secs(5);
 
 /// Why local transcription could not produce text.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -891,8 +899,7 @@ async fn decode_to_wav(
         .arg("pipe:1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
+        .stderr(Stdio::null());
     let file = open_no_follow_write(output)?;
     let mut process = SupervisedProcess::spawn(&mut command, AsrError::UnsupportedCodec)?;
     let status = write_bounded_decode(
@@ -947,7 +954,7 @@ async fn write_bounded_decode(
                 process.terminate_and_wait().await;
                 return Err(AsrError::UnsupportedCodec);
             };
-            if leader.is_some() {
+            if leader {
                 exit_status = Some(
                     process
                         .finish_after_leader()
@@ -1205,8 +1212,7 @@ async fn run_sidecar(
         .arg(wav_path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
+        .stderr(Stdio::null());
     let mut child = SupervisedProcess::spawn(&mut process, AsrError::SidecarFailed)?;
     let mut stdout = child.take_stdout().ok_or(AsrError::SidecarFailed)?;
     let stdout_limit = config
@@ -1224,7 +1230,7 @@ async fn run_sidecar(
                 child.terminate_and_wait().await;
                 return Err(AsrError::SidecarFailed);
             };
-            if leader.is_some() {
+            if leader {
                 exit_status = Some(
                     child
                         .finish_after_leader()
@@ -1300,53 +1306,169 @@ fn bounded_transcript(text: &str, max_bytes: usize) -> Result<String, AsrError> 
 
 struct SupervisedProcess {
     child: Option<Box<dyn TokioChildWrapper>>,
+    leader_pid: u32,
+    group_signal_authorized: bool,
+    identity_lost: bool,
+    leader_status: Option<ExitStatus>,
 }
 
 impl SupervisedProcess {
     fn spawn(command: &mut Command, spawn_error: AsrError) -> Result<Self, AsrError> {
         let command = std::mem::replace(command, Command::new(""));
         let mut group = TokioCommandWrap::from(command);
+        #[cfg(windows)]
         group.wrap(KillOnDrop);
         #[cfg(unix)]
         group.wrap(ProcessGroup::leader());
         #[cfg(windows)]
         group.wrap(JobObject);
         let child = group.spawn().map_err(|_| spawn_error)?;
-        Ok(Self { child: Some(child) })
+        let Some(leader_pid) = child.inner().id() else {
+            // Without the original PID there is no safe POSIX group identity
+            // to signal. Quarantine the uncertain handle and fail this request.
+            drop_or_forget_unreaped_child(child, true);
+            return Err(spawn_error);
+        };
+        Ok(Self {
+            child: Some(child),
+            leader_pid,
+            group_signal_authorized: true,
+            identity_lost: false,
+            leader_status: None,
+        })
     }
 
     fn take_stdout(&mut self) -> Option<tokio::process::ChildStdout> {
         self.child.as_mut()?.stdout().take()
     }
 
-    fn try_wait_leader(&mut self) -> std::io::Result<Option<ExitStatus>> {
-        self.child
-            .as_mut()
-            .expect("supervised child exists until reaped")
+    fn try_wait_leader(&mut self) -> std::io::Result<bool> {
+        if self.identity_lost {
+            return Err(std::io::Error::other(
+                "owned ASR process identity is no longer available",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            try_wait_for_owned_leader_exit_without_reaping(
+                self.leader_pid,
+                &mut self.group_signal_authorized,
+                &mut self.identity_lost,
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows cleanup is keyed by the Job handle rather than this PID.
+            let _ = self.leader_pid;
+            if self.leader_status.is_some() {
+                return Ok(true);
+            }
             // Poll only the leader here. JobObjectChild::try_wait also polls
             // the completion port, which can consume the job-empty event that
             // its later whole-job wait needs in order to finish.
-            .inner_mut()
-            .try_wait()
+            let status = self
+                .child
+                .as_mut()
+                .expect("supervised child exists until reaped")
+                .inner_mut()
+                .try_wait()?;
+            if let Some(status) = status {
+                self.leader_status = Some(status);
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
     }
 
     async fn finish_after_leader(&mut self) -> std::io::Result<ExitStatus> {
-        let child = self
-            .child
-            .as_mut()
-            .expect("supervised child exists until reaped");
-        // A successful leader may still have spawned descendants. Always close
-        // the entire group/job before releasing the private workspace.
-        let _ = child.start_kill();
-        let waited = Box::into_pin(child.wait()).await;
-        self.child.take();
-        waited
+        self.cleanup_owned_tree().await
     }
 
     async fn terminate_and_wait(&mut self) {
-        if let Some(mut child) = self.child.take() {
+        if let Err(error) = self.cleanup_owned_tree().await {
+            tracing::warn!(
+                error = %error,
+                "ASR process-tree cleanup was not confirmed within its bound"
+            );
+        }
+    }
+
+    async fn cleanup_owned_tree(&mut self) -> std::io::Result<ExitStatus> {
+        if self.identity_lost {
+            self.release_child();
+            return Err(std::io::Error::other(
+                "owned ASR process-tree cleanup cannot be confirmed",
+            ));
+        }
+        let deadline = Instant::now() + ASR_PROCESS_CLEANUP_GRACE;
+        #[cfg(unix)]
+        {
+            let child_id_is_available = self
+                .child
+                .as_ref()
+                .is_some_and(|child| child.inner().id().is_some());
+            if !child_id_is_available
+                || try_wait_for_owned_leader_exit_without_reaping(
+                    self.leader_pid,
+                    &mut self.group_signal_authorized,
+                    &mut self.identity_lost,
+                )
+                .is_err()
+            {
+                self.group_signal_authorized = false;
+            }
+        }
+        if self.identity_lost {
+            self.release_child();
+            return Err(std::io::Error::other(
+                "owned ASR process identity was lost before cleanup",
+            ));
+        }
+        let child = self
+            .child
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("owned ASR process was already released"))?;
+        if self.group_signal_authorized {
+            // A successful leader may still have spawned descendants. Signal
+            // the owned group/Job exactly once before releasing its identity.
             let _ = child.start_kill();
-            let _ = Box::into_pin(child.wait()).await;
+            self.group_signal_authorized = false;
+        }
+
+        let waited = timeout_at(deadline, wait_owned_leader_or_job(child)).await;
+        let status = match waited {
+            Ok(Ok(status)) => status,
+            Ok(Err(source)) => {
+                record_wait_identity_loss(
+                    &source,
+                    &mut self.group_signal_authorized,
+                    &mut self.identity_lost,
+                );
+                self.release_child();
+                return Err(source);
+            }
+            Err(_) => {
+                self.release_child();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "owned ASR process-tree cleanup timed out",
+                ));
+            }
+        };
+        #[cfg(unix)]
+        if let Err(source) = wait_for_owned_process_group_empty(self.leader_pid, deadline).await {
+            self.release_child();
+            return Err(source);
+        }
+        let status = self.leader_status.take().unwrap_or(status);
+        self.release_child();
+        Ok(status)
+    }
+
+    fn release_child(&mut self) {
+        if let Some(child) = self.child.take() {
+            drop_or_forget_unreaped_child(child, self.identity_lost);
         }
     }
 
@@ -1371,7 +1493,7 @@ impl SupervisedProcess {
                 self.terminate_and_wait().await;
                 return Err(process_error);
             };
-            if leader_status.is_some() {
+            if leader_status {
                 let status = self
                     .finish_after_leader()
                     .await
@@ -1406,11 +1528,50 @@ impl SupervisedProcess {
 impl Drop for SupervisedProcess {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            let _ = child.start_kill();
+            #[cfg(unix)]
+            if !self.identity_lost
+                && (child.inner().id().is_none()
+                    || try_wait_for_owned_leader_exit_without_reaping(
+                        self.leader_pid,
+                        &mut self.group_signal_authorized,
+                        &mut self.identity_lost,
+                    )
+                    .is_err())
+            {
+                self.group_signal_authorized = false;
+            }
+            if !self.identity_lost && self.group_signal_authorized {
+                let _ = child.start_kill();
+                self.group_signal_authorized = false;
+            }
+            if self.identity_lost {
+                drop_or_forget_unreaped_child(child, true);
+                return;
+            }
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                #[cfg(unix)]
+                let leader_pid = self.leader_pid;
                 runtime.spawn(async move {
-                    let _ = Box::into_pin(child.wait()).await;
+                    let deadline = Instant::now() + ASR_PROCESS_CLEANUP_GRACE;
+                    let waited = timeout_at(deadline, wait_owned_leader_or_job(&mut child)).await;
+                    let mut group_signal_authorized = false;
+                    let mut identity_lost = false;
+                    match waited {
+                        Ok(Ok(_)) => {
+                            #[cfg(unix)]
+                            let _ = wait_for_owned_process_group_empty(leader_pid, deadline).await;
+                        }
+                        Ok(Err(source)) => record_wait_identity_loss(
+                            &source,
+                            &mut group_signal_authorized,
+                            &mut identity_lost,
+                        ),
+                        Err(_) => {}
+                    }
+                    drop_or_forget_unreaped_child(child, identity_lost);
                 });
+            } else {
+                drop(child);
             }
         }
     }
@@ -1831,8 +1992,7 @@ mod tests {
             command
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .kill_on_drop(true);
+                .stderr(Stdio::null());
             let file = open_no_follow_write(&output).expect("open bounded destination");
             let mut process = SupervisedProcess::spawn(&mut command, AsrError::UnsupportedCodec)
                 .expect("spawn single writer");
@@ -2118,8 +2278,7 @@ mod tests {
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
+            .stderr(Stdio::null());
         let mut process = SupervisedProcess::spawn(&mut command, AsrError::SidecarFailed)
             .expect("spawn process group");
         let pid = read_descendant_pid_handshake(&mut process).await;
@@ -2177,8 +2336,7 @@ mod tests {
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
+            .stderr(Stdio::null());
         let mut process = SupervisedProcess::spawn(&mut command, AsrError::SidecarFailed)
             .expect("spawn timeout tree");
         let pid = read_descendant_pid_handshake(&mut process).await;
@@ -2634,8 +2792,7 @@ mod tests {
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
+            .stderr(Stdio::null());
         let mut process = SupervisedProcess::spawn(&mut command, AsrError::SidecarFailed)
             .expect("spawn Job Object tree");
         let pid = read_descendant_pid_handshake(&mut process).await;
