@@ -582,6 +582,16 @@ fn fake_process_tree_version_probe() -> (tempfile::TempDir, std::path::PathBuf) 
 }
 
 #[cfg(unix)]
+fn fake_detached_process_tree_version_probe() -> (tempfile::TempDir, std::path::PathBuf) {
+    let directory = tempfile::tempdir().expect("temporary directory should be created");
+    let binary = install_executable_fixture(
+        directory.path(),
+        "codex version probe detached tree fixture",
+    );
+    (directory, binary)
+}
+
+#[cfg(unix)]
 fn unix_process_matches(pid: u32, token: &str) -> bool {
     let output = std::process::Command::new("/bin/ps")
         .args([
@@ -720,6 +730,33 @@ async fn timed_out_version_probe_reaps_its_owned_process_group() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn successful_version_probe_reaps_a_detached_descendant_before_returning() {
+    let (directory, binary) = fake_detached_process_tree_version_probe();
+    let marker = directory.path().join("version-detached-descendant.pid");
+    let config = CodexProcessConfig {
+        binary,
+        codex_home: None,
+    };
+
+    let version = timeout(
+        VERSION_PROBE_TIMEOUT + EVENT_TIMEOUT,
+        probe_version(&config),
+    )
+    .await
+    .expect("successful version-probe cleanup must remain bounded")
+    .expect("valid version output should succeed after owned-tree cleanup");
+    let descendant = read_descendant(&marker).await;
+    let _cleanup = NativeDescendantCleanup(&descendant);
+
+    assert_eq!(version, semver::Version::new(0, 149, 0));
+    assert!(
+        !unix_process_matches(descendant.pid, &descendant.token),
+        "successful version probe must not leave a detached descendant alive"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn app_server_stdio_is_transferred_once_and_shutdown_by_eof() {
     use lark_codex_bridge::codex::{process::spawn_app_server, transport::TransportExit};
 
@@ -763,20 +800,20 @@ async fn native_app_server_termination_reaps_descendants_after_leader_exit() {
     let descendant = read_descendant(&marker).await;
     let _cleanup = NativeDescendantCleanup(&descendant);
 
-    let leader = timeout(EVENT_TIMEOUT, process.wait())
+    timeout(EVENT_TIMEOUT, process.wait_for_exit_without_reaping())
         .await
         .expect("fake app-server leader should exit")
-        .expect("leader wait should succeed");
-    assert!(leader.success);
+        .expect("non-reaping leader observation should succeed");
     assert!(
         unix_process_matches(descendant.pid, &descendant.token),
         "fixture descendant must outlive its leader before cleanup"
     );
 
-    process
+    let leader = process
         .terminate(Duration::from_secs(2))
         .await
         .expect("native process-group termination must confirm full reap");
+    assert!(leader.success);
     assert!(
         !unix_process_matches(descendant.pid, &descendant.token),
         "confirmed native cleanup must leave no live descendant"

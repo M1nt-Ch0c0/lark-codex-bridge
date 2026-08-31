@@ -133,13 +133,20 @@ Failed cleanup retains both the mapping and a `release_failed` fence. Release
 never calls archive/delete/rename/fork and never treats unsubscribe as writer
 release.
 
-On Linux and macOS, the owned wrapper first signals and waits for its process
-group. The bridge then uses a side-effect-free signal-0 group probe under the
-same absolute force-cleanup deadline. Only `ESRCH` confirms that the group is
-empty; success and `EPERM` mean it still exists, while every other OS error
-fails closed. Sidecar bootstrap failures use the same proof when a leader PID
-is available. A missing PID is never reported as confirmed cleanup. An
-unconfirmed bootstrap cleanup remains a typed supervisor failure, so a pending
+On Linux and macOS, supervisor lifecycle observation uses `waitid(WNOWAIT)` so
+an exited leader remains unreaped and continues to reserve the numeric PID/PGID.
+Every destructive process-group signal occurs while that identity is still
+reserved; no stale numeric PGID is signalled after exact leader wait/reap. Unix
+never calls the outer process-group wrapper's `waitpid(-pgid, ...)`: it waits
+only for the exact leader through the innermost Tokio child, then uses a
+side-effect-free signal-0 group probe under the same absolute force-cleanup
+deadline. Only `ESRCH` confirms that the group is empty; success and `EPERM`
+mean it still exists, while every other OS error fails closed. `ECHILD`
+immediately poisons the numeric identity; every later signal, wait, and try-wait
+is forbidden, and the stale Tokio handle is excluded from orphan reaping.
+Sidecar bootstrap failures use the same proof when a leader PID is available.
+A missing or already released PID never authorizes another destructive group
+signal. Unconfirmed cleanup remains a typed supervisor failure, so a pending
 adoption generation is fenced instead of terminalized as freely retryable.
 
 ## Durable state and recovery matrix

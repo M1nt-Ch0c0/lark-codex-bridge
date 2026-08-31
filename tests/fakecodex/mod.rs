@@ -353,6 +353,12 @@ impl AppServerProcess for FakeProcess {
         })
     }
 
+    fn wait_for_exit(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ProcessError>> + Send + '_>> {
+        Box::pin(async move { self.wait().await.map(|_| ()) })
+    }
+
     fn terminate(
         &mut self,
         grace: Duration,

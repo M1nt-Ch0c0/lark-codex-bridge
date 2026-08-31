@@ -21,12 +21,17 @@ The sidecar is a single local process tree supervised by Rust. The Node leader
 is placed in a dedicated POSIX process group or a Windows Job object; Rust
 terminates that entire boundary on bootstrap failure, protocol failure,
 timeout, crash, stdout EOF, shutdown expiry, cancellation, and handle drop.
-The direct child is reaped within a fixed bound. Stdin and stdout carry
-UTF-8 NDJSON version 1 (`v: 1`, `protocol: "lark-channel"`), with one JSON
-object per line and a 1 MiB hard frame limit. Stderr is log-only. Rust drains
-it in fixed-size chunks, discards the remainder of an oversized or unterminated
-record, and keeps draining later records. It records only byte counts and
-static classifications, never content. The child logger similarly discards
+On POSIX, leader exit is observed with `waitid(WNOWAIT)`: Rust sends its one
+destructive group signal while the unreaped leader still reserves the numeric
+PID/PGID, then reaps only that exact child and accepts only a signal-0 `ESRCH`
+as proof that the group is empty. `ECHILD`, a missing PID, timeout, or failed
+absence proof poisons the process epoch and permanently fences sidecar restart.
+Windows uses its stable Job handle instead. Stdin and stdout carry UTF-8 NDJSON
+version 1 (`v: 1`, `protocol: "lark-channel"`), with one JSON object per line
+and a 1 MiB hard frame limit. Stderr is log-only. Rust drains it in fixed-size
+chunks, discards the remainder of an oversized or unterminated record, and
+keeps draining later records. It records only byte counts and static
+classifications, never content. The child logger similarly discards
 SDK-provided messages and writes static classifications only.
 
 Startup is:

@@ -1053,6 +1053,7 @@ dependencies = [
  "prost",
  "reqwest",
  "rusqlite",
+ "rustix",
  "secrecy",
  "semver",
  "serde",

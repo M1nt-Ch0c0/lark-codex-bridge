@@ -77,10 +77,17 @@ pub trait AppServerProcess: Send {
     ///
     /// Returns a [`ProcessError`] when the pipes are unavailable or were taken.
     fn take_stdio(&mut self) -> Result<ProcessStdio, ProcessError>;
-    /// Waits for the child to exit, reaping it exactly once.
+    /// Waits for the child to exit, reaping it exactly once. POSIX lifecycle
+    /// cleanup must use `wait_for_exit` before `terminate` instead.
     fn wait(
         &mut self,
     ) -> Pin<Box<dyn Future<Output = Result<ProcessExit, ProcessError>> + Send + '_>>;
+    /// Observes process exit for supervisor lifecycle selection. POSIX owned
+    /// implementations must not reap the leader here, because cleanup still
+    /// needs its PID to identify the process group safely.
+    fn wait_for_exit(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ProcessError>> + Send + '_>>;
     /// Closes process-owned stdin, waits for `grace`, then force-kills and waits.
     fn terminate(
         &mut self,
@@ -106,6 +113,12 @@ impl AppServerProcess for CodexProcess {
         &mut self,
     ) -> Pin<Box<dyn Future<Output = Result<ProcessExit, ProcessError>> + Send + '_>> {
         Box::pin(CodexProcess::wait(self))
+    }
+
+    fn wait_for_exit(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ProcessError>> + Send + '_>> {
+        Box::pin(CodexProcess::wait_for_exit_without_reaping(self))
     }
 
     fn terminate(
@@ -946,7 +959,7 @@ async fn finish_running_epoch(
     let graceful = tokio::select! {
         biased;
         () = shutdown.cancelled() => true,
-        _ = running.process.wait() => false,
+        _ = running.process.wait_for_exit() => false,
     };
     *ready_slot.lock().unwrap_or_else(PoisonError::into_inner) = None;
     if graceful {
@@ -963,12 +976,10 @@ async fn cleanup_exited_running_epoch(
     state_tx: &watch::Sender<SupervisorState>,
     shutdown: &CancellationToken,
 ) -> Result<(), SupervisorError> {
-    // `wait` reaped the leader, so its numeric PID/PGID could be reused as soon
-    // as the old group becomes empty. Terminate and prove that ownership
-    // boundary immediately; waiting for transport actors first would leave a
-    // reuse window in which a later group-directed kill could hit an unrelated
-    // process. Once the process boundary is settled, finish the bounded client
-    // teardown before starting any replacement epoch.
+    // POSIX exit observation deliberately leaves the leader unreaped, so
+    // terminate can still address the owned group under that reserved identity.
+    // Once the process boundary is settled, finish the bounded client teardown
+    // before starting any replacement epoch.
     let cleanup = running.process.terminate(Duration::ZERO).await;
     if cleanup.is_err() {
         publish_cleanup_failure(state_tx);

@@ -9,11 +9,11 @@ use std::{
     collections::BTreeSet, ffi::OsString, fmt, path::PathBuf, process::Stdio, time::Duration,
 };
 
-#[cfg(windows)]
-use process_wrap::tokio::JobObject;
 #[cfg(unix)]
 use process_wrap::tokio::ProcessGroup;
-use process_wrap::tokio::{KillOnDrop, TokioChildWrapper, TokioCommandWrap};
+#[cfg(windows)]
+use process_wrap::tokio::{JobObject, KillOnDrop};
+use process_wrap::tokio::{TokioChildWrapper, TokioCommandWrap};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -27,8 +27,9 @@ use crate::{
     codex::{
         compat::WireAdapter,
         process::{
-            ProcessError, ProcessExit, SidecarBootstrapFailure, SidecarSpawnFailure, process_exit,
-            reap_owned_process_tree,
+            ProcessCleanupState, ProcessError, ProcessExit, SidecarBootstrapFailure,
+            SidecarSpawnFailure, drop_or_forget_unreaped_child, process_exit,
+            reap_owned_process_tree, record_wait_identity_loss, wait_owned_leader_or_job,
         },
         supervisor::{AppServerProcess, ProcessStdio, ProtocolInfo},
     },
@@ -37,6 +38,9 @@ use crate::{
         CODEX_SIDECAR_SHUTDOWN_GRACE,
     },
 };
+
+#[cfg(unix)]
+use crate::codex::process::wait_for_owned_leader_exit_without_reaping;
 
 /// Stable local protocol identifier. It is deliberately independent of an
 /// upstream Codex release.
@@ -174,7 +178,7 @@ impl CodexSidecarConfig {
 /// One configured sidecar epoch. Construction does not return until the
 /// sidecar has probed and started exactly one supported upstream Codex child.
 pub struct CodexSidecarProcess {
-    child: Box<dyn TokioChildWrapper>,
+    child: Option<Box<dyn TokioChildWrapper>>,
     version: Version,
     stdout: Option<BufReader<ChildStdout>>,
     stdin: Option<ChildStdin>,
@@ -183,25 +187,35 @@ pub struct CodexSidecarProcess {
     pid: u32,
     shutdown_grace: Duration,
     tree_reaped: bool,
+    group_signal_authorized: bool,
+    identity_lost: bool,
 }
 
 /// Owns the process-tree boundary from the instant the Node leader is spawned.
 ///
 /// The supervisor is allowed to cancel a factory future while bootstrap is in
-/// progress. `KillOnDrop` only targets the inner Node leader, so a separate
-/// guard must invoke the outer process-group/Job-object wrapper before an
-/// in-flight bootstrap future can be dropped. Successful bootstrap transfers
-/// the same wrapper into [`CodexSidecarProcess`].
+/// progress. Unix deliberately avoids an irreversible inner `kill_on_drop`;
+/// this authority-aware guard invokes the outer process-group wrapper when an
+/// in-flight bootstrap future is dropped. Successful bootstrap transfers the
+/// same wrapper and authority into [`CodexSidecarProcess`].
 struct BootstrapProcessGuard {
     child: Option<Box<dyn TokioChildWrapper>>,
     cleanup_confirmed: bool,
+    group_signal_authorized: bool,
+    identity_lost: bool,
 }
 
 impl BootstrapProcessGuard {
     fn new(child: Box<dyn TokioChildWrapper>) -> Self {
+        #[cfg(unix)]
+        let group_signal_authorized = child.inner().id().is_some();
+        #[cfg(not(unix))]
+        let group_signal_authorized = true;
         Self {
             child: Some(child),
             cleanup_confirmed: false,
+            group_signal_authorized,
+            identity_lost: false,
         }
     }
 
@@ -220,18 +234,37 @@ impl BootstrapProcessGuard {
     fn mark_cleanup_confirmed(&mut self) {
         self.cleanup_confirmed = true;
     }
+
+    fn cleanup_parts(&mut self) -> (&mut Box<dyn TokioChildWrapper>, &mut bool, &mut bool) {
+        (
+            self.child
+                .as_mut()
+                .expect("bootstrap process guard always owns its child"),
+            &mut self.group_signal_authorized,
+            &mut self.identity_lost,
+        )
+    }
 }
 
 impl Drop for BootstrapProcessGuard {
     fn drop(&mut self) {
-        if !self.cleanup_confirmed
-            && let Some(child) = self.child.as_mut()
-        {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        if !self.cleanup_confirmed && self.group_signal_authorized {
             // The outer wrapper targets the full POSIX process group or
             // Windows Job object. Waiting is impossible from Drop, but the
             // synchronous kill request closes the cancellation leak window.
-            let _ = child.start_kill();
+            #[cfg(unix)]
+            let leader_identity_reserved = child.inner().id().is_some();
+            #[cfg(not(unix))]
+            let leader_identity_reserved = true;
+            if leader_identity_reserved {
+                let _ = child.start_kill();
+                self.group_signal_authorized = false;
+            }
         }
+        drop_or_forget_unreaped_child(child, self.identity_lost);
     }
 }
 
@@ -240,15 +273,52 @@ impl CodexSidecarProcess {
         if let Some(exit) = self.exit {
             return Ok(exit);
         }
-        let status = self
+        if self.identity_lost {
+            return Err(ProcessError::ProcessTreeCleanupUnconfirmed);
+        }
+        let child = self
             .child
-            .inner_mut()
-            .wait()
-            .await
-            .map_err(ProcessError::Wait)?;
+            .as_mut()
+            .ok_or(ProcessError::ProcessTreeCleanupUnconfirmed)?;
+        let status = child.inner_mut().wait().await;
+        match &status {
+            #[cfg(unix)]
+            Ok(_) => self.group_signal_authorized = false,
+            Err(source) => record_wait_identity_loss(
+                source,
+                &mut self.group_signal_authorized,
+                &mut self.identity_lost,
+            ),
+            #[cfg(not(unix))]
+            Ok(_) => {}
+        }
+        let status = status.map_err(ProcessError::Wait)?;
         let exit = process_exit(self.pid, status);
         self.exit = Some(exit);
         Ok(exit)
+    }
+
+    async fn wait_for_exit_without_reaping(&mut self) -> Result<(), ProcessError> {
+        if self.exit.is_some() {
+            return Ok(());
+        }
+        if self.identity_lost {
+            return Err(ProcessError::ProcessTreeCleanupUnconfirmed);
+        }
+        #[cfg(unix)]
+        {
+            wait_for_owned_leader_exit_without_reaping(
+                self.pid,
+                &mut self.group_signal_authorized,
+                &mut self.identity_lost,
+            )
+            .await
+            .map_err(ProcessError::Wait)
+        }
+        #[cfg(not(unix))]
+        {
+            self.wait_leader().await.map(|_| ())
+        }
     }
 
     async fn terminate_group(&mut self, grace: Duration) -> Result<ProcessExit, ProcessError> {
@@ -263,18 +333,32 @@ impl CodexSidecarProcess {
         drop(self.stdout.take());
         drop(self.stderr.take());
 
+        #[cfg(unix)]
         if self.exit.is_none() {
-            if let Ok(result) = timeout(grace, self.wait_leader()).await {
-                result?;
-            }
+            tokio::time::sleep(grace).await;
+        }
+        #[cfg(not(unix))]
+        if self.exit.is_none()
+            && let Ok(result) = timeout(grace, self.wait_leader()).await
+        {
+            result?;
         }
 
+        let child = self
+            .child
+            .as_mut()
+            .ok_or(ProcessError::ProcessTreeCleanupUnconfirmed)?;
+        let state = ProcessCleanupState {
+            cached_exit: &mut self.exit,
+            tree_reaped: &mut self.tree_reaped,
+            group_signal_authorized: &mut self.group_signal_authorized,
+            identity_lost: &mut self.identity_lost,
+        };
         reap_owned_process_tree(
-            &mut self.child,
+            child,
             self.pid,
             grace,
-            &mut self.exit,
-            &mut self.tree_reaped,
+            state,
             "Codex sidecar process tree did not exit within its bound",
         )
         .await
@@ -283,9 +367,18 @@ impl CodexSidecarProcess {
 
 impl Drop for CodexSidecarProcess {
     fn drop(&mut self) {
-        if !self.tree_reaped {
-            let _ = self.child.start_kill();
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        #[cfg(unix)]
+        let leader_identity_reserved = child.inner().id().is_some();
+        #[cfg(not(unix))]
+        let leader_identity_reserved = true;
+        if !self.tree_reaped && self.group_signal_authorized && leader_identity_reserved {
+            let _ = child.start_kill();
+            self.group_signal_authorized = false;
         }
+        drop_or_forget_unreaped_child(child, self.identity_lost);
     }
 }
 
@@ -337,6 +430,13 @@ impl AppServerProcess for CodexSidecarProcess {
         Box::pin(self.wait_leader())
     }
 
+    fn wait_for_exit(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ProcessError>> + Send + '_>>
+    {
+        Box::pin(self.wait_for_exit_without_reaping())
+    }
+
     fn terminate(
         &mut self,
         grace: Duration,
@@ -372,6 +472,7 @@ pub async fn spawn_codex_sidecar(
     }
 
     let mut command = TokioCommandWrap::from(command);
+    #[cfg(windows)]
     command.wrap(KillOnDrop);
     #[cfg(unix)]
     command.wrap(ProcessGroup::leader());
@@ -439,7 +540,7 @@ pub async fn spawn_codex_sidecar(
     };
 
     Ok(CodexSidecarProcess {
-        child: child.into_child(),
+        child: Some(child.into_child()),
         version,
         stdout: Some(stdout),
         stdin: Some(stdin),
@@ -448,6 +549,8 @@ pub async fn spawn_codex_sidecar(
         pid,
         shutdown_grace: config.shutdown_grace,
         tree_reaped: false,
+        group_signal_authorized: true,
+        identity_lost: false,
     })
 }
 
@@ -457,13 +560,38 @@ async fn cleanup_bootstrap_process(
     grace: Duration,
 ) -> Result<(), ProcessError> {
     let cleanup_deadline = Instant::now() + grace.max(Duration::from_secs(1));
-    let _ = child.child_mut().start_kill();
-    if !matches!(
-        timeout_at(cleanup_deadline, Box::into_pin(child.child_mut().wait())).await,
-        Ok(Ok(_))
-    ) {
-        let _ = child.child_mut().start_kill();
-        return Err(ProcessError::ProcessTreeCleanupUnconfirmed);
+    {
+        let (process, group_signal_authorized, identity_lost) = child.cleanup_parts();
+        if *identity_lost {
+            return Err(ProcessError::ProcessTreeCleanupUnconfirmed);
+        }
+        #[cfg(unix)]
+        let leader_identity_reserved = {
+            if process.inner().id().is_none() {
+                *group_signal_authorized = false;
+            }
+            *group_signal_authorized
+        };
+        #[cfg(not(unix))]
+        let leader_identity_reserved = {
+            let _ = group_signal_authorized;
+            true
+        };
+        if leader_identity_reserved {
+            let _ = process.start_kill();
+            #[cfg(unix)]
+            {
+                *group_signal_authorized = false;
+            }
+        }
+        match timeout_at(cleanup_deadline, wait_owned_leader_or_job(process)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(source)) => {
+                record_wait_identity_loss(&source, group_signal_authorized, identity_lost);
+                return Err(ProcessError::ProcessTreeCleanupUnconfirmed);
+            }
+            Err(_) => return Err(ProcessError::ProcessTreeCleanupUnconfirmed),
+        }
     }
 
     // A leader wait alone is not Issue #4 process-tree evidence. On POSIX,
@@ -703,6 +831,7 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let mut command = TokioCommandWrap::from(command);
+        #[cfg(windows)]
         command.wrap(KillOnDrop);
         #[cfg(unix)]
         command.wrap(ProcessGroup::leader());
@@ -726,6 +855,67 @@ mod tests {
             start_kill_calls.load(Ordering::SeqCst),
             1,
             "Drop must not signal a process group after its absence was proved"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reaped_leader_is_never_targeted_by_group_cleanup() {
+        let executable = std::env::current_exe().expect("current test executable");
+        let mut command = Command::new(executable);
+        command
+            .arg("--help")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut command = TokioCommandWrap::from(command);
+        command.wrap(ProcessGroup::leader());
+        let mut child = command.spawn().expect("spawn cleanup fixture");
+        let pid = child.inner().id().expect("fixture exposes its PID");
+        let status = child
+            .inner_mut()
+            .wait()
+            .await
+            .expect("reap fixture leader first");
+        assert!(
+            child.inner().id().is_none(),
+            "leader PID must be released before cleanup regression"
+        );
+
+        let start_kill_calls = Arc::new(AtomicUsize::new(0));
+        let child = CountingChild {
+            inner: child,
+            start_kill_calls: Arc::clone(&start_kill_calls),
+        };
+        let mut child: Box<dyn TokioChildWrapper> = Box::new(child);
+        let mut exit = Some(process_exit(pid, status));
+        let mut tree_reaped = false;
+        let mut group_signal_authorized = true;
+        let mut identity_lost = false;
+        let state = ProcessCleanupState {
+            cached_exit: &mut exit,
+            tree_reaped: &mut tree_reaped,
+            group_signal_authorized: &mut group_signal_authorized,
+            identity_lost: &mut identity_lost,
+        };
+
+        reap_owned_process_tree(
+            &mut child,
+            pid,
+            Duration::from_millis(100),
+            state,
+            "fixture cleanup timed out",
+        )
+        .await
+        .expect("read-only absence proof succeeds after leader reap");
+
+        assert!(tree_reaped);
+        assert!(!group_signal_authorized);
+        assert!(!identity_lost);
+        assert_eq!(
+            start_kill_calls.load(Ordering::SeqCst),
+            0,
+            "a released leader PID must never be reused for a group kill"
         );
     }
 

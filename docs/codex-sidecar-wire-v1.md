@@ -535,19 +535,25 @@ accepts a correlated `sidecar/shutdown` request and replies with `{}` before
 starting the same cleanup, but the Rust supervisor does not depend on that
 request for correctness.
 
-Rust then waits for the sidecar leader within the effective five-second process
-grace. If needed it targets the whole POSIX process group or Windows Job,
-performs another bounded wait, and reaps the leader. The shutdown path contains
-multiple bounded phases; five seconds is the configured per-process grace, not
-a promise that every supervisor shutdown completes within five wall-clock
-seconds. Process-tree ownership begins immediately after spawn: a bootstrap
-guard targets the full group/Job even if the supervisor cancels the factory
-future before configure completes.
+On POSIX, Rust observes unexpected leader exit with `waitid(WNOWAIT)`, retaining
+the leader PID as the process-group identity. It keeps that identity through
+the effective five-second process grace, targets the whole group before any
+wait/reap, and only then waits for the exact leader through the innermost Tokio
+child and performs the side-effect-free absence proof. It never invokes the
+outer POSIX wrapper's `waitpid(-pgid, ...)` after releasing the leader. An
+`ECHILD` observation poisons the identity immediately: no later signal, wait,
+or try-wait is allowed, and the stale Tokio handle is quarantined from its
+orphan reaper. Windows keeps the corresponding Job-object cleanup path. The
+shutdown path contains multiple bounded phases; five seconds is the configured
+per-process grace, not a promise that every supervisor shutdown completes
+within five wall-clock seconds. Process-tree ownership begins immediately after
+spawn: a bootstrap guard targets the full group/Job even if the supervisor
+cancels the factory future before configure completes.
 
 If the Codex child exits unexpectedly, the sidecar session fails. Rust clears
 the old client, terminates the owned tree, applies bounded supervisor backoff,
 and only then starts a new epoch. It never leaves a knowingly live descendant
-before spawning the replacement. A kill, wrapper wait, or bootstrap-cleanup
+before spawning the replacement. A kill, exact-leader wait, or bootstrap-cleanup
 failure enters a static terminal degraded state and fences replacement until
 the bridge is restarted; it is never treated as permission to overlap epochs.
 

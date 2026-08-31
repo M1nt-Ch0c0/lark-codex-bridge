@@ -786,8 +786,38 @@ fn signal_process_group(pid: u32, signal: SignalKind) -> Result<()> {
     };
     match killpg(Pid::from_raw(pid), signal) {
         Ok(()) | Err(Errno::ESRCH) => Ok(()),
+        // Darwin reports EPERM when the owned group's only remaining member is
+        // its unreaped zombie leader. The retained leader PID still fences PGID
+        // reuse here; a live same-user descendant makes killpg succeed instead.
+        #[cfg(target_os = "macos")]
+        Err(Errno::EPERM) => Ok(()),
         Err(_) => bail!("unable to signal independent process group"),
     }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn darwin_zombie_only_independent_group_is_safe_to_reap() {
+    use std::os::unix::process::CommandExt as _;
+
+    let mut command = Command::new("/usr/bin/true");
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    command.as_std_mut().process_group(0);
+    let mut child = command.spawn().expect("spawn Darwin process-group fixture");
+    let pid = child.id().expect("fixture exposes its PID");
+    let mut stdout = child.stdout.take().expect("fixture exposes stdout");
+    let mut output = Vec::new();
+    stdout
+        .read_to_end(&mut output)
+        .await
+        .expect("observe fixture stdout EOF without reaping its leader");
+
+    signal_process_group(pid, SignalKind::Kill)
+        .expect("Darwin zombie-only EPERM is a safe terminal group outcome");
+    child.wait().await.expect("reap Darwin fixture leader");
 }
 
 #[cfg(not(unix))]

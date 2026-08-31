@@ -2,11 +2,13 @@ use std::{fmt, path::PathBuf, process::Stdio, time::Duration};
 
 #[cfg(unix)]
 use nix::{errno::Errno, sys::signal::killpg, unistd::Pid};
-#[cfg(windows)]
-use process_wrap::tokio::JobObject;
 #[cfg(unix)]
 use process_wrap::tokio::ProcessGroup;
-use process_wrap::tokio::{KillOnDrop, TokioChildWrapper, TokioCommandWrap};
+#[cfg(windows)]
+use process_wrap::tokio::{JobObject, KillOnDrop};
+use process_wrap::tokio::{TokioChildWrapper, TokioCommandWrap};
+#[cfg(unix)]
+use rustix::process::{Pid as RustixPid, WaitId, WaitIdOptions, waitid};
 use semver::Version;
 use thiserror::Error;
 #[cfg(unix)]
@@ -242,45 +244,214 @@ pub(crate) async fn wait_for_owned_process_group_empty(
     }
 }
 
+/// Polls the owned POSIX leader without consuming its wait status.
+///
+/// Keeping the leader as an unreaped zombie reserves the numeric PID/PGID until
+/// the cleanup owner has sent its final process-group signal. `waitid` with
+/// `WNOWAIT` is safe for both synchronous poll loops and cancellation-prone
+/// async waits because neither path releases that identity.
+#[cfg(unix)]
+pub(crate) fn try_wait_for_owned_leader_exit_without_reaping(
+    leader_pid: u32,
+    group_signal_authorized: &mut bool,
+    identity_lost: &mut bool,
+) -> std::io::Result<bool> {
+    if *identity_lost {
+        return Err(std::io::Error::other(
+            "owned process identity is no longer available",
+        ));
+    }
+    let raw_pid = i32::try_from(leader_pid).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "owned process id is outside the platform range",
+        )
+    })?;
+    let pid = RustixPid::from_raw(raw_pid).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "owned process id must be positive",
+        )
+    })?;
+    let options = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
+    loop {
+        match waitid(WaitId::Pid(pid), options) {
+            Ok(Some(_)) => return Ok(true),
+            Ok(None) => return Ok(false),
+            Err(rustix::io::Errno::INTR) => {}
+            // `ECHILD` means some other mechanism already consumed the wait
+            // status. Tokio's `Child::id()` may still expose the stale numeric
+            // PID in that case, so revoke signal authority explicitly.
+            Err(error @ rustix::io::Errno::CHILD) => {
+                *group_signal_authorized = false;
+                *identity_lost = true;
+                return Err(error.into());
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+/// Waits for the owned POSIX leader without consuming its wait status.
+#[cfg(unix)]
+pub(crate) async fn wait_for_owned_leader_exit_without_reaping(
+    leader_pid: u32,
+    group_signal_authorized: &mut bool,
+    identity_lost: &mut bool,
+) -> std::io::Result<()> {
+    loop {
+        if try_wait_for_owned_leader_exit_without_reaping(
+            leader_pid,
+            group_signal_authorized,
+            identity_lost,
+        )? {
+            return Ok(());
+        }
+        tokio::time::sleep(PROCESS_GROUP_POLL_INTERVAL).await;
+    }
+}
+
+pub(crate) fn record_wait_identity_loss(
+    source: &std::io::Error,
+    group_signal_authorized: &mut bool,
+    identity_lost: &mut bool,
+) {
+    #[cfg(unix)]
+    if source.raw_os_error() == Some(libc::ECHILD) {
+        *group_signal_authorized = false;
+        *identity_lost = true;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (source, group_signal_authorized, identity_lost);
+    }
+}
+
+/// Reaps only the exact POSIX leader, or waits for the Windows Job wrapper.
+///
+/// The POSIX `ProcessGroupChild::wait` implementation performs
+/// `waitpid(-pgid, ...)` after reaping the leader. Once that leader releases the
+/// numeric PGID, such a wait could attach to a reused group and steal another
+/// owner's child status. Unix cleanup therefore waits through the innermost
+/// Tokio child and uses a later signal-0 probe for group absence.
+pub(crate) async fn wait_owned_leader_or_job(
+    child: &mut Box<dyn TokioChildWrapper>,
+) -> std::io::Result<std::process::ExitStatus> {
+    #[cfg(unix)]
+    {
+        child.inner_mut().wait().await
+    }
+    #[cfg(not(unix))]
+    {
+        Box::into_pin(child.wait()).await
+    }
+}
+
+/// Drops a confirmed-reaped child normally and quarantines an uncertain Unix
+/// handle without running Tokio's orphan-reaper Drop path.
+///
+/// After `ECHILD`, Tokio may still retain a stale numeric PID. Dropping that
+/// handle would enqueue another `waitpid(pid, WNOHANG)` and could consume the
+/// status of a later child that reused the PID. Forgetting the small wrapper is
+/// the fail-closed boundary; it is used only after that explicit identity-loss
+/// poison, never for an ordinarily owned child awaiting Tokio's reaper.
+pub(crate) fn drop_or_forget_unreaped_child(
+    child: Box<dyn TokioChildWrapper>,
+    identity_lost: bool,
+) {
+    #[cfg(unix)]
+    {
+        if identity_lost {
+            std::mem::forget(child);
+        } else {
+            drop(child);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = identity_lost;
+        drop(child);
+    }
+}
+
 /// Force-terminates an owned process tree and records proof that it is empty.
 ///
 /// Native and sidecar-backed app servers use the same release-authority
 /// sequence. Callers retain their own graceful phase and error wording, but
 /// the force-kill, bounded wrapper wait, POSIX absence proof, exit caching,
 /// and `tree_reaped` transition must not drift apart.
+pub(crate) struct ProcessCleanupState<'a> {
+    pub(crate) cached_exit: &'a mut Option<ProcessExit>,
+    pub(crate) tree_reaped: &'a mut bool,
+    pub(crate) group_signal_authorized: &'a mut bool,
+    pub(crate) identity_lost: &'a mut bool,
+}
+
 pub(crate) async fn reap_owned_process_tree(
     child: &mut Box<dyn TokioChildWrapper>,
     leader_pid: u32,
     grace: Duration,
-    cached_exit: &mut Option<ProcessExit>,
-    tree_reaped: &mut bool,
+    state: ProcessCleanupState<'_>,
     timeout_message: &'static str,
 ) -> Result<ProcessExit, ProcessError> {
+    if *state.identity_lost {
+        return Err(ProcessError::ProcessTreeCleanupUnconfirmed);
+    }
     let cleanup_deadline = Instant::now() + grace.max(Duration::from_secs(1));
-    let kill_error = child.start_kill().err();
-    match timeout_at(cleanup_deadline, Box::into_pin(child.wait())).await {
+    // A completed inner wait releases the leader PID even when the outer
+    // process-group wrapper is still available. Never direct a destructive
+    // signal at that stale numeric PGID: it may already identify an unrelated
+    // group. If the leader was reaped, the later signal-0 probe can only fail
+    // closed; it must not be followed by another group kill.
+    #[cfg(unix)]
+    let leader_identity_reserved = {
+        if child.inner().id().is_none() {
+            *state.group_signal_authorized = false;
+        }
+        *state.group_signal_authorized
+    };
+    #[cfg(not(unix))]
+    let leader_identity_reserved = {
+        let _ = state.group_signal_authorized;
+        true
+    };
+    let kill_error = if leader_identity_reserved {
+        let error = child.start_kill().err();
+        // A final POSIX group signal consumes the retained-identity authority.
+        // All later work is wait/reap plus passive absence proof.
+        #[cfg(unix)]
+        {
+            *state.group_signal_authorized = false;
+        }
+        error
+    } else {
+        None
+    };
+    match timeout_at(cleanup_deadline, wait_owned_leader_or_job(child)).await {
         Ok(Ok(status)) => {
-            let exit = cached_exit.unwrap_or_else(|| process_exit(leader_pid, status));
-            *cached_exit = Some(exit);
+            let exit = state
+                .cached_exit
+                .unwrap_or_else(|| process_exit(leader_pid, status));
+            *state.cached_exit = Some(exit);
             #[cfg(unix)]
             wait_for_owned_process_group_empty(leader_pid, cleanup_deadline)
                 .await
                 .map_err(ProcessError::Terminate)?;
-            *tree_reaped = true;
+            *state.tree_reaped = true;
             Ok(exit)
         }
-        Ok(Err(source)) => Err(ProcessError::Wait(source)),
-        Err(_) => {
-            let _ = child.start_kill();
-            Err(ProcessError::Terminate(kill_error.unwrap_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::TimedOut, timeout_message)
-            })))
+        Ok(Err(source)) => {
+            record_wait_identity_loss(&source, state.group_signal_authorized, state.identity_lost);
+            Err(ProcessError::Wait(source))
         }
+        Err(_) => Err(ProcessError::Terminate(kill_error.unwrap_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, timeout_message)
+        }))),
     }
 }
 
 pub struct CodexProcess {
-    child: Box<dyn TokioChildWrapper>,
+    child: Option<Box<dyn TokioChildWrapper>>,
     version: Version,
     stdout: Option<ChildStdout>,
     stdin: Option<ChildStdin>,
@@ -288,6 +459,8 @@ pub struct CodexProcess {
     exit: Option<ProcessExit>,
     pid: u32,
     tree_reaped: bool,
+    group_signal_authorized: bool,
+    identity_lost: bool,
 }
 
 impl CodexProcess {
@@ -331,6 +504,12 @@ impl CodexProcess {
 
     /// Waits for app-server to exit and caches its sanitized status.
     ///
+    /// On POSIX this releases the leader PID. A later [`Self::terminate`] will
+    /// never send a destructive signal to that stale numeric PGID and can only
+    /// confirm that the group is already absent. Lifecycle owners that still
+    /// require cleanup authority must first use
+    /// [`Self::wait_for_exit_without_reaping`], then call `terminate`.
+    ///
     /// # Errors
     ///
     /// Returns [`ProcessError::Wait`] if the operating system wait fails.
@@ -338,15 +517,58 @@ impl CodexProcess {
         if let Some(exit) = self.exit {
             return Ok(exit);
         }
-        let status = self
+        if self.identity_lost {
+            return Err(ProcessError::ProcessTreeCleanupUnconfirmed);
+        }
+        let child = self
             .child
-            .inner_mut()
-            .wait()
-            .await
-            .map_err(ProcessError::Wait)?;
+            .as_mut()
+            .ok_or(ProcessError::ProcessTreeCleanupUnconfirmed)?;
+        let status = child.inner_mut().wait().await;
+        match &status {
+            #[cfg(unix)]
+            Ok(_) => self.group_signal_authorized = false,
+            Err(source) => record_wait_identity_loss(
+                source,
+                &mut self.group_signal_authorized,
+                &mut self.identity_lost,
+            ),
+            #[cfg(not(unix))]
+            Ok(_) => {}
+        }
+        let status = status.map_err(ProcessError::Wait)?;
         let exit = process_exit(self.pid, status);
         self.exit = Some(exit);
         Ok(exit)
+    }
+
+    /// Observes leader exit without releasing its POSIX PID/PGID identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProcessError::Wait`] when the operating system cannot observe
+    /// the owned leader's exit state.
+    pub async fn wait_for_exit_without_reaping(&mut self) -> Result<(), ProcessError> {
+        if self.exit.is_some() {
+            return Ok(());
+        }
+        if self.identity_lost {
+            return Err(ProcessError::ProcessTreeCleanupUnconfirmed);
+        }
+        #[cfg(unix)]
+        {
+            wait_for_owned_leader_exit_without_reaping(
+                self.pid,
+                &mut self.group_signal_authorized,
+                &mut self.identity_lost,
+            )
+            .await
+            .map_err(ProcessError::Wait)
+        }
+        #[cfg(not(unix))]
+        {
+            self.wait().await.map(|_| ())
+        }
     }
 
     /// Closes any process-owned stdin, waits for the grace period, then force-kills.
@@ -369,16 +591,35 @@ impl CodexProcess {
         drop(self.stdout.take());
         drop(self.stderr.take());
 
+        // On POSIX, waiting here would reap the process-group leader before
+        // the force-cleanup helper can safely address its PGID. Preserve the
+        // leader identity for the whole grace period, then signal the group.
+        // Windows Job handles do not have the numeric-PGID reuse hazard and
+        // keep the existing early-exit wait.
+        #[cfg(unix)]
+        if self.exit.is_none() {
+            tokio::time::sleep(grace).await;
+        }
+        #[cfg(not(unix))]
         if self.exit.is_none() {
             let _ = timeout(grace, self.wait()).await;
         }
 
+        let child = self
+            .child
+            .as_mut()
+            .ok_or(ProcessError::ProcessTreeCleanupUnconfirmed)?;
+        let state = ProcessCleanupState {
+            cached_exit: &mut self.exit,
+            tree_reaped: &mut self.tree_reaped,
+            group_signal_authorized: &mut self.group_signal_authorized,
+            identity_lost: &mut self.identity_lost,
+        };
         reap_owned_process_tree(
-            &mut self.child,
+            child,
             self.pid,
             grace,
-            &mut self.exit,
-            &mut self.tree_reaped,
+            state,
             "Codex app-server process tree did not exit within its bound",
         )
         .await
@@ -387,8 +628,167 @@ impl CodexProcess {
 
 impl Drop for CodexProcess {
     fn drop(&mut self) {
-        if !self.tree_reaped {
-            let _ = self.child.start_kill();
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        #[cfg(unix)]
+        let leader_identity_reserved = child.inner().id().is_some();
+        #[cfg(not(unix))]
+        let leader_identity_reserved = true;
+        if !self.tree_reaped && self.group_signal_authorized && leader_identity_reserved {
+            let _ = child.start_kill();
+            self.group_signal_authorized = false;
+        }
+        drop_or_forget_unreaped_child(child, self.identity_lost);
+    }
+}
+
+/// Cancellation guard for the short-lived version probe.
+///
+/// Unix intentionally does not use Tokio's irreversible `kill_on_drop`: after
+/// an `ECHILD` observation that mechanism could target a reused numeric PID.
+/// This guard owns the same revocable authority as the explicit cleanup path.
+struct ProbeProcessGuard {
+    child: Option<Box<dyn TokioChildWrapper>>,
+    group_signal_authorized: bool,
+    identity_lost: bool,
+}
+
+impl ProbeProcessGuard {
+    fn new(child: Box<dyn TokioChildWrapper>) -> Self {
+        #[cfg(unix)]
+        let group_signal_authorized = child.inner().id().is_some();
+        #[cfg(not(unix))]
+        let group_signal_authorized = true;
+        Self {
+            child: Some(child),
+            group_signal_authorized,
+            identity_lost: false,
+        }
+    }
+
+    fn child_mut(&mut self) -> &mut Box<dyn TokioChildWrapper> {
+        self.child
+            .as_mut()
+            .expect("probe guard retains its child until Drop")
+    }
+
+    fn authority_parts(&mut self) -> (&mut bool, &mut bool) {
+        (&mut self.group_signal_authorized, &mut self.identity_lost)
+    }
+
+    fn cleanup_parts(&mut self) -> (&mut Box<dyn TokioChildWrapper>, &mut bool, &mut bool) {
+        (
+            self.child
+                .as_mut()
+                .expect("probe guard retains its child until Drop"),
+            &mut self.group_signal_authorized,
+            &mut self.identity_lost,
+        )
+    }
+
+    async fn cleanup(
+        &mut self,
+        pid: Option<u32>,
+        deadline: Instant,
+    ) -> Result<std::process::ExitStatus, ProcessError> {
+        let (process, authority, identity_lost) = self.cleanup_parts();
+        cleanup_probe_process(process, pid, authority, identity_lost, deadline).await
+    }
+}
+
+impl Drop for ProbeProcessGuard {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        #[cfg(unix)]
+        let leader_identity_reserved = child.inner().id().is_some();
+        #[cfg(not(unix))]
+        let leader_identity_reserved = true;
+        if self.group_signal_authorized && leader_identity_reserved {
+            let _ = child.start_kill();
+            self.group_signal_authorized = false;
+        }
+        drop_or_forget_unreaped_child(child, self.identity_lost);
+    }
+}
+
+async fn collect_version_probe(
+    child: &mut ProbeProcessGuard,
+    pid: Option<u32>,
+    stdout: ChildStdout,
+    stderr: ChildStderr,
+    collection_deadline: Instant,
+    probe_deadline: Instant,
+) -> Result<
+    (
+        std::io::Result<LimitedOutput>,
+        std::io::Result<LimitedOutput>,
+        std::process::ExitStatus,
+    ),
+    ProcessError,
+> {
+    #[cfg(unix)]
+    {
+        let Some(group_pid) = pid else {
+            drop(stdout);
+            drop(stderr);
+            child.cleanup(pid, probe_deadline).await?;
+            return Err(ProcessError::ProcessTreeCleanupUnconfirmed);
+        };
+        let collected = {
+            let (authority, identity_lost) = child.authority_parts();
+            timeout_at(collection_deadline, async {
+                tokio::join!(
+                    read_limited(stdout),
+                    read_limited(stderr),
+                    wait_for_owned_leader_exit_without_reaping(group_pid, authority, identity_lost,)
+                )
+            })
+            .await
+        };
+        match collected {
+            Ok((stdout, stderr, Ok(()))) => {
+                let status = child.cleanup(pid, probe_deadline).await?;
+                Ok((stdout, stderr, status))
+            }
+            Ok((_, _, Err(source))) => {
+                child.cleanup(pid, probe_deadline).await?;
+                Err(ProcessError::ProbeIo {
+                    stream: "process status",
+                    source,
+                })
+            }
+            Err(_) => {
+                child.cleanup(pid, probe_deadline).await?;
+                Err(ProcessError::ProbeTimeout(VERSION_PROBE_TIMEOUT))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let collected = timeout_at(collection_deadline, async {
+            tokio::join!(
+                read_limited(stdout),
+                read_limited(stderr),
+                wait_owned_leader_or_job(child.child_mut())
+            )
+        })
+        .await;
+        match collected {
+            Ok((stdout, stderr, Ok(status))) => Ok((stdout, stderr, status)),
+            Ok((_, _, Err(source))) => {
+                child.cleanup(pid, probe_deadline).await?;
+                Err(ProcessError::ProbeIo {
+                    stream: "process status",
+                    source,
+                })
+            }
+            Err(_) => {
+                child.cleanup(pid, probe_deadline).await?;
+                Err(ProcessError::ProbeTimeout(VERSION_PROBE_TIMEOUT))
+            }
         }
     }
 }
@@ -407,72 +807,43 @@ pub async fn probe_version(config: &CodexProcessConfig) -> Result<Version, Proce
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = owned_command(command)
+    let child = owned_command(command)
         .spawn()
         .map_err(|source| ProcessError::Spawn {
             binary: config.binary.clone(),
             source,
         })?;
+    let mut child = ProbeProcessGuard::new(child);
     // Reserve the final second of the advertised probe bound for confirmed
-    // process-tree cleanup. The output collection, passive group-empty check,
-    // and forced cleanup all share `probe_deadline`; no failure path receives
-    // a second full probe interval.
+    // process-tree cleanup. Output collection and forced cleanup share
+    // `probe_deadline`; no failure path receives a second full probe interval.
     let probe_deadline = Instant::now() + VERSION_PROBE_TIMEOUT;
     let collection_deadline = probe_deadline
         .checked_sub(VERSION_PROBE_CLEANUP_RESERVE.min(VERSION_PROBE_TIMEOUT))
         .unwrap_or(probe_deadline);
-    let pid = child.inner().id();
+    let pid = child.child_mut().inner().id();
     let (stdout, stderr) = {
-        let inner = child.inner_mut();
+        let inner = child.child_mut().inner_mut();
         (inner.stdout.take(), inner.stderr.take())
     };
     let Some(stdout) = stdout else {
-        cleanup_probe_process(&mut child, pid, probe_deadline).await?;
+        child.cleanup(pid, probe_deadline).await?;
         return Err(ProcessError::StdioUnavailable("version stdout"));
     };
     let Some(stderr) = stderr else {
-        cleanup_probe_process(&mut child, pid, probe_deadline).await?;
+        child.cleanup(pid, probe_deadline).await?;
         return Err(ProcessError::StdioUnavailable("version stderr"));
     };
 
-    let collected = timeout_at(collection_deadline, async {
-        tokio::join!(
-            read_limited(stdout),
-            read_limited(stderr),
-            Box::into_pin(child.wait())
-        )
-    })
-    .await;
-
-    let (stdout, stderr, status) = match collected {
-        Ok((stdout, stderr, Ok(status))) => (stdout, stderr, status),
-        Ok((_, _, Err(source))) => {
-            cleanup_probe_process(&mut child, pid, probe_deadline).await?;
-            return Err(ProcessError::ProbeIo {
-                stream: "process status",
-                source,
-            });
-        }
-        Err(_) => {
-            cleanup_probe_process(&mut child, pid, probe_deadline).await?;
-            return Err(ProcessError::ProbeTimeout(VERSION_PROBE_TIMEOUT));
-        }
-    };
-
-    #[cfg(unix)]
-    {
-        let Some(group_pid) = pid else {
-            cleanup_probe_process(&mut child, pid, probe_deadline).await?;
-            return Err(ProcessError::ProcessTreeCleanupUnconfirmed);
-        };
-        if wait_for_owned_process_group_empty(group_pid, collection_deadline)
-            .await
-            .is_err()
-        {
-            cleanup_probe_process(&mut child, pid, probe_deadline).await?;
-            return Err(ProcessError::ProbeTimeout(VERSION_PROBE_TIMEOUT));
-        }
-    }
+    let (stdout, stderr, status) = collect_version_probe(
+        &mut child,
+        pid,
+        stdout,
+        stderr,
+        collection_deadline,
+        probe_deadline,
+    )
+    .await?;
 
     let stdout = stdout.map_err(|source| ProcessError::ProbeIo {
         stream: "stdout",
@@ -525,8 +896,12 @@ pub async fn spawn_app_server(config: &CodexProcessConfig) -> Result<CodexProces
         source,
     })?;
     let Some(pid) = child.inner_mut().id() else {
+        // A Windows Job object retains the owned-tree identity independently
+        // of the wrapper PID. POSIX process-group identity does not: without
+        // the leader PID, a destructive signal could target a reused PGID.
+        #[cfg(not(unix))]
         let _ = child.start_kill();
-        let _ = timeout(VERSION_PROBE_TIMEOUT, Box::into_pin(child.wait())).await;
+        let _ = timeout(VERSION_PROBE_TIMEOUT, wait_owned_leader_or_job(&mut child)).await;
         // Without the leader PID there is no process-group identity to probe.
         // A wrapper wait therefore cannot prove that the owned tree is empty.
         return Err(ProcessError::ProcessTreeCleanupUnconfirmed);
@@ -537,7 +912,7 @@ pub async fn spawn_app_server(config: &CodexProcessConfig) -> Result<CodexProces
     };
 
     Ok(CodexProcess {
-        child,
+        child: Some(child),
         version,
         stdout,
         stdin,
@@ -545,11 +920,14 @@ pub async fn spawn_app_server(config: &CodexProcessConfig) -> Result<CodexProces
         exit: None,
         pid,
         tree_reaped: false,
+        group_signal_authorized: true,
+        identity_lost: false,
     })
 }
 
 fn owned_command(command: Command) -> TokioCommandWrap {
     let mut command = TokioCommandWrap::from(command);
+    #[cfg(windows)]
     command.wrap(KillOnDrop);
     #[cfg(unix)]
     command.wrap(ProcessGroup::leader());
@@ -561,16 +939,40 @@ fn owned_command(command: Command) -> TokioCommandWrap {
 async fn cleanup_probe_process(
     child: &mut Box<dyn TokioChildWrapper>,
     pid: Option<u32>,
+    group_signal_authorized: &mut bool,
+    identity_lost: &mut bool,
     cleanup_deadline: Instant,
-) -> Result<(), ProcessError> {
-    let _ = child.start_kill();
-    if !matches!(
-        timeout_at(cleanup_deadline, Box::into_pin(child.wait())).await,
-        Ok(Ok(_))
-    ) {
-        let _ = child.start_kill();
+) -> Result<std::process::ExitStatus, ProcessError> {
+    if *identity_lost {
         return Err(ProcessError::ProcessTreeCleanupUnconfirmed);
     }
+    #[cfg(unix)]
+    let leader_identity_reserved = {
+        if child.inner().id().is_none() {
+            *group_signal_authorized = false;
+        }
+        *group_signal_authorized
+    };
+    #[cfg(not(unix))]
+    let leader_identity_reserved = {
+        let _ = group_signal_authorized;
+        true
+    };
+    if leader_identity_reserved {
+        let _ = child.start_kill();
+        #[cfg(unix)]
+        {
+            *group_signal_authorized = false;
+        }
+    }
+    let status = match timeout_at(cleanup_deadline, wait_owned_leader_or_job(child)).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(source)) => {
+            record_wait_identity_loss(&source, group_signal_authorized, identity_lost);
+            return Err(ProcessError::ProcessTreeCleanupUnconfirmed);
+        }
+        Err(_) => return Err(ProcessError::ProcessTreeCleanupUnconfirmed),
+    };
     #[cfg(unix)]
     {
         let pid = pid.ok_or(ProcessError::ProcessTreeCleanupUnconfirmed)?;
@@ -582,7 +984,7 @@ async fn cleanup_probe_process(
     {
         let _ = pid;
     }
-    Ok(())
+    Ok(status)
 }
 
 fn base_command(config: &CodexProcessConfig) -> Result<Command, ProcessError> {
@@ -677,6 +1079,46 @@ fn exit_signal(_status: std::process::ExitStatus) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_reap_explicitly_revokes_group_signal_authority() {
+        use rustix::process::{WaitOptions, waitpid};
+
+        let mut command = Command::new("/usr/bin/true");
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = owned_command(command)
+            .spawn()
+            .expect("spawn authority fixture");
+        let pid = child.inner().id().expect("fixture exposes its PID");
+        let raw_pid = i32::try_from(pid).expect("fixture PID fits platform range");
+        let rustix_pid = RustixPid::from_raw(raw_pid).expect("fixture PID is positive");
+        waitpid(Some(rustix_pid), WaitOptions::empty())
+            .expect("external waitpid reaps fixture")
+            .expect("blocking waitpid returns a status");
+        assert!(
+            child.inner().id().is_some(),
+            "Tokio retains a stale raw PID until its own wait observes ECHILD"
+        );
+
+        let mut group_signal_authorized = true;
+        let mut identity_lost = false;
+        let error = wait_for_owned_leader_exit_without_reaping(
+            pid,
+            &mut group_signal_authorized,
+            &mut identity_lost,
+        )
+        .await
+        .expect_err("an externally reaped child must report ECHILD");
+
+        assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
+        assert!(!group_signal_authorized);
+        assert!(identity_lost);
+        drop_or_forget_unreaped_child(child, identity_lost);
+    }
 
     #[test]
     fn parses_only_the_exact_codex_version_shape() {
