@@ -376,6 +376,23 @@ CREATE INDEX IF NOT EXISTS external_approval_claims_state
         version: 11,
         name: "durable persisted thread adoption saga",
         sql: "
+-- Versions through v10 allowed the same active Codex thread ID to be mapped by
+-- multiple scopes. There is no durable ownership fact that can select one of
+-- those scopes safely. Archive every active row in each ambiguous set, keeping
+-- all history while ensuring that no scope inherits write authority merely by
+-- row order. The migration transaction makes this rewrite and the unique index
+-- atomic. Active rows normally have no archived_ms, so created_ms is the stable
+-- deterministic fallback for historical stores.
+UPDATE threads
+SET status = 'archived', archived_ms = COALESCE(archived_ms, created_ms)
+WHERE status = 'active' AND codex_thread_id IN (
+    SELECT codex_thread_id
+    FROM threads
+    WHERE status = 'active'
+    GROUP BY codex_thread_id
+    HAVING COUNT(*) > 1
+);
+
 ALTER TABLE threads ADD COLUMN origin TEXT NOT NULL DEFAULT 'bridge_created'
     CHECK (origin IN ('bridge_created', 'externally_adopted'));
 ALTER TABLE threads ADD COLUMN adoption_generation INTEGER

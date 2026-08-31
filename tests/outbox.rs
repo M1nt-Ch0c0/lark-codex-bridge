@@ -20,7 +20,9 @@ use lark_codex_bridge::lark::http::LarkHttp;
 use lark_codex_bridge::lark::normalize::{InboundEvent, ScopeKey};
 use lark_codex_bridge::lark::token::TenantTokenProvider;
 use lark_codex_bridge::lark::transport::TransportState;
-use lark_codex_bridge::limits::{LARK_CARD_MARKDOWN_ELEMENT_MAX_BYTES, STORE_OUTBOX_MAX_ATTEMPTS};
+use lark_codex_bridge::limits::{
+    LARK_CARD_MARKDOWN_ELEMENT_MAX_BYTES, REPLY_MESSAGE_MAX_CHARS, STORE_OUTBOX_MAX_ATTEMPTS,
+};
 use lark_codex_bridge::outbox::{
     AppliedCertainty, DeliveryClass, OutboxError, OutboxOperation, OutboxPump, OutboxPumpConfig,
     OutboxReplySink, Retryability, classify_delivery, delivery_decision,
@@ -1348,8 +1350,10 @@ async fn control_reply_is_bounded_and_deterministic() {
         sink.control_reply(&key, &event, ""),
         Err(ReplySinkError::Invariant)
     ));
+    sink.control_reply(&key, &event, &"x".repeat(REPLY_MESSAGE_MAX_CHARS))
+        .expect("exact reply character limit remains accepted");
     assert!(matches!(
-        sink.control_reply(&key, &event, &"x".repeat(4_001)),
+        sink.control_reply(&key, &event, &"x".repeat(REPLY_MESSAGE_MAX_CHARS + 1),),
         Err(ReplySinkError::Invariant)
     ));
 }

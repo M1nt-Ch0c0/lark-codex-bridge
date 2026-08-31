@@ -204,6 +204,7 @@ pub struct ProcessExit {
 
 #[cfg(unix)]
 const PROCESS_GROUP_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const VERSION_PROBE_CLEANUP_RESERVE: Duration = Duration::from_secs(1);
 
 /// Waits until the owned POSIX process group no longer exists.
 ///
@@ -238,6 +239,43 @@ pub(crate) async fn wait_for_owned_process_group_empty(
             ));
         }
         sleep_until((now + PROCESS_GROUP_POLL_INTERVAL).min(deadline)).await;
+    }
+}
+
+/// Force-terminates an owned process tree and records proof that it is empty.
+///
+/// Native and sidecar-backed app servers use the same release-authority
+/// sequence. Callers retain their own graceful phase and error wording, but
+/// the force-kill, bounded wrapper wait, POSIX absence proof, exit caching,
+/// and `tree_reaped` transition must not drift apart.
+pub(crate) async fn reap_owned_process_tree(
+    child: &mut Box<dyn TokioChildWrapper>,
+    leader_pid: u32,
+    grace: Duration,
+    cached_exit: &mut Option<ProcessExit>,
+    tree_reaped: &mut bool,
+    timeout_message: &'static str,
+) -> Result<ProcessExit, ProcessError> {
+    let cleanup_deadline = Instant::now() + grace.max(Duration::from_secs(1));
+    let kill_error = child.start_kill().err();
+    match timeout_at(cleanup_deadline, Box::into_pin(child.wait())).await {
+        Ok(Ok(status)) => {
+            let exit = cached_exit.unwrap_or_else(|| process_exit(leader_pid, status));
+            *cached_exit = Some(exit);
+            #[cfg(unix)]
+            wait_for_owned_process_group_empty(leader_pid, cleanup_deadline)
+                .await
+                .map_err(ProcessError::Terminate)?;
+            *tree_reaped = true;
+            Ok(exit)
+        }
+        Ok(Err(source)) => Err(ProcessError::Wait(source)),
+        Err(_) => {
+            let _ = child.start_kill();
+            Err(ProcessError::Terminate(kill_error.unwrap_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, timeout_message)
+            })))
+        }
     }
 }
 
@@ -335,42 +373,15 @@ impl CodexProcess {
             let _ = timeout(grace, self.wait()).await;
         }
 
-        // The leader may already be reaped while descendants still retain the
-        // process group or Job. Always kill and wait for the outer ownership
-        // boundary before reporting cleanup success. The wrapper wait and the
-        // direct POSIX group-empty proof share one absolute cleanup deadline;
-        // the latter never receives a second full grace interval.
-        let reap_bound = grace.max(Duration::from_secs(1));
-        let cleanup_deadline = Instant::now() + reap_bound;
-        let kill_error = self.child.start_kill().err();
-        match timeout_at(cleanup_deadline, Box::into_pin(self.child.wait())).await {
-            Ok(Ok(status)) => {
-                let exit = self.exit.unwrap_or_else(|| self.cache_exit(status));
-                self.exit = Some(exit);
-                #[cfg(unix)]
-                wait_for_owned_process_group_empty(self.pid, cleanup_deadline)
-                    .await
-                    .map_err(ProcessError::Terminate)?;
-                self.tree_reaped = true;
-                Ok(exit)
-            }
-            Ok(Err(source)) => Err(ProcessError::Wait(source)),
-            Err(_) => {
-                let _ = self.child.start_kill();
-                Err(ProcessError::Terminate(kill_error.unwrap_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "Codex app-server process tree did not exit within its bound",
-                    )
-                })))
-            }
-        }
-    }
-
-    fn cache_exit(&mut self, status: std::process::ExitStatus) -> ProcessExit {
-        let exit = process_exit(self.pid, status);
-        self.exit = Some(exit);
-        exit
+        reap_owned_process_tree(
+            &mut self.child,
+            self.pid,
+            grace,
+            &mut self.exit,
+            &mut self.tree_reaped,
+            "Codex app-server process tree did not exit within its bound",
+        )
+        .await
     }
 }
 
@@ -402,22 +413,29 @@ pub async fn probe_version(config: &CodexProcessConfig) -> Result<Version, Proce
             binary: config.binary.clone(),
             source,
         })?;
+    // Reserve the final second of the advertised probe bound for confirmed
+    // process-tree cleanup. The output collection, passive group-empty check,
+    // and forced cleanup all share `probe_deadline`; no failure path receives
+    // a second full probe interval.
+    let probe_deadline = Instant::now() + VERSION_PROBE_TIMEOUT;
+    let collection_deadline = probe_deadline
+        .checked_sub(VERSION_PROBE_CLEANUP_RESERVE.min(VERSION_PROBE_TIMEOUT))
+        .unwrap_or(probe_deadline);
     let pid = child.inner().id();
     let (stdout, stderr) = {
         let inner = child.inner_mut();
         (inner.stdout.take(), inner.stderr.take())
     };
     let Some(stdout) = stdout else {
-        cleanup_probe_process(&mut child, pid).await?;
+        cleanup_probe_process(&mut child, pid, probe_deadline).await?;
         return Err(ProcessError::StdioUnavailable("version stdout"));
     };
     let Some(stderr) = stderr else {
-        cleanup_probe_process(&mut child, pid).await?;
+        cleanup_probe_process(&mut child, pid, probe_deadline).await?;
         return Err(ProcessError::StdioUnavailable("version stderr"));
     };
 
-    let probe_deadline = Instant::now() + VERSION_PROBE_TIMEOUT;
-    let collected = timeout_at(probe_deadline, async {
+    let collected = timeout_at(collection_deadline, async {
         tokio::join!(
             read_limited(stdout),
             read_limited(stderr),
@@ -429,14 +447,14 @@ pub async fn probe_version(config: &CodexProcessConfig) -> Result<Version, Proce
     let (stdout, stderr, status) = match collected {
         Ok((stdout, stderr, Ok(status))) => (stdout, stderr, status),
         Ok((_, _, Err(source))) => {
-            cleanup_probe_process(&mut child, pid).await?;
+            cleanup_probe_process(&mut child, pid, probe_deadline).await?;
             return Err(ProcessError::ProbeIo {
                 stream: "process status",
                 source,
             });
         }
         Err(_) => {
-            cleanup_probe_process(&mut child, pid).await?;
+            cleanup_probe_process(&mut child, pid, probe_deadline).await?;
             return Err(ProcessError::ProbeTimeout(VERSION_PROBE_TIMEOUT));
         }
     };
@@ -444,14 +462,14 @@ pub async fn probe_version(config: &CodexProcessConfig) -> Result<Version, Proce
     #[cfg(unix)]
     {
         let Some(group_pid) = pid else {
-            cleanup_probe_process(&mut child, pid).await?;
+            cleanup_probe_process(&mut child, pid, probe_deadline).await?;
             return Err(ProcessError::ProcessTreeCleanupUnconfirmed);
         };
-        if wait_for_owned_process_group_empty(group_pid, probe_deadline)
+        if wait_for_owned_process_group_empty(group_pid, collection_deadline)
             .await
             .is_err()
         {
-            cleanup_probe_process(&mut child, pid).await?;
+            cleanup_probe_process(&mut child, pid, probe_deadline).await?;
             return Err(ProcessError::ProbeTimeout(VERSION_PROBE_TIMEOUT));
         }
     }
@@ -543,8 +561,8 @@ fn owned_command(command: Command) -> TokioCommandWrap {
 async fn cleanup_probe_process(
     child: &mut Box<dyn TokioChildWrapper>,
     pid: Option<u32>,
+    cleanup_deadline: Instant,
 ) -> Result<(), ProcessError> {
-    let cleanup_deadline = Instant::now() + VERSION_PROBE_TIMEOUT;
     let _ = child.start_kill();
     if !matches!(
         timeout_at(cleanup_deadline, Box::into_pin(child.wait())).await,

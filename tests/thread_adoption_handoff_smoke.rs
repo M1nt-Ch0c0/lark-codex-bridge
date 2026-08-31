@@ -59,7 +59,7 @@ use tokio::{
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
     sync::{Notify, Semaphore},
     task::JoinHandle,
-    time::{Instant, sleep, timeout},
+    time::{sleep, timeout},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -76,7 +76,6 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(20);
 const TURN_TIMEOUT: Duration = Duration::from_secs(60);
 const ROUTER_TIMEOUT: Duration = Duration::from_secs(60);
 const PROCESS_GRACE: Duration = Duration::from_secs(5);
-const PROCESS_TREE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PROTOCOL_LINE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PROTOCOL_STREAM_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PROVIDER_REQUEST_BYTES: usize = 2 * 1024 * 1024;
@@ -430,6 +429,8 @@ struct IndependentOwner {
     notifications: VecDeque<Value>,
     next_id: u64,
     pid: u32,
+    leader_reaped: bool,
+    group_kill_sent: bool,
     stopped: bool,
 }
 
@@ -477,6 +478,8 @@ impl IndependentOwner {
             notifications: VecDeque::new(),
             next_id: 1,
             pid,
+            leader_reaped: false,
+            group_kill_sent: false,
             stopped: false,
         })
     }
@@ -676,29 +679,51 @@ impl IndependentOwner {
         Ok(())
     }
 
+    async fn drain_stdout_until_close(&mut self) -> Result<()> {
+        let mut chunk = [0_u8; 8192];
+        loop {
+            let read = self
+                .stdout
+                .read(&mut chunk)
+                .await
+                .context("unable to drain independent app-server stdout")?;
+            if read == 0 {
+                return Ok(());
+            }
+            self.stdout_bytes = self.stdout_bytes.saturating_add(read);
+            ensure!(
+                self.stdout_bytes <= MAX_PROTOCOL_STREAM_BYTES,
+                "independent app-server stdout exceeded bound during shutdown"
+            );
+        }
+    }
+
+    async fn wait_for_stdout_close(&mut self) -> Result<bool> {
+        match timeout(PROCESS_GRACE, self.drain_stdout_until_close()).await {
+            Ok(result) => result.map(|()| true),
+            Err(_) => Ok(false),
+        }
+    }
+
     async fn stop(mut self) -> Result<()> {
         drop(self.stdin.take());
-        let mut leader_reaped = match timeout(PROCESS_GRACE, self.child.wait()).await {
-            Ok(Ok(_)) => true,
-            Ok(Err(_)) => bail!("unable to reap independent app-server leader"),
-            Err(_) => false,
-        };
-        if !leader_reaped {
+        if !self.wait_for_stdout_close().await? {
             signal_process_group(self.pid, SignalKind::Terminate)?;
-            leader_reaped = match timeout(PROCESS_GRACE, self.child.wait()).await {
-                Ok(Ok(_)) => true,
-                Ok(Err(_)) => bail!("unable to reap independent app-server leader"),
-                Err(_) => false,
-            };
+            let _ = self.wait_for_stdout_close().await?;
         }
-        if !leader_reaped {
-            signal_process_group(self.pid, SignalKind::Kill)?;
-            timeout(PROCESS_GRACE, self.child.wait())
-                .await
-                .context("independent app-server leader reap timed out")??;
-        }
-        signal_process_group(self.pid, SignalKind::Kill)?;
-        wait_for_process_group_absence(self.pid).await?;
+
+        // Keep the leader unreaped until the final destructive group signal.
+        // Its reserved PID therefore still identifies this owned process group
+        // and cannot have been recycled for an unrelated group. No PGID-based
+        // operation follows wait(); the later owner's exact successful resume
+        // is the end-to-end writer-release evidence for this smoke sequence.
+        let group_kill = signal_process_group(self.pid, SignalKind::Kill);
+        self.group_kill_sent = true;
+        group_kill?;
+        timeout(PROCESS_GRACE, self.child.wait())
+            .await
+            .context("independent app-server leader reap timed out")??;
+        self.leader_reaped = true;
         let stderr_exceeded = match self.stderr_task.take() {
             Some(task) => timeout(PROCESS_GRACE, task)
                 .await
@@ -721,7 +746,10 @@ impl Drop for IndependentOwner {
             return;
         }
         #[cfg(unix)]
-        if let Ok(pid) = i32::try_from(self.pid) {
+        if !self.leader_reaped
+            && !self.group_kill_sent
+            && let Ok(pid) = i32::try_from(self.pid)
+        {
             let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
         }
         let _ = self.child.start_kill();
@@ -764,30 +792,6 @@ fn signal_process_group(pid: u32, signal: SignalKind) -> Result<()> {
 
 #[cfg(not(unix))]
 fn signal_process_group(_pid: u32, _signal: SignalKind) -> Result<()> {
-    bail!("independent process-group proof requires Unix")
-}
-
-#[cfg(unix)]
-async fn wait_for_process_group_absence(pid: u32) -> Result<()> {
-    let pid = i32::try_from(pid).context("independent process id exceeded platform range")?;
-    let group = Pid::from_raw(pid);
-    let deadline = Instant::now() + PROCESS_TREE_TIMEOUT;
-    loop {
-        match killpg(group, None) {
-            Err(Errno::ESRCH) => return Ok(()),
-            Ok(()) | Err(Errno::EPERM) => {}
-            Err(_) => bail!("independent process-group probe failed"),
-        }
-        ensure!(
-            Instant::now() < deadline,
-            "independent process group was not reaped"
-        );
-        sleep(Duration::from_millis(20)).await;
-    }
-}
-
-#[cfg(not(unix))]
-async fn wait_for_process_group_absence(_pid: u32) -> Result<()> {
     bail!("independent process-group proof requires Unix")
 }
 

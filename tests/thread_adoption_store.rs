@@ -56,6 +56,105 @@ async fn commit(store: &StoreHandle, saga: &ThreadAdoptionSaga, cwd: &Path, fing
         .expect("commit adoption");
 }
 
+fn create_schema_through(connection: &mut rusqlite::Connection, version: u32) {
+    for migration in lark_codex_bridge::store::schema::MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version <= version)
+    {
+        let transaction = connection.transaction().expect("migration transaction");
+        transaction
+            .execute_batch(migration.sql)
+            .expect("apply historical schema");
+        transaction
+            .pragma_update(None, "user_version", migration.version)
+            .expect("record historical schema version");
+        transaction.commit().expect("commit historical schema");
+    }
+}
+
+#[tokio::test]
+async fn migration_v11_archives_every_ambiguous_active_mapping_without_choosing_an_owner() {
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("ambiguous-v10.sqlite");
+    {
+        let mut connection = rusqlite::Connection::open(&path).expect("open v10 fixture");
+        create_schema_through(&mut connection, 10);
+        connection
+            .execute_batch(
+                "INSERT INTO scopes (scope_key, cwd, policy_fingerprint, updated_ms) VALUES
+                     ('im:first-owner', '/first', 'first-fp', 1),
+                     ('im:second-owner', '/second', 'second-fp', 1);
+                 INSERT INTO threads (
+                     scope_key, codex_thread_id, status, created_ms, archived_ms,
+                     context_tools_version
+                 ) VALUES
+                     ('im:first-owner', 'ambiguous-thread', 'active', 1, NULL, 0),
+                     ('im:second-owner', 'ambiguous-thread', 'active', 2, NULL, 0);",
+            )
+            .expect("seed ambiguous v10 mappings");
+    }
+
+    let store = StoreHandle::open(&path)
+        .await
+        .expect("ambiguous mappings migrate without selecting an owner");
+    assert_eq!(store.pragmas().await.expect("pragmas").user_version, 12);
+    for scope in [
+        ScopeKey::Chat("first-owner".to_owned()),
+        ScopeKey::Chat("second-owner".to_owned()),
+    ] {
+        assert!(
+            store
+                .active_thread(&scope)
+                .await
+                .expect("active mapping query")
+                .is_none()
+        );
+        assert!(
+            store
+                .thread_adoption_saga(&scope)
+                .await
+                .expect("saga query")
+                .is_none()
+        );
+    }
+    store.shutdown().await.expect("shutdown migrated store");
+
+    let connection = rusqlite::Connection::open(&path).expect("inspect migrated store");
+    let version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .expect("read migrated version");
+    assert_eq!(version, 12);
+    let active: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM threads
+             WHERE codex_thread_id = 'ambiguous-thread' AND status = 'active'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count active mappings");
+    assert_eq!(active, 0, "migration must not choose an active owner");
+    let archived: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM threads
+             WHERE codex_thread_id = 'ambiguous-thread' AND status = 'archived'
+               AND archived_ms = created_ms AND origin = 'bridge_created'
+               AND adoption_generation IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count archived mappings");
+    assert_eq!(archived, 2, "migration must preserve every historical row");
+    let sagas: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM thread_adoption_sagas
+             WHERE codex_thread_id = 'ambiguous-thread'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count adoption sagas");
+    assert_eq!(sagas, 0, "migration must not synthesize ownership");
+}
+
 #[tokio::test]
 async fn migration_v11_defaults_bridge_threads_and_filters_bound_targets() {
     let store = StoreHandle::open_in_memory().await.expect("open");
@@ -560,5 +659,128 @@ async fn startup_fence_marks_every_live_saga_without_dropping_mappings() {
         individually_fenced,
         StoreError::InvalidTransition { .. }
     ));
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn startup_fence_rejects_external_mapping_without_its_live_saga() {
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("mapping-without-saga.sqlite");
+    let scope = ScopeKey::Chat("mapping-without-saga".to_owned());
+    let store = StoreHandle::open(&path).await.expect("open");
+    store
+        .upsert_scope(&scope, Path::new("/mapping-without-saga"), "fp")
+        .await
+        .expect("seed scope");
+    let reservation = store
+        .reserve_thread_adoption(&scope, "orphaned-external-mapping")
+        .await
+        .expect("reserve");
+    commit(
+        &store,
+        &reservation,
+        Path::new("/mapping-without-saga"),
+        "fp",
+    )
+    .await;
+    store.shutdown().await.expect("shutdown seed store");
+
+    {
+        let connection = rusqlite::Connection::open(&path).expect("open corruption fixture");
+        assert_eq!(
+            connection
+                .execute(
+                    "DELETE FROM thread_adoption_sagas WHERE scope_key = ?1",
+                    [scope.to_string()],
+                )
+                .expect("remove live saga"),
+            1
+        );
+    }
+
+    let store = StoreHandle::open(&path)
+        .await
+        .expect("reopen corrupt store");
+    assert!(matches!(
+        store.fence_thread_adoptions_on_startup().await,
+        Err(StoreError::CorruptData { .. })
+    ));
+    let mapping = store
+        .active_thread(&scope)
+        .await
+        .expect("mapping query")
+        .expect("mapping remains fenced");
+    assert_eq!(mapping.origin, ThreadOrigin::ExternallyAdopted);
+    assert_eq!(mapping.codex_thread_id, "orphaned-external-mapping");
+    assert!(
+        store
+            .active_thread_adoption(&scope)
+            .await
+            .expect("saga query")
+            .is_none()
+    );
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn startup_fence_rejects_owned_live_saga_without_its_exact_mapping() {
+    let temp = tempdir().expect("tempdir");
+    let path = temp.path().join("saga-without-mapping.sqlite");
+    let scope = ScopeKey::Chat("saga-without-mapping".to_owned());
+    let store = StoreHandle::open(&path).await.expect("open");
+    store
+        .upsert_scope(&scope, Path::new("/saga-without-mapping"), "fp")
+        .await
+        .expect("seed scope");
+    let reservation = store
+        .reserve_thread_adoption(&scope, "orphaned-owned-saga")
+        .await
+        .expect("reserve");
+    commit(
+        &store,
+        &reservation,
+        Path::new("/saga-without-mapping"),
+        "fp",
+    )
+    .await;
+    store.shutdown().await.expect("shutdown seed store");
+
+    {
+        let connection = rusqlite::Connection::open(&path).expect("open corruption fixture");
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE threads SET status = 'archived', archived_ms = 1
+                     WHERE scope_key = ?1 AND codex_thread_id = 'orphaned-owned-saga'
+                       AND status = 'active'",
+                    [scope.to_string()],
+                )
+                .expect("remove exact active mapping"),
+            1
+        );
+    }
+
+    let store = StoreHandle::open(&path)
+        .await
+        .expect("reopen corrupt store");
+    assert!(matches!(
+        store.fence_thread_adoptions_on_startup().await,
+        Err(StoreError::CorruptData { .. })
+    ));
+    assert!(
+        store
+            .active_thread(&scope)
+            .await
+            .expect("mapping query")
+            .is_none()
+    );
+    let saga = store
+        .active_thread_adoption(&scope)
+        .await
+        .expect("saga query")
+        .expect("live saga remains fenced");
+    assert_eq!(saga.state, ThreadAdoptionState::Owned);
+    assert_eq!(saga.generation, reservation.generation);
+    assert_eq!(saga.codex_thread_id, "orphaned-owned-saga");
     store.shutdown().await.expect("shutdown");
 }

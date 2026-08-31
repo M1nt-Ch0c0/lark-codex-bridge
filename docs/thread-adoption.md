@@ -164,6 +164,13 @@ constraint prevents two Feishu scopes from reserving or mapping the same Codex
 thread. `bridge_created` rows have no adoption generation;
 `externally_adopted` rows must have one.
 
+The v11 migration applies that uniqueness rule fail closed. If a pre-v11 store
+contains the same active Codex thread ID in more than one scope, every active
+row in that ambiguous set is archived atomically before the unique index is
+created. The migration preserves the rows as history but selects no owner and
+creates no adoption saga; restoring access therefore requires a new explicit
+`/threads` selection after the operator has verified the intended handoff.
+
 ## Context and shared-endpoint boundaries
 
 Adoption changes the Codex history routed for future messages; it does not

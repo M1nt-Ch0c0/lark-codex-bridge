@@ -24,7 +24,8 @@ use crate::{
     },
     limits::PROBE_TIMEOUT,
     runtime::adoption::{
-        THREAD_ADOPTION_SUPPORTED_PLATFORMS, ThreadAdoptionAvailability, ThreadAdoptionGate,
+        THREAD_ADOPTION_SUPPORTED_PLATFORMS, ThreadAdoptionAvailability, ThreadAdoptionBackend,
+        ThreadAdoptionGate,
     },
 };
 
@@ -333,7 +334,10 @@ fn report_thread_adoption_status() -> Result<()> {
         classification: availability,
         guidance: availability.guidance(),
         release_authority: availability.release_authority(),
-        managed_backends: ["spawned_stdio", "protocol_sidecar"],
+        managed_backends: [
+            ThreadAdoptionBackend::ManagedStdio.code(),
+            ThreadAdoptionBackend::ManagedSidecar.code(),
+        ],
         supported_platforms: THREAD_ADOPTION_SUPPORTED_PLATFORMS,
         external_endpoint: ThreadAdoptionExternalEndpointReport {
             available: external.is_available(),

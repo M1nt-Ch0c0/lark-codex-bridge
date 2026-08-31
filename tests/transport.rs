@@ -582,29 +582,47 @@ fn fake_process_tree_version_probe() -> (tempfile::TempDir, std::path::PathBuf) 
 }
 
 #[cfg(unix)]
-fn unix_process_is_live(pid: u32) -> bool {
+fn unix_process_matches(pid: u32, token: &str) -> bool {
     let output = std::process::Command::new("/bin/ps")
-        .args(["-p", &pid.to_string(), "-o", "stat="])
+        .args([
+            "-ww",
+            "-p",
+            &pid.to_string(),
+            "-o",
+            "stat=",
+            "-o",
+            "command=",
+        ])
         .stderr(std::process::Stdio::null())
         .output();
     let Ok(output) = output else {
         return false;
     };
-    output.status.success()
-        && !String::from_utf8_lossy(&output.stdout)
-            .trim_start()
-            .starts_with('Z')
+    if !output.status.success() {
+        return false;
+    }
+    let process = String::from_utf8_lossy(&output.stdout);
+    let mut fields = process.trim_start().splitn(2, char::is_whitespace);
+    let state = fields.next().unwrap_or_default();
+    let command = fields.next().unwrap_or_default().trim_start();
+    !state.starts_with('Z') && command.contains(token)
 }
 
 #[cfg(unix)]
-struct NativeDescendantCleanup(u32);
+struct NativeDescendant {
+    pid: u32,
+    token: String,
+}
 
 #[cfg(unix)]
-impl Drop for NativeDescendantCleanup {
+struct NativeDescendantCleanup<'a>(&'a NativeDescendant);
+
+#[cfg(unix)]
+impl Drop for NativeDescendantCleanup<'_> {
     fn drop(&mut self) {
-        if unix_process_is_live(self.0) {
+        if unix_process_matches(self.0.pid, &self.0.token) {
             let _ = std::process::Command::new("/bin/kill")
-                .args(["-KILL", &self.0.to_string()])
+                .args(["-KILL", &self.0.pid.to_string()])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status();
@@ -613,13 +631,18 @@ impl Drop for NativeDescendantCleanup {
 }
 
 #[cfg(unix)]
-async fn read_descendant_pid(path: &std::path::Path) -> u32 {
+async fn read_descendant(path: &std::path::Path) -> NativeDescendant {
     timeout(EVENT_TIMEOUT, async {
         loop {
             if let Ok(contents) = std::fs::read_to_string(path)
-                && let Ok(pid) = contents.trim().parse()
+                && let Some((pid, token)) = contents.trim_end().split_once('\t')
+                && let Ok(pid) = pid.parse()
+                && !token.is_empty()
             {
-                return pid;
+                return NativeDescendant {
+                    pid,
+                    token: token.to_owned(),
+                };
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -678,8 +701,8 @@ async fn timed_out_version_probe_reaps_its_owned_process_group() {
         codex_home: None,
     };
     let probe = tokio::spawn(async move { probe_version(&config).await });
-    let descendant_pid = read_descendant_pid(&marker).await;
-    let _cleanup = NativeDescendantCleanup(descendant_pid);
+    let descendant = read_descendant(&marker).await;
+    let _cleanup = NativeDescendantCleanup(&descendant);
 
     let result = timeout(VERSION_PROBE_TIMEOUT + EVENT_TIMEOUT, probe)
         .await
@@ -690,7 +713,7 @@ async fn timed_out_version_probe_reaps_its_owned_process_group() {
         Err(lark_codex_bridge::codex::process::ProcessError::ProbeTimeout(_))
     ));
     assert!(
-        !unix_process_is_live(descendant_pid),
+        !unix_process_matches(descendant.pid, &descendant.token),
         "timed-out version probe must not leave its descendant alive"
     );
 }
@@ -737,8 +760,8 @@ async fn native_app_server_termination_reaps_descendants_after_leader_exit() {
     })
     .await
     .expect("process-tree fake app-server should start");
-    let descendant_pid = read_descendant_pid(&marker).await;
-    let _cleanup = NativeDescendantCleanup(descendant_pid);
+    let descendant = read_descendant(&marker).await;
+    let _cleanup = NativeDescendantCleanup(&descendant);
 
     let leader = timeout(EVENT_TIMEOUT, process.wait())
         .await
@@ -746,7 +769,7 @@ async fn native_app_server_termination_reaps_descendants_after_leader_exit() {
         .expect("leader wait should succeed");
     assert!(leader.success);
     assert!(
-        unix_process_is_live(descendant_pid),
+        unix_process_matches(descendant.pid, &descendant.token),
         "fixture descendant must outlive its leader before cleanup"
     );
 
@@ -755,7 +778,7 @@ async fn native_app_server_termination_reaps_descendants_after_leader_exit() {
         .await
         .expect("native process-group termination must confirm full reap");
     assert!(
-        !unix_process_is_live(descendant_pid),
+        !unix_process_matches(descendant.pid, &descendant.token),
         "confirmed native cleanup must leave no live descendant"
     );
 }

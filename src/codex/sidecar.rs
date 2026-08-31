@@ -28,6 +28,7 @@ use crate::{
         compat::WireAdapter,
         process::{
             ProcessError, ProcessExit, SidecarBootstrapFailure, SidecarSpawnFailure, process_exit,
+            reap_owned_process_tree,
         },
         supervisor::{AppServerProcess, ProcessStdio, ProtocolInfo},
     },
@@ -268,40 +269,15 @@ impl CodexSidecarProcess {
             }
         }
 
-        // The leader may have exited while an upstream descendant is still
-        // alive. Always target and then wait for the outer ownership boundary.
-        // A failed kill is not independently decisive: the group may already
-        // be empty, which only the direct absence probe below can confirm.
-        // The wrapper wait and direct POSIX group-empty proof share one
-        // absolute cleanup deadline, so polling cannot add another full grace.
-        let cleanup_deadline = Instant::now() + grace.max(Duration::from_secs(1));
-        let kill_error = self.child.start_kill().err();
-        let waited = timeout_at(cleanup_deadline, Box::into_pin(self.child.wait())).await;
-        match waited {
-            Ok(Ok(status)) => {
-                let exit = self.exit.unwrap_or_else(|| process_exit(self.pid, status));
-                self.exit = Some(exit);
-                #[cfg(unix)]
-                crate::codex::process::wait_for_owned_process_group_empty(
-                    self.pid,
-                    cleanup_deadline,
-                )
-                .await
-                .map_err(ProcessError::Terminate)?;
-                self.tree_reaped = true;
-                Ok(exit)
-            }
-            Ok(Err(source)) => Err(ProcessError::Wait(source)),
-            Err(_) => {
-                let _ = self.child.start_kill();
-                Err(ProcessError::Terminate(kill_error.unwrap_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "Codex sidecar process tree did not exit within its bound",
-                    )
-                })))
-            }
-        }
+        reap_owned_process_tree(
+            &mut self.child,
+            self.pid,
+            grace,
+            &mut self.exit,
+            &mut self.tree_reaped,
+            "Codex sidecar process tree did not exit within its bound",
+        )
+        .await
     }
 }
 

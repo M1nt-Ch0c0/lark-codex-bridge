@@ -1120,7 +1120,8 @@ async fn execute_adopt_control(
         .await
         .is_err()
     {
-        return "Adoption refused because this scope has no policy-valid workspace.".to_owned();
+        return "Adoption refused because this scope has no policy-valid workspace. The one-shot selection proof was consumed; fix the workspace policy, then run /threads again."
+            .to_owned();
     }
     let access = supervisor.borrow().clone();
     let Some(shared_client) = access.client else {
@@ -3461,9 +3462,12 @@ mod tests {
             .await
             .expect("durable cleanup before reply");
 
-        let adoption = Arc::new(ThreadAdoptionCoordinator::new(
+        // This is a durable terminal-replay test. Use a supported no-launch
+        // harness so the state-machine assertion remains platform-neutral;
+        // production adoption itself intentionally stays unavailable on
+        // Windows, where process-tree absence cannot be proved.
+        let adoption = Arc::new(ThreadAdoptionCoordinator::with_test_replay_only_launcher(
             store.clone(),
-            fixture.settings.backend.clone(),
             4,
         ));
         assert_eq!(adoption.startup_fence().await.expect("startup fence"), 0);

@@ -546,14 +546,12 @@ async fn failed_bootstrap_confirms_its_spawned_process_group_is_empty() {
     let marker = temp.path().join("bootstrap-events.jsonl");
     let mut config = bootstrap_config(&node, "tests/fixtures/fake_sidecar_hanging_bootstrap.cjs");
     config.codex_binary = Some(marker.clone());
-    config.handshake_timeout = Duration::from_millis(100);
+    config.handshake_timeout = Duration::from_secs(5);
     config.shutdown_grace = Duration::from_secs(2);
+    let handshake_timeout = config.handshake_timeout;
 
-    let Err(error) = spawn_codex_sidecar(&config).await else {
-        panic!("the fixture never completes its configure response");
-    };
-    assert!(matches!(error, ProcessError::SidecarHandshakeTimeout(_)));
-
+    let bootstrap = tokio::spawn(async move { spawn_codex_sidecar(&config).await });
+    wait_for_event(&marker, "descendant").await;
     let descendant = marker_events(&marker)
         .into_iter()
         .find(|event| event["event"] == "descendant")
@@ -570,6 +568,22 @@ async fn failed_bootstrap_confirms_its_spawned_process_group_is_empty() {
         pid: descendant_pid,
         token: descendant_token.clone(),
     };
+    assert!(
+        unix_process_matches(descendant_pid, &descendant_token),
+        "the descendant must be alive before handshake-timeout cleanup begins"
+    );
+
+    let result = timeout(TEST_TIMEOUT, bootstrap)
+        .await
+        .expect("the hanging bootstrap must reach its bounded timeout")
+        .expect("the bootstrap task must not panic");
+    let Err(error) = result else {
+        panic!("the fixture never completes its configure response");
+    };
+    assert!(matches!(
+        error,
+        ProcessError::SidecarHandshakeTimeout(duration) if duration == handshake_timeout
+    ));
     assert!(
         !unix_process_matches(descendant_pid, &descendant_token),
         "returning the original bootstrap error requires an empty owned group"

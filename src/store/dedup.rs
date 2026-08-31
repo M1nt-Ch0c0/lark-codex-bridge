@@ -258,6 +258,18 @@ pub enum InboundRejectionKind {
 }
 
 impl InboundRejectionKind {
+    const ALL: [Self; 9] = [
+        Self::Overloaded,
+        Self::NotOwner,
+        Self::NotSender,
+        Self::NotGroup,
+        Self::MissingMention,
+        Self::OwnerCommandRequired,
+        Self::Policy,
+        Self::Stale,
+        Self::Internal,
+    ];
+
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Overloaded => "overloaded",
@@ -2396,18 +2408,9 @@ fn validate_inbound_reply_effect(tenant: &str, stored: &StoredInbound) -> Result
 }
 
 fn is_classified_inbound_rejection(reason: &str) -> bool {
-    matches!(
-        reason,
-        "overloaded"
-            | "not_owner"
-            | "not_sender"
-            | "not_group"
-            | "missing_mention"
-            | "owner_command_required"
-            | "policy"
-            | "stale"
-            | "internal"
-    )
+    InboundRejectionKind::ALL
+        .into_iter()
+        .any(|kind| kind.as_str() == reason)
 }
 
 fn validate_turn_association(

@@ -451,6 +451,20 @@ struct ProductionLauncher {
     backend: LaunchBackend,
 }
 
+#[cfg(test)]
+struct ReplayOnlyTestLauncher;
+
+#[cfg(test)]
+impl DomainLauncher for ReplayOnlyTestLauncher {
+    fn supported(&self) -> bool {
+        true
+    }
+
+    fn launch(&self) -> DomainFuture<'static, Result<Box<dyn DomainOwner>, DomainOperationError>> {
+        Box::pin(async { Err(DomainOperationError::NotReady) })
+    }
+}
+
 impl DomainLauncher for ProductionLauncher {
     fn supported(&self) -> bool {
         thread_adoption_platform_supported() && !matches!(self.backend, LaunchBackend::Unsupported)
@@ -709,6 +723,11 @@ impl ThreadAdoptionCoordinator {
             operations_changed: Arc::new(Notify::new()),
             allow_missing_test_client: true,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_replay_only_launcher(store: StoreHandle, max_domains: usize) -> Self {
+        Self::with_test_launcher(store, Arc::new(ReplayOnlyTestLauncher), max_domains)
     }
 
     /// Fences every non-terminal generation before this process serves work.

@@ -22,17 +22,20 @@ case "$fixture_name" in
     [ "$1" = "app-server" ] || exit 91
     [ "$2" = "--listen" ] || exit 92
     [ "$3" = "stdio://" ] || exit 93
-    sleep 60 &
+    descendant_token="bridge-native-descendant:${0}:$$:app-server"
+    /bin/sh -c 'kill -STOP "$$"' "$descendant_token" &
     child=$!
-    printf '%s\n' "$child" > "${0%/*}/descendant.pid"
+    printf '%s\t%s\n' "$child" "$descendant_token" > "${0%/*}/descendant.pid"
     exit 0
     ;;
   "codex version probe tree fixture")
     [ "$1" = "--version" ] || exit 91
-    sleep 60 &
+    descendant_token="bridge-native-descendant:${0}:$$:version-probe"
+    /bin/sh -c 'kill -STOP "$$"' "$descendant_token" &
     child=$!
-    printf '%s\n' "$child" > "${0%/*}/version-descendant.pid"
+    printf '%s\t%s\n' "$child" "$descendant_token" > "${0%/*}/version-descendant.pid"
     wait "$child"
+    exit 0
     ;;
   "codex supported 0.146.0") output='codex-cli 0.146.0' ;;
   "codex supported 0.149.0") output='codex-cli 0.149.0' ;;

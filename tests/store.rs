@@ -214,13 +214,20 @@ fn seed_inbound_logical_bytes_to(path: &std::path::Path, target_bytes: u64) {
     assert_eq!(inbound_logical_bytes(&connection), target_bytes);
 }
 
-fn downgrade_store_schema_to_v5(connection: &rusqlite::Connection) {
+fn remove_v12_reply_effect_schema(connection: &rusqlite::Connection) {
+    connection
+        .execute_batch(
+            "DROP TRIGGER IF EXISTS inbound_events_v12_reply_effect_insert;
+             DROP TRIGGER IF EXISTS inbound_events_v12_reply_effect_update;
+             ALTER TABLE inbound_events DROP COLUMN reply_outbox_key;",
+        )
+        .expect("remove v12 reply-effect schema");
+}
+
+fn remove_v11_thread_adoption_schema(connection: &rusqlite::Connection) {
     connection
         .execute_batch(
             "PRAGMA foreign_keys = OFF;
-             DROP TRIGGER IF EXISTS inbound_events_v12_reply_effect_insert;
-             DROP TRIGGER IF EXISTS inbound_events_v12_reply_effect_update;
-             ALTER TABLE inbound_events DROP COLUMN reply_outbox_key;
              DROP TRIGGER IF EXISTS threads_adoption_shape_insert;
              DROP TRIGGER IF EXISTS threads_adoption_shape_update;
              DROP INDEX IF EXISTS threads_one_active_thread_id;
@@ -246,8 +253,17 @@ fn downgrade_store_schema_to_v5(connection: &rusqlite::Connection) {
              SELECT scope_key, codex_thread_id, status, created_ms, archived_ms,
                     context_tools_version
              FROM threads_v11;
-             DROP TABLE threads_v11;
-             DROP INDEX attachment_leases_sha256;
+             DROP TABLE threads_v11;",
+        )
+        .expect("remove v11 thread-adoption schema");
+}
+
+fn downgrade_store_schema_to_v5(connection: &rusqlite::Connection) {
+    remove_v12_reply_effect_schema(connection);
+    remove_v11_thread_adoption_schema(connection);
+    connection
+        .execute_batch(
+            "DROP INDEX attachment_leases_sha256;
              DROP INDEX attachment_leases_turn;
              ALTER TABLE attachment_leases RENAME TO attachment_leases_v7;
              CREATE TABLE attachment_leases (
@@ -266,51 +282,17 @@ fn downgrade_store_schema_to_v5(connection: &rusqlite::Connection) {
 }
 
 fn downgrade_store_schema_to_v10(connection: &rusqlite::Connection) {
+    remove_v12_reply_effect_schema(connection);
+    remove_v11_thread_adoption_schema(connection);
     connection
-        .execute_batch(
-            "PRAGMA foreign_keys = OFF;
-             DROP TRIGGER IF EXISTS inbound_events_v12_reply_effect_insert;
-             DROP TRIGGER IF EXISTS inbound_events_v12_reply_effect_update;
-             ALTER TABLE inbound_events DROP COLUMN reply_outbox_key;
-             DROP TRIGGER IF EXISTS threads_adoption_shape_insert;
-             DROP TRIGGER IF EXISTS threads_adoption_shape_update;
-             DROP INDEX IF EXISTS threads_one_active_thread_id;
-             DROP TABLE IF EXISTS thread_adoption_sagas;
-             DROP INDEX threads_one_active_per_scope;
-             ALTER TABLE threads RENAME TO threads_v11;
-             CREATE TABLE threads (
-                 scope_key TEXT NOT NULL,
-                 codex_thread_id TEXT NOT NULL,
-                 status TEXT NOT NULL CHECK (status IN ('active', 'archived')),
-                 created_ms INTEGER NOT NULL,
-                 archived_ms INTEGER,
-                 context_tools_version INTEGER NOT NULL DEFAULT 0
-                     CHECK (context_tools_version >= 0),
-                 PRIMARY KEY (scope_key, codex_thread_id)
-             );
-             CREATE UNIQUE INDEX threads_one_active_per_scope
-                 ON threads (scope_key) WHERE status = 'active';
-             INSERT INTO threads (
-                 scope_key, codex_thread_id, status, created_ms, archived_ms,
-                 context_tools_version
-             )
-             SELECT scope_key, codex_thread_id, status, created_ms, archived_ms,
-                    context_tools_version
-             FROM threads_v11;
-             DROP TABLE threads_v11;
-             PRAGMA user_version = 10;",
-        )
+        .pragma_update(None, "user_version", 10_u32)
         .expect("downgrade store to v10 shape");
 }
 
 fn downgrade_store_schema_to_v11(connection: &rusqlite::Connection) {
+    remove_v12_reply_effect_schema(connection);
     connection
-        .execute_batch(
-            "DROP TRIGGER IF EXISTS inbound_events_v12_reply_effect_insert;
-             DROP TRIGGER IF EXISTS inbound_events_v12_reply_effect_update;
-             ALTER TABLE inbound_events DROP COLUMN reply_outbox_key;
-             PRAGMA user_version = 11;",
-        )
+        .pragma_update(None, "user_version", 11_u32)
         .expect("downgrade store to v11 shape");
 }
 
