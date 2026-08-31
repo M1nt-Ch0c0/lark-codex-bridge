@@ -253,7 +253,8 @@ fn remove_v11_thread_adoption_schema(connection: &rusqlite::Connection) {
              SELECT scope_key, codex_thread_id, status, created_ms, archived_ms,
                     context_tools_version
              FROM threads_v11;
-             DROP TABLE threads_v11;",
+             DROP TABLE threads_v11;
+             PRAGMA foreign_keys = ON;",
         )
         .expect("remove v11 thread-adoption schema");
 }

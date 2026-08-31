@@ -735,20 +735,10 @@ async fn real_exact_binary_coordinates_two_clients_queue_exact_ids_and_one_appro
         }),
     );
     let (bridge_race, operator_race) = tokio::join!(bridge_race, operator_race);
-    let (race_turn, race_fenced) = match (bridge_race, operator_race?) {
+    let (race_turn, race_fenced, bridge_won) = match (bridge_race, operator_race?) {
         (Ok(applied), OperatorResponse::Rejected) => {
             let turn_id = applied.result_id.context("bridge race omitted turn id")?;
-            race_coordinator
-                .as_ref()
-                .expect("coordinator present")
-                .interrupt_turn(
-                    source.clone(),
-                    "intent-race-interrupt",
-                    TurnInterruptParams::new(&thread_id, &turn_id),
-                )
-                .await
-                .context("bridge race winner interrupt failed")?;
-            (turn_id, false)
+            (turn_id, false, true)
         }
         (
             Err(
@@ -762,20 +752,37 @@ async fn real_exact_binary_coordinates_two_clients_queue_exact_ids_and_one_appro
                 .as_str()
                 .context("operator race omitted turn id")?
                 .to_owned();
-            operator_request(
-                &mut operator,
-                12,
-                "turn/interrupt",
-                json!({"threadId": thread_id, "turnId": turn_id}),
-            )
-            .await?;
-            (turn_id, error != ExternalWriteError::Conflict)
+            (turn_id, error != ExternalWriteError::Conflict, false)
         }
         (bridge, operator) => bail!(
             "two-client start race did not have one correlated or safely fenced winner: bridge={bridge:?} operator={operator:?}"
         ),
     };
+    // First prove that the winning turn reached the model provider. Request 7
+    // intentionally blocks until interruption; interrupting immediately after
+    // turn/start races Codex before it has opened that request and makes the
+    // request-count assertion scheduler-dependent on slower macOS runners.
     model_stub.wait_for_count(7).await?;
+    if bridge_won {
+        race_coordinator
+            .as_ref()
+            .expect("coordinator present")
+            .interrupt_turn(
+                source.clone(),
+                "intent-race-interrupt",
+                TurnInterruptParams::new(&thread_id, &race_turn),
+            )
+            .await
+            .context("bridge race winner interrupt failed")?;
+    } else {
+        operator_request(
+            &mut operator,
+            12,
+            "turn/interrupt",
+            json!({"threadId": thread_id, "turnId": race_turn}),
+        )
+        .await?;
+    }
     wait_operator_idle(&mut operator, 13, &thread_id).await?;
     let turns = operator_request(
         &mut operator,
