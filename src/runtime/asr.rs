@@ -1386,7 +1386,12 @@ impl SupervisedProcess {
     }
 
     async fn terminate_and_wait(&mut self) {
-        let _ = self.cleanup_owned_tree().await;
+        if let Err(error) = self.cleanup_owned_tree().await {
+            tracing::warn!(
+                error = %error,
+                "ASR process-tree cleanup was not confirmed within its bound"
+            );
+        }
     }
 
     async fn cleanup_owned_tree(&mut self) -> std::io::Result<ExitStatus> {

@@ -334,8 +334,10 @@ impl CodexSidecarProcess {
         drop(self.stderr.take());
 
         #[cfg(unix)]
-        if self.exit.is_none() {
-            tokio::time::sleep(grace).await;
+        if self.exit.is_none()
+            && let Ok(result) = timeout(grace, self.wait_for_exit_without_reaping()).await
+        {
+            result?;
         }
         #[cfg(not(unix))]
         if self.exit.is_none()

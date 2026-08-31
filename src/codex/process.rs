@@ -571,7 +571,7 @@ impl CodexProcess {
         }
     }
 
-    /// Closes any process-owned stdin, waits for the grace period, then force-kills.
+    /// Closes any process-owned stdin, waits up to the grace period, then force-kills.
     ///
     /// If stdio was transferred to a transport, cancel or drop that transport first so
     /// its writer closes stdin during the graceful portion.
@@ -591,14 +591,17 @@ impl CodexProcess {
         drop(self.stdout.take());
         drop(self.stderr.take());
 
-        // On POSIX, waiting here would reap the process-group leader before
-        // the force-cleanup helper can safely address its PGID. Preserve the
-        // leader identity for the whole grace period, then signal the group.
-        // Windows Job handles do not have the numeric-PGID reuse hazard and
-        // keep the existing early-exit wait.
+        // On POSIX, an ordinary wait here would reap the process-group leader
+        // before the force-cleanup helper can safely address its PGID. Observe
+        // exit with waitid(WNOWAIT) so an early leader exit shortens the
+        // graceful phase without releasing that identity. Windows Job handles
+        // do not have the numeric-PGID reuse hazard and keep their ordinary
+        // early-exit wait.
         #[cfg(unix)]
-        if self.exit.is_none() {
-            tokio::time::sleep(grace).await;
+        if self.exit.is_none()
+            && let Ok(result) = timeout(grace, self.wait_for_exit_without_reaping()).await
+        {
+            result?;
         }
         #[cfg(not(unix))]
         if self.exit.is_none() {
@@ -1118,6 +1121,45 @@ mod tests {
         assert!(!group_signal_authorized);
         assert!(identity_lost);
         drop_or_forget_unreaped_child(child, identity_lost);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminate_observes_early_leader_exit_without_waiting_full_grace() {
+        let mut command = Command::new("/usr/bin/true");
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = owned_command(command)
+            .spawn()
+            .expect("spawn early-exit fixture");
+        let pid = child.inner().id().expect("fixture exposes its PID");
+        let mut process = CodexProcess {
+            child: Some(child),
+            version: Version::new(0, 149, 0),
+            stdout: None,
+            stdin: None,
+            stderr: None,
+            exit: None,
+            pid,
+            tree_reaped: false,
+            group_signal_authorized: true,
+            identity_lost: false,
+        };
+
+        let exit = timeout(
+            Duration::from_secs(1),
+            process.terminate(Duration::from_secs(5)),
+        )
+        .await
+        .expect("an exited leader must not consume the full graceful phase")
+        .expect("early-exit process tree cleanup succeeds");
+
+        assert_eq!(exit.pid, pid);
+        assert!(exit.success);
+        assert!(process.tree_reaped);
+        assert!(!process.identity_lost);
     }
 
     #[test]
