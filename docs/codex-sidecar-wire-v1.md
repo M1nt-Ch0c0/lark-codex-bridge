@@ -536,19 +536,20 @@ starting the same cleanup, but the Rust supervisor does not depend on that
 request for correctness.
 
 On POSIX, Rust observes unexpected leader exit with `waitid(WNOWAIT)`, retaining
-the leader PID as the process-group identity. It keeps that identity until the
-leader exits or the effective five-second process grace elapses, targets the
-whole group before any wait/reap, and only then waits for the exact leader
-through the innermost Tokio child and performs the side-effect-free absence
-proof. It never invokes the outer POSIX wrapper's `waitpid(-pgid, ...)` after
-releasing the leader. An `ECHILD` observation poisons the identity immediately:
-no later signal, wait, or try-wait is allowed, and the stale Tokio handle is
-quarantined from its orphan reaper. Windows keeps the corresponding Job-object
-cleanup path. The shutdown path contains multiple bounded phases; five seconds
-is the configured per-process grace, not a promise that every supervisor
-shutdown completes within five wall-clock seconds. Process-tree ownership
-begins immediately after spawn: a bootstrap guard targets the full group/Job
-even if the supervisor cancels the factory future before configure completes.
+the leader PID as the process-group identity even after exit is observed. The
+graceful phase ends when that exit is observed or the effective five-second
+process grace elapses. With the identity still reserved, Rust targets the whole
+group before any wait/reap, then waits for and reaps the exact leader through
+the innermost Tokio child and performs the side-effect-free absence proof. It
+never invokes the outer POSIX wrapper's `waitpid(-pgid, ...)` after releasing
+the leader. An `ECHILD` observation poisons the identity immediately: no later
+signal, wait, or try-wait is allowed, and the stale Tokio handle is quarantined
+from its orphan reaper. Windows keeps the corresponding Job-object cleanup
+path. The shutdown path contains multiple bounded phases; five seconds is the
+configured per-process grace, not a promise that every supervisor shutdown
+completes within five wall-clock seconds. Process-tree ownership begins
+immediately after spawn: a bootstrap guard targets the full group/Job even if
+the supervisor cancels the factory future before configure completes.
 
 If the Codex child exits unexpectedly, the sidecar session fails. Rust clears
 the old client, terminates the owned tree, applies bounded supervisor backoff,
