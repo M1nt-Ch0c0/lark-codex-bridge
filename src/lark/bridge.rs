@@ -10,9 +10,8 @@
 //! payload size returned by the store. In either mode the byte permit is parked
 //! inside the queued item and released only when the receiver drops it. A full channel fails the
 //! handler, so the transport's receipt honestly reports `{code: 500}` instead
-//! of silently dropping the event. Card-action payloads are acknowledged with
-//! `{code: 200, data}` and logged as unsupported (IDs only) for this
-//! milestone rather than routed.
+//! of silently dropping the event. Card-action payloads that reconstruct a
+//! recognized slash command are routed through the same durable inbound path.
 //!
 //! Redaction: handler return values and errors carry IDs, sizes, and
 //! classified error kinds only — never message text or card content.
@@ -22,7 +21,6 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures_util::future::BoxFuture;
-use serde_json::json;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use super::api::LarkApi;
@@ -255,11 +253,11 @@ impl LarkBridge {
             let tx = tx.clone();
             let budget = Arc::clone(&budget);
             Box::pin(async move {
-                if matches!(headers.ty(), Some(MessageType::Card)) {
-                    tracing::info!("lark card action is unsupported; acknowledging");
-                    return Ok(Some(json!({ "status": "unsupported" })));
-                }
-                let outcome = normalizer.normalize(&payload).await?;
+                let outcome = if matches!(headers.ty(), Some(MessageType::Card)) {
+                    normalizer.normalize_card_action(&payload).await?
+                } else {
+                    normalizer.normalize(&payload).await?
+                };
                 match outcome {
                     NormalizeOutcome::Ignored { reason } => {
                         tracing::debug!(reason, "lark event ignored by the normalizer");
@@ -334,8 +332,7 @@ impl LarkBridge {
     }
 
     /// Starts the native WebSocket over an already-prepared durable event
-    /// handler. Card actions remain explicitly unsupported and are answered
-    /// without entering the message pipeline.
+    /// handler. Card actions are forwarded into the same durable pipeline.
     #[must_use]
     pub fn start_prepared_native(
         http: LarkHttp,
@@ -343,18 +340,9 @@ impl LarkBridge {
         config: BridgeConfig,
         event_handler: InboundEventHandler,
     ) -> TransportHandle {
-        let handler: InboundFrameHandler = Arc::new(move |headers, payload: Bytes| {
+        let handler: InboundFrameHandler = Arc::new(move |_headers, payload: Bytes| {
             let event_handler = Arc::clone(&event_handler);
-            Box::pin(async move {
-                if matches!(headers.ty(), Some(MessageType::Card)) {
-                    tracing::info!(
-                        message_id = headers.message_id().unwrap_or(""),
-                        "lark card action is unsupported in this milestone; acknowledging"
-                    );
-                    return Ok(Some(json!({ "status": "unsupported" })));
-                }
-                event_handler(payload).await
-            })
+            Box::pin(async move { event_handler(payload).await })
         });
         LarkTransport::start_with_config(http, creds, handler, config.transport)
     }
@@ -446,7 +434,7 @@ impl LarkBridge {
             let tx = tx.clone();
             let budget = Arc::clone(&budget);
             Box::pin(async move {
-                let outcome = normalizer.normalize(&payload).await?;
+                let outcome = normalizer.normalize_message_or_card(&payload).await?;
                 let NormalizeOutcome::Event {
                     event,
                     live_transcripts,

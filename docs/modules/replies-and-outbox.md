@@ -62,6 +62,6 @@ Lark。两者分离，避免网络失败改变回复语义。
 
 ## 当前限制
 
-- 用户无法通过 `/status` 查看 parked uncertain 行，因为 handler 尚未接线；
-- 交互卡按钮尚未路由；
-- 尚无外部 dead-letter 管理命令。
+- `/status` 已展示出箱排队 / 失败 / 未确认计数，但没有 dead-letter 管理命令，也不能点开某一行的原文；
+- 交互卡按钮已路由为白名单 slash command；无法识别的 `card.action.trigger` 只 ACK、不入队；
+- 飞书审批卡仍未接线。

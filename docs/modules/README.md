@@ -13,5 +13,6 @@
 | [回复与 outbox](replies-and-outbox.md) | 进度/终答投影、持久发送、重试与 receipt |
 | [附件](attachments.md) | 下载、内容寻址缓存、lease、GC 和 reconcile |
 
-“底层 API 已存在”不等于“用户入口已完成”。例如命令 parser 和 interrupt seam 已存在，
-但 slash command handler 尚未进入生产 runtime。
+“底层 API 已存在”不等于“用户入口已完成”。第一阶段 slash command（`/new` `/stop`
+`/status` `/info` `/help` `/cd` `/resume` `/config` 以及 owner 的 thread adoption）已经
+进入生产 runtime；飞书审批卡、后台 service 子命令和完整故障注入仍未接线。

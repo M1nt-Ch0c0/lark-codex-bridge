@@ -24,9 +24,11 @@
   scope actor、同 scope 串行 turn 和不同 scope 的有界并发；
 - 延迟进度卡、独立最终回复、重试/receipt/uncertain delivery，以及终态先持久化再收口；
 - 图片 `localImage` 和普通文件结构化路径输入、内容寻址缓存、turn lease、GC 与启动校验；
-- 完整应用装配和 `run --config`：飞书消息 → Codex turn → 飞书进度/终答。
+- 完整应用装配和 `run --config`：飞书消息 → Codex turn → 飞书进度/终答；
+- 第一阶段飞书命令与 Card 2.0：`/help` `/status` `/info` `/new` `/stop` `/resume` `/cd`
+  `/config`，以及失败分类回传；群聊引用会展开合并转发，话题首次介入会注入最近上文。
 
-尚未接线的是 slash command handler、Codex 审批卡、服务管理和完整故障注入/恢复。
+尚未接线的是 Codex 审批卡、后台 service 子命令和完整故障注入/恢复。
 外部端点已有 fail-closed 准入、只读长连接 transport、持久 epoch fence 和有界
 resume/read reconciliation，并已具备显式 `mutate_shared` / `queue_shared` 的持久写入与
 单审批处理者策略；这些写入能力仍未接入普通 `run` 链路。选择 external mode 不会回退
@@ -39,8 +41,8 @@ resume/read reconciliation，并已具备显式 `mutate_shared` / `queue_shared`
 Codex 0.149.0 Unix-socket listener 的原始 WebSocket 握手 RFC/双 Unix 平台门禁；当前运行时仍
 明确拒绝 `unix://`，不会把它别名为 JSONL、stdio 或 TCP，结论与复现见
 [`docs/codex-unix-websocket-contract.md`](docs/codex-unix-websocket-contract.md)。
-`/stop`、`/status` 按当前最小试用范围明确暂缓；`/new`、`/cd`、`/help` 目前也只有
-解析与 help 元数据，还未进入运行时。启动时会预装有界的 `Received` 行，但尚无周期性
+命令与卡片的操作说明见
+[`docs/guide/commands.md`](docs/guide/commands.md)。启动时会预装有界的 `Received` 行，但尚无周期性
 重扫。首次启动 onboarding 已恢复参考实现的一命令体验：扫码注册后自动携带创建者身份、
 生成安全默认工作区和运行配置并直接启动，见
 [GitHub Issue #2](https://github.com/M1nt-Ch0c0/lark-codex-bridge/issues/2)。
@@ -72,7 +74,8 @@ cargo run --locked -- run
 `%APPDATA%\lark-codex-bridge\config.toml`）。已有配置文件或显式 `--config` 绝不会被
 静默覆盖；重复运行与并发首次运行均幂等。
 
-私聊可直接发消息；群聊和话题需要直接 @机器人。按 `Ctrl-C` 结束。当前真实飞书的
+私聊可直接发消息；群聊和话题需要直接 @机器人。按 `Ctrl-C` 结束。起来后可先私聊
+`/help`、`/status`、`/info` 确认命令卡和环境清单。当前真实飞书的
 “发消息 → Codex 回答 → 飞书收到回复”验收由操作者手动执行。
 
 ### 终端日志与排障
@@ -219,9 +222,8 @@ cargo run --locked -- codex adoption-status
   不创建 scope actor，不进入 pending/context/附件缓存，也不运行 ASR。
 - 群聊/话题用“直接 @机器人并回复媒体消息”触发。Bridge 在当前触发消息通过 sender/group/
   mention 策略后只拉取直接父消息一跳，并对父消息 sender 再独立执行 human/owner/sender/group
-  授权；资源 key 留在 turn-scoped capability registry，
-  `bridge_context.resolve` 只返回 opaque handle。删除、无权限、超限、不支持和暂时不可用均有
-  稳定状态，不递归读取引用链或聊天历史。
+  授权；引用正文、合并转发和话题首次上文会注入 prompt。删除、无权限、超限、不支持和暂时不可用均有
+  稳定状态，不递归读取引用链或整段聊天历史。
 
 真实移动端引用 smoke 是人工操作、显式门控的测试。运行后按终端提示，在指定群里先发送一条
 不 `@bot` 的图片/视频/文件/语音，再用飞书移动端直接回复该消息并 `@bot` 附带给出的 marker。

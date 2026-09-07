@@ -7,9 +7,12 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use crate::codex::types::SandboxMode;
 use crate::limits::{
     BRIDGE_COMMAND_MAX_BYTES, THREAD_ADOPTION_SELECTOR_MAX_BYTES, THREAD_DISCOVERY_CURSOR_MAX_BYTES,
 };
+use crate::render::InteractiveCardSpec;
+use crate::runtime::live::ConfigPatch;
 
 /// One recognized first-stage command.
 #[derive(Clone, Eq, PartialEq)]
@@ -20,11 +23,16 @@ pub enum BridgeCommand {
     Stop,
     /// Show a redacted structural runtime summary.
     Status,
+    /// List or apply a same-scope historical session.
+    Resume {
+        /// Opaque selector issued by a previous `/resume` card, when applying.
+        selector: Option<String>,
+    },
     /// Change to a policy-validated workspace and reset the session.
     Cd {
         /// Raw user-supplied path. The handler must validate and canonicalize
         /// it through `AccessPolicy` before any persistence or RPC.
-        path: PathBuf,
+        path: Option<PathBuf>,
     },
     /// Request a bounded page of persisted-thread candidates.
     Threads {
@@ -40,6 +48,15 @@ pub enum BridgeCommand {
     Release,
     /// Render the command table.
     Help,
+    /// Show MCP, skills, workspace, and sessions.
+    Info,
+    /// Show or apply owner-only runtime settings. Execution is P2P-only.
+    Config {
+        /// Parsed `/config` action. `None` shows the current form.
+        action: Option<ConfigPatch>,
+        /// True when the operator cancelled the config card.
+        cancel: bool,
+    },
 }
 
 impl fmt::Debug for BridgeCommand {
@@ -48,9 +65,16 @@ impl fmt::Debug for BridgeCommand {
             Self::New => formatter.write_str("New"),
             Self::Stop => formatter.write_str("Stop"),
             Self::Status => formatter.write_str("Status"),
+            Self::Resume { selector } => formatter
+                .debug_struct("Resume")
+                .field("selector_bytes", &selector.as_ref().map(String::len))
+                .finish(),
             Self::Cd { path } => formatter
                 .debug_struct("Cd")
-                .field("path_bytes", &path.as_os_str().len())
+                .field(
+                    "path_bytes",
+                    &path.as_ref().map(|path| path.as_os_str().len()),
+                )
                 .finish(),
             Self::Threads { cursor } => formatter
                 .debug_struct("Threads")
@@ -62,6 +86,12 @@ impl fmt::Debug for BridgeCommand {
                 .finish(),
             Self::Release => formatter.write_str("Release"),
             Self::Help => formatter.write_str("Help"),
+            Self::Info => formatter.write_str("Info"),
+            Self::Config { action, cancel } => formatter
+                .debug_struct("Config")
+                .field("has_action", &action.is_some())
+                .field("cancel", cancel)
+                .finish(),
         }
     }
 }
@@ -90,6 +120,9 @@ pub enum CommandParseError {
     /// The adoption selector is neither one token nor one JSON string.
     #[error("/adopt selector must be one token or one JSON string")]
     InvalidSelector,
+    /// A recognized `/config` value is not one of the allowed tokens.
+    #[error("/config received an invalid value")]
+    InvalidConfigValue,
 }
 
 /// Stable command metadata used to render `/help` and audit command drift.
@@ -103,7 +136,58 @@ pub struct CommandSpec {
     pub description: &'static str,
 }
 
-const COMMAND_SPECS: [CommandSpec; 8] = [
+/// Visible command reply. Text stays for adoption controls; cards are the
+/// preferred surface for `/new` `/cd` `/resume` `/help` `/status`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ControlReply {
+    /// Plain text, sent as a Lark text reply.
+    Text(String),
+    /// Card 2.0 spec rendered by the outbox pump.
+    Card(InteractiveCardSpec),
+}
+
+impl ControlReply {
+    /// Convenience constructor for a short text reply.
+    #[must_use]
+    pub fn text(value: impl Into<String>) -> Self {
+        Self::Text(value.into())
+    }
+}
+
+/// Owner-gated commands that change workspace reach or adopted ownership.
+#[must_use]
+pub fn command_requires_owner(command: &BridgeCommand) -> bool {
+    matches!(
+        command,
+        BridgeCommand::Cd { .. }
+            | BridgeCommand::Threads { .. }
+            | BridgeCommand::Adopt { .. }
+            | BridgeCommand::Release
+            | BridgeCommand::Config { .. }
+    )
+}
+
+/// Reconstructs a slash command from a Card 2.0 callback value.
+#[must_use]
+pub fn command_text_from_card_action(cmd: &str, arg: Option<&str>) -> Option<String> {
+    let command = match (cmd, arg) {
+        ("new" | "reset", _) => "/new".to_owned(),
+        ("stop", _) => "/stop".to_owned(),
+        ("status", _) => "/status".to_owned(),
+        ("help", _) => "/help".to_owned(),
+        ("info", _) => "/info".to_owned(),
+        ("resume", None) => "/resume".to_owned(),
+        ("resume" | "resume.use", Some(selector)) => format!("/resume use {selector}"),
+        ("cd", None) => "/cd".to_owned(),
+        ("cd", Some(path)) => format!("/cd {path}"),
+        ("config", _) => "/config".to_owned(),
+        ("config.cancel", _) => "/config cancel".to_owned(),
+        _ => return None,
+    };
+    Some(command)
+}
+
+const COMMAND_SPECS: [CommandSpec; 11] = [
     CommandSpec {
         name: "/new",
         usage: "/new",
@@ -120,9 +204,14 @@ const COMMAND_SPECS: [CommandSpec; 8] = [
         description: "show a redacted runtime status",
     },
     CommandSpec {
+        name: "/resume",
+        usage: "/resume [use <selector>]",
+        description: "list or restore a historical session",
+    },
+    CommandSpec {
         name: "/cd",
-        usage: "/cd <path>",
-        description: "change workspace and reset the session",
+        usage: "/cd [path]",
+        description: "show or change workspace and reset the session",
     },
     CommandSpec {
         name: "/threads",
@@ -143,6 +232,16 @@ const COMMAND_SPECS: [CommandSpec; 8] = [
         name: "/help",
         usage: "/help",
         description: "list bridge commands",
+    },
+    CommandSpec {
+        name: "/info",
+        usage: "/info",
+        description: "show MCP servers, skills, workspace, and sessions",
+    },
+    CommandSpec {
+        name: "/config",
+        usage: "/config [model|effort|sandbox|approval|group|sender] …",
+        description: "show or change model and allowlists in a private chat",
     },
 ];
 
@@ -183,7 +282,18 @@ pub fn parse_command(text: &str) -> Result<Option<BridgeCommand>, CommandParseEr
     };
     let recognized = matches!(
         name,
-        "/new" | "/stop" | "/status" | "/cd" | "/threads" | "/adopt" | "/release" | "/help"
+        "/new"
+            | "/reset"
+            | "/stop"
+            | "/status"
+            | "/resume"
+            | "/cd"
+            | "/threads"
+            | "/adopt"
+            | "/release"
+            | "/help"
+            | "/info"
+            | "/config"
     );
     if !recognized {
         return Ok(None);
@@ -192,18 +302,21 @@ pub fn parse_command(text: &str) -> Result<Option<BridgeCommand>, CommandParseEr
         return Err(CommandParseError::TooLong);
     }
     match name {
-        "/new" => no_argument(arguments, "/new", BridgeCommand::New),
+        "/new" | "/reset" => no_argument(arguments, "/new", BridgeCommand::New),
         "/stop" => no_argument(arguments, "/stop", BridgeCommand::Stop),
         "/status" => no_argument(arguments, "/status", BridgeCommand::Status),
         "/release" => no_argument(arguments, "/release", BridgeCommand::Release),
         "/help" => no_argument(arguments, "/help", BridgeCommand::Help),
+        "/info" => no_argument(arguments, "/info", BridgeCommand::Info),
+        "/config" => parse_config(arguments),
+        "/resume" => parse_resume(arguments),
         "/cd" => {
             let path = arguments.trim();
             if path.is_empty() {
-                Err(CommandParseError::MissingArgument { command: "/cd" })
+                Ok(Some(BridgeCommand::Cd { path: None }))
             } else {
                 Ok(Some(BridgeCommand::Cd {
-                    path: PathBuf::from(path),
+                    path: Some(PathBuf::from(path)),
                 }))
             }
         }
@@ -268,6 +381,160 @@ fn split_command(text: &str) -> Option<(&str, &str)> {
     }
     let split_at = text.find(char::is_whitespace).unwrap_or(text.len());
     Some((&text[..split_at], &text[split_at..]))
+}
+
+fn parse_config(arguments: &str) -> Result<Option<BridgeCommand>, CommandParseError> {
+    let trimmed = arguments.trim();
+    if trimmed.is_empty() {
+        return Ok(Some(BridgeCommand::Config {
+            action: None,
+            cancel: false,
+        }));
+    }
+    let mut values = trimmed.split_whitespace();
+    let verb = values.next().unwrap_or_default();
+    match verb {
+        "cancel" => {
+            if values.next().is_some() {
+                return Err(CommandParseError::UnexpectedArgument { command: "/config" });
+            }
+            Ok(Some(BridgeCommand::Config {
+                action: None,
+                cancel: true,
+            }))
+        }
+        "model" => {
+            let name = remaining_token(&mut values, true)?;
+            Ok(Some(config_patch(ConfigPatch::Model(Some(name)))))
+        }
+        "effort" => {
+            let effort = remaining_token(&mut values, true)?;
+            Ok(Some(config_patch(ConfigPatch::Effort(Some(effort)))))
+        }
+        "sandbox" => {
+            let sandbox = parse_sandbox_token(&remaining_token(&mut values, true)?)?;
+            Ok(Some(config_patch(ConfigPatch::Sandbox(sandbox))))
+        }
+        "approval" => {
+            let approval = remaining_token(&mut values, true)?;
+            Ok(Some(config_patch(ConfigPatch::Approval(approval))))
+        }
+        "group" | "sender" => {
+            let op = values
+                .next()
+                .ok_or(CommandParseError::MissingArgument { command: "/config" })?;
+            let id = remaining_token(&mut values, true)?;
+            let action = match (verb, op) {
+                ("group", "add") => ConfigPatch::GroupAdd(id),
+                ("group", "rm" | "remove") => ConfigPatch::GroupRemove(id),
+                ("sender", "add") => ConfigPatch::SenderAdd(id),
+                ("sender", "rm" | "remove") => ConfigPatch::SenderRemove(id),
+                _ => return Err(CommandParseError::InvalidConfigValue),
+            };
+            Ok(Some(config_patch(action)))
+        }
+        "apply" => parse_config_apply(values),
+        _ => Err(CommandParseError::UnexpectedArgument { command: "/config" }),
+    }
+}
+
+fn parse_config_apply(
+    values: std::str::SplitWhitespace<'_>,
+) -> Result<Option<BridgeCommand>, CommandParseError> {
+    let mut model = None;
+    let mut effort = None;
+    let mut sandbox = None;
+    let mut approval = None;
+    let mut seen = false;
+    for token in values {
+        let Some((key, value)) = token.split_once('=') else {
+            return Err(CommandParseError::InvalidConfigValue);
+        };
+        if value.is_empty() {
+            return Err(CommandParseError::InvalidConfigValue);
+        }
+        match key {
+            "model" => model = Some(value.to_owned()),
+            "effort" => effort = Some(value.to_owned()),
+            "sandbox" => sandbox = Some(parse_sandbox_token(value)?),
+            "approval" => approval = Some(value.to_owned()),
+            _ => return Err(CommandParseError::InvalidConfigValue),
+        }
+        seen = true;
+    }
+    if !seen {
+        return Err(CommandParseError::MissingArgument { command: "/config" });
+    }
+    Ok(Some(config_patch(ConfigPatch::Form {
+        model,
+        effort,
+        sandbox,
+        approval,
+    })))
+}
+
+fn remaining_token(
+    values: &mut std::str::SplitWhitespace<'_>,
+    required: bool,
+) -> Result<String, CommandParseError> {
+    let Some(first) = values.next() else {
+        return if required {
+            Err(CommandParseError::MissingArgument { command: "/config" })
+        } else {
+            Ok(String::new())
+        };
+    };
+    if values.next().is_some() {
+        return Err(CommandParseError::UnexpectedArgument { command: "/config" });
+    }
+    Ok(first.to_owned())
+}
+
+fn parse_sandbox_token(value: &str) -> Result<SandboxMode, CommandParseError> {
+    match value {
+        "read-only" => Ok(SandboxMode::ReadOnly),
+        "workspace-write" => Ok(SandboxMode::WorkspaceWrite),
+        "danger-full-access" => Ok(SandboxMode::DangerFullAccess),
+        _ => Err(CommandParseError::InvalidConfigValue),
+    }
+}
+
+fn config_patch(action: ConfigPatch) -> BridgeCommand {
+    BridgeCommand::Config {
+        action: Some(action),
+        cancel: false,
+    }
+}
+
+fn parse_resume(arguments: &str) -> Result<Option<BridgeCommand>, CommandParseError> {
+    let trimmed = arguments.trim();
+    if trimmed.is_empty() {
+        return Ok(Some(BridgeCommand::Resume { selector: None }));
+    }
+    let mut values = trimmed.split_whitespace();
+    let first = values.next().unwrap_or_default();
+    let selector = if first == "use" {
+        let Some(selector) = values.next() else {
+            return Err(CommandParseError::MissingArgument { command: "/resume" });
+        };
+        if values.next().is_some() {
+            return Err(CommandParseError::UnexpectedArgument { command: "/resume" });
+        }
+        selector
+    } else if values.next().is_some() {
+        return Err(CommandParseError::UnexpectedArgument { command: "/resume" });
+    } else {
+        first
+    };
+    if selector.is_empty() || selector.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(CommandParseError::InvalidSelector);
+    }
+    if selector.len() > THREAD_ADOPTION_SELECTOR_MAX_BYTES {
+        return Err(CommandParseError::TooLong);
+    }
+    Ok(Some(BridgeCommand::Resume {
+        selector: Some(selector.to_owned()),
+    }))
 }
 
 fn no_argument(

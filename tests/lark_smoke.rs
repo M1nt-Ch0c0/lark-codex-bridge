@@ -38,7 +38,7 @@ use futures_util::future::BoxFuture;
 use lark_codex_bridge::codex::process::{CodexProcessConfig, ProcessError};
 use lark_codex_bridge::codex::supervisor::AppServerSupervisor;
 use lark_codex_bridge::config::{BridgeConfig, WorkspacePolicy};
-use lark_codex_bridge::lark::api::LarkApi;
+use lark_codex_bridge::lark::api::{ChatMode, LarkApi};
 use lark_codex_bridge::lark::bridge::{LarkBridge, QueuedInboundEvent};
 use lark_codex_bridge::lark::config::{LarkEndpoints, TenantBrand};
 use lark_codex_bridge::lark::credentials::{LarkCredentials, load_credentials};
@@ -682,6 +682,7 @@ async fn run_mobile_quote_smoke() -> Result<()> {
         .resolve(QuoteRequest {
             parent_message_id: parent_id,
             chat_id: chat_id.clone(),
+            chat_mode: ChatMode::Group,
         })
         .await;
     if quote.status != lark_codex_bridge::runtime::context::QuoteStatus::Available {

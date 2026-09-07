@@ -30,8 +30,8 @@
 | `src/app.rs` | 生产组件装配和退出顺序 |
 | `src/codex/` | app-server RPC 和生命周期 |
 | `src/lark/` | 飞书协议、API 和 transport |
-| `src/runtime/` | intake、策略、actor 和附件 |
+| `src/runtime/` | intake、策略、actor、命令、prompt 注入和附件 |
 | `src/store/` | durable state 和事务 |
-| `src/render/` | 纯回复投影 |
+| `src/render/` | 纯回复投影和 Card 2.0 模板 |
 | `src/outbox/` | 持久副作用投递 |
 | `src/limits.rs` | 全局硬上限 |

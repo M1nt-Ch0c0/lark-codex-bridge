@@ -112,6 +112,15 @@ lark-codex-bridge lark probe
 auth check 成功但 probe 失败，通常是 endpoint 获取、DNS、TLS、代理、防火墙或
 WebSocket ping/pong 问题。probe 只报告 endpoint host，不会输出完整带参数 URL。
 
+## 先看机器人自己的状态
+
+私聊或群里对机器人发送 `/status`。卡片会给出当前 model / sandbox、范围状态、工作目录、
+会话短 ID、是否在跑、待消费附件和出箱排队/失败/未确认。`/info` 再列出本机 MCP 和 skill
+名称。两者都不回显用户正文、token 或完整 home 路径。
+
+turn 失败时飞书通知会带稳定分类，例如「附件未能处理」「工作目录无效」「模型或请求被拒绝」。
+`-v` 日志里对应 `failure=` 字段。不要把分类文案理解成 Codex 或飞书的原始错误正文。
+
 ## Bot 收不到消息
 
 - 确认机器人已经加入会话；

@@ -35,9 +35,9 @@ Runtime 把已持久化的 Lark 事件变成有权限、有工作区、有顺序
 入站富媒体不预下载。Runtime 只保存有界描述符和 turn-scoped opaque handle：
 
 - `ContextRegistry` 把 resource key 留在进程内 capability；
-- `bridge_context.resolve` / `bridge_media.read` 按需读取；
+- 当前生产路径把会话元数据、引用、话题上文和本地附件路径直接注入 prompt，不再要求模型先调用 `bridge_context.resolve`；
 - 群聊未 @机器人的媒体做无 turn settlement，不创建 actor/context/cache；
-- 引用只解析直接父消息一跳，不递归聊天历史。
+- 引用只解析直接父消息一跳；合并转发会展开子消息，话题首次介入会注入最近上游消息。
 
 ## Router
 
@@ -65,14 +65,15 @@ Router 按 scope 管理 actor：
 
 ## 中断与状态
 
-底层已有：
+生产命令已经路由到同 scope 串行控制路径：
 
-- 高优先级 interrupt seam；
-- redacted `ScopeSnapshot`；
-- outbox depth 查询；
-- thread archive 和 turn interrupted 状态。
+- `/stop` 走高优先级 interrupt，不排在普通消息队尾；
+- `/status` 展示热更新设置、范围状态、待消费附件和出箱深度（含 parked uncertain）；
+- `/info` 只展示本机 MCP / skill 名称、工作区和当前 scope 的 sessions；
+- `/new` `/cd` `/resume` `/help` `/config` 都通过 durable outbox 回卡片；
+- thread archive、turn interrupted 和 redacted snapshot 仍是底层状态机。
 
-但 `/stop`、`/status`、`/new`、`/cd`、`/help` 尚未作为生产命令路由。
+命令表和卡片约定见 [飞书命令与卡片](../guide/commands.md)。
 
 ## 故障语义
 

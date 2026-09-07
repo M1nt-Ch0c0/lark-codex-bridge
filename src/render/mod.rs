@@ -4,10 +4,8 @@
 //! The hard reply contracts from the design (§9) live here as testable
 //! functions, never as comments:
 //!
-//! 1. The last agent message with `MessagePhase::FinalAnswer` (or the trailing
-//!    agent message when no phase marker exists) is the standalone final
-//!    answer, never mixed into a progress view.
-//! 2. A final-only turn produces no progress at all.
+//! 1. Live deltas, including the eventual final answer, stream on one card.
+//! 2. A finished turn that already opened a card finalizes that card in place.
 //! 3. A clean-empty turn (no visible output, empty final) sends nothing.
 //! 4. A progress-send failure never swallows the final: progress and final are
 //!    independent projections, so dropping a progress output cannot remove the
@@ -28,6 +26,7 @@
 
 #![allow(clippy::doc_markdown)]
 
+use std::collections::HashMap;
 use std::fmt;
 use std::time::{Duration, Instant};
 
@@ -38,6 +37,7 @@ use crate::limits::{
     REPLY_UPDATE_MIN_CHARS, REPLY_UPDATE_MIN_INTERVAL,
 };
 
+pub mod card;
 mod markdown;
 
 #[cfg(test)]
@@ -76,6 +76,12 @@ fn take_measured_projection_work() -> MeasuredProjectionWork {
     MEASURED_PROJECTION_WORK.with(|work| work.replace(MeasuredProjectionWork::default()))
 }
 
+pub use card::{
+    CardAccent, CardButton, ConfigFormSpec, InfoSnapshot, InteractiveCardSpec, ResumeEntry,
+    RunCardPhase, StatusSnapshot, cd_card, config_cancelled_card, config_card, config_saved_card,
+    help_card, info_card, new_session_card, render_interactive_card, render_run_card,
+    resume_applied_card, resume_card, status_card,
+};
 pub use markdown::{
     card_markdown_element_wire_len, render_lark_markdown, split_lark_markdown,
     stabilize_streaming_markdown,
@@ -185,23 +191,14 @@ pub struct ReplyProjector {
     /// from the bounded text buffer means truncating a later chunk can never
     /// erase knowledge that an earlier progress card already exists.
     progress_checkpoint: Option<ProgressCheckpoint>,
-    /// Id of the item whose deltas are currently buffered. A single slot is
-    /// enough and bounded (`O(1)`): Codex delivers one agent message's deltas
-    /// to completion before the next item, so the slot resets when the item id
-    /// changes.
-    current_item_id: Option<String>,
-    /// Delta text received so far for `current_item_id`, not yet emitted.
-    /// Deltas are never emitted directly: an `AgentMessageDelta` carries no
-    /// phase, so the item's role (final answer vs. progress) is only known when
-    /// its `ItemCompleted` arrives.
-    current_item_buffer: String,
+    /// Bytes already counted for each in-flight agent item. Used so
+    /// `ItemCompleted` appends only the uncovered tail, even when two items'
+    /// deltas interleave.
+    item_prefix_bytes: HashMap<String, usize>,
     /// Id of the most recently completed progress item. A single slot is
     /// enough and bounded (`O(1)`): Codex delivers one agent message to
     /// completion before the next item, so a duplicate `ItemCompleted` for the
-    /// same item is recognized and dropped. A later item overwrites the slot,
-    /// matching the existing single-slot delta buffer; an out-of-order
-    /// duplicate of an earlier item is rare and the slot keeps no unbounded
-    /// per-item memory.
+    /// same item is recognized and dropped.
     last_completed_item_id: Option<String>,
 }
 
@@ -216,8 +213,7 @@ impl ReplyProjector {
             emitted_progress: 0,
             streamed_content: String::new(),
             progress_checkpoint: None,
-            current_item_id: None,
-            current_item_buffer: String::new(),
+            item_prefix_bytes: HashMap::new(),
             last_completed_item_id: None,
         }
     }
@@ -229,100 +225,65 @@ impl ReplyProjector {
     }
 
     /// Feeds one streaming event, returning a throttled progress update when
-    /// both the interval and the character thresholds have been met.
+    /// the interval and character thresholds have been met.
     ///
-    /// A `FinalAnswer`-phase agent message is never progress (contract 2); it
-    /// is reserved for the terminal projection. Because an
-    /// `AgentMessageDelta` carries no phase, a delta is only buffered per item
-    /// and **never** emitted on its own: its text becomes progress (for a
-    /// non-final item) or is dropped (for a `FinalAnswer` item) only when the
-    /// item's `ItemCompleted` arrives and reveals its phase.
-    ///
-    /// Deduplication: Codex emits `AgentMessageDelta` events as an item
-    /// streams and then an `ItemCompleted` event carrying the same item's full
-    /// text. The deltas are held in a single-item buffer; at `ItemCompleted`
-    /// that buffer becomes the progress prefix and only the tail beyond the
-    /// deltas is appended, so the same content is never counted twice. A
-    /// single-item slot is enough and bounded (`O(1)`): Codex delivers one
-    /// agent message's deltas to completion before the next item, so the slot
-    /// resets automatically when the item id changes.
+    /// Live cards stream every agent delta as it arrives, including the text
+    /// that will become the final answer. Tool and reasoning items are shown
+    /// as compact status lines. `ItemCompleted` only appends the tail that
+    /// deltas did not already cover, so the same content is never counted
+    /// twice.
     #[must_use]
     pub fn observe(&mut self, event: &AppServerEvent, now: Instant) -> ProjectorOutput {
         match event {
             AppServerEvent::AgentMessageDelta { item_id, delta, .. } => {
-                // No phase is available here: only accumulate into the current
-                // item's buffer. Progress is emitted exclusively at completion.
-                self.begin_or_continue_delta(item_id);
-                self.current_item_buffer.push_str(delta);
-                truncate_to_chars(&mut self.current_item_buffer, self.config.max_chars);
-                ProjectorOutput::Nothing
+                *self.item_prefix_bytes.entry(item_id.clone()).or_insert(0) += delta.len();
+                self.progress_buffer.push_str(delta);
+                truncate_to_chars(&mut self.progress_buffer, self.config.max_chars);
+                self.maybe_emit(now)
+            }
+            AppServerEvent::ItemStarted { item, .. } => {
+                if let Some(line) = item_status_line(item, true) {
+                    self.append_status_line(&line);
+                    self.maybe_emit(now)
+                } else {
+                    ProjectorOutput::Nothing
+                }
             }
             AppServerEvent::ItemCompleted {
-                item:
-                    ThreadItem::AgentMessage {
-                        id, text, phase, ..
-                    },
+                item: ThreadItem::AgentMessage { id, text, .. },
                 ..
             } => {
-                if !is_progress_phase(phase.as_ref()) {
-                    // Only an explicitly commentary-phase item is safe to
-                    // expose as progress. A phase-less agent message is the
-                    // protocol fallback final when no explicit final exists,
-                    // so treating `None` as progress could both leak and then
-                    // swallow the terminal answer.
-                    self.drop_item_buffer(id);
-                    return ProjectorOutput::Nothing;
-                }
                 if self.last_completed_item_id.as_deref() == Some(id.as_str()) {
-                    // A duplicate `ItemCompleted` for the item already emitted:
-                    // its full text was appended once, and the single-item
-                    // delta buffer is now cleared, so replaying it would
-                    // re-append the whole text (`tail_beyond(text, 0)`).
                     return ProjectorOutput::Nothing;
                 }
                 self.last_completed_item_id = Some(id.to_owned());
-                // A non-final item's whole text becomes progress. Move the
-                // not-yet-emitted delta prefix into the progress buffer and
-                // append only the tail the deltas did not cover.
-                let delta_prefix = self.take_item_buffer(id);
-                self.progress_buffer.push_str(&delta_prefix);
-                self.progress_buffer
-                    .push_str(tail_beyond(text, delta_prefix.len()));
-                truncate_to_chars(&mut self.progress_buffer, self.config.max_chars);
+                let delta_prefix = self.item_prefix_bytes.remove(id).unwrap_or(0);
+                let tail = tail_beyond(text, delta_prefix);
+                if !tail.is_empty() {
+                    self.progress_buffer.push_str(tail);
+                    truncate_to_chars(&mut self.progress_buffer, self.config.max_chars);
+                }
                 self.maybe_emit(now)
+            }
+            AppServerEvent::ItemCompleted { item, .. } => {
+                if let Some(line) = item_status_line(item, false) {
+                    self.append_status_line(&line);
+                    self.maybe_emit(now)
+                } else {
+                    ProjectorOutput::Nothing
+                }
             }
             _ => ProjectorOutput::Nothing,
         }
     }
 
-    /// Records the item id whose deltas are now streaming, resetting the
-    /// single-item slot when the item id changes.
-    fn begin_or_continue_delta(&mut self, item_id: &str) {
-        if self.current_item_id.as_deref() != Some(item_id) {
-            self.current_item_id = Some(item_id.to_owned());
-            self.current_item_buffer.clear();
+    fn append_status_line(&mut self, line: &str) {
+        if !self.progress_buffer.is_empty() && !self.progress_buffer.ends_with('\n') {
+            self.progress_buffer.push('\n');
         }
-    }
-
-    /// Drops the buffered deltas of a `FinalAnswer` item: their content is the
-    /// terminal answer and must never leak out as progress.
-    fn drop_item_buffer(&mut self, item_id: &str) {
-        if self.current_item_id.as_deref() == Some(item_id) {
-            self.current_item_id = None;
-            self.current_item_buffer.clear();
-        }
-    }
-
-    /// Moves the buffered delta text for `item_id` out of the single-item slot,
-    /// leaving the slot empty. Returns an empty string when the slot holds a
-    /// different (or no) item.
-    fn take_item_buffer(&mut self, item_id: &str) -> String {
-        if self.current_item_id.as_deref() == Some(item_id) {
-            self.current_item_id = None;
-            std::mem::take(&mut self.current_item_buffer)
-        } else {
-            String::new()
-        }
+        self.progress_buffer.push_str(line);
+        self.progress_buffer.push('\n');
+        truncate_to_chars(&mut self.progress_buffer, self.config.max_chars);
     }
 
     /// Emits the accumulated progress buffer once both the interval and
@@ -332,12 +293,17 @@ impl ReplyProjector {
         if self.progress_buffer.is_empty() {
             return ProjectorOutput::Nothing;
         }
+        let first_card = self.emitted_progress == 0;
+        let min_chars = if first_card { 1 } else { self.config.min_chars };
+        let min_interval = if first_card {
+            Duration::ZERO
+        } else {
+            self.config.min_interval
+        };
         let elapsed = self
             .last_progress
             .map_or(Duration::MAX, |last| now.saturating_duration_since(last));
-        if elapsed >= self.config.min_interval
-            && self.progress_buffer.chars().count() >= self.config.min_chars
-        {
+        if elapsed >= min_interval && self.progress_buffer.chars().count() >= min_chars {
             let text = email_mask(&self.progress_buffer);
             self.progress_checkpoint = Some(ProgressCheckpoint {
                 streamed_content: self.streamed_content.clone(),
@@ -383,10 +349,8 @@ impl ReplyProjector {
     /// Projects the terminal reply, honoring the "never repeat streamed text"
     /// contract: when a turn ends without an independent final answer, the
     /// content already emitted into the progress view is finalized in place
-    /// (contract 5). Anything accumulated but not yet emitted — the progress
-    /// buffer plus any un-completed item's delta buffer — is delivered as the
-    /// final, so a short streaming answer below the progress threshold is
-    /// never silently dropped.
+    /// (contract 5). Anything still sitting in the progress buffer is included
+    /// in that final card update.
     #[must_use]
     pub fn finish(&self, outcome: &TurnOutcome) -> ProjectedReply {
         let Some(extracted) = extract_final(outcome) else {
@@ -395,15 +359,10 @@ impl ReplyProjector {
             }
             return ProjectedReply::Empty;
         };
-        if extracted.independent {
-            // The standalone final answer never mixes in streamed progress
-            // (contract 1/4): any residual progress buffer is dropped.
-            return self.render_final(&extracted.text);
-        }
         if self.emitted_progress > 0 {
-            // The complete fallback is applied to the existing progress card
-            // in place. This neither repeats already displayed text in a new
-            // message nor loses residual text that missed a progress update.
+            if extracted.independent {
+                return self.render_progress_final(&extracted.text);
+            }
             return self.render_progress_snapshot();
         }
         self.render_final(&extracted.text)
@@ -470,7 +429,6 @@ impl ReplyProjector {
     fn render_progress_snapshot(&self) -> ProjectedReply {
         let mut complete = self.streamed_content.clone();
         complete.push_str(&email_mask(&self.progress_buffer));
-        complete.push_str(&email_mask(&self.current_item_buffer));
         self.render_progress_final(&complete)
     }
 }
@@ -491,11 +449,7 @@ impl fmt::Debug for ReplyProjector {
             .field("streamed", &(self.emitted_progress > 0))
             .field("buffered_chars", &self.progress_buffer.chars().count())
             .field("streamed_chars", &self.streamed_content.chars().count())
-            .field("has_current_item", &self.current_item_id.is_some())
-            .field(
-                "current_item_buffer_chars",
-                &self.current_item_buffer.chars().count(),
-            )
+            .field("tracked_items", &self.item_prefix_bytes.len())
             .field(
                 "has_last_completed_item",
                 &self.last_completed_item_id.is_some(),
@@ -540,8 +494,19 @@ fn is_final_phase(phase: Option<&MessagePhase>) -> bool {
     matches!(phase, Some(MessagePhase::FinalAnswer))
 }
 
-fn is_progress_phase(phase: Option<&MessagePhase>) -> bool {
-    matches!(phase, Some(MessagePhase::Commentary))
+fn item_status_line(item: &ThreadItem, started: bool) -> Option<String> {
+    let verb = if started { "正在" } else { "已完成" };
+    match item {
+        ThreadItem::Reasoning { .. } => Some(format!("> 🧠 {verb}思考")),
+        ThreadItem::CommandExecution { .. } => Some(format!("> 🔧 {verb}执行命令")),
+        ThreadItem::FileChange { .. } => Some(format!("> 📝 {verb}修改文件")),
+        ThreadItem::McpToolCall { .. } | ThreadItem::DynamicToolCall { .. } => {
+            Some(format!("> 🛠 {verb}调用工具"))
+        }
+        ThreadItem::WebSearch { .. } => Some(format!("> 🔍 {verb}搜索")),
+        ThreadItem::ImageView { .. } => Some(format!("> 🖼 {verb}查看图片")),
+        _ => None,
+    }
 }
 
 /// Returns the portion of a completed item's `text` not already buffered as

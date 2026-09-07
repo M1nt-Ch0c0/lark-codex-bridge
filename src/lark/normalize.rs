@@ -24,7 +24,7 @@
 //! types, and lengths only — never message text, mention names, or file
 //! names.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -309,6 +309,10 @@ impl LiveTranscriptHandoff {
         self
     }
 
+    pub(crate) fn drain_texts(&mut self) -> Vec<String> {
+        self.entries.drain(..).map(|entry| entry.text).collect()
+    }
+
     pub(crate) fn take_for_part(&mut self, part_index: usize) -> Option<String> {
         let index = self
             .entries
@@ -469,6 +473,16 @@ impl fmt::Debug for ShortId<'_> {
     }
 }
 
+impl ScopeKey {
+    /// Chat identifier used for allowlist checks. Never logged by callers.
+    #[must_use]
+    pub fn chat_id(&self) -> &str {
+        match self {
+            Self::Chat(chat_id) | Self::Thread(chat_id, _) => chat_id,
+        }
+    }
+}
+
 impl fmt::Display for ScopeKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -585,6 +599,111 @@ impl Normalizer {
     /// envelopes.
     pub async fn normalize(&self, payload: &[u8]) -> Result<NormalizeOutcome, LarkError> {
         self.normalize_at(payload, Instant::now()).await
+    }
+
+    /// Normalizes either an IM receive event or a Card 2.0 callback.
+    ///
+    /// # Errors
+    ///
+    /// Same contract as [`Normalizer::normalize`].
+    pub async fn normalize_message_or_card(
+        &self,
+        payload: &[u8],
+    ) -> Result<NormalizeOutcome, LarkError> {
+        if looks_like_card_action(payload) {
+            return self.normalize_card_action(payload).await;
+        }
+        match self.normalize(payload).await? {
+            NormalizeOutcome::Ignored { reason }
+                if reason == "not an im.message.receive_v1 event" =>
+            {
+                self.normalize_card_action(payload).await
+            }
+            outcome => Ok(outcome),
+        }
+    }
+
+    /// Turns a Card 2.0 `card.action.trigger` payload into a synthetic slash
+    /// command event so the existing command pipeline can handle the click.
+    pub async fn normalize_card_action(
+        &self,
+        payload: &[u8],
+    ) -> Result<NormalizeOutcome, LarkError> {
+        self.normalize_card_action_at(payload, Instant::now()).await
+    }
+
+    async fn normalize_card_action_at(
+        &self,
+        payload: &[u8],
+        now: Instant,
+    ) -> Result<NormalizeOutcome, LarkError> {
+        if payload.len() > LARK_MAX_EVENT_PAYLOAD_BYTES {
+            return Err(LarkError::exhausted(
+                "the inbound event exceeds the payload cap",
+                LARK_MAX_EVENT_PAYLOAD_BYTES as u64,
+            ));
+        }
+        let value: Value = serde_json::from_slice(payload)
+            .map_err(|_| LarkError::protocol("card action payload is not valid JSON"))?;
+        let Some(parsed) = parse_card_action(&value, &self.bot_open_id) else {
+            return Ok(NormalizeOutcome::Ignored {
+                reason: "card action is not a recognized bridge command",
+            });
+        };
+        let (chat_mode, mut scope, mut degradation) = self.resolve_scope(&parsed, now).await;
+        if chat_mode != ChatMode::P2p {
+            if let ScopeKey::Chat(chat_id) = &scope {
+                if parsed.message_id != "om_card_action" {
+                    match self.query.message(parsed.message_id.clone()).await {
+                        Ok(raw) => {
+                            if let Some(thread_id) =
+                                non_empty(raw.thread_id).or_else(|| parsed.thread_id.clone())
+                            {
+                                scope = ScopeKey::Thread(chat_id.clone(), thread_id);
+                            }
+                        }
+                        Err(error) => {
+                            if let Some(thread_id) = parsed.thread_id.clone() {
+                                scope = ScopeKey::Thread(chat_id.clone(), thread_id);
+                            } else if degradation.is_none() {
+                                degradation =
+                                    Some(Degradation::ThreadBackfillFailed { kind: error.kind() });
+                            }
+                        }
+                    }
+                } else if let Some(thread_id) = parsed.thread_id.clone() {
+                    scope = ScopeKey::Thread(chat_id.clone(), thread_id);
+                }
+            }
+        }
+        let thread_id = match &scope {
+            ScopeKey::Chat(_) => None,
+            ScopeKey::Thread(_, thread_id) => Some(thread_id.clone()),
+        };
+        Ok(NormalizeOutcome::Event {
+            event: Box::new(InboundEvent {
+                event_id: parsed.event_id,
+                message_id: parsed.message_id,
+                chat_id: parsed.chat_id,
+                sender_id: parsed.sender_open_id,
+                chat_type: chat_mode,
+                thread_id,
+                root_id: parsed.root_id,
+                reply_to_message_id: parsed.parent_id,
+                text: parsed.text,
+                mentions_bot: true,
+                mention_all: false,
+                sender_is_human: parsed.sender_is_human,
+                mentions: parsed.mentions,
+                parts: parsed.parts,
+                resources: parsed.resources,
+                message_type: "text".to_owned(),
+                create_time_ms: parsed.create_time_ms,
+                scope,
+            }),
+            live_transcripts: crate::lark::normalize::LiveTranscriptHandoff::empty(),
+            degradation,
+        })
     }
 
     /// Normalizes one raw event payload, using `now` for cache TTL
@@ -915,9 +1034,23 @@ fn extract_message_content(
             | "card"
             | "merge_forward"
             | "forward"
+            | "post"
+            | "share_chat"
+            | "share_user"
+            | "share_calendar"
+            | "share_calendar_event"
+            | "calendar"
+            | "general_calendar"
+            | "location"
+            | "todo"
+            | "system"
+            | "folder"
+            | "hongbao"
+            | "vote"
+            | "video_chat"
     );
     if !known {
-        return Ok(unsupported_content(message_type));
+        return Ok(extract_unknown_content(message_type, content));
     }
     let value: Value = serde_json::from_str(content)
         .map_err(|_| LarkError::protocol("message content is not valid JSON"))?;
@@ -972,15 +1105,40 @@ fn extract_message_content(
                 live_transcripts: Vec::new(),
             })
         }
-        "interactive" | "card" => Ok(ExtractedContent {
-            text: String::new(),
-            mentions_all: false,
-            resources: Vec::new(),
-            parts: vec![MessagePart::Card {
-                status: PartStatus::Unsupported,
-            }],
-            live_transcripts: Vec::new(),
-        }),
+        "interactive" | "card" => Ok(extract_card_content(&value)),
+        "post" => Ok(extract_post_content(&value)),
+        "share_chat" => Ok(labeled_id_or_fallback(
+            &value,
+            "[shared chat]",
+            &["name", "chat_name", "chat_id"],
+        )),
+        "share_user" => Ok(labeled_id_or_fallback(
+            &value,
+            "[shared user]",
+            &["name", "user_name", "user_id"],
+        )),
+        "share_calendar" | "calendar" | "general_calendar" | "share_calendar_event" => Ok(
+            labeled_or_fallback(&value, &["summary", "title", "name"], "[shared calendar]"),
+        ),
+        "location" => Ok(labeled_or_fallback(
+            &value,
+            &["name", "address", "title"],
+            "[location]",
+        )),
+        "todo" => Ok(extract_todo_content(&value)),
+        "system" => Ok(extract_system_content(&value)),
+        "folder" => Ok(labeled_id_or_fallback(
+            &value,
+            "[shared folder]",
+            &["file_name", "name", "file_key"],
+        )),
+        "hongbao" => Ok(labeled_or_fallback(&value, &["text", "title"], "[hongbao]")),
+        "vote" => Ok(extract_vote_content(&value)),
+        "video_chat" => Ok(labeled_or_fallback(
+            &value,
+            &["topic", "meet_number", "title"],
+            "[video chat]",
+        )),
         "merge_forward" | "forward" => {
             let message_id = content_string(&value, "message_id");
             let status = if message_id.is_some() {
@@ -1009,6 +1167,479 @@ pub(crate) fn normalize_message_parts(
     content: &str,
 ) -> Result<Vec<MessagePart>, LarkError> {
     extract_message_content(message_type, content).map(|extracted| extracted.parts)
+}
+
+fn extract_post_content(value: &Value) -> ExtractedContent {
+    let Some(body) = unwrap_locale(value) else {
+        return labeled_text_content("[rich text message]");
+    };
+    let mut texts = Vec::new();
+    let mut mentions_all = false;
+    let mut resources = Vec::new();
+    let mut extra_parts = Vec::new();
+    if let Some(title) = body.get("title").and_then(Value::as_str) {
+        let title = title.trim();
+        if !title.is_empty() {
+            texts.push(title.to_owned());
+        }
+    }
+    for paragraph in post_paragraphs(body) {
+        let Some(runs) = paragraph.as_array() else {
+            continue;
+        };
+        let mut line = String::new();
+        for run in runs {
+            match run.get("tag").and_then(Value::as_str).unwrap_or_default() {
+                "text" | "md" => {
+                    if let Some(text) = run.get("text").and_then(Value::as_str) {
+                        line.push_str(text);
+                    }
+                }
+                "a" => {
+                    if let Some(text) = run.get("text").and_then(Value::as_str) {
+                        line.push_str(text);
+                    } else if let Some(href) = run.get("href").and_then(Value::as_str) {
+                        line.push_str(href);
+                    }
+                }
+                "at" => {
+                    let user_id = run
+                        .get("user_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if user_id == "all" || user_id == "all_members" {
+                        mentions_all = true;
+                        line.push_str("@all");
+                    } else if let Some(name) = run.get("user_name").and_then(Value::as_str) {
+                        line.push('@');
+                        line.push_str(name);
+                    }
+                }
+                "img" => {
+                    let key = content_string(run, "image_key");
+                    if key.is_some() {
+                        resources.extend(resource_desc(key.clone(), ResourceKind::Image));
+                        extra_parts.push(MessagePart::Image(media_part(key, None, run)));
+                    }
+                }
+                "media" => {
+                    let key = content_string(run, "file_key");
+                    if key.is_some() {
+                        resources.extend(resource_desc(key.clone(), ResourceKind::File));
+                        extra_parts.push(MessagePart::File(media_part(key, None, run)));
+                    }
+                }
+                "code_block" => {
+                    if let Some(text) = run.get("text").and_then(Value::as_str) {
+                        if !line.is_empty() {
+                            texts.push(std::mem::take(&mut line));
+                        }
+                        texts.push(text.to_owned());
+                    }
+                }
+                "hr" => {
+                    if !line.is_empty() {
+                        texts.push(std::mem::take(&mut line));
+                    }
+                }
+                _ => {
+                    if let Some(text) = run.get("text").and_then(Value::as_str) {
+                        line.push_str(text);
+                    }
+                }
+            }
+        }
+        let line = strip_mention_tags(&line);
+        if !line.is_empty() {
+            texts.push(line);
+        }
+    }
+    let text = bound_join(&texts);
+    let mut parts = Vec::new();
+    if !text.is_empty() {
+        parts.push(MessagePart::Text { text: text.clone() });
+    }
+    parts.extend(extra_parts);
+    if parts.is_empty() {
+        return labeled_text_content("[rich text message]");
+    }
+    ExtractedContent {
+        text,
+        mentions_all,
+        resources,
+        parts,
+        live_transcripts: Vec::new(),
+    }
+}
+
+const POST_LOCALE_PRIORITY: &[&str] = &["zh_cn", "zh-CN", "en_us", "en-US", "ja_jp", "ja-JP"];
+
+fn unwrap_locale(value: &Value) -> Option<&Value> {
+    let object = value.as_object()?;
+    if object.contains_key("title")
+        || object.contains_key("content")
+        || object.contains_key("content_v2")
+    {
+        return Some(value);
+    }
+    for locale in POST_LOCALE_PRIORITY {
+        if let Some(hit) = object.get(*locale).filter(|hit| hit.is_object()) {
+            return Some(hit);
+        }
+    }
+    object.values().find(|hit| hit.is_object())
+}
+
+fn post_paragraphs(body: &Value) -> Vec<Value> {
+    if let Some(paragraphs) = body
+        .get("content_v2")
+        .and_then(Value::as_array)
+        .filter(|paragraphs| !paragraphs.is_empty())
+    {
+        return paragraphs.clone();
+    }
+    match body.get("content") {
+        Some(Value::Array(paragraphs)) => paragraphs.clone(),
+        Some(Value::String(encoded)) => serde_json::from_str::<Value>(encoded)
+            .ok()
+            .map(|nested| {
+                if let Some(paragraphs) = nested.as_array() {
+                    paragraphs.clone()
+                } else {
+                    unwrap_locale(&nested)
+                        .map(post_paragraphs)
+                        .unwrap_or_default()
+                }
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+fn extract_card_content(value: &Value) -> ExtractedContent {
+    let mut texts = Vec::new();
+    collect_card_text(value, &mut texts);
+    if texts.is_empty() {
+        if let Some(card) = value.get("card") {
+            collect_card_text(card, &mut texts);
+        }
+    }
+    let mut seen = HashSet::new();
+    texts.retain(|text| seen.insert(text.clone()));
+    let mut text = bound_join(&texts);
+    if text.is_empty() {
+        text = "[interactive card]".to_owned();
+    }
+    ExtractedContent {
+        text: text.clone(),
+        mentions_all: false,
+        resources: Vec::new(),
+        parts: vec![
+            MessagePart::Text { text },
+            MessagePart::Card {
+                status: PartStatus::Available,
+            },
+        ],
+        live_transcripts: Vec::new(),
+    }
+}
+
+fn collect_card_text(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_card_text(item, out);
+            }
+        }
+        Value::Object(map) => {
+            let tag = map.get("tag").and_then(Value::as_str).unwrap_or_default();
+            if matches!(tag, "plain_text" | "lark_md" | "markdown") {
+                if let Some(text) = map
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                {
+                    out.push(text.to_owned());
+                }
+                return;
+            }
+            for key in ["title", "content", "text"] {
+                if let Some(text) = plain_text_value(map.get(key)) {
+                    out.push(text);
+                }
+            }
+            for key in [
+                "header",
+                "body",
+                "elements",
+                "i18n_elements",
+                "children",
+                "fields",
+                "actions",
+                "columns",
+                "label",
+                "placeholder",
+            ] {
+                if let Some(child) = map.get(key) {
+                    collect_card_text(child, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn plain_text_value(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    if let Some(text) = value
+        .as_str()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        return Some(text.to_owned());
+    }
+    let object = value.as_object()?;
+    object
+        .get("content")
+        .and_then(Value::as_str)
+        .or_else(|| object.get("text").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn labeled_text_content(label: &str) -> ExtractedContent {
+    ExtractedContent {
+        text: label.to_owned(),
+        mentions_all: false,
+        resources: Vec::new(),
+        parts: vec![MessagePart::Text {
+            text: label.to_owned(),
+        }],
+        live_transcripts: Vec::new(),
+    }
+}
+
+fn labeled_or_fallback(value: &Value, keys: &[&str], fallback: &str) -> ExtractedContent {
+    let mut texts = Vec::new();
+    for key in keys {
+        push_plain_text(&mut texts, value.get(*key));
+    }
+    if texts.is_empty() {
+        labeled_text_content(fallback)
+    } else {
+        let text = bound_join(&texts);
+        ExtractedContent {
+            text: text.clone(),
+            mentions_all: false,
+            resources: Vec::new(),
+            parts: vec![MessagePart::Text { text }],
+            live_transcripts: Vec::new(),
+        }
+    }
+}
+
+fn labeled_id_or_fallback(value: &Value, fallback: &str, keys: &[&str]) -> ExtractedContent {
+    for key in keys {
+        if let Some(text) = value
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            return labeled_text_content(&format!("{fallback}: {text}"));
+        }
+    }
+    labeled_text_content(fallback)
+}
+
+fn extract_todo_content(value: &Value) -> ExtractedContent {
+    let mut texts = Vec::new();
+    match value.get("summary") {
+        Some(Value::String(summary)) => {
+            let summary = summary.trim();
+            if !summary.is_empty() {
+                texts.push(summary.to_owned());
+            }
+        }
+        Some(Value::Object(summary)) => {
+            push_plain_text(&mut texts, summary.get("title"));
+            if let Some(paragraphs) = summary.get("content").and_then(Value::as_array) {
+                for paragraph in paragraphs {
+                    let Some(runs) = paragraph.as_array() else {
+                        continue;
+                    };
+                    let mut line = String::new();
+                    for run in runs {
+                        if let Some(text) = run.get("text").and_then(Value::as_str) {
+                            line.push_str(text);
+                        }
+                    }
+                    let line = line.trim();
+                    if !line.is_empty() {
+                        texts.push(line.to_owned());
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    push_plain_text(&mut texts, value.get("title"));
+    push_plain_text(&mut texts, value.get("text"));
+    if texts.is_empty() {
+        labeled_text_content("[todo]")
+    } else {
+        let text = bound_join(&texts);
+        ExtractedContent {
+            text: text.clone(),
+            mentions_all: false,
+            resources: Vec::new(),
+            parts: vec![MessagePart::Text { text }],
+            live_transcripts: Vec::new(),
+        }
+    }
+}
+
+fn extract_system_content(value: &Value) -> ExtractedContent {
+    if let Some(template) = value.get("template").and_then(Value::as_str) {
+        let rendered = interpolate_system_template(template, value);
+        if !rendered.trim().is_empty() {
+            return labeled_text_content(rendered.trim());
+        }
+    }
+    labeled_or_fallback(value, &["text", "title"], "[system]")
+}
+
+fn interpolate_system_template(template: &str, value: &Value) -> String {
+    let mut out = String::new();
+    let mut rest = template;
+    while let Some(start) = rest.find('{') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        if let Some(end) = after.find('}') {
+            let name = &after[..end];
+            if let Some(replacement) = system_placeholder(value, name) {
+                out.push_str(&replacement);
+            }
+            rest = &after[end + 1..];
+        } else {
+            out.push_str(&rest[start..]);
+            return out;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn system_placeholder(value: &Value, name: &str) -> Option<String> {
+    match value.get(name)? {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(items) => {
+            let parts: Vec<String> = items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join(", "))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn extract_vote_content(value: &Value) -> ExtractedContent {
+    let mut texts = Vec::new();
+    push_plain_text(&mut texts, value.get("topic"));
+    if let Some(options) = value.get("options").and_then(Value::as_array) {
+        for option in options {
+            let label = option
+                .as_str()
+                .or_else(|| option.get("text").and_then(Value::as_str))
+                .or_else(|| option.get("name").and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|text| !text.is_empty());
+            if let Some(label) = label {
+                texts.push(format!("- {label}"));
+            }
+        }
+    }
+    if texts.is_empty() {
+        labeled_text_content("[vote]")
+    } else {
+        let text = bound_join(&texts);
+        ExtractedContent {
+            text: text.clone(),
+            mentions_all: false,
+            resources: Vec::new(),
+            parts: vec![MessagePart::Text { text }],
+            live_transcripts: Vec::new(),
+        }
+    }
+}
+
+fn push_plain_text(texts: &mut Vec<String>, value: Option<&Value>) {
+    if let Some(text) = value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        texts.push(text.to_owned());
+    }
+}
+
+fn extract_unknown_content(message_type: &str, content: &str) -> ExtractedContent {
+    let Ok(value) = serde_json::from_str::<Value>(content) else {
+        return unsupported_content(message_type);
+    };
+    let mut texts = Vec::new();
+    for key in ["text", "title", "name", "address", "summary"] {
+        if let Some(text) = value
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            texts.push(text.to_owned());
+        }
+    }
+    if texts.is_empty() {
+        return unsupported_content(message_type);
+    }
+    let text = bound_join(&texts);
+    ExtractedContent {
+        text: text.clone(),
+        mentions_all: false,
+        resources: Vec::new(),
+        parts: vec![MessagePart::Text { text }],
+        live_transcripts: Vec::new(),
+    }
+}
+
+fn bound_join(texts: &[String]) -> String {
+    let mut joined = String::new();
+    for text in texts {
+        if text.is_empty() {
+            continue;
+        }
+        if !joined.is_empty() {
+            joined.push('\n');
+        }
+        let remaining = crate::limits::STORE_INBOUND_TEXT_MAX_BYTES.saturating_sub(joined.len());
+        if remaining == 0 {
+            break;
+        }
+        if text.len() <= remaining {
+            joined.push_str(text);
+        } else {
+            joined.push_str(&text[..remaining]);
+            break;
+        }
+    }
+    joined
 }
 
 fn unsupported_content(message_type: &str) -> ExtractedContent {
@@ -1048,9 +1679,8 @@ fn audio_content(value: &Value) -> ExtractedContent {
         .map(|text| vec![(0, text)])
         .unwrap_or_default();
     ExtractedContent {
-        // Recognition text remains inside the turn-scoped media capability.
-        // Copying it into the ordinary event text would bypass the operator's
-        // configured ASR transcript limit before `bridge_media.read` runs.
+        // Recognition text stays in the live handoff. Assemble injects it
+        // into user_input only after the configured transcript-size check.
         text: String::new(),
         mentions_all: false,
         resources: Vec::new(),
@@ -1311,5 +1941,147 @@ fn mention_identity(mention: EventMention) -> MentionIdentity {
         user_id: non_empty(id.user_id),
         union_id: non_empty(id.union_id),
         name: non_empty(mention.name),
+    }
+}
+
+fn looks_like_card_action(payload: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(payload)
+        .ok()
+        .is_some_and(|value| {
+            value.pointer("/action").is_some() || value.pointer("/event/action").is_some()
+        })
+}
+
+fn parse_card_action(value: &Value, bot_open_id: &str) -> Option<ParsedEvent> {
+    let event = value.get("event").unwrap_or(value);
+    let action = event.get("action").or_else(|| value.get("action"))?;
+    let cmd = action
+        .pointer("/value/cmd")
+        .and_then(Value::as_str)
+        .or_else(|| action.get("cmd").and_then(Value::as_str))?;
+    let arg = action
+        .pointer("/value/arg")
+        .and_then(Value::as_str)
+        .or_else(|| action.get("arg").and_then(Value::as_str));
+    let form_value = action.get("form_value").or_else(|| action.get("formValue"));
+    let text = if cmd == "config.submit" {
+        config_command_from_form(form_value)?
+    } else {
+        crate::runtime::commands::command_text_from_card_action(cmd, arg)?
+    };
+    let chat_id = event
+        .pointer("/context/open_chat_id")
+        .or_else(|| event.pointer("/context/chat_id"))
+        .or_else(|| value.pointer("/context/open_chat_id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())?
+        .to_owned();
+    let message_id = event
+        .pointer("/context/open_message_id")
+        .or_else(|| event.pointer("/context/message_id"))
+        .or_else(|| value.pointer("/context/open_message_id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("om_card_action")
+        .to_owned();
+    let sender_open_id = event
+        .pointer("/operator/open_id")
+        .or_else(|| value.pointer("/operator/open_id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())?
+        .to_owned();
+    let event_id = value
+        .pointer("/header/event_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("card:{message_id}:{cmd}"));
+    let create_time_ms = value
+        .pointer("/header/create_time")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
+    let chat_type_wire = card_action_string(
+        event,
+        value,
+        &[
+            "/context/chat_type",
+            "/context/open_chat_type",
+            "/chat_type",
+        ],
+    )
+    .map(|value| value.to_ascii_lowercase())
+    .filter(|value| matches!(value.as_str(), "p2p" | "group" | "topic"))
+    .unwrap_or_default();
+    let thread_id = card_action_string(
+        event,
+        value,
+        &[
+            "/context/thread_id",
+            "/context/open_thread_id",
+            "/thread_id",
+        ],
+    );
+    let _ = bot_open_id;
+    Some(ParsedEvent {
+        event_id,
+        message_id,
+        chat_id,
+        chat_type_wire,
+        message_type: "text".to_owned(),
+        create_time_ms,
+        sender_open_id,
+        thread_id,
+        root_id: None,
+        parent_id: None,
+        text,
+        mentions_bot: true,
+        mention_all: false,
+        sender_is_human: true,
+        mentions: Vec::new(),
+        parts: Vec::new(),
+        resources: Vec::new(),
+        live_transcripts: Vec::new(),
+    })
+}
+
+fn card_action_string(event: &Value, root: &Value, pointers: &[&str]) -> Option<String> {
+    pointers
+        .iter()
+        .find_map(|pointer| {
+            event
+                .pointer(pointer)
+                .or_else(|| root.pointer(pointer))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+        })
+        .map(ToOwned::to_owned)
+}
+
+fn config_command_from_form(form: Option<&Value>) -> Option<String> {
+    let form = form?;
+    let mut tokens = vec!["/config".to_owned(), "apply".to_owned()];
+    for key in ["model", "effort", "sandbox", "approval"] {
+        let Some(value) = form.get(key).and_then(form_field_text) else {
+            continue;
+        };
+        if value.is_empty()
+            || value
+                .bytes()
+                .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+        {
+            continue;
+        }
+        tokens.push(format!("{key}={value}"));
+    }
+    (tokens.len() > 2).then(|| tokens.join(" "))
+}
+
+fn form_field_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.trim().to_owned()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(flag) => Some(flag.to_string()),
+        _ => None,
     }
 }

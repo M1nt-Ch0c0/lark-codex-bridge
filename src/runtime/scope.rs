@@ -23,12 +23,13 @@ use crate::codex::types::{
     SandboxMode, ThreadResumeParams, ThreadStartParams, TurnSandboxPolicy, TurnStartParams,
     TurnStatus, UserInput,
 };
+use crate::config::AsrSection;
 use crate::lark::api::ChatMode;
 use crate::lark::bridge::QueuedInboundEvent;
-use crate::lark::normalize::{InboundEvent, MessagePart, ScopeKey};
+use crate::lark::normalize::{InboundEvent, MessagePart, ScopeKey, TranscriptFailure};
 use crate::limits::{
     REPLY_MESSAGE_MAX_CHARS, SCOPE_MAILBOX_BYTE_BUDGET, SCOPE_MAILBOX_CAPACITY,
-    TURN_BATCH_MAX_MESSAGES, TURN_BATCH_TEXT_BYTE_BUDGET,
+    TOPIC_CONTEXT_MAX_MESSAGES, TURN_BATCH_MAX_MESSAGES, TURN_BATCH_TEXT_BYTE_BUDGET,
 };
 use crate::render::{ProjectedReply, ProjectorOutput, ReplyProjector};
 use crate::runtime::adoption::ThreadCandidatePage;
@@ -36,15 +37,23 @@ use crate::runtime::adoption_coordinator::{
     AdoptionResumeSettings, CandidateSelectionProof, ExplicitHandoff, ReleaseOutcome,
     ThreadAdoptionCoordinator, ThreadAdoptionCoordinatorError,
 };
+use crate::runtime::asr::{self, AsrError};
 use crate::runtime::attachments::{AttachError, AttachmentCache};
-use crate::runtime::commands::{BridgeCommand, CommandParseError};
-use crate::runtime::context::{
-    ContextDraft, ContextId, ContextRegistry, PendingBinding, RevocationReason,
+use crate::runtime::commands::{
+    BridgeCommand, CommandParseError, ControlReply, command_requires_owner,
 };
+use crate::runtime::context::{
+    ContextDraft, ContextId, ContextRegistry, DraftPart, MediaKind, PendingBinding,
+    RevocationReason,
+};
+use crate::runtime::live::{ConfigPatch, LiveBridgeConfig};
 use crate::runtime::policy::AccessPolicy;
-use crate::runtime::quote::{QuoteRequest, QuoteResolver};
+use crate::runtime::prompt::{
+    BuildAgentPromptInput, PromptAttachment, prefix_bridge_system_prompt,
+    prompt_context_from_event, quoted_message_from_draft,
+};
+use crate::runtime::quote::{QuoteRequest, QuoteResolver, TopicContextRequest};
 use crate::runtime::router::RouterSettings;
-use crate::runtime::tools::{CONTEXT_TOOLS_VERSION, bridge_dynamic_tools};
 use crate::store::{
     BeginTurnOutcome, ClaimedInbound, InboundKey, InboundRejectionKind, InboundTerminal,
     NewOutboxRow, NewTurnRow, StoreHandle, ThreadAdoptionState, ThreadOrigin, TurnResolution,
@@ -103,6 +112,52 @@ pub struct TurnFinalization {
     pub resolution: TurnResolution,
     /// Authoritative Codex terminal outcome; absent only for uncertainty.
     pub outcome: Option<TurnOutcome>,
+    /// Stable failure category for notices and logs. Never carries paths or text.
+    pub failure: Option<TurnFailureKind>,
+}
+
+/// User-visible, content-free turn failure category.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TurnFailureKind {
+    /// Quoted or inbound media could not be assembled.
+    Attachment,
+    /// The workspace failed revalidation.
+    Workspace,
+    /// Codex rejected `turn/start` before applying it.
+    TurnStartRejected,
+    /// Codex completed the turn as failed.
+    TurnFailed,
+    /// The connection or response was lost; the request may have been applied.
+    ConnectionLost,
+    /// The operator interrupted the turn.
+    Interrupted,
+}
+
+impl TurnFailureKind {
+    /// Short Chinese notice safe to show in Feishu.
+    #[must_use]
+    pub const fn notice(self) -> &'static str {
+        match self {
+            Self::Attachment => "任务执行失败（附件未能处理）",
+            Self::Workspace => "任务执行失败（工作目录无效）",
+            Self::TurnStartRejected => "任务未能启动（模型或请求被拒绝）",
+            Self::TurnFailed => "任务执行失败（Codex 返回失败）",
+            Self::ConnectionLost => "任务执行结果未知，请重新发起",
+            Self::Interrupted => "任务已中断",
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Attachment => "attachment",
+            Self::Workspace => "workspace",
+            Self::TurnStartRejected => "turn_start_rejected",
+            Self::TurnFailed => "turn_failed",
+            Self::ConnectionLost => "connection_lost",
+            Self::Interrupted => "interrupted",
+        }
+    }
 }
 
 /// One durable progress-card snapshot for a running turn.
@@ -142,6 +197,7 @@ impl fmt::Debug for TurnFinalization {
             .field("source_count", &self.sources.len())
             .field("resolution", &self.resolution)
             .field("has_outcome", &self.outcome.is_some())
+            .field("failure", &self.failure)
             .finish()
     }
 }
@@ -179,6 +235,16 @@ pub trait DurableReplySink: Send + Sync {
         _key: &InboundKey,
         _event: &InboundEvent,
         _text: &str,
+    ) -> Result<NewOutboxRow, ReplySinkError> {
+        Err(ReplySinkError::Invariant)
+    }
+
+    /// Builds one deterministic command card without performing I/O.
+    fn control_card(
+        &self,
+        _key: &InboundKey,
+        _event: &InboundEvent,
+        _spec: &crate::render::InteractiveCardSpec,
     ) -> Result<NewOutboxRow, ReplySinkError> {
         Err(ReplySinkError::Invariant)
     }
@@ -564,8 +630,7 @@ impl ScopeActorHandle {
     pub(crate) fn spawn(
         scope: ScopeKey,
         store: StoreHandle,
-        policy: AccessPolicy,
-        settings: RouterSettings,
+        live: Arc<LiveBridgeConfig>,
         supervisor: watch::Receiver<SupervisorAccess>,
         active_turns: Arc<Semaphore>,
         sink: Arc<dyn DurableReplySink>,
@@ -580,13 +645,13 @@ impl ScopeActorHandle {
         let active_turn = Arc::new(RwLock::new(None));
         let task_active_turn = Arc::clone(&active_turn);
         let shutdown = CancellationToken::new();
+        let settings = live.settings();
         let pending_media = Arc::new(Mutex::new(PendingMediaQueue::new(&settings)));
         let join = tokio::spawn(run_scope_actor(
             scope.clone(),
             receiver,
             store.clone(),
-            policy,
-            settings,
+            live,
             supervisor.clone(),
             active_turns,
             sink,
@@ -749,8 +814,7 @@ async fn run_scope_actor(
     scope: ScopeKey,
     mut receiver: mpsc::Receiver<ScopeCommand>,
     store: StoreHandle,
-    policy: AccessPolicy,
-    settings: RouterSettings,
+    live: Arc<LiveBridgeConfig>,
     supervisor: watch::Receiver<SupervisorAccess>,
     active_turns: Arc<Semaphore>,
     sink: Arc<dyn DurableReplySink>,
@@ -768,6 +832,8 @@ async fn run_scope_actor(
     // restart, or one ownership-changing attempt drops it permanently.
     let mut candidate_proof: Option<CandidateSelectionProof> = None;
     'actor: loop {
+        let policy = live.policy();
+        let settings = live.settings();
         let first = match deferred.take() {
             Some(DeferredScopeWork::Prepared(first)) => Some(*first),
             Some(DeferredScopeWork::Control(control)) => {
@@ -775,12 +841,13 @@ async fn run_scope_actor(
                     &scope,
                     *control,
                     &store,
-                    &policy,
-                    &settings,
+                    &live,
                     &supervisor,
                     sink.as_ref(),
                     adoption.as_ref(),
                     &pending_media,
+                    &active_turn,
+                    &state,
                     &mut candidate_proof,
                     &shutdown,
                 )
@@ -839,12 +906,13 @@ async fn run_scope_actor(
                             &scope,
                             *control,
                             &store,
-                            &policy,
-                            &settings,
+                            &live,
                             &supervisor,
                             sink.as_ref(),
                             adoption.as_ref(),
                             &pending_media,
+                            &active_turn,
+                            &state,
                             &mut candidate_proof,
                             &shutdown,
                         )
@@ -959,48 +1027,67 @@ async fn process_control(
     scope: &ScopeKey,
     control: ActorControl,
     store: &StoreHandle,
-    policy: &AccessPolicy,
-    settings: &RouterSettings,
+    live: &LiveBridgeConfig,
     supervisor: &watch::Receiver<SupervisorAccess>,
     sink: &dyn DurableReplySink,
     adoption: &ThreadAdoptionCoordinator,
     pending_media: &Arc<Mutex<PendingMediaQueue>>,
+    active_turn: &RwLock<Option<ActiveTurn>>,
+    state: &RwLock<ScopeState>,
     candidate_proof: &mut Option<CandidateSelectionProof>,
     shutdown: &CancellationToken,
 ) -> Result<(), ScopeFailureKind> {
+    let policy = live.policy();
+    let settings = live.settings();
     if is_stale(&control.inbound.queued.event, settings.message_max_age) {
         return reject_item(store, sink, &control.inbound, InboundRejectionKind::Stale).await;
     }
-    if let Some(reason) = policy
-        .decide_command(&control.inbound.queued.event)
-        .rejection_kind()
-    {
+    let owner_gated = match &control.control {
+        ScopeControl::Command(command) => command_requires_owner(command),
+        ScopeControl::Malformed(_) => false,
+    };
+    let decision = if owner_gated {
+        policy.decide_command(&control.inbound.queued.event)
+    } else {
+        policy.decide(&control.inbound.queued.event)
+    };
+    if let Some(reason) = decision.rejection_kind() {
         return reject_item(store, sink, &control.inbound, reason).await;
     }
 
     let reply = match control.control {
-        ScopeControl::Malformed(error) => {
-            format!("Command rejected: {error}. Use /help for exact syntax.")
-        }
+        ScopeControl::Malformed(error) => ControlReply::text(format!(
+            "Command rejected: {error}. Use /help for exact syntax."
+        )),
         ScopeControl::Command(command) => {
             execute_control(
                 scope,
                 command,
                 store,
-                policy,
-                settings,
+                &policy,
+                &settings,
+                live,
                 supervisor,
                 adoption,
                 pending_media,
+                active_turn,
+                state,
                 candidate_proof,
+                control.inbound.queued.event.chat_type,
             )
             .await
         }
     };
-    let row = sink
-        .control_reply(&control.inbound.key, &control.inbound.queued.event, &reply)
-        .map_err(|_| ScopeFailureKind::Projection)?;
-    complete_control_reply(store, settings, &control.inbound.key, row, shutdown).await
+    let row = match &reply {
+        ControlReply::Text(text) => {
+            sink.control_reply(&control.inbound.key, &control.inbound.queued.event, text)
+        }
+        ControlReply::Card(spec) => {
+            sink.control_card(&control.inbound.key, &control.inbound.queued.event, spec)
+        }
+    }
+    .map_err(|_| ScopeFailureKind::Projection)?;
+    complete_control_reply(store, &settings, &control.inbound.key, row, shutdown).await
 }
 
 async fn complete_control_reply(
@@ -1035,17 +1122,21 @@ async fn execute_control(
     store: &StoreHandle,
     policy: &AccessPolicy,
     settings: &RouterSettings,
+    live: &LiveBridgeConfig,
     supervisor: &watch::Receiver<SupervisorAccess>,
     adoption: &ThreadAdoptionCoordinator,
     pending_media: &Arc<Mutex<PendingMediaQueue>>,
+    active_turn: &RwLock<Option<ActiveTurn>>,
+    state: &RwLock<ScopeState>,
     candidate_proof: &mut Option<CandidateSelectionProof>,
-) -> String {
+    chat_mode: crate::channel::ConversationMode,
+) -> ControlReply {
     match command {
-        BridgeCommand::Threads { cursor } => {
+        BridgeCommand::Threads { cursor } => ControlReply::text(
             execute_threads_control(scope, cursor, policy, supervisor, adoption, candidate_proof)
-                .await
-        }
-        BridgeCommand::Adopt { selector } => {
+                .await,
+        ),
+        BridgeCommand::Adopt { selector } => ControlReply::text(
             execute_adopt_control(
                 scope,
                 &selector,
@@ -1057,17 +1148,450 @@ async fn execute_control(
                 pending_media,
                 candidate_proof,
             )
+            .await,
+        ),
+        BridgeCommand::Release => ControlReply::text(
+            execute_release_control(scope, policy, settings, supervisor, adoption).await,
+        ),
+        BridgeCommand::New => {
+            execute_new_control(
+                scope,
+                store,
+                policy,
+                settings,
+                adoption,
+                pending_media,
+                active_turn,
+            )
             .await
         }
-        BridgeCommand::Release => {
-            execute_release_control(scope, policy, settings, supervisor, adoption).await
+        BridgeCommand::Stop => execute_stop_control(pending_media, active_turn).await,
+        BridgeCommand::Status => {
+            execute_status_control(
+                scope,
+                store,
+                live,
+                policy,
+                pending_media,
+                active_turn,
+                state,
+                chat_mode,
+            )
+            .await
         }
-        BridgeCommand::New
-        | BridgeCommand::Stop
-        | BridgeCommand::Status
-        | BridgeCommand::Cd { .. }
-        | BridgeCommand::Help => unreachable!("router admits only adoption controls"),
+        BridgeCommand::Info => execute_info_control(scope, store, settings, chat_mode).await,
+        BridgeCommand::Help => ControlReply::Card(crate::render::help_card()),
+        BridgeCommand::Cd { path } => {
+            execute_cd_control(
+                scope,
+                path,
+                store,
+                policy,
+                settings,
+                adoption,
+                pending_media,
+                active_turn,
+            )
+            .await
+        }
+        BridgeCommand::Resume { selector } => {
+            execute_resume_control(
+                scope,
+                selector,
+                store,
+                policy,
+                settings,
+                pending_media,
+                active_turn,
+            )
+            .await
+        }
+        BridgeCommand::Config { action, cancel } => {
+            execute_config_control(live, chat_mode, action, cancel)
+        }
     }
+}
+
+fn execute_config_control(
+    live: &LiveBridgeConfig,
+    chat_mode: crate::channel::ConversationMode,
+    action: Option<ConfigPatch>,
+    cancel: bool,
+) -> ControlReply {
+    if chat_mode != ChatMode::P2p {
+        return ControlReply::text("只能在私聊中使用 /config，群聊里改不了运行设置。");
+    }
+    if cancel {
+        return ControlReply::Card(crate::render::config_cancelled_card());
+    }
+    let Some(action) = action else {
+        return ControlReply::Card(config_view_card(&live.view()));
+    };
+    match live.apply(&action) {
+        Ok(view) => ControlReply::Card(config_saved_view_card(&view)),
+        Err(crate::runtime::live::LiveConfigError::InvalidValue) => {
+            ControlReply::text("设置值无效。请检查模型名、effort、sandbox、approval 或白名单 ID。")
+        }
+        Err(_) => ControlReply::text("保存设置失败，请稍后重试。"),
+    }
+}
+
+fn config_view_card(view: &crate::runtime::live::ConfigView) -> crate::render::InteractiveCardSpec {
+    crate::render::config_card(
+        view.model.as_deref(),
+        view.effort.as_deref(),
+        sandbox_label(view.sandbox),
+        &view.approval,
+        &view.allowed_groups,
+        &view.allowed_senders,
+    )
+}
+
+fn config_saved_view_card(
+    view: &crate::runtime::live::ConfigView,
+) -> crate::render::InteractiveCardSpec {
+    crate::render::config_saved_card(&crate::render::ConfigFormSpec {
+        model: view.model.clone().unwrap_or_default(),
+        effort: view.effort.clone().unwrap_or_default(),
+        sandbox: sandbox_label(view.sandbox).to_owned(),
+        approval: view.approval.clone(),
+        allowed_groups: view.allowed_groups.clone(),
+        allowed_senders: view.allowed_senders.clone(),
+    })
+}
+
+fn sandbox_label(mode: SandboxMode) -> &'static str {
+    match mode {
+        SandboxMode::ReadOnly => "read-only",
+        SandboxMode::WorkspaceWrite => "workspace-write",
+        SandboxMode::DangerFullAccess => "danger-full-access",
+    }
+}
+
+async fn interrupt_active_turn(
+    pending_media: &Arc<Mutex<PendingMediaQueue>>,
+    active_turn: &RwLock<Option<ActiveTurn>>,
+) -> bool {
+    if let Ok(mut pending) = pending_media.lock() {
+        pending.clear();
+    }
+    let snapshot = {
+        let Ok(active) = active_turn.read() else {
+            return false;
+        };
+        active.as_ref().cloned()
+    };
+    let Some(active) = snapshot else {
+        return false;
+    };
+    if let Some((registry, binding)) = &active.context_binding {
+        let _ = registry
+            .revoke_turn_and_wait(binding, RevocationReason::Cancelled)
+            .await;
+    }
+    active
+        .client
+        .interrupt_turn(&active.thread_id, &active.turn_id)
+        .await
+        .is_ok()
+}
+
+async fn execute_new_control(
+    scope: &ScopeKey,
+    store: &StoreHandle,
+    policy: &AccessPolicy,
+    settings: &RouterSettings,
+    adoption: &ThreadAdoptionCoordinator,
+    pending_media: &Arc<Mutex<PendingMediaQueue>>,
+    active_turn: &RwLock<Option<ActiveTurn>>,
+) -> ControlReply {
+    let interrupted = interrupt_active_turn(pending_media, active_turn).await;
+    let cwd = current_cwd(scope, store, settings).await;
+    match store.active_thread(scope).await {
+        Ok(Some(row)) if row.origin == ThreadOrigin::ExternallyAdopted => {
+            let _ = adoption.release(scope).await;
+        }
+        Ok(Some(_)) => {
+            let _ = store.archive_active_thread(scope).await;
+        }
+        Ok(None) => {}
+        Err(_) => {
+            return ControlReply::text("无法开始新会话：存储暂时不可用。");
+        }
+    }
+    let _ = policy;
+    ControlReply::Card(crate::render::new_session_card(interrupted, cwd.as_deref()))
+}
+
+async fn execute_stop_control(
+    pending_media: &Arc<Mutex<PendingMediaQueue>>,
+    active_turn: &RwLock<Option<ActiveTurn>>,
+) -> ControlReply {
+    if interrupt_active_turn(pending_media, active_turn).await {
+        ControlReply::text("已请求停止当前任务。")
+    } else {
+        ControlReply::text("当前没有正在运行的任务。")
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_status_control(
+    scope: &ScopeKey,
+    store: &StoreHandle,
+    live: &LiveBridgeConfig,
+    policy: &AccessPolicy,
+    pending_media: &Arc<Mutex<PendingMediaQueue>>,
+    active_turn: &RwLock<Option<ActiveTurn>>,
+    state: &RwLock<ScopeState>,
+    chat_mode: crate::channel::ConversationMode,
+) -> ControlReply {
+    let view = live.view();
+    let settings = live.settings();
+    let cwd = current_cwd(scope, store, &settings)
+        .await
+        .map(|path| display_workspace_path(&path));
+    let session = store
+        .active_thread(scope)
+        .await
+        .ok()
+        .flatten()
+        .map(|row| row.codex_thread_id);
+    let active_run = active_turn.read().ok().is_some_and(|guard| guard.is_some());
+    let pending = pending_media
+        .lock()
+        .map(|mut queue| queue.stats().0)
+        .unwrap_or(0);
+    let depth = store.outbox_depth().await.unwrap_or_default();
+    let scope_state = state
+        .read()
+        .map(|current| scope_state_label(*current))
+        .unwrap_or_else(|_| "unknown".to_owned());
+    let chat_mode_label = chat_mode_label(chat_mode);
+    let group_allowed = match chat_mode {
+        crate::channel::ConversationMode::P2p => None,
+        crate::channel::ConversationMode::Group | crate::channel::ConversationMode::Topic => Some(
+            policy
+                .allowed_groups()
+                .iter()
+                .any(|id| id == scope.chat_id()),
+        ),
+    };
+    ControlReply::Card(crate::render::status_card(&crate::render::StatusSnapshot {
+        chat_mode: chat_mode_label.to_owned(),
+        cwd,
+        session_id: session,
+        active_run,
+        scope_state,
+        model: view.model,
+        effort: view.effort,
+        sandbox: sandbox_label(view.sandbox).to_owned(),
+        approval: view.approval,
+        pending_media: pending,
+        outbox_pending: depth.pending,
+        outbox_failed: depth.failed,
+        outbox_uncertain: depth.uncertain,
+        group_allowed,
+        show_config: chat_mode == crate::channel::ConversationMode::P2p,
+    }))
+}
+
+async fn execute_info_control(
+    scope: &ScopeKey,
+    store: &StoreHandle,
+    settings: &RouterSettings,
+    chat_mode: crate::channel::ConversationMode,
+) -> ControlReply {
+    let _ = chat_mode;
+    let cwd = current_cwd(scope, store, settings).await;
+    let cwd_path = cwd.as_deref().map(PathBuf::from);
+    let current = store
+        .active_thread(scope)
+        .await
+        .ok()
+        .flatten()
+        .map(|row| row.codex_thread_id);
+    let threads = store.list_scope_threads(scope, 8).await.unwrap_or_default();
+    let snapshot = crate::runtime::inventory::collect_inventory(
+        settings.backend.configured_codex_home(),
+        cwd_path.as_deref(),
+        &threads,
+        current.as_deref(),
+    );
+    ControlReply::Card(crate::render::info_card(&crate::render::InfoSnapshot {
+        workspace: snapshot.workspace,
+        mcp: snapshot.mcp,
+        skills: snapshot
+            .skills
+            .into_iter()
+            .map(|skill| (skill.name, skill.summary))
+            .collect(),
+        sessions: snapshot
+            .sessions
+            .into_iter()
+            .map(|session| (session.short_id, session.status.to_owned(), session.current))
+            .collect(),
+    }))
+}
+
+fn chat_mode_label(chat_mode: crate::channel::ConversationMode) -> &'static str {
+    match chat_mode {
+        crate::channel::ConversationMode::P2p => "p2p",
+        crate::channel::ConversationMode::Group => "group",
+        crate::channel::ConversationMode::Topic => "topic",
+    }
+}
+
+fn scope_state_label(state: ScopeState) -> String {
+    match state {
+        ScopeState::Idle => "idle".to_owned(),
+        ScopeState::Debouncing => "debouncing".to_owned(),
+        ScopeState::WaitingPermit => "waiting_permit".to_owned(),
+        ScopeState::StartingTurn => "starting".to_owned(),
+        ScopeState::Running { .. } => "running".to_owned(),
+        ScopeState::Finalizing { .. } => "finalizing".to_owned(),
+        ScopeState::Failed { kind } => {
+            format!("failed:{}", format!("{kind:?}").to_ascii_lowercase())
+        }
+    }
+}
+
+fn display_workspace_path(path: &str) -> String {
+    if let Ok(home) = std::env::var("HOME") {
+        if let Some(rest) = path.strip_prefix(&home) {
+            return format!("~{rest}");
+        }
+    }
+    path.to_owned()
+}
+
+async fn execute_cd_control(
+    scope: &ScopeKey,
+    path: Option<PathBuf>,
+    store: &StoreHandle,
+    policy: &AccessPolicy,
+    settings: &RouterSettings,
+    adoption: &ThreadAdoptionCoordinator,
+    pending_media: &Arc<Mutex<PendingMediaQueue>>,
+    active_turn: &RwLock<Option<ActiveTurn>>,
+) -> ControlReply {
+    let Some(path) = path else {
+        let cwd = current_cwd(scope, store, settings)
+            .await
+            .unwrap_or_else(|| "（未设置）".to_owned());
+        return ControlReply::Card(crate::render::cd_card(&cwd, false));
+    };
+    let expanded = expand_user_path(&path);
+    let canonical = match policy.validate_workspace(&expanded) {
+        Ok(canonical) => canonical,
+        Err(error) => {
+            return ControlReply::text(format!("无法切换目录：{error}"));
+        }
+    };
+    let fingerprint = match policy.fingerprint(&canonical) {
+        Ok(fingerprint) => fingerprint,
+        Err(error) => return ControlReply::text(format!("无法切换目录：{error}")),
+    };
+    let _ = interrupt_active_turn(pending_media, active_turn).await;
+    match store.active_thread(scope).await {
+        Ok(Some(row)) if row.origin == ThreadOrigin::ExternallyAdopted => {
+            let _ = adoption.release(scope).await;
+        }
+        Ok(Some(_)) => {
+            let _ = store.archive_active_thread(scope).await;
+        }
+        Ok(None) => {}
+        Err(_) => return ControlReply::text("无法切换目录：存储暂时不可用。"),
+    }
+    if store
+        .upsert_scope(scope, &canonical, fingerprint.as_str())
+        .await
+        .is_err()
+    {
+        return ControlReply::text("无法切换目录：存储暂时不可用。");
+    }
+    ControlReply::Card(crate::render::cd_card(
+        &canonical.display().to_string(),
+        true,
+    ))
+}
+
+async fn execute_resume_control(
+    scope: &ScopeKey,
+    selector: Option<String>,
+    store: &StoreHandle,
+    policy: &AccessPolicy,
+    settings: &RouterSettings,
+    pending_media: &Arc<Mutex<PendingMediaQueue>>,
+    active_turn: &RwLock<Option<ActiveTurn>>,
+) -> ControlReply {
+    let Some(cwd) = current_cwd(scope, store, settings).await else {
+        return ControlReply::text("请先使用 /cd <path> 选择工作目录，再查看或恢复会话。");
+    };
+    if let Some(selector) = selector {
+        let _ = interrupt_active_turn(pending_media, active_turn).await;
+        return match store.reactivate_archived_thread(scope, &selector).await {
+            Ok(Some(_)) => ControlReply::Card(crate::render::resume_applied_card()),
+            Ok(None) => ControlReply::text("当前上下文不可恢复这个会话，请先用 /resume 重新选择。"),
+            Err(_) => ControlReply::text("恢复会话失败：存储暂时不可用。"),
+        };
+    }
+    let threads = match store.list_scope_threads(scope, 8).await {
+        Ok(threads) => threads,
+        Err(_) => return ControlReply::text("无法列出历史会话：存储暂时不可用。"),
+    };
+    let _ = policy;
+    let entries = threads
+        .into_iter()
+        .map(|row| crate::render::ResumeEntry {
+            selector: row.codex_thread_id.clone(),
+            preview: if row.status == crate::store::ThreadStatus::Active {
+                "当前会话".to_owned()
+            } else {
+                "历史会话".to_owned()
+            },
+            detail: format!(
+                "`{}` · {}",
+                row.codex_thread_id.chars().take(8).collect::<String>(),
+                if row.status == crate::store::ThreadStatus::Active {
+                    "进行中"
+                } else {
+                    "已归档"
+                }
+            ),
+            current: row.status == crate::store::ThreadStatus::Active,
+        })
+        .collect::<Vec<_>>();
+    ControlReply::Card(crate::render::resume_card(&cwd, &entries))
+}
+
+async fn current_cwd(
+    scope: &ScopeKey,
+    store: &StoreHandle,
+    settings: &RouterSettings,
+) -> Option<String> {
+    if let Ok(Some(row)) = store.scope_row(scope).await {
+        return Some(row.cwd.display().to_string());
+    }
+    settings
+        .default_workspace
+        .as_ref()
+        .map(|path| path.display().to_string())
+}
+
+fn expand_user_path(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if raw == "~" {
+        return std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| path.to_path_buf());
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    path.to_path_buf()
 }
 
 async fn execute_threads_control(
@@ -1510,6 +2034,12 @@ async fn process_batch(
         return Ok(());
     }
     let mut batch = eligible;
+    let had_active_thread = store.active_thread(scope).await.ok().flatten().is_some();
+    let inject_topic_context = !externally_adopted
+        && !had_active_thread
+        && batch
+            .first()
+            .is_some_and(|item| item.inbound.queued.event.chat_type == ChatMode::Topic);
     let (cwd, fingerprint, policy_changed) =
         match prepare_workspace(scope, store, policy, settings).await {
             Ok(workspace) => workspace,
@@ -1579,7 +2109,6 @@ async fn process_batch(
                 &cwd,
                 &fingerprint,
                 policy_changed,
-                contexts.is_some(),
             ) => result,
         };
         let thread_id = match thread_result {
@@ -1699,6 +2228,9 @@ async fn process_batch(
         &pending_contexts,
         &thread_id,
         turn_row_id,
+        settings.bot_open_id.as_deref(),
+        &settings.asr,
+        inject_topic_context,
         shutdown,
     )
     .await
@@ -1712,6 +2244,7 @@ async fn process_batch(
                 turn_row_id,
                 scope,
                 sources,
+                TurnFailureKind::Attachment,
                 shutdown,
             )
             .await?;
@@ -1730,6 +2263,7 @@ async fn process_batch(
             turn_row_id,
             scope,
             sources,
+            TurnFailureKind::Workspace,
             shutdown,
         )
         .await?;
@@ -1766,6 +2300,7 @@ async fn process_batch(
                 elapsed_ms =
                     u64::try_from(turn_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
                 outcome = "rejected",
+                failure = TurnFailureKind::TurnStartRejected.as_str(),
                 "Codex turn start failed"
             );
             finalize_failed(
@@ -1775,6 +2310,7 @@ async fn process_batch(
                 turn_row_id,
                 scope,
                 sources,
+                TurnFailureKind::TurnStartRejected,
                 shutdown,
             )
             .await?;
@@ -1943,6 +2479,7 @@ async fn process_batch(
             epoch = turn_epoch,
             elapsed_ms = u64::try_from(turn_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
             outcome = "uncertain",
+            failure = TurnFailureKind::ConnectionLost.as_str(),
             "Codex turn ended without an authoritative completion"
         );
         finalize_uncertain_and_settle_attachments(
@@ -1971,6 +2508,12 @@ async fn process_batch(
             sources,
             resolution,
             outcome: Some(outcome),
+            failure: match resolution {
+                TurnResolution::Failed => Some(TurnFailureKind::TurnFailed),
+                TurnResolution::Interrupted => Some(TurnFailureKind::Interrupted),
+                TurnResolution::Uncertain => Some(TurnFailureKind::ConnectionLost),
+                TurnResolution::Completed => None,
+            },
         },
         Some(projected_reply),
         shutdown,
@@ -1983,6 +2526,7 @@ async fn process_batch(
     tracing::info!(
         epoch = turn_epoch,
         resolution = ?resolution,
+        failure = failure_label(resolution),
         elapsed_ms = u64::try_from(turn_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
         source_count,
         "Codex turn completed"
@@ -2076,129 +2620,186 @@ async fn assemble_turn_inputs(
     claimed: &[ClaimedInbound],
     live_transcripts: &mut HashMap<InboundKey, crate::lark::normalize::LiveTranscriptHandoff>,
     attachments: Option<&AttachmentCache>,
-    contexts: Option<&ContextRegistry>,
+    _contexts: Option<&ContextRegistry>,
     quote_resolver: Option<&dyn QuoteResolver>,
     pending_contexts: &HashMap<String, Vec<ContextDraft>>,
-    codex_thread_id: &str,
+    _codex_thread_id: &str,
     turn_row_id: i64,
+    bot_open_id: Option<&str>,
+    asr: &AsrSection,
+    inject_topic_context: bool,
     shutdown: &CancellationToken,
 ) -> Result<TurnInputAssembly, AttachmentAssemblyError> {
-    // Resource counts are untrusted until each message passes the cache's
-    // hard limit, so reserve only the already bounded claimed-message count.
     let mut inputs = Vec::with_capacity(claimed.len());
     let mut turn_bytes = 0_u64;
     let mut attachment_sequence = 0_u32;
-    let binding = PendingBinding {
-        codex_thread_id: codex_thread_id.to_owned(),
-        local_turn_row_id: turn_row_id,
+    let context_lease = None;
+    let topic_context = if inject_topic_context {
+        fetch_topic_messages(claimed, quote_resolver, shutdown).await
+    } else {
+        Vec::new()
     };
-    let context_lease = contexts.map(|registry| TurnContextLease {
-        registry: registry.clone(),
-        binding: binding.clone(),
-        context_ids: Vec::with_capacity(
-            claimed
-                .len()
-                .saturating_add(pending_contexts.values().map(Vec::len).sum()),
-        ),
-        reason: RevocationReason::Failed,
-    });
-    let mut context_lease = context_lease;
 
     for claimed in claimed {
         if shutdown.is_cancelled() {
             return Err(AttachmentAssemblyError::Cancelled);
         }
         let event = claimed.retained.event();
-        inputs.push(UserInput::text(event.text.clone()));
-        if let (Some(registry), Some(lease)) = (contexts, context_lease.as_mut()) {
-            if let Some(pending) = pending_contexts.get(&event.event_id) {
-                for draft in pending {
-                    register_context_input(
+        let mut prompt_attachments = Vec::new();
+        let mut quoted_messages = Vec::new();
+        let mut draft = ContextDraft::from_inbound(event);
+        if let (Some(parent_message_id), Some(resolver)) =
+            (event.reply_to_message_id.as_ref(), quote_resolver)
+        {
+            draft.quote = Some(
+                resolver
+                    .resolve(QuoteRequest {
+                        parent_message_id: parent_message_id.clone(),
+                        chat_id: event.chat_id.clone(),
+                        chat_mode: event.chat_type,
+                    })
+                    .await,
+            );
+        }
+        if let Some(quote) = draft.quote.as_ref() {
+            let mut quoted = quoted_message_from_draft(quote);
+            if let Some(cache) = attachments {
+                let limits = cache.limits();
+                for part in &quote.parts {
+                    let DraftPart::Media { kind, resource, .. } = part else {
+                        continue;
+                    };
+                    if *kind == MediaKind::Audio {
+                        continue;
+                    }
+                    let cached = cache
+                        .fetch_cancellable(&quote.message_id, resource, turn_row_id, shutdown)
+                        .await
+                        .map_err(|error| match error {
+                            AttachError::Cancelled { .. } => AttachmentAssemblyError::Cancelled,
+                            _ => AttachmentAssemblyError::Failed,
+                        })?;
+                    turn_bytes = turn_bytes.saturating_add(cached.bytes);
+                    limits
+                        .check_turn_total(turn_bytes)
+                        .map_err(|_| AttachmentAssemblyError::Failed)?;
+                    attachment_sequence = attachment_sequence.saturating_add(1);
+                    push_materialized_attachment(
                         &mut inputs,
-                        registry,
-                        lease,
-                        &binding,
-                        draft.clone(),
-                        crate::lark::normalize::LiveTranscriptHandoff::empty(),
-                        "pending_media",
-                        false,
+                        &mut prompt_attachments,
+                        cached,
+                        "quoted",
+                        attachment_sequence,
                     )?;
                 }
+                let mut quote_transcripts = Vec::new();
+                transcribe_audio_parts(
+                    attachments,
+                    &quote.message_id,
+                    &quote.parts,
+                    asr,
+                    &mut quote_transcripts,
+                    turn_row_id,
+                    shutdown,
+                    true,
+                )
+                .await?;
+                if !quote_transcripts.is_empty() {
+                    if !quoted.content.is_empty() {
+                        quoted.content.push('\n');
+                    }
+                    quoted.content.push_str(&quote_transcripts.join("\n"));
+                }
             }
-            let mut draft = ContextDraft::from_inbound(event);
-            if let (Some(parent_message_id), Some(resolver)) =
-                (event.reply_to_message_id.as_ref(), quote_resolver)
-            {
-                draft.quote = Some(
-                    resolver
-                        .resolve(QuoteRequest {
-                            parent_message_id: parent_message_id.clone(),
-                            chat_id: event.chat_id.clone(),
-                        })
-                        .await,
-                );
-            }
-            let wake = if event.mentions_bot {
-                "mention"
-            } else {
-                "message"
-            };
-            register_context_input(
-                &mut inputs,
-                registry,
-                lease,
-                &binding,
-                draft,
-                live_transcripts.remove(&claimed.key).unwrap_or_default(),
-                wake,
-                event.mentions_bot,
-            )?;
-            continue;
+            quoted_messages.push(quoted);
         }
-        let Some(cache) = attachments else {
-            continue;
-        };
-        let limits = cache.limits();
-        limits
-            .check_resource_batch(&event.resources)
-            .map_err(|_| AttachmentAssemblyError::Failed)?;
-        for resource in &event.resources {
-            let cached = cache
-                .fetch_cancellable(&event.message_id, resource, turn_row_id, shutdown)
-                .await
-                .map_err(|error| match error {
-                    AttachError::Cancelled { .. } => AttachmentAssemblyError::Cancelled,
-                    _ => AttachmentAssemblyError::Failed,
-                })?;
-            turn_bytes = turn_bytes.saturating_add(cached.bytes);
+        if let Some(cache) = attachments {
+            let limits = cache.limits();
             limits
-                .check_turn_total(turn_bytes)
+                .check_resource_batch(&event.resources)
                 .map_err(|_| AttachmentAssemblyError::Failed)?;
-            attachment_sequence = attachment_sequence.saturating_add(1);
-            match cached.kind {
-                ResourceKind::Image => inputs.push(UserInput::LocalImage {
-                    path: cached.path,
-                    detail: None,
-                }),
-                ResourceKind::File => {
-                    let path = cached
-                        .path
-                        .to_str()
-                        .ok_or(AttachmentAssemblyError::Failed)?;
-                    let context = serde_json::to_string(&serde_json::json!({
-                        "attachment": {
-                            "kind": "file",
-                            "name": format!("attachment-{attachment_sequence}"),
-                            "path": path,
-                            "sha256": cached.sha256,
-                            "bytes": cached.bytes,
-                        }
-                    }))
+            for resource in &event.resources {
+                let cached = cache
+                    .fetch_cancellable(&event.message_id, resource, turn_row_id, shutdown)
+                    .await
+                    .map_err(|error| match error {
+                        AttachError::Cancelled { .. } => AttachmentAssemblyError::Cancelled,
+                        _ => AttachmentAssemblyError::Failed,
+                    })?;
+                turn_bytes = turn_bytes.saturating_add(cached.bytes);
+                limits
+                    .check_turn_total(turn_bytes)
                     .map_err(|_| AttachmentAssemblyError::Failed)?;
-                    inputs.push(UserInput::text(context));
+                attachment_sequence = attachment_sequence.saturating_add(1);
+                push_materialized_attachment(
+                    &mut inputs,
+                    &mut prompt_attachments,
+                    cached,
+                    "file",
+                    attachment_sequence,
+                )?;
+            }
+        }
+        if let Some(pending) = pending_contexts.get(&event.event_id) {
+            for pending_draft in pending {
+                if let Some(cache) = attachments {
+                    materialize_draft_media(
+                        cache,
+                        pending_draft,
+                        &mut inputs,
+                        &mut prompt_attachments,
+                        &mut turn_bytes,
+                        &mut attachment_sequence,
+                        turn_row_id,
+                        "pending",
+                        shutdown,
+                    )
+                    .await?;
                 }
             }
         }
+        let mut handoff = live_transcripts.remove(&claimed.key).unwrap_or_default();
+        let live_texts = handoff.drain_texts();
+        let had_live_transcript = !live_texts.is_empty();
+        let mut transcripts = live_texts
+            .into_iter()
+            .filter(|text| text.len() <= asr.max_transcript_bytes)
+            .collect::<Vec<_>>();
+        if transcripts.is_empty() && !had_live_transcript {
+            transcribe_audio_parts(
+                attachments,
+                &draft.message_id,
+                &draft.parts,
+                asr,
+                &mut transcripts,
+                turn_row_id,
+                shutdown,
+                false,
+            )
+            .await?;
+        }
+        let mut user_input = event.text.clone();
+        if !transcripts.is_empty() {
+            if !user_input.is_empty() {
+                user_input.push('\n');
+            }
+            user_input.push_str(&transcripts.join("\n"));
+        }
+        let mut context = prompt_context_from_event(event, bot_open_id, "im");
+        if let Some(resolver) = quote_resolver {
+            context.sender_name = resolver.display_name(&event.sender_id).await;
+        }
+        let structured = crate::runtime::prompt::build_agent_prompt(&BuildAgentPromptInput {
+            context,
+            user_input,
+            quoted_messages,
+            topic_context: topic_context.clone(),
+            attachments: prompt_attachments,
+        });
+        inputs.push(UserInput::text(prefix_bridge_system_prompt(
+            &structured,
+            bot_open_id,
+        )));
     }
     Ok(TurnInputAssembly {
         inputs,
@@ -2206,30 +2807,184 @@ async fn assemble_turn_inputs(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn register_context_input(
+async fn fetch_topic_messages(
+    claimed: &[ClaimedInbound],
+    quote_resolver: Option<&dyn QuoteResolver>,
+    shutdown: &CancellationToken,
+) -> Vec<crate::runtime::prompt::PromptQuotedMessage> {
+    let Some(resolver) = quote_resolver else {
+        return Vec::new();
+    };
+    let Some(event) = claimed
+        .iter()
+        .map(|item| item.retained.event())
+        .find(|event| event.thread_id.is_some())
+    else {
+        return Vec::new();
+    };
+    let Some(thread_id) = event.thread_id.clone() else {
+        return Vec::new();
+    };
+    if shutdown.is_cancelled() {
+        return Vec::new();
+    }
+    let mut exclude_ids = HashSet::new();
+    for item in claimed {
+        let event = item.retained.event();
+        exclude_ids.insert(event.message_id.clone());
+        if let Some(parent) = event.reply_to_message_id.clone() {
+            exclude_ids.insert(parent);
+        }
+    }
+    resolver
+        .topic_context(TopicContextRequest {
+            thread_id,
+            chat_id: event.chat_id.clone(),
+            exclude_ids,
+            max_messages: TOPIC_CONTEXT_MAX_MESSAGES,
+        })
+        .await
+        .into_iter()
+        .map(|draft| quoted_message_from_draft(&draft))
+        .collect()
+}
+
+fn push_materialized_attachment(
     inputs: &mut Vec<UserInput>,
-    registry: &ContextRegistry,
-    lease: &mut TurnContextLease,
-    binding: &PendingBinding,
-    draft: ContextDraft,
-    live_transcripts: crate::lark::normalize::LiveTranscriptHandoff,
-    wake: &'static str,
-    mentioned_self: bool,
+    prompt_attachments: &mut Vec<PromptAttachment>,
+    cached: crate::runtime::attachments::CachedAttachment,
+    kind_prefix: &str,
+    sequence: u32,
 ) -> Result<(), AttachmentAssemblyError> {
-    let registered = registry
-        .register_pending_with_transcripts(binding.clone(), draft, live_transcripts)
-        .map_err(|_| AttachmentAssemblyError::Failed)?;
-    let reference = serde_json::to_string(&serde_json::json!({
-        "id": registered.context_id.as_str(),
-        "wake": wake,
-        "mentioned_self": mentioned_self,
-    }))
-    .map_err(|_| AttachmentAssemblyError::Failed)?;
-    inputs.push(UserInput::text(format!(
-        "<bridge_context>{reference}</bridge_context>"
-    )));
-    lease.context_ids.push(registered.context_id);
+    let path = cached
+        .path
+        .to_str()
+        .ok_or(AttachmentAssemblyError::Failed)?
+        .to_owned();
+    let kind = match cached.kind {
+        ResourceKind::Image => "image",
+        ResourceKind::File => kind_prefix,
+    };
+    prompt_attachments.push(PromptAttachment {
+        path: path.clone(),
+        kind: kind.to_owned(),
+        hash: Some(cached.sha256.clone()),
+        size: Some(cached.bytes),
+    });
+    match cached.kind {
+        ResourceKind::Image => inputs.push(UserInput::LocalImage {
+            path: cached.path,
+            detail: None,
+        }),
+        ResourceKind::File => {
+            let _ = sequence;
+        }
+    }
+    Ok(())
+}
+
+async fn transcribe_audio_parts(
+    attachments: Option<&AttachmentCache>,
+    message_id: &str,
+    parts: &[DraftPart],
+    asr: &AsrSection,
+    transcripts: &mut Vec<String>,
+    turn_row_id: i64,
+    shutdown: &CancellationToken,
+    allow_not_retained: bool,
+) -> Result<(), AttachmentAssemblyError> {
+    let Some(cache) = attachments else {
+        return Ok(());
+    };
+    for part in parts {
+        let DraftPart::Media {
+            kind: MediaKind::Audio,
+            resource,
+            metadata,
+            transcript_failure,
+            ..
+        } = part
+        else {
+            continue;
+        };
+        if let Some(failure) = transcript_failure {
+            if !(allow_not_retained && *failure == TranscriptFailure::NotRetained) {
+                continue;
+            }
+        }
+        if metadata.duration_ms.is_some_and(|duration| {
+            duration
+                > asr
+                    .max_duration_ms
+                    .min(crate::limits::ASR_ABSOLUTE_MAX_DURATION_MS)
+        }) {
+            continue;
+        }
+        if !asr.is_configured() {
+            continue;
+        }
+        let cached = cache
+            .fetch_cancellable(message_id, resource, turn_row_id, shutdown)
+            .await
+            .map_err(|error| match error {
+                AttachError::Cancelled { .. } => AttachmentAssemblyError::Cancelled,
+                _ => AttachmentAssemblyError::Failed,
+            })?;
+        match asr::transcribe_file_cancellable(
+            asr,
+            &cached.path,
+            metadata.duration_ms,
+            shutdown,
+            shutdown,
+        )
+        .await
+        {
+            Ok(text) if text.len() <= asr.max_transcript_bytes => transcripts.push(text),
+            Ok(_) | Err(AsrError::Cancelled) if shutdown.is_cancelled() => {
+                return Err(AttachmentAssemblyError::Cancelled);
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
+    Ok(())
+}
+
+async fn materialize_draft_media(
+    cache: &AttachmentCache,
+    draft: &ContextDraft,
+    inputs: &mut Vec<UserInput>,
+    prompt_attachments: &mut Vec<PromptAttachment>,
+    turn_bytes: &mut u64,
+    attachment_sequence: &mut u32,
+    turn_row_id: i64,
+    kind_prefix: &str,
+    shutdown: &CancellationToken,
+) -> Result<(), AttachmentAssemblyError> {
+    let limits = cache.limits();
+    for part in &draft.parts {
+        let DraftPart::Media { resource, .. } = part else {
+            continue;
+        };
+        let cached = cache
+            .fetch_cancellable(&draft.message_id, resource, turn_row_id, shutdown)
+            .await
+            .map_err(|error| match error {
+                AttachError::Cancelled { .. } => AttachmentAssemblyError::Cancelled,
+                _ => AttachmentAssemblyError::Failed,
+            })?;
+        *turn_bytes = turn_bytes.saturating_add(cached.bytes);
+        limits
+            .check_turn_total(*turn_bytes)
+            .map_err(|_| AttachmentAssemblyError::Failed)?;
+        *attachment_sequence = attachment_sequence.saturating_add(1);
+        push_materialized_attachment(
+            inputs,
+            prompt_attachments,
+            cached,
+            kind_prefix,
+            *attachment_sequence,
+        )?;
+    }
     Ok(())
 }
 
@@ -2468,19 +3223,13 @@ async fn ensure_thread(
     cwd: &Path,
     fingerprint: &str,
     policy_changed: bool,
-    context_tools: bool,
 ) -> Result<String, ThreadPreparationError> {
     if let Some(active) = store
         .active_thread(scope)
         .await
         .map_err(|_| ThreadPreparationError::Scope(ScopeFailureKind::Store))?
     {
-        let required_version = if context_tools {
-            CONTEXT_TOOLS_VERSION
-        } else {
-            0
-        };
-        if active.context_tools_version == required_version {
+        if active.context_tools_version == 0 {
             let rpc_cwd = revalidate_workspace(policy, cwd, fingerprint)
                 .map_err(ThreadPreparationError::Scope)?;
             let mut params = ThreadResumeParams::new(&active.codex_thread_id);
@@ -2515,7 +3264,7 @@ async fn ensure_thread(
         sandbox: Some(settings.sandbox),
         approval_policy: Some(settings.approval_policy.clone()),
         model: settings.model.clone(),
-        dynamic_tools: context_tools.then(bridge_dynamic_tools),
+        dynamic_tools: None,
         ..ThreadStartParams::default()
     };
     let thread = client
@@ -2523,15 +3272,7 @@ async fn ensure_thread(
         .await
         .map_err(ThreadPreparationError::Client)?;
     store
-        .record_active_thread_with_context_tools(
-            scope,
-            &thread.id,
-            if context_tools {
-                CONTEXT_TOOLS_VERSION
-            } else {
-                0
-            },
-        )
+        .record_active_thread_with_context_tools(scope, &thread.id, 0)
         .await
         .map_err(|_| ThreadPreparationError::Scope(ScopeFailureKind::Store))?;
     if policy_changed {
@@ -2578,6 +3319,15 @@ fn turn_sandbox(settings: &RouterSettings, cwd: PathBuf) -> TurnSandboxPolicy {
     }
 }
 
+fn failure_label(resolution: TurnResolution) -> Option<&'static str> {
+    match resolution {
+        TurnResolution::Failed => Some(TurnFailureKind::TurnFailed.as_str()),
+        TurnResolution::Interrupted => Some(TurnFailureKind::Interrupted.as_str()),
+        TurnResolution::Uncertain => Some(TurnFailureKind::ConnectionLost.as_str()),
+        TurnResolution::Completed => None,
+    }
+}
+
 fn resolution_for(status: &TurnStatus) -> (TurnResolution, InboundTerminal) {
     match status {
         TurnStatus::Completed => (TurnResolution::Completed, InboundTerminal::Completed),
@@ -2596,8 +3346,13 @@ async fn finalize_failed(
     turn_row_id: i64,
     scope: &ScopeKey,
     sources: Vec<TurnSource>,
+    failure: TurnFailureKind,
     shutdown: &CancellationToken,
 ) -> Result<(), ScopeFailureKind> {
+    tracing::warn!(
+        failure = failure.as_str(),
+        "Codex turn failed before completion"
+    );
     persist_finalization(
         sink,
         settings,
@@ -2607,6 +3362,7 @@ async fn finalize_failed(
             sources,
             resolution: TurnResolution::Failed,
             outcome: None,
+            failure: Some(failure),
         },
         None,
         shutdown,
@@ -2641,6 +3397,7 @@ async fn finalize_uncertain(
             sources,
             resolution: TurnResolution::Uncertain,
             outcome: None,
+            failure: Some(TurnFailureKind::ConnectionLost),
         },
         None,
         shutdown,
@@ -2741,6 +3498,7 @@ async fn persist_finalization_inner(
             sources: finalization.sources.clone(),
             resolution: finalization.resolution,
             outcome: finalization.outcome.clone(),
+            failure: finalization.failure,
         };
         let operation = if let Some(reply) = projected_reply.clone() {
             sink.finalize_projected(attempt, reply)
@@ -2876,6 +3634,15 @@ mod tests {
                 payload_json: "control".to_owned(),
                 next_retry_ms: 0,
             })
+        }
+
+        fn control_card(
+            &self,
+            key: &InboundKey,
+            event: &InboundEvent,
+            _spec: &crate::render::InteractiveCardSpec,
+        ) -> Result<NewOutboxRow, ReplySinkError> {
+            self.control_reply(key, event, "card")
         }
 
         fn finalize(
@@ -3075,8 +3842,7 @@ mod tests {
         let actor = ScopeActorHandle::spawn(
             scope.clone(),
             store.clone(),
-            fixture.policy,
-            fixture.settings,
+            LiveBridgeConfig::from_runtime(fixture.policy, fixture.settings),
             supervisor,
             Arc::new(Semaphore::new(1)),
             Arc::new(sink.clone()),
@@ -3187,8 +3953,7 @@ mod tests {
         let actor = ScopeActorHandle::spawn(
             scope.clone(),
             store.clone(),
-            fixture.policy,
-            fixture.settings,
+            LiveBridgeConfig::from_runtime(fixture.policy, fixture.settings),
             supervisor,
             Arc::new(Semaphore::new(1)),
             Arc::new(sink.clone()),
@@ -3287,8 +4052,7 @@ mod tests {
         let mapped_actor = ScopeActorHandle::spawn(
             mapped_scope.clone(),
             store.clone(),
-            fixture.policy.clone(),
-            fixture.settings.clone(),
+            LiveBridgeConfig::from_runtime(fixture.policy.clone(), fixture.settings.clone()),
             supervisor.clone(),
             Arc::clone(&active_turns),
             Arc::new(sink.clone()),
@@ -3300,8 +4064,7 @@ mod tests {
         let unmapped_actor = ScopeActorHandle::spawn(
             unmapped_scope.clone(),
             store.clone(),
-            fixture.policy,
-            fixture.settings,
+            LiveBridgeConfig::from_runtime(fixture.policy, fixture.settings),
             supervisor,
             active_turns,
             Arc::new(sink.clone()),
@@ -3481,8 +4244,7 @@ mod tests {
         let actor = ScopeActorHandle::spawn(
             scope.clone(),
             store.clone(),
-            fixture.policy,
-            fixture.settings,
+            LiveBridgeConfig::from_runtime(fixture.policy, fixture.settings),
             supervisor,
             Arc::new(Semaphore::new(1)),
             Arc::new(sink.clone()),
@@ -3610,5 +4372,33 @@ mod tests {
         pending.restore(generation, reserved);
         assert!(pending.items.is_empty());
         assert_eq!(pending.stats(), (0, 0));
+    }
+
+    #[test]
+    fn config_control_is_private_chat_only_and_applies_immediately() {
+        let fixture = actor_fixture();
+        let live = LiveBridgeConfig::from_runtime(fixture.policy, fixture.settings);
+        match execute_config_control(&live, ChatMode::Group, None, false) {
+            ControlReply::Text(text) => assert!(text.contains("私聊")),
+            other => panic!("expected group refusal, got {other:?}"),
+        }
+        match execute_config_control(&live, ChatMode::Topic, None, false) {
+            ControlReply::Text(text) => assert!(text.contains("私聊")),
+            other => panic!("expected topic refusal, got {other:?}"),
+        }
+        match execute_config_control(&live, ChatMode::P2p, None, false) {
+            ControlReply::Card(card) => assert_eq!(card.title, "运行设置"),
+            other => panic!("expected config card, got {other:?}"),
+        }
+        match execute_config_control(
+            &live,
+            ChatMode::P2p,
+            Some(ConfigPatch::Model(Some("gpt-6-astra".to_owned()))),
+            false,
+        ) {
+            ControlReply::Card(card) => assert_eq!(card.title, "设置已保存"),
+            other => panic!("expected saved card, got {other:?}"),
+        }
+        assert_eq!(live.settings().model.as_deref(), Some("gpt-6-astra"));
     }
 }

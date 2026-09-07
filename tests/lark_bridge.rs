@@ -13,8 +13,6 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use futures_util::{FutureExt, StreamExt};
 use lark_codex_bridge::lark::api::ChatMode;
 use lark_codex_bridge::lark::bridge::{BridgeConfig, IntakeHook, IntakeVerdict, LarkBridge};
@@ -245,7 +243,7 @@ async fn full_channel_fails_the_handler_with_a_500_receipt() {
 }
 
 #[tokio::test]
-async fn card_action_is_acked_unsupported_and_not_routed() {
+async fn unrecognized_card_action_is_acked_and_not_routed() {
     let (_stub, mut ws_server, handle, mut events) = start_bridge(
         |_| StubResponse::text(500, "unused"),
         BridgeConfig::default(),
@@ -260,14 +258,52 @@ async fn card_action_is_acked_unsupported_and_not_routed() {
     let (message_id, body) = conn.recv_receipt().await;
     assert_eq!(message_id, "m-card");
     assert_eq!(body["code"], 200);
-    let data = BASE64
-        .decode(body["data"].as_str().expect("card ack carries data"))
-        .expect("base64 decodes");
-    let data: Value = serde_json::from_slice(&data).expect("data is json");
-    assert_eq!(data["status"], "unsupported");
+    assert!(body.get("data").is_none());
+    assert!(
+        events.try_recv().is_err(),
+        "no event queued for an unrecognized card"
+    );
 
-    // Card actions are never routed into the inbound event channel.
-    assert!(events.try_recv().is_err(), "no event queued for a card");
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn recognized_card_action_is_normalized_and_queued() {
+    let (_stub, mut ws_server, handle, mut events) = start_bridge(
+        |_| StubResponse::json(200, r#"{"code":0,"data":{"chat_mode":"p2p"}}"#),
+        BridgeConfig::default(),
+    )
+    .await;
+
+    let mut conn = ws_server.accept().await;
+    let _ping = conn.recv_frame().await;
+    let payload = serde_json::json!({
+        "header": {"event_id": "evt_card_new", "event_type": "card.action.trigger"},
+        "event": {
+            "operator": {"open_id": "ou_alice"},
+            "action": {"value": {"cmd": "new"}},
+            "context": {
+                "open_chat_id": "oc_p2p_chat",
+                "open_message_id": "om_card_001"
+            }
+        }
+    });
+    conn.send_data("card", "m-card-new", payload.to_string().as_bytes())
+        .await;
+
+    let (message_id, body) = conn.recv_receipt().await;
+    assert_eq!(message_id, "m-card-new");
+    assert_eq!(body["code"], 200);
+
+    let queued = timeout(TEST_TIMEOUT, events.recv())
+        .await
+        .expect("a card action arrives")
+        .expect("event channel stays open");
+    let event = queued.into_event();
+    assert_eq!(event.text, "/new");
+    assert_eq!(event.chat_id, "oc_p2p_chat");
+    assert_eq!(event.sender_id, "ou_alice");
+    assert!(event.mentions_bot);
 
     handle.shutdown().await;
 }

@@ -584,6 +584,80 @@ async fn sticker_is_a_typed_part_and_unknown_types_are_explicitly_unsupported() 
 }
 
 #[tokio::test]
+async fn post_messages_flatten_title_text_and_images() {
+    let server = StubServer::start(im_stub(|_| chat_mode_ok("group"), failing)).await;
+    let normalizer = normalizer_for(&server);
+    let payload = make_event(
+        "oc_group_chat",
+        "group",
+        "om_post",
+        "post",
+        &serde_json::json!({
+            "title": "周报",
+            "content": [
+                [
+                    {"tag": "text", "text": "本周完成了桥接改造"},
+                    {"tag": "at", "user_id": "all", "user_name": "所有人"}
+                ],
+                [{"tag": "img", "image_key": "img_post_secret"}]
+            ]
+        }),
+        None,
+        &serde_json::json!([]),
+    );
+    let (event, _) = unwrap_event(
+        normalizer
+            .normalize(payload.as_bytes())
+            .await
+            .expect("post should normalize"),
+    );
+    assert_eq!(event.message_type, "post");
+    assert!(event.mention_all);
+    assert_eq!(event.text, "周报\n本周完成了桥接改造@all");
+    assert_eq!(event.parts.len(), 2);
+    assert!(matches!(
+        &event.parts[0],
+        MessagePart::Text { text } if text.contains("周报") && text.contains("本周完成了桥接改造")
+    ));
+    assert!(matches!(
+        &event.parts[1],
+        MessagePart::Image(media)
+            if media.key.as_deref() == Some("img_post_secret")
+                && media.status == PartStatus::Available
+    ));
+    assert!(!format!("{event:?}").contains("img_post_secret"));
+
+    let locale = make_event(
+        "oc_group_chat",
+        "group",
+        "om_post_locale",
+        "post",
+        &serde_json::json!({
+            "zh_cn": {
+                "title": "办公报告",
+                "content": [[
+                    {"tag": "text", "text": "前 20% 用户消耗近九成算力"},
+                    {"tag": "text", "text": "，头部效应明显", "style": ["bold"]}
+                ]]
+            }
+        }),
+        None,
+        &serde_json::json!([]),
+    );
+    let (event, _) = unwrap_event(
+        normalizer
+            .normalize(locale.as_bytes())
+            .await
+            .expect("locale-wrapped post should normalize"),
+    );
+    assert_eq!(event.message_type, "post");
+    assert!(event.text.contains("办公报告"));
+    assert!(event.text.contains("前 20% 用户消耗近九成算力"));
+    assert!(event.text.contains("头部效应明显"));
+    assert!(matches!(event.parts.as_slice(), [MessagePart::Text { .. }]));
+}
+
+#[tokio::test]
 async fn audio_video_card_and_forward_have_typed_availability() {
     let server = StubServer::start(im_stub(|_| chat_mode_ok("group"), failing)).await;
     let normalizer = normalizer_for(&server);
@@ -630,8 +704,9 @@ async fn audio_video_card_and_forward_have_typed_availability() {
                 assert_eq!(media.thumbnail_key.as_deref(), Some("thumb_key"));
                 assert_eq!(media.metadata.duration_ms, Some(5678));
             }
-            ("interactive", [MessagePart::Card { status }]) => {
-                assert_eq!(*status, PartStatus::Unsupported);
+            ("interactive", [MessagePart::Text { text }, MessagePart::Card { status }]) => {
+                assert_eq!(text, "[interactive card]");
+                assert_eq!(*status, PartStatus::Available);
             }
             ("merge_forward", [MessagePart::Forward { message_id, status }]) => {
                 assert_eq!(message_id.as_deref(), Some("om_forwarded"));
@@ -1045,5 +1120,166 @@ async fn non_message_events_are_ignored() {
         .await
         .expect("other events should parse");
 
+    assert!(matches!(outcome, NormalizeOutcome::Ignored { .. }));
+}
+
+#[tokio::test]
+async fn card_action_becomes_a_synthetic_slash_command() {
+    let server = StubServer::start(im_stub(|_| chat_mode_ok("p2p"), failing)).await;
+    let normalizer = normalizer_for(&server);
+    let payload = serde_json::json!({
+        "header": {"event_id": "evt_card_resume", "event_type": "card.action.trigger"},
+        "event": {
+            "operator": {"open_id": "ou_alice"},
+            "action": {"value": {"cmd": "resume", "arg": "thread-3"}},
+            "context": {
+                "open_chat_id": "oc_p2p_chat",
+                "open_message_id": "om_card"
+            }
+        }
+    })
+    .to_string();
+    let outcome = normalizer
+        .normalize_message_or_card(payload.as_bytes())
+        .await
+        .expect("card action should normalize");
+    match outcome {
+        NormalizeOutcome::Event { event, .. } => {
+            assert_eq!(event.text, "/resume use thread-3");
+            assert_eq!(event.chat_id, "oc_p2p_chat");
+            assert_eq!(event.sender_id, "ou_alice");
+            assert_eq!(event.chat_type, lark_codex_bridge::lark::api::ChatMode::P2p);
+            assert_eq!(event.thread_id, None);
+            assert!(event.mentions_bot);
+        }
+        NormalizeOutcome::Ignored { reason } => panic!("card action ignored: {reason}"),
+    }
+}
+
+#[tokio::test]
+async fn card_action_backfills_thread_id_even_when_chat_mode_says_group() {
+    let server = StubServer::start(im_stub(
+        |_| chat_mode_ok("group"),
+        |_| message_ok(Some("omt_topic")),
+    ))
+    .await;
+    let normalizer = normalizer_for(&server);
+    let payload = serde_json::json!({
+        "header": {"event_id": "evt_card_topic", "event_type": "card.action.trigger"},
+        "event": {
+            "operator": {"open_id": "ou_alice"},
+            "action": {"value": {"cmd": "stop"}},
+            "context": {
+                "open_chat_id": "oc_topic_chat",
+                "open_message_id": "om_card"
+            }
+        }
+    })
+    .to_string();
+    let outcome = normalizer
+        .normalize_card_action(payload.as_bytes())
+        .await
+        .expect("topic card action should normalize");
+    match outcome {
+        NormalizeOutcome::Event { event, .. } => {
+            assert_eq!(event.text, "/stop");
+            assert_eq!(event.thread_id.as_deref(), Some("omt_topic"));
+            assert_eq!(
+                event.scope,
+                ScopeKey::Thread("oc_topic_chat".to_owned(), "omt_topic".to_owned())
+            );
+        }
+        NormalizeOutcome::Ignored { reason } => panic!("card action ignored: {reason}"),
+    }
+}
+
+#[tokio::test]
+async fn card_action_keeps_context_thread_id_without_hardcoding_group() {
+    let server = StubServer::start(im_stub(failing, failing)).await;
+    let normalizer = normalizer_for(&server);
+    let payload = serde_json::json!({
+        "header": {"event_id": "evt_card_thread", "event_type": "card.action.trigger"},
+        "event": {
+            "operator": {"open_id": "ou_alice"},
+            "action": {"value": {"cmd": "stop"}},
+            "context": {
+                "open_chat_id": "oc_topic_chat",
+                "open_message_id": "om_card",
+                "chat_type": "topic",
+                "thread_id": "omt_from_context"
+            }
+        }
+    })
+    .to_string();
+    let outcome = normalizer
+        .normalize_card_action(payload.as_bytes())
+        .await
+        .expect("card action with thread_id should normalize");
+    match outcome {
+        NormalizeOutcome::Event { event, .. } => {
+            assert_eq!(event.text, "/stop");
+            assert_eq!(event.thread_id.as_deref(), Some("omt_from_context"));
+            assert_eq!(
+                event.scope,
+                ScopeKey::Thread("oc_topic_chat".to_owned(), "omt_from_context".to_owned())
+            );
+        }
+        NormalizeOutcome::Ignored { reason } => panic!("card action ignored: {reason}"),
+    }
+}
+
+#[tokio::test]
+async fn card_action_config_submit_uses_form_value() {
+    let server = StubServer::start(im_stub(|_| chat_mode_ok("p2p"), failing)).await;
+    let normalizer = normalizer_for(&server);
+    let payload = serde_json::json!({
+        "header": {"event_id": "evt_card_config", "event_type": "card.action.trigger"},
+        "event": {
+            "operator": {"open_id": "ou_alice"},
+            "action": {
+                "value": {"cmd": "config.submit"},
+                "form_value": {
+                    "model": "gpt-6-astra",
+                    "effort": "high",
+                    "sandbox": "workspace-write",
+                    "approval": "never"
+                }
+            },
+            "context": {
+                "open_chat_id": "oc_p2p_chat",
+                "open_message_id": "om_config",
+                "chat_type": "p2p"
+            }
+        }
+    })
+    .to_string();
+    let outcome = normalizer
+        .normalize_card_action(payload.as_bytes())
+        .await
+        .expect("config submit should normalize");
+    match outcome {
+        NormalizeOutcome::Event { event, .. } => {
+            assert_eq!(
+                event.text,
+                "/config apply model=gpt-6-astra effort=high sandbox=workspace-write approval=never"
+            );
+            assert_eq!(event.chat_type, lark_codex_bridge::lark::api::ChatMode::P2p);
+        }
+        NormalizeOutcome::Ignored { reason } => panic!("config submit ignored: {reason}"),
+    }
+}
+
+#[tokio::test]
+async fn unrecognized_card_action_is_ignored() {
+    let server = StubServer::start(im_stub(failing, failing)).await;
+    let normalizer = normalizer_for(&server);
+    let payload = serde_json::json!({
+        "event": {"action": {"value": {"cmd": "unknown"}}, "operator": {"open_id": "ou_alice"}}
+    })
+    .to_string();
+    let outcome = normalizer
+        .normalize_card_action(payload.as_bytes())
+        .await
+        .expect("unrecognized cards parse");
     assert!(matches!(outcome, NormalizeOutcome::Ignored { .. }));
 }

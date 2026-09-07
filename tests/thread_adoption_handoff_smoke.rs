@@ -1416,6 +1416,9 @@ fn outbox_operation_contains(operation: &OutboxOperation, marker: &str) -> bool 
             fallback_markdown,
             ..
         } => text.contains(marker) || fallback_markdown.contains(marker),
+        OutboxOperation::ReplyInteractiveCard { spec, .. } => {
+            serde_json::to_string(spec).is_ok_and(|encoded| encoded.contains(marker))
+        }
     }
 }
 

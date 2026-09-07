@@ -312,72 +312,99 @@ impl LarkApi {
     /// Returns a classified error on token, transport, or server failure, and
     /// `ProtocolViolation` when the response carries no message item.
     pub async fn get_message(&self, message_id: &str) -> Result<RawMessage, LarkError> {
-        #[derive(Deserialize)]
-        struct MessageData {
-            items: Option<Vec<MessageItem>>,
+        let mut items = self.get_message_items(message_id).await?;
+        if items.is_empty() {
+            return Err(LarkError::protocol(
+                "message response missing the items array",
+            ));
         }
-        #[derive(Deserialize)]
-        struct MessageItem {
-            message_id: Option<String>,
-            chat_id: Option<String>,
-            chat_type: Option<String>,
-            sender: Option<MessageSender>,
-            msg_type: Option<String>,
-            root_id: Option<String>,
-            parent_id: Option<String>,
-            thread_id: Option<String>,
-            #[serde(default)]
-            deleted: bool,
-            body: Option<MessageBody>,
-        }
-        #[derive(Deserialize)]
-        struct MessageBody {
-            content: Option<String>,
-        }
-        #[derive(Deserialize)]
-        struct MessageSender {
-            id: Option<String>,
-            sender_type: Option<String>,
-        }
+        Ok(items.remove(0))
+    }
 
+    /// Fetches every item Lark returns for one message id (parent + forward children).
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified error on token, transport, or server failure.
+    pub async fn get_message_items(&self, message_id: &str) -> Result<Vec<RawMessage>, LarkError> {
         check_path_segment(message_id)?;
         let path = format!("{MESSAGES_PATH}/{message_id}");
-        let data: MessageData = self
+        let data: MessageListData = self
             .with_auth_retry(|token| {
                 let path = path.clone();
                 async move { self.checked_get(&path, &token, "fetching a message").await }
             })
             .await?;
-        let item = data
-            .items
-            .and_then(|mut items| {
-                if items.is_empty() {
-                    None
-                } else {
-                    Some(items.swap_remove(0))
+        parse_message_items(data, None)
+    }
+
+    /// Lists messages in one topic thread, newest first, one page at a time.
+    ///
+    /// First-engagement topic context needs the recent window, not the
+    /// oldest page. Callers reverse the kept slice back into chronological
+    /// order before injecting it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified error on token, transport, or server failure.
+    pub async fn list_thread_messages(
+        &self,
+        thread_id: &str,
+        chat_id: &str,
+        page_token: Option<&str>,
+        page_size: u32,
+    ) -> Result<ThreadMessagePage, LarkError> {
+        check_path_segment(thread_id)?;
+        check_path_segment(chat_id)?;
+        let mut path = format!(
+            "{MESSAGES_PATH}?container_id_type=thread&container_id={thread_id}&sort_type=ByCreateTimeDesc&page_size={page_size}"
+        );
+        if let Some(token) = page_token.filter(|token| !token.is_empty()) {
+            path.push_str("&page_token=");
+            append_query_component(&mut path, token);
+        }
+        let data: MessageListData = self
+            .with_auth_retry(|token| {
+                let path = path.clone();
+                async move {
+                    self.checked_get(&path, &token, "listing thread messages")
+                        .await
                 }
             })
-            .ok_or_else(|| LarkError::protocol("message response missing the items array"))?;
-        let (sender_id, sender_type) = item
-            .sender
-            .map_or((None, None), |sender| (sender.id, sender.sender_type));
-        Ok(RawMessage {
-            message_id: item
-                .message_id
-                .ok_or_else(|| LarkError::protocol("message item missing message_id"))?,
-            chat_id: item
-                .chat_id
-                .ok_or_else(|| LarkError::protocol("message item missing chat_id"))?,
-            chat_type: item.chat_type.unwrap_or_default(),
-            sender_id,
-            sender_type,
-            message_type: item.msg_type.unwrap_or_default(),
-            root_id: item.root_id,
-            parent_id: item.parent_id,
-            thread_id: item.thread_id,
-            deleted: item.deleted,
-            content: item.body.and_then(|body| body.content),
+            .await?;
+        let has_more = data.has_more.unwrap_or(false);
+        let next_page_token = data.page_token.clone();
+        Ok(ThreadMessagePage {
+            items: parse_message_items(data, Some(chat_id))?,
+            page_token: if has_more { next_page_token } else { None },
         })
+    }
+
+    /// Best-effort display name lookup. Missing contact permission returns `None`.
+    pub async fn get_user_name(&self, open_id: &str) -> Option<String> {
+        check_path_segment(open_id).ok()?;
+        #[derive(Deserialize)]
+        struct UserData {
+            user: Option<UserBody>,
+        }
+        #[derive(Deserialize)]
+        struct UserBody {
+            name: Option<String>,
+        }
+        let path = format!("/open-apis/contact/v3/users/{open_id}?user_id_type=open_id");
+        let data: UserData = self
+            .with_auth_retry(|token| {
+                let path = path.clone();
+                async move {
+                    self.checked_get(&path, &token, "fetching a user name")
+                        .await
+                }
+            })
+            .await
+            .ok()?;
+        data.user
+            .and_then(|user| user.name)
+            .filter(|name| !name.is_empty() && name.chars().count() <= 64)
     }
 
     /// Fetches the conversation mode of a chat.
@@ -820,6 +847,97 @@ fn check_upload_size(len: usize) -> Result<(), LarkError> {
         ));
     }
     Ok(())
+}
+
+/// One page of topic-thread messages.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ThreadMessagePage {
+    /// Messages in this page.
+    pub items: Vec<RawMessage>,
+    /// Opaque continuation token, when more pages exist.
+    pub page_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MessageListData {
+    items: Option<Vec<MessageItem>>,
+    messages: Option<Vec<MessageItem>>,
+    #[serde(default)]
+    has_more: Option<bool>,
+    page_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MessageItem {
+    message_id: Option<String>,
+    chat_id: Option<String>,
+    chat_type: Option<String>,
+    sender: Option<MessageSender>,
+    msg_type: Option<String>,
+    root_id: Option<String>,
+    parent_id: Option<String>,
+    thread_id: Option<String>,
+    #[serde(default)]
+    deleted: bool,
+    body: Option<MessageBody>,
+}
+
+#[derive(Deserialize)]
+struct MessageBody {
+    content: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MessageSender {
+    id: Option<String>,
+    sender_type: Option<String>,
+}
+
+fn parse_message_items(
+    data: MessageListData,
+    fallback_chat_id: Option<&str>,
+) -> Result<Vec<RawMessage>, LarkError> {
+    let items = data.items.or(data.messages).unwrap_or_default();
+    let mut messages = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(message_id) = item.message_id.filter(|id| !id.is_empty()) else {
+            continue;
+        };
+        let chat_id = item
+            .chat_id
+            .filter(|id| !id.is_empty())
+            .or_else(|| fallback_chat_id.map(ToOwned::to_owned));
+        let Some(chat_id) = chat_id else {
+            continue;
+        };
+        let (sender_id, sender_type) = item
+            .sender
+            .map_or((None, None), |sender| (sender.id, sender.sender_type));
+        messages.push(RawMessage {
+            message_id,
+            chat_id,
+            chat_type: item.chat_type.unwrap_or_default(),
+            sender_id,
+            sender_type,
+            message_type: item.msg_type.unwrap_or_default(),
+            root_id: item.root_id,
+            parent_id: item.parent_id,
+            thread_id: item.thread_id,
+            deleted: item.deleted,
+            content: item.body.and_then(|body| body.content),
+        });
+    }
+    Ok(messages)
+}
+
+fn append_query_component(path: &mut String, value: &str) {
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            path.push(byte as char);
+        } else {
+            path.push_str(&format!("%{byte:02X}"));
+        }
+    }
 }
 
 /// Server-issued IDs (`om_…`/`oc_…`/`ou_…`) use a URL-safe alphabet; reject

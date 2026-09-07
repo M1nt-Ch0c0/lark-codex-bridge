@@ -8,9 +8,12 @@
 | `policy.rs` | owner/sender/group allowlist、mention、quoted-parent 和 workspace 准入 |
 | `router.rs` | scope actor 生命周期、容量和全局并发 |
 | `scope.rs` | 单 scope 状态机和 Codex turn |
-| `commands.rs` | 第一阶段纯 parser/metadata |
+| `commands.rs` | 第一阶段 parser/metadata，以及卡片回调到 slash command 的白名单映射 |
+| `live.rs` | `/config` 热更新：内存策略与可选原子写回 `config.toml` |
+| `prompt.rs` | 注入 `<bridge_context>` / `<quoted_messages>` / `<topic_context>` |
+| `inventory.rs` | `/info` 用的脱敏 MCP / skill / session 清单 |
 | `context.rs` | turn-scoped opaque context/media capability |
-| `quote.rs` | 单跳父消息解析和 fail-closed 状态 |
+| `quote.rs` | 单跳父消息、合并转发展开、话题首次上文 |
 | `attachments.rs` | attachment cache 和 downloader |
 
 ## Scope actor 模型
@@ -79,18 +82,21 @@ Unavailable/Unauthorized/Deleted/Oversize/Unsupported 状态，不暴露父消�
 
 ## Command 扩展
 
-当前 `BridgeCommand` 是纯 parser，`ScopeCommand` 尚未包含 control variant。接入命令时：
+第一阶段命令已经进入 scope actor。继续加命令时仍须遵守：
 
 - command 必须在进入 Codex 前截获；
 - 状态变更命令与普通 inbound 在同 scope 串行；
 - `/stop` 使用独立高优先级控制通道，不能排在长普通队列尾部；
 - 所有回复进入 durable outbox；
-- owner/admin gate 在模型外执行。
+- owner/admin gate 在模型外执行；
+- 卡片 `value.cmd` 必须走白名单，不能把任意 callback 当成命令。
 
 ## 推荐测试
 
 - `tests/runtime_intake.rs`；
 - `tests/runtime_policy.rs`；
 - `tests/runtime_scope.rs`；
+- `tests/runtime_quote.rs`；
+- `tests/runtime_commands.rs`；
 - `tests/store.rs`；
 - fake Codex 和 Lark stub 联合的应用装配测试。

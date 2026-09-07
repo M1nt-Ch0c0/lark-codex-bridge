@@ -241,6 +241,8 @@ fn quoted_media_handle_reads_from_the_parent_and_debug_redacts_keys_and_text() {
     context.quote = Some(QuoteDraft {
         message_id: "om_parent".to_owned(),
         message_type: Some("image".to_owned()),
+        sender_id: None,
+        sender_name: None,
         status: QuoteStatus::Available,
         parts: vec![DraftPart::Media {
             kind: MediaKind::Image,
@@ -459,7 +461,7 @@ fn inbound_rich_parts_become_opaque_typed_context_parts() {
         )
         .expect("thumbnail grant");
     assert_eq!(thumbnail.media_kind, MediaKind::Image);
-    assert!(matches!(snapshot.parts[1], TypedPart::Unsupported { .. }));
+    assert!(matches!(snapshot.parts[1], TypedPart::Card { .. }));
 
     let json = serde_json::to_string(&snapshot).expect("serialize");
     assert!(!json.contains("file_video_secret"));

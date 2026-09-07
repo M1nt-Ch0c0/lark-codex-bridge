@@ -7,6 +7,7 @@
 - [Release 安装](guide/installation.md)：下载、校验、升级和卸载。
 - [配置手册](guide/configuration.md)：完整 TOML、路径、权限和环境变量。
 - [运行与维护](guide/operations.md)：探针、启动、数据目录、备份和退出。
+- [飞书命令与卡片](guide/commands.md)：`/status` `/info` `/config`、失败分类和群聊上下文。
 - [故障排查](guide/troubleshooting.md)：按错误阶段定位常见问题。
 
 ## 模块功能手册

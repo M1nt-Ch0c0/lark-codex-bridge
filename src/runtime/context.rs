@@ -326,6 +326,10 @@ pub struct QuoteDraft {
     pub message_id: String,
     /// Open Lark wire type, when known.
     pub message_type: Option<String>,
+    /// Parent sender `open_id`, when the one-hop lookup returned it.
+    pub sender_id: Option<String>,
+    /// Parent sender display name, when available.
+    pub sender_name: Option<String>,
     /// Stable resolution/degradation state.
     pub status: QuoteStatus,
     /// Sanitized parent parts, containing resource descriptors only while the
@@ -342,6 +346,10 @@ impl fmt::Debug for QuoteDraft {
                 "message_type_len",
                 &self.message_type.as_deref().map_or(0, str::len),
             )
+            .field(
+                "sender_id_len",
+                &self.sender_id.as_deref().map_or(0, str::len),
+            )
             .field("status", &self.status)
             .field("part_count", &self.parts.len())
             .finish_non_exhaustive()
@@ -355,6 +363,8 @@ impl QuoteDraft {
         Self {
             message_id,
             message_type: None,
+            sender_id: None,
+            sender_name: None,
             status: QuoteStatus::Unavailable,
             parts: Vec::new(),
         }
@@ -710,10 +720,7 @@ pub(crate) fn draft_part_from_inbound(part: &MessagePart) -> DraftPart {
             message_id: message_id.clone(),
             status: part_availability(*status),
         },
-        MessagePart::Card { status } => DraftPart::Unsupported {
-            message_type: "card".to_owned(),
-            reason: part_status_reason(*status).to_owned(),
-        },
+        MessagePart::Card { .. } => DraftPart::Card(Value::Object(serde_json::Map::new())),
         MessagePart::Unsupported {
             message_type,
             status,
