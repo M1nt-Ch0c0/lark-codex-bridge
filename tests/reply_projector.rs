@@ -833,7 +833,6 @@ fn duplicate_final_item_completed_stays_dropped() {
 }
 
 #[test]
-#[test]
 fn tool_and_reasoning_items_append_status_lines() {
     let mut projector = ReplyProjector::new(eager_config());
     let now = Instant::now();
@@ -857,6 +856,7 @@ fn tool_and_reasoning_items_append_status_lines() {
     }
 }
 
+#[test]
 fn debug_output_never_leaks_agent_text() {
     let projector = ReplyProjector::with_defaults();
     let rendered = format!("{projector:?}");

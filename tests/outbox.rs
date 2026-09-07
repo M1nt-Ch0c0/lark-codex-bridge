@@ -497,6 +497,22 @@ fn payload_rejects_oversize_input() {
     ));
 }
 
+#[test]
+fn payload_rejects_running_progress_finalization() {
+    let operation = OutboxOperation::FinalizeProgressCard {
+        anchor_key: "11:progress".to_owned(),
+        message_id: "om_parent".to_owned(),
+        thread_id: None,
+        text: "still running".to_owned(),
+        fallback_markdown: "still running".to_owned(),
+        phase: lark_codex_bridge::render::RunCardPhase::Running,
+    };
+    assert!(matches!(
+        operation.encode(),
+        Err(OutboxError::Invalid { context }) if context.contains("running")
+    ));
+}
+
 // ---------------------------------------------------------------------------
 // Delivery classification.
 // ---------------------------------------------------------------------------
@@ -756,14 +772,13 @@ async fn progress_cards_are_created_updated_and_finalized_through_the_outbox() {
     let final_card = card_json(&requests[2]);
     assert_eq!(create_card["header"]["title"]["content"], "Codex 正在回答");
     assert_eq!(create_card["header"]["template"], "blue");
-    assert_eq!(
+    assert!(
         create_card["body"]["elements"]
             .as_array()
             .expect("running card elements")
             .iter()
             .any(|element| element["tag"] == "button"
-                && element["behaviors"][0]["value"]["cmd"] == "stop"),
-        true
+                && element["behaviors"][0]["value"]["cmd"] == "stop")
     );
     assert_eq!(update_card["header"]["title"]["content"], "Codex 正在回答");
     assert_eq!(final_card["header"]["title"]["content"], "Codex 已完成");

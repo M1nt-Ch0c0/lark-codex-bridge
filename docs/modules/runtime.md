@@ -26,7 +26,7 @@ Runtime 把已持久化的 Lark 事件变成有权限、有工作区、有顺序
 - p2p 不要求 mention；
 - group/topic 必须直接 @机器人；
 - `@all` 不算直接 mention；
-- 引用父消息 sender 再独立走 human/owner/sender/group 检查，授权不传递；
+- 引用解析发生在触发消息已通过策略之后，只校验父消息 `message_id`/`chat_id`、删除状态和会话类型，不再对父消息 sender 重做 allowlist；
 - 工作区必须通过 allow roots 和系统危险路径检查；
 - policy fingerprint 随关键配置变化。
 

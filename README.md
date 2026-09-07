@@ -221,14 +221,14 @@ cargo run --locked -- codex adoption-status
 - 群聊/话题里未触发的图片、视频、文件和语音直接忽略并做无 turn 的 durable settlement；
   不创建 scope actor，不进入 pending/context/附件缓存，也不运行 ASR。
 - 群聊/话题用“直接 @机器人并回复媒体消息”触发。Bridge 在当前触发消息通过 sender/group/
-  mention 策略后只拉取直接父消息一跳，并对父消息 sender 再独立执行 human/owner/sender/group
-  授权；引用正文、合并转发和话题首次上文会注入 prompt。删除、无权限、超限、不支持和暂时不可用均有
+  mention 策略后只拉取直接父消息一跳，并校验父消息 `message_id`/`chat_id`、删除状态和会话类型；
+  引用正文、合并转发和话题首次上文会注入 prompt。删除、无权限、超限、不支持和暂时不可用均有
   稳定状态，不递归读取引用链或整段聊天历史。
 
 真实移动端引用 smoke 是人工操作、显式门控的测试。运行后按终端提示，在指定群里先发送一条
 不 `@bot` 的图片/视频/文件/语音，再用飞书移动端直接回复该消息并 `@bot` 附带给出的 marker。
 启用路径会验证 standalone 群媒体完成 no-turn settlement 且未创建 actor/context/cache 工作，随后
-验证触发消息策略、父消息发送者授权、单跳引用解析、opaque handle（序列化结果不含 resource key）
+验证触发消息策略、父消息标识与会话边界、单跳引用解析、opaque handle（序列化结果不含 resource key）
 以及通过有界附件缓存的真实按需读取；全过程不打印 resource key 或媒体内容。未设置 gate 时会
 明确报告 skip，而 skip 不算验收证据。
 

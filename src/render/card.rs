@@ -329,16 +329,14 @@ pub fn config_cancelled_card() -> InteractiveCardSpec {
 /// `/status` troubleshooting card.
 #[must_use]
 pub fn status_card(snapshot: &StatusSnapshot) -> InteractiveCardSpec {
-    let session = snapshot
-        .session_id
-        .as_deref()
-        .map(|id| format!("`{}`", short_id(id)))
-        .unwrap_or_else(|| "（未建立）".to_owned());
+    let session = snapshot.session_id.as_deref().map_or_else(
+        || "（未建立）".to_owned(),
+        |id| format!("`{}`", short_id(id)),
+    );
     let cwd = snapshot
         .cwd
         .as_deref()
-        .map(|path| format!("`{path}`"))
-        .unwrap_or_else(|| "（未设置）".to_owned());
+        .map_or_else(|| "（未设置）".to_owned(), |path| format!("`{path}`"));
     let model = snapshot.model.as_deref().unwrap_or("（默认）");
     let effort = snapshot.effort.as_deref().unwrap_or("（默认）");
     let group_line = match snapshot.group_allowed {
@@ -391,8 +389,7 @@ pub fn info_card(snapshot: &InfoSnapshot) -> InteractiveCardSpec {
     let workspace = snapshot
         .workspace
         .as_deref()
-        .map(|path| format!("`{path}`"))
-        .unwrap_or_else(|| "（未设置）".to_owned());
+        .map_or_else(|| "（未设置）".to_owned(), |path| format!("`{path}`"));
     let mcp = if snapshot.mcp.is_empty() {
         "- （未发现或无法读取）".to_owned()
     } else {
@@ -451,9 +448,10 @@ pub fn info_card(snapshot: &InfoSnapshot) -> InteractiveCardSpec {
 /// `/new` confirmation card.
 #[must_use]
 pub fn new_session_card(interrupted: bool, cwd: Option<&str>) -> InteractiveCardSpec {
-    let cwd = cwd
-        .map(|path| format!("当前目录：`{path}`"))
-        .unwrap_or_else(|| "当前目录未设置。".to_owned());
+    let cwd = cwd.map_or_else(
+        || "当前目录未设置。".to_owned(),
+        |path| format!("当前目录：`{path}`"),
+    );
     InteractiveCardSpec {
         title: "已开始新会话".to_owned(),
         subtitle: None,

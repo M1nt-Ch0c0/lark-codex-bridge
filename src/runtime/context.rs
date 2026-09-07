@@ -848,7 +848,9 @@ pub struct AuthorizedResource {
     /// Cancellation tied to the exact context/turn capability. This is kept
     /// crate-private so callers cannot mint or replace lifecycle authority.
     pub(crate) cancellation: CancellationToken,
+    #[allow(dead_code)]
     read_charge: Option<ReadCharge>,
+    #[allow(dead_code)]
     response_operation: ResponseOperation,
 }
 
@@ -862,6 +864,7 @@ impl AuthorizedResource {
     /// Replaces this attempt's pessimistic byte reservation with the exact
     /// materialized size. Failed attempts deliberately retain their charge so
     /// retries cannot bypass the turn budget.
+    #[allow(dead_code)]
     pub(crate) fn settle_read(&mut self, actual_bytes: u64) {
         if let Some(charge) = self.read_charge.as_mut() {
             charge.settle(actual_bytes);
@@ -871,6 +874,7 @@ impl AuthorizedResource {
     /// Establishes the response-vs-revocation linearization point. A `true`
     /// result authorizes one response while interrupt acknowledgement waits for
     /// this operation to be dropped; `false` forbids returning media content.
+    #[allow(dead_code)]
     pub(crate) fn commit_response(&self) -> bool {
         self.response_operation.commit()
     }
@@ -960,6 +964,7 @@ impl TurnReadMeter {
     }
 }
 
+#[allow(dead_code)]
 struct ReadCharge {
     meter: Arc<Mutex<TurnReadMeter>>,
     handle: MediaHandle,
@@ -968,6 +973,7 @@ struct ReadCharge {
 }
 
 impl ReadCharge {
+    #[allow(dead_code)]
     fn settle(&mut self, actual_bytes: u64) {
         if self.settled {
             return;
@@ -1064,6 +1070,7 @@ struct ResponseOperation {
 }
 
 impl ResponseOperation {
+    #[allow(dead_code)]
     fn commit(&self) -> bool {
         let state = self
             .gate

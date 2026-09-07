@@ -219,9 +219,9 @@ fn build_finalization_rows(
                 ProjectedReply::Empty => Ok(Vec::new()),
             }
         }
-        TurnResolution::Failed => notice_rows(turn, notice_for(turn)),
-        TurnResolution::Interrupted => notice_rows(turn, notice_for(turn)),
-        TurnResolution::Uncertain => notice_rows(turn, notice_for(turn)),
+        TurnResolution::Failed | TurnResolution::Interrupted | TurnResolution::Uncertain => {
+            notice_rows(turn, notice_for(turn))
+        }
     }
 }
 
@@ -360,8 +360,8 @@ fn notice_for(turn: &TurnFinalization) -> &'static str {
 fn terminal_phase(turn: &TurnFinalization) -> RunCardPhase {
     match turn.failure.unwrap_or(TurnFailureKind::TurnFailed) {
         TurnFailureKind::Interrupted => RunCardPhase::Interrupted,
-        TurnFailureKind::ConnectionLost => RunCardPhase::Failed,
-        TurnFailureKind::Attachment
+        TurnFailureKind::ConnectionLost
+        | TurnFailureKind::Attachment
         | TurnFailureKind::Workspace
         | TurnFailureKind::TurnStartRejected
         | TurnFailureKind::TurnFailed => RunCardPhase::Failed,

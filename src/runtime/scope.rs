@@ -240,6 +240,11 @@ pub trait DurableReplySink: Send + Sync {
     }
 
     /// Builds one deterministic command card without performing I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns a static projection classification when the event or bounded
+    /// card cannot be represented as one deterministic outbox row.
     fn control_card(
         &self,
         _key: &InboundKey,
@@ -1357,15 +1362,12 @@ async fn execute_status_control(
         .flatten()
         .map(|row| row.codex_thread_id);
     let active_run = active_turn.read().ok().is_some_and(|guard| guard.is_some());
-    let pending = pending_media
-        .lock()
-        .map(|mut queue| queue.stats().0)
-        .unwrap_or(0);
+    let pending = pending_media.lock().map_or(0, |mut queue| queue.stats().0);
     let depth = store.outbox_depth().await.unwrap_or_default();
-    let scope_state = state
-        .read()
-        .map(|current| scope_state_label(*current))
-        .unwrap_or_else(|_| "unknown".to_owned());
+    let scope_state = state.read().map_or_else(
+        |_| "unknown".to_owned(),
+        |current| scope_state_label(*current),
+    );
     let chat_mode_label = chat_mode_label(chat_mode);
     let group_allowed = match chat_mode {
         crate::channel::ConversationMode::P2p => None,
@@ -1411,12 +1413,20 @@ async fn execute_info_control(
         .flatten()
         .map(|row| row.codex_thread_id);
     let threads = store.list_scope_threads(scope, 8).await.unwrap_or_default();
-    let snapshot = crate::runtime::inventory::collect_inventory(
-        settings.backend.configured_codex_home(),
-        cwd_path.as_deref(),
-        &threads,
-        current.as_deref(),
-    );
+    let configured = settings.backend.configured_codex_home().map(PathBuf::from);
+    let snapshot = match tokio::task::spawn_blocking(move || {
+        crate::runtime::inventory::collect_inventory(
+            configured.as_deref(),
+            cwd_path.as_deref(),
+            &threads,
+            current.as_deref(),
+        )
+    })
+    .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(_) => crate::runtime::inventory::collect_inventory(None, None, &[], None),
+    };
     ControlReply::Card(crate::render::info_card(&crate::render::InfoSnapshot {
         workspace: snapshot.workspace,
         mcp: snapshot.mcp,
@@ -1456,14 +1466,20 @@ fn scope_state_label(state: ScopeState) -> String {
 }
 
 fn display_workspace_path(path: &str) -> String {
-    if let Ok(home) = std::env::var("HOME") {
-        if let Some(rest) = path.strip_prefix(&home) {
-            return format!("~{rest}");
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        if let Ok(rest) = Path::new(path).strip_prefix(Path::new(&home)) {
+            let rest = rest.to_string_lossy().replace('\\', "/");
+            return if rest.is_empty() {
+                "~".to_owned()
+            } else {
+                format!("~/{rest}")
+            };
         }
     }
     path.to_owned()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_cd_control(
     scope: &ScopeKey,
     path: Option<PathBuf>,
@@ -1535,9 +1551,8 @@ async fn execute_resume_control(
             Err(_) => ControlReply::text("恢复会话失败：存储暂时不可用。"),
         };
     }
-    let threads = match store.list_scope_threads(scope, 8).await {
-        Ok(threads) => threads,
-        Err(_) => return ControlReply::text("无法列出历史会话：存储暂时不可用。"),
+    let Ok(threads) = store.list_scope_threads(scope, 8).await else {
+        return ControlReply::text("无法列出历史会话：存储暂时不可用。");
     };
     let _ = policy;
     let entries = threads
@@ -1583,8 +1598,7 @@ fn expand_user_path(path: &Path) -> PathBuf {
     if raw == "~" {
         return std::env::var_os("HOME")
             .or_else(|| std::env::var_os("USERPROFILE"))
-            .map(PathBuf::from)
-            .unwrap_or_else(|| path.to_path_buf());
+            .map_or_else(|| path.to_path_buf(), PathBuf::from);
     }
     if let Some(rest) = raw.strip_prefix("~/") {
         if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
@@ -2883,6 +2897,7 @@ fn push_materialized_attachment(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn transcribe_audio_parts(
     attachments: Option<&AttachmentCache>,
     message_id: &str,
@@ -2949,6 +2964,7 @@ async fn transcribe_audio_parts(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn materialize_draft_media(
     cache: &AttachmentCache,
     draft: &ContextDraft,
@@ -3229,7 +3245,9 @@ async fn ensure_thread(
         .await
         .map_err(|_| ThreadPreparationError::Scope(ScopeFailureKind::Store))?
     {
-        if active.context_tools_version == 0 {
+        // 0 is the current prompt-injected contract; 1 is the previous
+        // in-thread tool injection marker. Both can safely resume.
+        if active.context_tools_version <= 1 {
             let rpc_cwd = revalidate_workspace(policy, cwd, fingerprint)
                 .map_err(ThreadPreparationError::Scope)?;
             let mut params = ThreadResumeParams::new(&active.codex_thread_id);
@@ -3339,6 +3357,7 @@ fn resolution_for(status: &TurnStatus) -> (TurnResolution, InboundTerminal) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn finalize_failed(
     store: &StoreHandle,
     sink: &dyn DurableReplySink,
@@ -4380,15 +4399,15 @@ mod tests {
         let live = LiveBridgeConfig::from_runtime(fixture.policy, fixture.settings);
         match execute_config_control(&live, ChatMode::Group, None, false) {
             ControlReply::Text(text) => assert!(text.contains("私聊")),
-            other => panic!("expected group refusal, got {other:?}"),
+            other @ ControlReply::Card(_) => panic!("expected group refusal, got {other:?}"),
         }
         match execute_config_control(&live, ChatMode::Topic, None, false) {
             ControlReply::Text(text) => assert!(text.contains("私聊")),
-            other => panic!("expected topic refusal, got {other:?}"),
+            other @ ControlReply::Card(_) => panic!("expected topic refusal, got {other:?}"),
         }
         match execute_config_control(&live, ChatMode::P2p, None, false) {
             ControlReply::Card(card) => assert_eq!(card.title, "运行设置"),
-            other => panic!("expected config card, got {other:?}"),
+            other @ ControlReply::Text(_) => panic!("expected config card, got {other:?}"),
         }
         match execute_config_control(
             &live,
@@ -4397,7 +4416,7 @@ mod tests {
             false,
         ) {
             ControlReply::Card(card) => assert_eq!(card.title, "设置已保存"),
-            other => panic!("expected saved card, got {other:?}"),
+            other @ ControlReply::Text(_) => panic!("expected saved card, got {other:?}"),
         }
         assert_eq!(live.settings().model.as_deref(), Some("gpt-6-astra"));
     }

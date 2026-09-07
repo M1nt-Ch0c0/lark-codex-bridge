@@ -493,7 +493,7 @@ async fn common_quoted_wire_types_flatten_to_readable_text() {
             r#"{"chat_id":"oc_shared"}"#,
             "shared chat",
         ),
-        ("share_user", "share_user", r#"{}"#, "shared user"),
+        ("share_user", "share_user", r"{}", "shared user"),
         (
             "system",
             "system",
@@ -521,7 +521,7 @@ async fn common_quoted_wire_types_flatten_to_readable_text() {
             r#"{"summary":{"title":"写周报"}}"#,
             "写周报",
         ),
-        ("folder", "folder", r#"{}"#, "shared folder"),
+        ("folder", "folder", r"{}", "shared folder"),
         ("empty_post", "post", r#"{"zh_cn":{}}"#, "rich text message"),
     ];
     for (name, message_type, content, expected) in cases {

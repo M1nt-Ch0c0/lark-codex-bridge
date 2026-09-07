@@ -217,6 +217,13 @@ impl OutboxOperation {
     /// Returns [`OutboxError::Serialize`] if the operation cannot be encoded,
     /// or [`OutboxError::PayloadTooLarge`] when the result exceeds the cap.
     pub fn encode(&self) -> Result<String, OutboxError> {
+        if let Self::FinalizeProgressCard { phase, .. } = self {
+            if matches!(phase, crate::render::RunCardPhase::Running) {
+                return Err(OutboxError::Invalid {
+                    context: "running phase cannot finalize a progress card",
+                });
+            }
+        }
         let dto = PayloadV2::from(self);
         let json = serde_json::to_string(&dto).map_err(|_| OutboxError::Serialize)?;
         if json.len() > STORE_OUTBOX_PAYLOAD_MAX_BYTES {
@@ -416,8 +423,7 @@ fn decode_progress_finalization(dto: PayloadV2) -> Result<OutboxOperation, Outbo
         phase: dto
             .phase
             .as_deref()
-            .map(parse_run_phase)
-            .unwrap_or(Ok(crate::render::RunCardPhase::Done))?,
+            .map_or(Ok(crate::render::RunCardPhase::Done), parse_run_phase)?,
     })
 }
 

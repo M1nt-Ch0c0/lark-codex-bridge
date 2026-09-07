@@ -1594,7 +1594,7 @@ async fn lazy_context_resolves_metadata_and_fetches_media_only_on_tool_call() {
         reference
             .get("relatedContextIds")
             .and_then(Value::as_array)
-            .map_or(true, Vec::is_empty)
+            .is_none_or(Vec::is_empty)
     );
 
     respond_turn_started(&control, &start_turn, "turn-lazy-context").await;
@@ -1990,7 +1990,7 @@ async fn pending_media_is_restored_when_the_consuming_turn_is_not_started() {
         first_context_reference(inputs)
             .get("relatedContextIds")
             .and_then(Value::as_array)
-            .map_or(true, Vec::is_empty)
+            .is_none_or(Vec::is_empty)
     );
     respond_turn_started(&control, &start_turn, "turn-pending-retry").await;
     send_turn_completed(
@@ -2237,7 +2237,7 @@ async fn p2p_audio_triggers_alone_without_consuming_pending_images() {
         first_context_reference(inputs)
             .get("relatedContextIds")
             .and_then(Value::as_array)
-            .map_or(true, Vec::is_empty)
+            .is_none_or(Vec::is_empty)
     );
     respond_turn_started(&control, &start_followup, "turn-audio-followup").await;
     send_turn_completed(

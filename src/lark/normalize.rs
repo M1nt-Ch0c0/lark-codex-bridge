@@ -614,17 +614,19 @@ impl Normalizer {
             return self.normalize_card_action(payload).await;
         }
         match self.normalize(payload).await? {
-            NormalizeOutcome::Ignored { reason }
-                if reason == "not an im.message.receive_v1 event" =>
-            {
-                self.normalize_card_action(payload).await
-            }
+            NormalizeOutcome::Ignored {
+                reason: "not an im.message.receive_v1 event",
+            } => self.normalize_card_action(payload).await,
             outcome => Ok(outcome),
         }
     }
 
     /// Turns a Card 2.0 `card.action.trigger` payload into a synthetic slash
     /// command event so the existing command pipeline can handle the click.
+    ///
+    /// # Errors
+    ///
+    /// Same contract as [`Normalizer::normalize`].
     pub async fn normalize_card_action(
         &self,
         payload: &[u8],
@@ -1017,6 +1019,7 @@ struct ExtractedContent {
 /// Extracts legacy text/resource fields and the richer typed representation
 /// in one parse. Unknown wire kinds survive as an explicit unsupported part;
 /// their opaque content is never retained.
+#[allow(clippy::too_many_lines)]
 fn extract_message_content(
     message_type: &str,
     content: &str,
@@ -1190,11 +1193,6 @@ fn extract_post_content(value: &Value) -> ExtractedContent {
         let mut line = String::new();
         for run in runs {
             match run.get("tag").and_then(Value::as_str).unwrap_or_default() {
-                "text" | "md" => {
-                    if let Some(text) = run.get("text").and_then(Value::as_str) {
-                        line.push_str(text);
-                    }
-                }
                 "a" => {
                     if let Some(text) = run.get("text").and_then(Value::as_str) {
                         line.push_str(text);
@@ -1328,7 +1326,7 @@ fn extract_card_content(value: &Value) -> ExtractedContent {
     texts.retain(|text| seen.insert(text.clone()));
     let mut text = bound_join(&texts);
     if text.is_empty() {
-        text = "[interactive card]".to_owned();
+        "[interactive card]".clone_into(&mut text);
     }
     ExtractedContent {
         text: text.clone(),
@@ -1635,7 +1633,11 @@ fn bound_join(texts: &[String]) -> String {
         if text.len() <= remaining {
             joined.push_str(text);
         } else {
-            joined.push_str(&text[..remaining]);
+            let mut end = remaining;
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            joined.push_str(&text[..end]);
             break;
         }
     }
@@ -1993,9 +1995,8 @@ fn parse_card_action(value: &Value, bot_open_id: &str) -> Option<ParsedEvent> {
     let event_id = value
         .pointer("/header/event_id")
         .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| format!("card:{message_id}:{cmd}"));
+        .filter(|value| !value.is_empty())?
+        .to_owned();
     let create_time_ms = value
         .pointer("/header/create_time")
         .and_then(Value::as_str)

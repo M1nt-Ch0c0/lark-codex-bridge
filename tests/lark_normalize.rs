@@ -1283,3 +1283,26 @@ async fn unrecognized_card_action_is_ignored() {
         .expect("unrecognized cards parse");
     assert!(matches!(outcome, NormalizeOutcome::Ignored { .. }));
 }
+
+#[tokio::test]
+async fn card_action_without_event_id_is_ignored() {
+    let server = StubServer::start(im_stub(failing, failing)).await;
+    let normalizer = normalizer_for(&server);
+    let payload = serde_json::json!({
+        "header": {"event_type": "card.action.trigger"},
+        "event": {
+            "operator": {"open_id": "ou_alice"},
+            "action": {"value": {"cmd": "status"}},
+            "context": {
+                "open_chat_id": "oc_p2p_chat",
+                "open_message_id": "om_card"
+            }
+        }
+    })
+    .to_string();
+    let outcome = normalizer
+        .normalize_card_action(payload.as_bytes())
+        .await
+        .expect("card without event_id should parse");
+    assert!(matches!(outcome, NormalizeOutcome::Ignored { .. }));
+}

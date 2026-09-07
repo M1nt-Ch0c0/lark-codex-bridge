@@ -17,6 +17,7 @@
 //! logged and never appears in `Debug` output or error messages.
 
 use std::fmt;
+use std::fmt::Write as _;
 use std::future::Future;
 
 use bytes::Bytes;
@@ -335,7 +336,7 @@ impl LarkApi {
                 async move { self.checked_get(&path, &token, "fetching a message").await }
             })
             .await?;
-        parse_message_items(data, None)
+        Ok(parse_message_items(data, None))
     }
 
     /// Lists messages in one topic thread, newest first, one page at a time.
@@ -375,14 +376,13 @@ impl LarkApi {
         let has_more = data.has_more.unwrap_or(false);
         let next_page_token = data.page_token.clone();
         Ok(ThreadMessagePage {
-            items: parse_message_items(data, Some(chat_id))?,
+            items: parse_message_items(data, Some(chat_id)),
             page_token: if has_more { next_page_token } else { None },
         })
     }
 
     /// Best-effort display name lookup. Missing contact permission returns `None`.
     pub async fn get_user_name(&self, open_id: &str) -> Option<String> {
-        check_path_segment(open_id).ok()?;
         #[derive(Deserialize)]
         struct UserData {
             user: Option<UserBody>,
@@ -391,6 +391,7 @@ impl LarkApi {
         struct UserBody {
             name: Option<String>,
         }
+        check_path_segment(open_id).ok()?;
         let path = format!("/open-apis/contact/v3/users/{open_id}?user_id_type=open_id");
         let data: UserData = self
             .with_auth_retry(|token| {
@@ -893,10 +894,7 @@ struct MessageSender {
     sender_type: Option<String>,
 }
 
-fn parse_message_items(
-    data: MessageListData,
-    fallback_chat_id: Option<&str>,
-) -> Result<Vec<RawMessage>, LarkError> {
+fn parse_message_items(data: MessageListData, fallback_chat_id: Option<&str>) -> Vec<RawMessage> {
     let items = data.items.or(data.messages).unwrap_or_default();
     let mut messages = Vec::with_capacity(items.len());
     for item in items {
@@ -927,7 +925,7 @@ fn parse_message_items(
             content: item.body.and_then(|body| body.content),
         });
     }
-    Ok(messages)
+    messages
 }
 
 fn append_query_component(path: &mut String, value: &str) {
@@ -935,7 +933,7 @@ fn append_query_component(path: &mut String, value: &str) {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
             path.push(byte as char);
         } else {
-            path.push_str(&format!("%{byte:02X}"));
+            let _ = write!(path, "%{byte:02X}");
         }
     }
 }

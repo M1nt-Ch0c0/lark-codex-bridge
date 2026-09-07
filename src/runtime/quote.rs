@@ -134,10 +134,7 @@ impl QuoteResolver for LarkQuoteResolver {
             if resolve_parent_chat_mode(&raw, request.chat_mode).is_none() {
                 return degraded(parent_id, QuoteStatus::Unauthorized);
             }
-            let mut draft = match draft_from_raw(&raw) {
-                Some(draft) => draft,
-                None => return degraded(parent_id, QuoteStatus::Unavailable),
-            };
+            let mut draft = draft_from_raw(&raw);
             expand_forwards(&api, &names, &mut draft, &items, 0).await;
             draft.sender_name = lookup_name(&api, &names, draft.sender_id.as_deref()).await;
             draft
@@ -222,9 +219,9 @@ fn degraded(message_id: String, status: QuoteStatus) -> QuoteDraft {
     }
 }
 
-fn draft_from_raw(raw: &RawMessage) -> Option<QuoteDraft> {
+fn draft_from_raw(raw: &RawMessage) -> QuoteDraft {
     if raw.deleted {
-        return Some(degraded(raw.message_id.clone(), QuoteStatus::Deleted));
+        return degraded(raw.message_id.clone(), QuoteStatus::Deleted);
     }
     let sender_id = raw.sender_id.as_deref().and_then(|sender_id| {
         if sender_id.is_empty() || sender_id.len() > STORE_INBOUND_ID_MAX_BYTES {
@@ -235,39 +232,39 @@ fn draft_from_raw(raw: &RawMessage) -> Option<QuoteDraft> {
     });
     if raw.message_type.is_empty() || raw.message_type.len() > STORE_INBOUND_MESSAGE_TYPE_MAX_BYTES
     {
-        return Some(degraded_with_type(
+        return degraded_with_type(
             raw.message_id.clone(),
             raw.message_type.clone(),
             QuoteStatus::Oversize,
-        ));
+        );
     }
     let Some(content) = raw.content.as_ref() else {
-        return Some(degraded_with_type(
+        return degraded_with_type(
             raw.message_id.clone(),
             raw.message_type.clone(),
             QuoteStatus::Unavailable,
-        ));
+        );
     };
     if content.len() > QUOTE_CONTENT_MAX_BYTES {
-        return Some(degraded_with_type(
+        return degraded_with_type(
             raw.message_id.clone(),
             raw.message_type.clone(),
             QuoteStatus::Oversize,
-        ));
+        );
     }
     let Ok(parts) = normalize_message_parts(&raw.message_type, content) else {
-        return Some(degraded_with_type(
+        return degraded_with_type(
             raw.message_id.clone(),
             raw.message_type.clone(),
             QuoteStatus::Unavailable,
-        ));
+        );
     };
     if parts.len() > QUOTE_MAX_PARTS || parts.iter().any(part_descriptor_oversize) {
-        return Some(degraded_with_type(
+        return degraded_with_type(
             raw.message_id.clone(),
             raw.message_type.clone(),
             QuoteStatus::Oversize,
-        ));
+        );
     }
     let status = if parts.iter().all(|part| {
         matches!(
@@ -279,14 +276,14 @@ fn draft_from_raw(raw: &RawMessage) -> Option<QuoteDraft> {
     } else {
         QuoteStatus::Available
     };
-    Some(QuoteDraft {
+    QuoteDraft {
         message_id: raw.message_id.clone(),
         message_type: Some(raw.message_type.clone()),
         sender_id,
         sender_name: None,
         status,
         parts: parts.iter().map(draft_part_from_inbound).collect(),
-    })
+    }
 }
 
 async fn expand_forwards(
@@ -319,9 +316,7 @@ async fn expand_forwards(
                 }
                 let mut lines = Vec::new();
                 for child in children.iter().take(FORWARD_EXPAND_MAX_ITEMS) {
-                    let Some(mut child_draft) = draft_from_raw(child) else {
-                        continue;
-                    };
+                    let mut child_draft = draft_from_raw(child);
                     Box::pin(expand_forwards(
                         api,
                         names,
@@ -436,9 +431,11 @@ async fn lookup_name(
         return cached;
     }
     let name = api.get_user_name(open_id).await;
-    if let Ok(mut guard) = cache.lock() {
-        if guard.len() < 256 {
-            guard.insert(open_id.to_owned(), name.clone());
+    if let Some(resolved) = name.as_ref() {
+        if let Ok(mut guard) = cache.lock() {
+            if guard.len() < 256 {
+                guard.insert(open_id.to_owned(), Some(resolved.clone()));
+            }
         }
     }
     name
@@ -449,11 +446,11 @@ async fn fetch_topic_context(
     names: &Mutex<HashMap<String, Option<String>>>,
     request: TopicContextRequest,
 ) -> Vec<QuoteDraft> {
-    let max = request.max_messages.min(TOPIC_CONTEXT_MAX_MESSAGES).max(1);
+    let max = request.max_messages.clamp(1, TOPIC_CONTEXT_MAX_MESSAGES);
     let mut newest = Vec::new();
     let mut page_token = None;
     for _ in 0..4 {
-        let page = match api
+        let Ok(page) = api
             .list_thread_messages(
                 &request.thread_id,
                 &request.chat_id,
@@ -461,9 +458,8 @@ async fn fetch_topic_context(
                 50,
             )
             .await
-        {
-            Ok(page) => page,
-            Err(_) => break,
+        else {
+            break;
         };
         for raw in page.items {
             if raw.deleted
@@ -485,9 +481,7 @@ async fn fetch_topic_context(
     newest.reverse();
     let mut drafts = Vec::new();
     for raw in newest {
-        let Some(mut draft) = draft_from_raw(&raw) else {
-            continue;
-        };
+        let mut draft = draft_from_raw(&raw);
         expand_forwards(api, names, &mut draft, &[], 0).await;
         draft.sender_name = lookup_name(api, names, draft.sender_id.as_deref()).await;
         drafts.push(draft);

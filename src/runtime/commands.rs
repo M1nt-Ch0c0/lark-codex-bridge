@@ -139,6 +139,7 @@ pub struct CommandSpec {
 /// Visible command reply. Text stays for adoption controls; cards are the
 /// preferred surface for `/new` `/cd` `/resume` `/help` `/status`.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum ControlReply {
     /// Plain text, sent as a Lark text reply.
     Text(String),

@@ -77,6 +77,7 @@ fn resolve_codex_home(configured: Option<&Path>) -> Option<PathBuf> {
     }
     std::env::var("HOME")
         .ok()
+        .or_else(|| std::env::var("USERPROFILE").ok())
         .map(|home| PathBuf::from(home).join(".codex"))
 }
 
@@ -155,7 +156,7 @@ fn skill_summary(path: &Path) -> Option<String> {
     };
     let text = String::from_utf8_lossy(&bytes[..bytes.len().min(2048)]);
     if let Some(front) = text.strip_prefix("---") {
-        let body = front.splitn(2, "\n---").next().unwrap_or("");
+        let body = front.split("\n---").next().unwrap_or("");
         for line in body.lines() {
             let Some(value) = line.trim().strip_prefix("description:") else {
                 continue;
@@ -191,12 +192,17 @@ fn session_entries(threads: &[ThreadRow], current_thread: Option<&str>) -> Vec<S
 }
 
 fn display_path(path: &Path) -> String {
-    let raw = path.to_string_lossy();
-    if let Ok(home) = std::env::var("HOME") {
-        if let Some(rest) = raw.strip_prefix(&home) {
-            return format!("~{rest}");
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        if let Ok(rest) = path.strip_prefix(Path::new(&home)) {
+            let rest = rest.to_string_lossy().replace('\\', "/");
+            return if rest.is_empty() {
+                "~".to_owned()
+            } else {
+                format!("~/{rest}")
+            };
         }
     }
+    let raw = path.to_string_lossy();
     let truncated: String = raw.chars().take(96).collect();
     if raw.chars().count() > 96 {
         format!("{truncated}…")
@@ -284,7 +290,9 @@ mod tests {
 
     #[test]
     fn redacts_home_prefix_in_workspace() {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/tester".to_owned());
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| "/home/tester".to_owned());
         let path = PathBuf::from(&home).join("src").join("bridge");
         let snapshot = collect_inventory(None, Some(&path), &[], None);
         assert_eq!(snapshot.workspace.as_deref(), Some("~/src/bridge"));

@@ -528,14 +528,14 @@ impl Router {
         quote_resolver: Option<Arc<dyn QuoteResolver>>,
         live: Option<Arc<LiveBridgeConfig>>,
     ) -> Result<RouterHandle, RouteError> {
-        if let Err(error) = settings.validate() {
-            supervisor.shutdown().await?;
-            return Err(error);
-        }
         let live = live
             .unwrap_or_else(|| LiveBridgeConfig::from_runtime(policy.clone(), settings.clone()));
         let _ = policy;
         let settings = live.settings();
+        if let Err(error) = settings.validate() {
+            supervisor.shutdown().await?;
+            return Err(error);
+        }
         let (sender, receiver) = mpsc::channel(ROUTER_COMMAND_CAPACITY);
         let (control_sender, control_receiver) = mpsc::channel(ROUTER_CONTROL_CAPACITY);
         let (startup_sender, startup_receiver) = oneshot::channel();

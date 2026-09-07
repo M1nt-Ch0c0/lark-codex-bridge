@@ -442,7 +442,7 @@ impl StoreHandle {
         limit: usize,
     ) -> Result<Vec<ThreadRow>, StoreError> {
         let scope_key = scope.to_string();
-        let limit = i64::try_from(limit.max(1).min(20)).unwrap_or(5);
+        let limit = i64::try_from(limit.clamp(1, 20)).unwrap_or(5);
         let request_size = request_bytes(&[&scope_key]);
         self.run_sized(request_size, move |connection| {
             let mut statement = connection
@@ -484,7 +484,10 @@ impl StoreHandle {
         let request_size = request_bytes(&[&scope_key, &thread_id]);
         self.run_sized(request_size, move |connection| {
             let now = now_ms();
-            let selected = connection.query_row(
+            let transaction = connection.transaction().map_err(|error| {
+                sqlite_error("starting a thread reactivation transaction", &error)
+            })?;
+            let selected = transaction.query_row(
                 "SELECT scope_key, codex_thread_id, status, created_ms, archived_ms,
                         context_tools_version, origin, adoption_generation
                  FROM threads
@@ -503,7 +506,7 @@ impl StoreHandle {
             if row.status == ThreadStatus::Active {
                 return Ok(Some(row));
             }
-            let active = connection.query_row(
+            let active = transaction.query_row(
                 "SELECT scope_key, codex_thread_id, status, created_ms, archived_ms,
                         context_tools_version, origin, adoption_generation
                  FROM threads WHERE scope_key = ?1 AND status = 'active'",
@@ -517,7 +520,7 @@ impl StoreHandle {
                         context: "archiving an externally adopted thread outside release finish",
                     });
                 }
-                connection
+                transaction
                     .execute(
                         "UPDATE threads SET status = 'archived', archived_ms = ?3
                          WHERE scope_key = ?1 AND codex_thread_id = ?2 AND status = 'active'",
@@ -527,13 +530,16 @@ impl StoreHandle {
                         sqlite_error("archiving the active thread for resume", &error)
                     })?;
             }
-            connection
+            transaction
                 .execute(
                     "UPDATE threads SET status = 'active', archived_ms = NULL
                      WHERE scope_key = ?1 AND codex_thread_id = ?2",
                     params![row.scope_key, row.codex_thread_id],
                 )
                 .map_err(|error| sqlite_error("reactivating an archived thread", &error))?;
+            transaction.commit().map_err(|error| {
+                sqlite_error("committing a thread reactivation transaction", &error)
+            })?;
             row.status = ThreadStatus::Active;
             row.archived_ms = None;
             Ok(Some(row))

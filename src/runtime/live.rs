@@ -104,22 +104,24 @@ impl LiveBridgeConfig {
 
     #[must_use]
     pub fn policy(&self) -> AccessPolicy {
-        self.inner.read().expect("live config lock").policy.clone()
+        self.read_inner().policy.clone()
     }
 
     #[must_use]
     pub fn settings(&self) -> RouterSettings {
-        self.inner
-            .read()
-            .expect("live config lock")
-            .settings
-            .clone()
+        self.read_inner().settings.clone()
     }
 
     #[must_use]
     pub fn view(&self) -> ConfigView {
-        let inner = self.inner.read().expect("live config lock");
+        let inner = self.read_inner();
         ConfigView::from_runtime(&inner.policy, &inner.settings)
+    }
+
+    fn read_inner(&self) -> std::sync::RwLockReadGuard<'_, LiveInner> {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Applies one patch to memory and, when a path is configured, to disk.
