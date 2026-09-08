@@ -23,7 +23,7 @@ case "$fixture_name" in
     [ "$2" = "--listen" ] || exit 92
     [ "$3" = "stdio://" ] || exit 93
     descendant_token="bridge-native-descendant:${0}:$$:app-server"
-    /bin/sh -c 'kill -STOP "$$"' "$descendant_token" &
+    /bin/sh -c 'trap "" HUP; kill -STOP "$$"' "$descendant_token" &
     child=$!
     printf '%s\t%s\n' "$child" "$descendant_token" > "${0%/*}/descendant.pid"
     exit 0
