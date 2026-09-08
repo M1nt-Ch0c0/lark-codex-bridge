@@ -53,7 +53,7 @@ use uuid::Uuid;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
-const CHILD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const CHILD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct ChildGuard {
     child: tokio::process::Child,
