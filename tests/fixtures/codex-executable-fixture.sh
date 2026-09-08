@@ -23,8 +23,19 @@ case "$fixture_name" in
     [ "$2" = "--listen" ] || exit 92
     [ "$3" = "stdio://" ] || exit 93
     descendant_token="bridge-native-descendant:${0}:$$:app-server"
-    /bin/sh -c 'trap "" HUP; kill -STOP "$$"' "$descendant_token" &
+    # Ignore HUP before STOP so a fast leader exit cannot reap the child
+    # under llvm-cov scheduling. Stay alive if something later continues it.
+    /bin/sh -c 'trap "" HUP INT TERM QUIT; kill -STOP "$$"; while :; do sleep 3600; done' "$descendant_token" &
     child=$!
+    i=0
+    while [ "$i" -lt 50 ]; do
+      state=$(ps -o stat= -p "$child" 2>/dev/null | tr -d '[:space:]')
+      case "$state" in
+        T*) break ;;
+      esac
+      i=$((i + 1))
+      sleep 0.02
+    done
     printf '%s\t%s\n' "$child" "$descendant_token" > "${0%/*}/descendant.pid"
     exit 0
     ;;
