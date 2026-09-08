@@ -545,7 +545,7 @@ if (mode === "eof") {
 
   lines.on("close", () => {
     mark("stdin-eof");
-    process.exitCode = 0;
+    process.exit(0);
   });
 }
 

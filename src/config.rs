@@ -3,7 +3,8 @@
 use std::collections::HashSet;
 use std::env;
 use std::fmt;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize};
@@ -75,6 +76,8 @@ pub enum ConfigError {
     AsrArgsTooLarge,
     #[error("bridge configuration contains an invalid ASR limit")]
     InvalidAsrLimit,
+    #[error("unable to write bridge configuration")]
+    Write,
 }
 
 impl fmt::Debug for ConfigError {
@@ -105,6 +108,7 @@ impl fmt::Debug for ConfigError {
             Self::TooManyAsrArgs => "TooManyAsrArgs",
             Self::AsrArgsTooLarge => "AsrArgsTooLarge",
             Self::InvalidAsrLimit => "InvalidAsrLimit",
+            Self::Write => "Write",
         };
         formatter.write_str(category)
     }
@@ -255,6 +259,17 @@ impl BridgeConfig {
             return Err(ConfigError::InvalidRuntimePath);
         }
         Ok(())
+    }
+
+    /// Atomically replaces `path` with the current configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Write`] when encoding or the same-directory
+    /// replace fails. A failed replace leaves the previous file in place.
+    pub fn write_atomic(&self, path: &Path) -> Result<(), ConfigError> {
+        let text = toml::to_string_pretty(self).map_err(|_| ConfigError::Write)?;
+        write_config_atomic(path, text.as_bytes())
     }
 
     fn resolve_runtime_paths(&mut self, config_path: &Path) -> Result<(), ConfigError> {
@@ -703,6 +718,42 @@ fn resolve_relative_path(parent: &Path, path: &Path) -> Result<PathBuf, ConfigEr
         return Err(ConfigError::InvalidRuntimePath);
     }
     Ok(lexical_normalize(&parent.join(path)))
+}
+
+fn write_config_atomic(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
+    let parent = path.parent().ok_or(ConfigError::Write)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.toml");
+    let temp = parent.join(format!(".{file_name}.tmp"));
+    if let Err(error) = write_private_bytes(&temp, bytes) {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+    if fs::rename(&temp, path).is_err() {
+        let _ = fs::remove_file(&temp);
+        return Err(ConfigError::Write);
+    }
+    Ok(())
+}
+
+fn write_private_bytes(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|_| ConfigError::Write)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|_| ConfigError::Write)?;
+    }
+    file.write_all(bytes).map_err(|_| ConfigError::Write)?;
+    file.sync_all().map_err(|_| ConfigError::Write)?;
+    Ok(())
 }
 
 /// Validates one identity/chat ID collection against its count and byte caps,

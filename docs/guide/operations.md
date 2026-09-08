@@ -58,6 +58,10 @@ RUST_LOG=info \
 每个 scope 同时只运行一个 turn；运行期间的新消息进入下一轮。不同 scope 可在全局许可数内
 并发。
 
+已授权用户可用 `/status` 看范围、队列和热更新设置，用 `/info` 看本机 MCP / skill /
+工作区和 sessions。owner 可在私聊用 `/config` 改模型与白名单，立即生效。命令表见
+[飞书命令与卡片](commands.md)。
+
 ## 回复
 
 - commentary 类型的 Codex 输出达到时间和字符阈值后更新进度卡；

@@ -12,7 +12,6 @@ use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, timeout};
 use tokio_util::sync::CancellationToken;
 
-use crate::codex::client::ControlEvent;
 use crate::codex::external::CodexBackendConfig;
 use crate::codex::supervisor::{SupervisorError, SupervisorHandle, SupervisorState};
 use crate::codex::types::{ApprovalPolicy, SandboxMode};
@@ -28,22 +27,25 @@ use crate::limits::{
 };
 use crate::runtime::adoption_coordinator::ThreadAdoptionCoordinator;
 use crate::runtime::attachments::AttachmentCache;
-use crate::runtime::commands::{BridgeCommand, parse_command};
+#[cfg(test)]
+use crate::runtime::commands::BridgeCommand;
+use crate::runtime::commands::{command_requires_owner, parse_command};
 use crate::runtime::context::ContextRegistry;
 use crate::runtime::intake::TenantNamespace;
+use crate::runtime::live::LiveBridgeConfig;
 use crate::runtime::policy::AccessPolicy;
 use crate::runtime::quote::QuoteResolver;
 use crate::runtime::scope::{
     ActorRouteError, DurableReplySink, InterruptOutcome, ReplySinkError, ScopeActorHandle,
     ScopeControl, ScopeSnapshot, SupervisorAccess,
 };
-use crate::runtime::tools::handle_server_request;
 use crate::store::{InboundKey, InboundRejectionKind, StoreError, StoreHandle};
 
 /// Redacted, validated inputs used by the scope runtime.
 #[derive(Clone)]
 pub struct RouterSettings {
     pub(crate) default_workspace: Option<PathBuf>,
+    pub(crate) bot_open_id: Option<String>,
     pub(crate) active_turn_permits: usize,
     pub(crate) max_scope_actors: usize,
     pub(crate) sandbox: SandboxMode,
@@ -126,6 +128,7 @@ impl RouterSettings {
     pub fn from_config(config: &BridgeConfig) -> Self {
         Self {
             default_workspace: config.default_workspace.clone(),
+            bot_open_id: None,
             active_turn_permits: config.concurrency.active_turn_permits,
             max_scope_actors: config.concurrency.max_scope_actors,
             sandbox: config.codex.sandbox,
@@ -189,6 +192,23 @@ impl RouterSettings {
         self
     }
 
+    pub(crate) fn overlay_hot_reload(&self, config: &BridgeConfig) -> Self {
+        let mut next = Self::from_config(config);
+        next.bot_open_id.clone_from(&self.bot_open_id);
+        next.debounce = self.debounce;
+        next.message_max_age = self.message_max_age;
+        next.finalization_retry = self.finalization_retry;
+        next.shutdown_cleanup_timeout = self.shutdown_cleanup_timeout;
+        next.pending_media_ttl = self.pending_media_ttl;
+        next.pending_media_max_count = self.pending_media_max_count;
+        next.pending_media_max_metadata_bytes = self.pending_media_max_metadata_bytes;
+        #[cfg(test)]
+        {
+            next.startup_gate.clone_from(&self.startup_gate);
+        }
+        next
+    }
+
     fn validate(&self) -> Result<(), RouteError> {
         if self.active_turn_permits == 0
             || self.active_turn_permits > ROUTER_ACTIVE_TURN_HARD_LIMIT
@@ -222,6 +242,7 @@ impl fmt::Debug for RouterSettings {
                 "default_workspace_configured",
                 &self.default_workspace.is_some(),
             )
+            .field("bot_open_id_configured", &self.bot_open_id.is_some())
             .field("active_turn_permits", &self.active_turn_permits)
             .field("max_scope_actors", &self.max_scope_actors)
             .field("sandbox", &self.sandbox)
@@ -360,7 +381,7 @@ impl Router {
         sink: Arc<dyn DurableReplySink>,
     ) -> Result<RouterHandle, RouteError> {
         Self::start_inner(
-            store, tenant, policy, settings, supervisor, sink, None, None, None,
+            store, tenant, policy, settings, supervisor, sink, None, None, None, None,
         )
         .await
     }
@@ -389,6 +410,7 @@ impl Router {
             supervisor,
             sink,
             Some(attachments),
+            None,
             None,
             None,
         )
@@ -422,6 +444,7 @@ impl Router {
             Some(attachments),
             Some(contexts),
             None,
+            None,
         )
         .await
     }
@@ -444,6 +467,39 @@ impl Router {
         contexts: Arc<ContextRegistry>,
         quote_resolver: Arc<dyn QuoteResolver>,
     ) -> Result<RouterHandle, RouteError> {
+        Self::start_with_live(
+            store,
+            tenant,
+            policy,
+            settings,
+            supervisor,
+            sink,
+            attachments,
+            contexts,
+            quote_resolver,
+            None,
+        )
+        .await
+    }
+
+    /// Starts the production router with a shared live configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same static classifications as [`Self::start`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_with_live(
+        store: StoreHandle,
+        tenant: TenantNamespace,
+        policy: AccessPolicy,
+        settings: RouterSettings,
+        supervisor: SupervisorHandle,
+        sink: Arc<dyn DurableReplySink>,
+        attachments: Arc<AttachmentCache>,
+        contexts: Arc<ContextRegistry>,
+        quote_resolver: Arc<dyn QuoteResolver>,
+        live: Option<Arc<LiveBridgeConfig>>,
+    ) -> Result<RouterHandle, RouteError> {
         Self::start_inner(
             store,
             tenant,
@@ -454,6 +510,7 @@ impl Router {
             Some(attachments),
             Some(contexts),
             Some(quote_resolver),
+            live,
         )
         .await
     }
@@ -469,7 +526,12 @@ impl Router {
         attachments: Option<Arc<AttachmentCache>>,
         contexts: Option<Arc<ContextRegistry>>,
         quote_resolver: Option<Arc<dyn QuoteResolver>>,
+        live: Option<Arc<LiveBridgeConfig>>,
     ) -> Result<RouterHandle, RouteError> {
+        let live = live
+            .unwrap_or_else(|| LiveBridgeConfig::from_runtime(policy.clone(), settings.clone()));
+        let _ = policy;
+        let settings = live.settings();
         if let Err(error) = settings.validate() {
             supervisor.shutdown().await?;
             return Err(error);
@@ -499,8 +561,7 @@ impl Router {
                 startup_cancel.clone(),
                 store,
                 tenant,
-                policy,
-                settings,
+                live,
                 Arc::clone(&active_turns),
                 supervisor,
                 sink,
@@ -728,29 +789,6 @@ struct RouterRetry {
     _queue_permit: OwnedSemaphorePermit,
 }
 
-struct ContextToolTask {
-    epoch: crate::codex::rpc::ConnectionEpoch,
-    shutdown: CancellationToken,
-    task: JoinHandle<()>,
-}
-
-impl ContextToolTask {
-    async fn stop(mut self, cleanup_timeout: Duration) {
-        self.shutdown.cancel();
-        if timeout(cleanup_timeout, &mut self.task).await.is_err() {
-            self.task.abort();
-            let _ = (&mut self.task).await;
-        }
-    }
-}
-
-impl Drop for ContextToolTask {
-    fn drop(&mut self) {
-        self.shutdown.cancel();
-        self.task.abort();
-    }
-}
-
 struct RouteFailure {
     error: RouteError,
     event: QueuedInboundEvent,
@@ -843,8 +881,7 @@ async fn run_router(
     startup_cancel: CancellationToken,
     store: StoreHandle,
     tenant: TenantNamespace,
-    policy: AccessPolicy,
-    settings: RouterSettings,
+    live: Arc<LiveBridgeConfig>,
     active_turns: Arc<Semaphore>,
     mut supervisor: SupervisorHandle,
     sink: Arc<dyn DurableReplySink>,
@@ -854,6 +891,7 @@ async fn run_router(
     adoption: Arc<ThreadAdoptionCoordinator>,
     snapshot: Arc<RwLock<RouterSnapshot>>,
 ) -> Result<(), RouteError> {
+    let settings = live.settings();
     let (supervisor_tx, supervisor_rx) = watch::channel(supervisor_access(&supervisor));
     let mut actors = HashMap::<String, ScopeActorHandle>::new();
     let retry_budget = Arc::new(Semaphore::new(ROUTER_RETRY_BYTE_BUDGET));
@@ -871,17 +909,10 @@ async fn run_router(
     // The startup round above replaces the interval's immediate first tick.
     stale_sweep.tick().await;
     let mut supervisor_open = true;
-    let mut tool_task = start_context_tool_task(
-        &supervisor,
-        attachments.as_ref(),
-        contexts.as_ref(),
-        settings.asr.clone(),
-    );
     if adoption.startup_fence().await.is_err() {
         let _ = startup_sender.send(Err(RouterStartupError::Adoption));
         let _ = adoption.shutdown_fence_and_reap().await;
         cleanup_router_startup(
-            tool_task,
             stale_sweep_task,
             supervisor,
             attachments.as_deref(),
@@ -910,7 +941,6 @@ async fn run_router(
         }
         let _ = adoption.shutdown_fence_and_reap().await;
         cleanup_router_startup(
-            tool_task,
             stale_sweep_task,
             supervisor,
             attachments.as_deref(),
@@ -936,7 +966,6 @@ async fn run_router(
         let _ = startup_sender.send(Err(error.clone()));
         let _ = adoption.shutdown_fence_and_reap().await;
         cleanup_router_startup(
-            tool_task,
             stale_sweep_task,
             supervisor,
             attachments.as_deref(),
@@ -948,7 +977,6 @@ async fn run_router(
     if startup_sender.send(Ok(())).is_err() {
         let _ = adoption.shutdown_fence_and_reap().await;
         cleanup_router_startup(
-            tool_task,
             stale_sweep_task,
             supervisor,
             attachments.as_deref(),
@@ -958,6 +986,8 @@ async fn run_router(
         return Ok(());
     }
     loop {
+        let policy = live.policy();
+        let settings = live.settings();
         tokio::select! {
             biased;
             () = startup_cancel.cancelled() => break,
@@ -980,22 +1010,7 @@ async fn run_router(
             state = supervisor.changed(), if supervisor_open => {
                 if state.is_ok() {
                     supervisor_tx.send_replace(supervisor_access(&supervisor));
-                    let current_epoch = supervisor.client().ok().map(|client| client.epoch());
-                    if tool_task.as_ref().map(|task| task.epoch) != current_epoch {
-                        if let Some(task) = tool_task.take() {
-                            task.stop(settings.shutdown_cleanup_timeout).await;
-                        }
-                        tool_task = start_context_tool_task(
-                            &supervisor,
-                            attachments.as_ref(),
-                            contexts.as_ref(),
-                            settings.asr.clone(),
-                        );
-                    }
                 } else {
-                    if let Some(task) = tool_task.take() {
-                        task.stop(settings.shutdown_cleanup_timeout).await;
-                    }
                     supervisor_open = false;
                     supervisor_tx.send_replace(SupervisorAccess {
                         epoch: 0,
@@ -1019,6 +1034,7 @@ async fn run_router(
                     contexts.as_ref(),
                     quote_resolver.as_ref(),
                     &adoption,
+                    &live,
                     &mut actors,
                 ).await;
                 update_runtime_snapshot(
@@ -1062,6 +1078,7 @@ async fn run_router(
                             contexts.as_ref(),
                             quote_resolver.as_ref(),
                             &adoption,
+                            &live,
                             &mut actors,
                             *event,
                         ).await {
@@ -1086,9 +1103,6 @@ async fn run_router(
                     }
                     RouterCommand::Shutdown { respond } => {
                         shutdown_actors(actors).await;
-                        if let Some(task) = tool_task.take() {
-                            task.stop(settings.shutdown_cleanup_timeout).await;
-                        }
                         finish_stale_sweep(stale_sweep_task).await;
                         let report = adoption.shutdown_fence_and_reap().await;
                         if report.failures != 0 {
@@ -1104,9 +1118,6 @@ async fn run_router(
         }
     }
     shutdown_actors(actors).await;
-    if let Some(task) = tool_task.take() {
-        task.stop(settings.shutdown_cleanup_timeout).await;
-    }
     finish_stale_sweep(stale_sweep_task).await;
     let report = adoption.shutdown_fence_and_reap().await;
     if report.failures != 0 {
@@ -1121,15 +1132,11 @@ async fn run_router(
 }
 
 async fn cleanup_router_startup(
-    tool_task: Option<ContextToolTask>,
     stale_sweep_task: Option<StaleSweepTask>,
     supervisor: SupervisorHandle,
     attachments: Option<&AttachmentCache>,
-    cleanup_timeout: Duration,
+    _cleanup_timeout: Duration,
 ) {
-    if let Some(task) = tool_task {
-        task.stop(cleanup_timeout).await;
-    }
     finish_stale_sweep(stale_sweep_task).await;
     let _ = supervisor.shutdown().await;
     let _ = reconcile_terminal_attachments(attachments).await;
@@ -1163,55 +1170,6 @@ async fn finish_stale_sweep(task: Option<StaleSweepTask>) {
     }
 }
 
-#[allow(clippy::ref_option, clippy::too_many_arguments)]
-fn start_context_tool_task(
-    supervisor: &SupervisorHandle,
-    attachments: Option<&Arc<AttachmentCache>>,
-    contexts: Option<&Arc<ContextRegistry>>,
-    asr: AsrSection,
-) -> Option<ContextToolTask> {
-    let attachments = attachments.map(Arc::clone)?;
-    let contexts = contexts.map(Arc::clone)?;
-    let client = supervisor.client().ok()?;
-    let epoch = client.epoch();
-    let mut events = client.take_control_events().ok()?;
-    let shutdown = CancellationToken::new();
-    let task_shutdown = shutdown.clone();
-    let task = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                biased;
-                () = task_shutdown.cancelled() => break,
-                event = events.recv() => {
-                    let Some(event) = event else { break };
-                    match event {
-                        ControlEvent::ServerRequest(request) => {
-                            handle_server_request(
-                                client.as_ref(),
-                                request,
-                                contexts.as_ref(),
-                                attachments.as_ref(),
-                                &asr,
-                                &task_shutdown,
-                            )
-                            .await;
-                        }
-                        ControlEvent::ConnectionClosed(_) => break,
-                        ControlEvent::ProtocolDrift
-                        | ControlEvent::UnknownNotification { .. }
-                        | ControlEvent::InvalidNotification { .. } => {}
-                    }
-                }
-            }
-        }
-    });
-    Some(ContextToolTask {
-        epoch,
-        shutdown,
-        task,
-    })
-}
-
 async fn reconcile_terminal_attachments(
     attachments: Option<&AttachmentCache>,
 ) -> Result<(), RouteError> {
@@ -1239,6 +1197,7 @@ async fn retry_one(
     contexts: Option<&Arc<ContextRegistry>>,
     quote_resolver: Option<&Arc<dyn QuoteResolver>>,
     adoption: &Arc<ThreadAdoptionCoordinator>,
+    live: &Arc<LiveBridgeConfig>,
     actors: &mut HashMap<String, ScopeActorHandle>,
 ) {
     let Some(mut retry) = retries.pop_front() else {
@@ -1256,6 +1215,7 @@ async fn retry_one(
         contexts,
         quote_resolver,
         adoption,
+        live,
         actors,
         retry.event,
     )
@@ -1286,6 +1246,7 @@ async fn route_one(
     contexts: Option<&Arc<ContextRegistry>>,
     quote_resolver: Option<&Arc<dyn QuoteResolver>>,
     adoption: &Arc<ThreadAdoptionCoordinator>,
+    live: &Arc<LiveBridgeConfig>,
     actors: &mut HashMap<String, ScopeActorHandle>,
     queued: QueuedInboundEvent,
 ) -> Result<(), Box<RouteFailure>> {
@@ -1304,11 +1265,12 @@ async fn route_one(
                 })
             });
     }
-    let control = adoption_control(&queued.event);
-    let decision = if control.is_some() {
-        policy.decide_command(&queued.event)
-    } else {
-        policy.decide(&queued.event)
+    let control = bridge_control(&queued.event);
+    let decision = match &control {
+        Some(ScopeControl::Command(command)) if command_requires_owner(command) => {
+            policy.decide_command(&queued.event)
+        }
+        Some(_) | None => policy.decide(&queued.event),
     };
     if let Some(kind) = decision.rejection_kind() {
         return reject_with_notice(store, sink.as_ref(), &key, &queued.event, kind)
@@ -1384,8 +1346,7 @@ async fn route_one(
             ScopeActorHandle::spawn(
                 queued.event.scope.clone(),
                 store.clone(),
-                policy.clone(),
-                settings.clone(),
+                Arc::clone(live),
                 supervisor.clone(),
                 active_turns,
                 Arc::clone(&sink),
@@ -1445,25 +1406,14 @@ fn is_conversation_media(message_type: &str) -> bool {
     matches!(message_type, "image" | "video" | "media" | "file" | "audio")
 }
 
-fn adoption_control(event: &crate::lark::normalize::InboundEvent) -> Option<ScopeControl> {
+fn bridge_control(event: &crate::lark::normalize::InboundEvent) -> Option<ScopeControl> {
     if event.message_type != "text" {
         return None;
     }
-    let trimmed = event.text.trim();
-    let name = trimmed
-        .split_once(char::is_whitespace)
-        .map_or(trimmed, |(name, _)| name);
-    if !matches!(name, "/threads" | "/adopt" | "/release") {
-        return None;
-    }
-    match parse_command(trimmed) {
-        Ok(Some(
-            command @ (BridgeCommand::Threads { .. }
-            | BridgeCommand::Adopt { .. }
-            | BridgeCommand::Release),
-        )) => Some(ScopeControl::Command(command)),
+    match parse_command(event.text.trim()) {
+        Ok(Some(command)) => Some(ScopeControl::Command(command)),
         Err(error) => Some(ScopeControl::Malformed(error)),
-        Ok(None | Some(_)) => None,
+        Ok(None) => None,
     }
 }
 
@@ -1651,34 +1601,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_adoption_slash_commands_are_intercepted() {
+    async fn first_stage_slash_commands_are_intercepted() {
         let mut event = queued("command-recognition").await.event;
 
-        for ordinary in ["/unknown value", "/new", "/new unexpected", "/help"] {
-            event.text = ordinary.to_owned();
-            assert!(
-                adoption_control(&event).is_none(),
-                "non-adoption slash text must remain ordinary input"
-            );
-        }
+        event.text = "/unknown value".to_owned();
+        assert!(
+            bridge_control(&event).is_none(),
+            "unknown slash text must remain ordinary input"
+        );
 
+        event.text = "/new".to_owned();
+        assert!(matches!(
+            bridge_control(&event),
+            Some(ScopeControl::Command(BridgeCommand::New))
+        ));
+        event.text = "/help".to_owned();
+        assert!(matches!(
+            bridge_control(&event),
+            Some(ScopeControl::Command(BridgeCommand::Help))
+        ));
+        event.text = "/resume".to_owned();
+        assert!(matches!(
+            bridge_control(&event),
+            Some(ScopeControl::Command(BridgeCommand::Resume {
+                selector: None
+            }))
+        ));
         event.text = "/threads".to_owned();
         assert!(matches!(
-            adoption_control(&event),
+            bridge_control(&event),
             Some(ScopeControl::Command(BridgeCommand::Threads {
                 cursor: None
             }))
         ));
         event.text = "/adopt selected-without-handoff".to_owned();
         assert!(matches!(
-            adoption_control(&event),
+            bridge_control(&event),
             Some(ScopeControl::Malformed(
                 crate::runtime::commands::CommandParseError::HandoffConfirmationRequired
             ))
         ));
         event.text = "/release unexpected".to_owned();
         assert!(matches!(
-            adoption_control(&event),
+            bridge_control(&event),
             Some(ScopeControl::Malformed(_))
         ));
     }

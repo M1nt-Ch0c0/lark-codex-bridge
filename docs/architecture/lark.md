@@ -71,15 +71,15 @@ Transport 广播连接状态供 outbox 判断是否可发送。断线时：
 
 ## Card ingress
 
-目前 `MessageType::Card` 被 ACK 为 unsupported。加入 callback 时必须先建立：
+`card.action.trigger` 已进入 normalizer：只接受白名单 `value.cmd`（以及 `/config` 表单的
+`form_value`），合成一条普通 slash command 后再走 durable intake。无法识别的回调 ACK 后忽略。
+
+继续扩卡片时仍须保持：
 
 - payload shape 和大小上限；
-- HMAC/nonce/expiry；
-- sender/scope/policy fingerprint 绑定；
-- 重放拒绝；
-- 到 runtime control queue 的单一入口。
-
-不能直接把任意 card value 当成 slash command。
+- sender/scope 来自飞书 callback context，不信任卡片正文里的 chat id；
+- 重放依赖 durable event_id 去重；
+- 到 runtime 的入口只有这条合成命令，不能把任意 card value 直接当命令执行。
 
 ## 推荐测试
 

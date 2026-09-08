@@ -935,6 +935,7 @@ impl AttachmentCache {
     ///
     /// Dynamic tool cancellation uses this narrower boundary so concurrent
     /// reads owned by the same turn keep their independent leases.
+    #[allow(dead_code)]
     pub(crate) async fn release_lease(&self, lease_token: &str) -> Result<bool, AttachError> {
         self.store
             .release_attachment_lease(lease_token)

@@ -455,6 +455,14 @@ pub const PENDING_MEDIA_MAX_METADATA_BYTES: usize = 256 * 1024;
 pub const QUOTE_CONTENT_MAX_BYTES: usize = 256 * 1024;
 /// Maximum typed parts accepted from one directly quoted message.
 pub const QUOTE_MAX_PARTS: usize = 16;
+/// Maximum upstream topic messages injected on first engagement.
+pub const TOPIC_CONTEXT_MAX_MESSAGES: usize = 40;
+/// Maximum items retained from one merge-forward expansion.
+pub const FORWARD_EXPAND_MAX_ITEMS: usize = 16;
+/// Maximum nested merge-forward hops (parent + one child level).
+pub const FORWARD_EXPAND_MAX_DEPTH: usize = 2;
+/// Maximum MCP server or skill names shown on the inventory card.
+pub const INVENTORY_MAX_ENTRIES: usize = 32;
 
 /// Maximum characters (Unicode scalar values) in one projected reply message
 /// before deterministic splitting. A part never exceeds this bound.
@@ -465,9 +473,10 @@ pub const REPLY_MAX_SPLITS: usize = 8;
 /// Deterministic truncation marker appended to the final split part.
 pub const REPLY_TRUNCATION_MARKER: &str = "…[truncated]";
 /// Minimum interval between two progress upserts of the same turn.
-pub const REPLY_UPDATE_MIN_INTERVAL: Duration = Duration::from_millis(1500);
-/// Minimum newly accumulated characters before the next progress upsert.
-pub const REPLY_UPDATE_MIN_CHARS: usize = 200;
+pub const REPLY_UPDATE_MIN_INTERVAL: Duration = Duration::from_millis(400);
+/// Minimum newly accumulated characters before a later progress upsert.
+/// The first visible card is emitted as soon as any text exists.
+pub const REPLY_UPDATE_MIN_CHARS: usize = 40;
 
 /// Base delay of the outbox pump's deterministic exponential backoff.
 pub const OUTBOX_RETRY_BASE: Duration = Duration::from_millis(500);

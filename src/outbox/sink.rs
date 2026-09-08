@@ -12,9 +12,10 @@ use futures_util::future::BoxFuture;
 use super::payload::OutboxOperation;
 use crate::lark::normalize::InboundEvent;
 use crate::limits::REPLY_MESSAGE_MAX_CHARS;
+use crate::render::RunCardPhase;
 use crate::render::{ProjectedReply, ReplyProjector, render_lark_markdown};
 use crate::runtime::scope::{
-    DurableReplySink, ReplySinkError, TurnFinalization, TurnProgress, TurnSource,
+    DurableReplySink, ReplySinkError, TurnFailureKind, TurnFinalization, TurnProgress, TurnSource,
 };
 use crate::store::{
     InboundKey, InboundRejectionKind, NewOutboxRow, StoreError, StoreHandle, TurnResolution,
@@ -77,6 +78,27 @@ impl DurableReplySink for OutboxReplySink {
             message_id: event.message_id.clone(),
             thread_id: event.thread_id.clone(),
             text: text.to_owned(),
+        };
+        let payload_json = operation.encode().map_err(|_| ReplySinkError::Invariant)?;
+        Ok(NewOutboxRow {
+            idempotency_key: key.control_outbox_idempotency_key(),
+            scope_key: event.scope.to_string(),
+            kind: "control".to_owned(),
+            payload_json,
+            next_retry_ms: 0,
+        })
+    }
+
+    fn control_card(
+        &self,
+        key: &InboundKey,
+        event: &InboundEvent,
+        spec: &crate::render::InteractiveCardSpec,
+    ) -> Result<NewOutboxRow, ReplySinkError> {
+        let operation = OutboxOperation::ReplyInteractiveCard {
+            message_id: event.message_id.clone(),
+            thread_id: event.thread_id.clone(),
+            spec: spec.clone(),
         };
         let payload_json = operation.encode().map_err(|_| ReplySinkError::Invariant)?;
         Ok(NewOutboxRow {
@@ -167,9 +189,9 @@ fn build_projected_finalization_rows(
             ProjectedReply::ProgressFinal { text } => progress_final_rows(turn, &text),
             ProjectedReply::Empty => Ok(Vec::new()),
         },
-        TurnResolution::Failed => notice_rows(turn, FAILED_TEXT),
-        TurnResolution::Interrupted => notice_rows(turn, INTERRUPTED_TEXT),
-        TurnResolution::Uncertain => notice_rows(turn, UNCERTAIN_TEXT),
+        TurnResolution::Failed | TurnResolution::Interrupted | TurnResolution::Uncertain => {
+            terminal_notice_rows(turn, reply)
+        }
     }
 }
 
@@ -197,9 +219,9 @@ fn build_finalization_rows(
                 ProjectedReply::Empty => Ok(Vec::new()),
             }
         }
-        TurnResolution::Failed => notice_rows(turn, FAILED_TEXT),
-        TurnResolution::Interrupted => notice_rows(turn, INTERRUPTED_TEXT),
-        TurnResolution::Uncertain => notice_rows(turn, UNCERTAIN_TEXT),
+        TurnResolution::Failed | TurnResolution::Interrupted | TurnResolution::Uncertain => {
+            notice_rows(turn, notice_for(turn))
+        }
     }
 }
 
@@ -217,6 +239,7 @@ fn progress_final_rows(
         thread_id: source.thread_id.clone(),
         text: text.to_owned(),
         fallback_markdown: nonempty_fallback_markdown(text),
+        phase: RunCardPhase::Done,
     };
     Ok(vec![NewOutboxRow {
         idempotency_key: format!("{anchor_key}:final"),
@@ -322,6 +345,72 @@ fn map_store_error(error: &StoreError) -> ReplySinkError {
 const FAILED_TEXT: &str = "任务执行失败";
 const INTERRUPTED_TEXT: &str = "任务已中断";
 const UNCERTAIN_TEXT: &str = "任务执行结果未知，请重新发起";
+
+fn notice_for(turn: &TurnFinalization) -> &'static str {
+    match turn.failure {
+        Some(kind) => kind.notice(),
+        None => match turn.resolution {
+            TurnResolution::Interrupted => INTERRUPTED_TEXT,
+            TurnResolution::Uncertain => UNCERTAIN_TEXT,
+            TurnResolution::Failed | TurnResolution::Completed => FAILED_TEXT,
+        },
+    }
+}
+
+fn terminal_phase(turn: &TurnFinalization) -> RunCardPhase {
+    match turn.failure.unwrap_or(TurnFailureKind::TurnFailed) {
+        TurnFailureKind::Interrupted => RunCardPhase::Interrupted,
+        TurnFailureKind::ConnectionLost
+        | TurnFailureKind::Attachment
+        | TurnFailureKind::Workspace
+        | TurnFailureKind::TurnStartRejected
+        | TurnFailureKind::TurnFailed => RunCardPhase::Failed,
+    }
+}
+
+fn terminal_notice_rows(
+    turn: &TurnFinalization,
+    reply: ProjectedReply,
+) -> Result<Vec<NewOutboxRow>, ReplySinkError> {
+    let notice = notice_for(turn);
+    match reply {
+        ProjectedReply::ProgressFinal { text } => {
+            let body = if text.trim().is_empty() {
+                notice.to_owned()
+            } else {
+                format!("{text}\n\n---\n{notice}")
+            };
+            progress_notice_rows(turn, &body, notice)
+        }
+        ProjectedReply::Final { .. } | ProjectedReply::Empty => notice_rows(turn, notice),
+    }
+}
+
+fn progress_notice_rows(
+    turn: &TurnFinalization,
+    text: &str,
+    fallback: &str,
+) -> Result<Vec<NewOutboxRow>, ReplySinkError> {
+    let Some(source) = turn.sources.last() else {
+        return Ok(Vec::new());
+    };
+    let anchor_key = format!("{}:progress", turn.turn_row_id);
+    let operation = OutboxOperation::FinalizeProgressCard {
+        anchor_key: anchor_key.clone(),
+        message_id: source.message_id.clone(),
+        thread_id: source.thread_id.clone(),
+        text: text.to_owned(),
+        fallback_markdown: nonempty_fallback_markdown(fallback),
+        phase: terminal_phase(turn),
+    };
+    Ok(vec![NewOutboxRow {
+        idempotency_key: format!("{anchor_key}:final"),
+        scope_key: turn.scope_key.clone(),
+        kind: "final".to_owned(),
+        payload_json: operation.encode().map_err(|_| ReplySinkError::Invariant)?,
+        next_retry_ms: 0,
+    }])
+}
 
 fn rejection_text(reason: InboundRejectionKind) -> &'static str {
     match reason {

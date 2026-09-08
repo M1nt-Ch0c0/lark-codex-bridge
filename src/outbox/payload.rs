@@ -45,6 +45,15 @@ pub enum OutboxOperation {
         /// Deterministic Lark-subset Markdown.
         markdown: String,
     },
+    /// Reply with a Card 2.0 command/status surface.
+    ReplyInteractiveCard {
+        /// Target parent message ID.
+        message_id: String,
+        /// Topic thread ID when the reply belongs to a thread.
+        thread_id: Option<String>,
+        /// Durable card spec rendered by the pump.
+        spec: crate::render::InteractiveCardSpec,
+    },
     /// Creates the first visible progress card for a turn.
     ReplyProgressCard {
         /// Target parent message ID.
@@ -75,6 +84,8 @@ pub enum OutboxOperation {
         /// Platform-projected Markdown used only if the initial card failed
         /// permanently and a standalone final must be sent instead.
         fallback_markdown: String,
+        /// Terminal visual phase. Absent rows default to `Done`.
+        phase: crate::render::RunCardPhase,
     },
 }
 
@@ -111,6 +122,18 @@ impl fmt::Debug for OutboxOperation {
                 .field("in_thread", &thread_id.is_some())
                 .field("markdown_chars", &markdown.chars().count())
                 .finish_non_exhaustive(),
+            Self::ReplyInteractiveCard {
+                message_id,
+                thread_id,
+                spec,
+            } => formatter
+                .debug_struct("ReplyInteractiveCard")
+                .field("message_id_len", &message_id.len())
+                .field("in_thread", &thread_id.is_some())
+                .field("title_chars", &spec.title.chars().count())
+                .field("body_chars", &spec.body.chars().count())
+                .field("action_count", &spec.actions.len())
+                .finish_non_exhaustive(),
             Self::UpdateProgressCard { anchor_key, text } => formatter
                 .debug_struct("UpdateProgressCard")
                 .field("anchor_key_len", &anchor_key.len())
@@ -122,6 +145,7 @@ impl fmt::Debug for OutboxOperation {
                 thread_id,
                 text,
                 fallback_markdown,
+                phase,
             } => formatter
                 .debug_struct("FinalizeProgressCard")
                 .field("anchor_key_len", &anchor_key.len())
@@ -132,6 +156,7 @@ impl fmt::Debug for OutboxOperation {
                     "fallback_markdown_chars",
                     &fallback_markdown.chars().count(),
                 )
+                .field("phase", phase)
                 .finish_non_exhaustive(),
         }
     }
@@ -192,6 +217,13 @@ impl OutboxOperation {
     /// Returns [`OutboxError::Serialize`] if the operation cannot be encoded,
     /// or [`OutboxError::PayloadTooLarge`] when the result exceeds the cap.
     pub fn encode(&self) -> Result<String, OutboxError> {
+        if let Self::FinalizeProgressCard { phase, .. } = self {
+            if matches!(phase, crate::render::RunCardPhase::Running) {
+                return Err(OutboxError::Invalid {
+                    context: "running phase cannot finalize a progress card",
+                });
+            }
+        }
         let dto = PayloadV2::from(self);
         let json = serde_json::to_string(&dto).map_err(|_| OutboxError::Serialize)?;
         if json.len() > STORE_OUTBOX_PAYLOAD_MAX_BYTES {
@@ -249,6 +281,7 @@ fn decode_v1(dto: PayloadV1) -> Result<OutboxOperation, OutboxError> {
             anchor_key: dto.anchor_key,
             text: dto.text,
             fallback_markdown: None,
+            phase: None,
         }),
         "update_progress_card" => decode_progress_update(PayloadV2 {
             version: OUTBOX_PAYLOAD_VERSION,
@@ -258,6 +291,7 @@ fn decode_v1(dto: PayloadV1) -> Result<OutboxOperation, OutboxError> {
             anchor_key: dto.anchor_key,
             text: dto.text,
             fallback_markdown: None,
+            phase: None,
         }),
         "finalize_progress_card" => {
             let fallback_markdown = legacy_fallback_markdown(&dto.text);
@@ -269,6 +303,7 @@ fn decode_v1(dto: PayloadV1) -> Result<OutboxOperation, OutboxError> {
                 anchor_key: dto.anchor_key,
                 text: dto.text,
                 fallback_markdown: Some(fallback_markdown),
+                phase: None,
             })
         }
         _ => Err(OutboxError::UnknownOperation),
@@ -279,7 +314,9 @@ fn decode_v2(dto: PayloadV2) -> Result<OutboxOperation, OutboxError> {
     debug_assert_eq!(dto.version, OUTBOX_PAYLOAD_VERSION);
     let operation = dto.op.clone();
     match operation.as_str() {
-        "reply_text" | "reply_markdown_post" | "reply_progress_card" => decode_reply(dto),
+        "reply_text" | "reply_markdown_post" | "reply_interactive_card" | "reply_progress_card" => {
+            decode_reply(dto)
+        }
         "update_progress_card" => decode_progress_update(dto),
         "finalize_progress_card" => decode_progress_finalization(dto),
         _ => Err(OutboxError::UnknownOperation),
@@ -292,7 +329,11 @@ fn decode_reply(dto: PayloadV2) -> Result<OutboxOperation, OutboxError> {
             context: "empty reply message_id",
         });
     };
-    if message_id.is_empty() || dto.anchor_key.is_some() || dto.fallback_markdown.is_some() {
+    if message_id.is_empty()
+        || dto.anchor_key.is_some()
+        || dto.fallback_markdown.is_some()
+        || dto.phase.is_some()
+    {
         return Err(OutboxError::Invalid {
             context: "invalid reply target",
         });
@@ -314,6 +355,14 @@ fn decode_reply(dto: PayloadV2) -> Result<OutboxOperation, OutboxError> {
             thread_id: dto.thread_id,
             markdown: dto.text,
         }),
+        "reply_interactive_card" => {
+            let spec = serde_json::from_str(&dto.text).map_err(|_| OutboxError::Deserialize)?;
+            Ok(OutboxOperation::ReplyInteractiveCard {
+                message_id,
+                thread_id: dto.thread_id,
+                spec,
+            })
+        }
         "reply_progress_card" => Ok(OutboxOperation::ReplyProgressCard {
             message_id,
             thread_id: dto.thread_id,
@@ -333,6 +382,7 @@ fn decode_progress_update(dto: PayloadV2) -> Result<OutboxOperation, OutboxError
         || dto.message_id.is_some()
         || dto.thread_id.is_some()
         || dto.fallback_markdown.is_some()
+        || dto.phase.is_some()
         || dto.text.is_empty()
     {
         return Err(OutboxError::Invalid {
@@ -370,7 +420,22 @@ fn decode_progress_finalization(dto: PayloadV2) -> Result<OutboxOperation, Outbo
         thread_id: dto.thread_id,
         text: dto.text,
         fallback_markdown,
+        phase: dto
+            .phase
+            .as_deref()
+            .map_or(Ok(crate::render::RunCardPhase::Done), parse_run_phase)?,
     })
+}
+
+fn parse_run_phase(value: &str) -> Result<crate::render::RunCardPhase, OutboxError> {
+    match value {
+        "done" => Ok(crate::render::RunCardPhase::Done),
+        "failed" => Ok(crate::render::RunCardPhase::Failed),
+        "interrupted" => Ok(crate::render::RunCardPhase::Interrupted),
+        _ => Err(OutboxError::Invalid {
+            context: "invalid progress finalization phase",
+        }),
+    }
 }
 
 fn legacy_fallback_markdown(text: &str) -> String {
@@ -428,6 +493,8 @@ struct PayloadV2 {
     text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fallback_markdown: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    phase: Option<String>,
 }
 
 impl From<&OutboxOperation> for PayloadV2 {
@@ -445,6 +512,7 @@ impl From<&OutboxOperation> for PayloadV2 {
                 anchor_key: None,
                 text: text.clone(),
                 fallback_markdown: None,
+                phase: None,
             },
             OutboxOperation::ReplyMarkdownPost {
                 message_id,
@@ -458,6 +526,21 @@ impl From<&OutboxOperation> for PayloadV2 {
                 anchor_key: None,
                 text: markdown.clone(),
                 fallback_markdown: None,
+                phase: None,
+            },
+            OutboxOperation::ReplyInteractiveCard {
+                message_id,
+                thread_id,
+                spec,
+            } => Self {
+                version: OUTBOX_PAYLOAD_VERSION,
+                op: "reply_interactive_card".to_owned(),
+                message_id: Some(message_id.clone()),
+                thread_id: thread_id.clone(),
+                anchor_key: None,
+                text: serde_json::to_string(spec).unwrap_or_else(|_| "{}".to_owned()),
+                fallback_markdown: None,
+                phase: None,
             },
             OutboxOperation::ReplyProgressCard {
                 message_id,
@@ -471,6 +554,7 @@ impl From<&OutboxOperation> for PayloadV2 {
                 anchor_key: None,
                 text: text.clone(),
                 fallback_markdown: None,
+                phase: None,
             },
             OutboxOperation::UpdateProgressCard { anchor_key, text } => Self {
                 version: OUTBOX_PAYLOAD_VERSION,
@@ -480,6 +564,7 @@ impl From<&OutboxOperation> for PayloadV2 {
                 anchor_key: Some(anchor_key.clone()),
                 text: text.clone(),
                 fallback_markdown: None,
+                phase: None,
             },
             OutboxOperation::FinalizeProgressCard {
                 anchor_key,
@@ -487,6 +572,7 @@ impl From<&OutboxOperation> for PayloadV2 {
                 thread_id,
                 text,
                 fallback_markdown,
+                phase,
             } => Self {
                 version: OUTBOX_PAYLOAD_VERSION,
                 op: "finalize_progress_card".to_owned(),
@@ -495,6 +581,12 @@ impl From<&OutboxOperation> for PayloadV2 {
                 anchor_key: Some(anchor_key.clone()),
                 text: text.clone(),
                 fallback_markdown: Some(fallback_markdown.clone()),
+                phase: match phase {
+                    crate::render::RunCardPhase::Done => None,
+                    crate::render::RunCardPhase::Failed => Some("failed".to_owned()),
+                    crate::render::RunCardPhase::Interrupted => Some("interrupted".to_owned()),
+                    crate::render::RunCardPhase::Running => Some("done".to_owned()),
+                },
             },
         }
     }

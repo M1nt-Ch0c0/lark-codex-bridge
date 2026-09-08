@@ -70,7 +70,7 @@ policy 执行。
 
 ## 当前限制
 
-- card action 目前返回 unsupported，不进入 runtime；
-- 引用正文、merge-forward 和完整话题历史尚未注入 Codex；
+- 已识别的 `card.action.trigger` 会合成 slash command 进入 runtime；无法识别的回调只 ACK；
+- 引用正文、合并转发和话题首次介入的最近上文会注入 Codex；不会递归整段聊天历史；
 - 文档评论入口尚未实现；
 - 真实 Lark smoke 必须显式启用，普通测试中的 skip 不是通过证据。

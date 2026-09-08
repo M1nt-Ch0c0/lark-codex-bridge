@@ -137,6 +137,17 @@ impl fmt::Debug for CodexBackendConfig {
 }
 
 impl CodexBackendConfig {
+    /// Configured Codex home for inventory scans. External endpoints have none.
+    #[must_use]
+    pub fn configured_codex_home(&self) -> Option<&std::path::Path> {
+        match self {
+            Self::SpawnedStdio { codex_home, .. } | Self::ProtocolSidecar { codex_home, .. } => {
+                codex_home.as_deref()
+            }
+            Self::ExternalEndpoint { .. } => None,
+        }
+    }
+
     /// Returns a process configuration only for the explicitly tagged process-owning mode.
     #[must_use]
     pub fn spawned_process_config(&self) -> Option<CodexProcessConfig> {

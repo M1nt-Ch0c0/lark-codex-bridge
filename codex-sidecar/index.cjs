@@ -171,11 +171,17 @@ async function main(options = {}) {
 if (require.main === module) {
   main().then(
     (code) => {
+      if (code !== 0) {
+        // Fail-closed paths must not linger on leftover stdout writes or
+        // upstream iterators; CI pipes on macOS/Windows stay full when the
+        // consumer is waiting on stderr instead of draining stdout.
+        process.exit(code);
+      }
       process.exitCode = code;
     },
     () => {
       process.stderr.write("codex_sidecar_failure code=sidecar_failed\n");
-      process.exitCode = 1;
+      process.exit(1);
     },
   );
 }

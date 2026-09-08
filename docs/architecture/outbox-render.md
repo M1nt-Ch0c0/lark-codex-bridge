@@ -70,6 +70,13 @@ pump 停止时：
 - 不会增加无实际发送的 attempt；
 - store 在 pump join 后关闭。
 
+## 交互卡
+
+`src/render/card.rs` 负责 Card 2.0 模板：运行中进度卡、`/help` `/status` `/info` `/config`
+以及 `/new` `/cd` `/resume`。规格先以 `InteractiveCardSpec` 写入 outbox，pump 再渲染。
+没有副标题时不要序列化 `subtitle: null`。失败终态把同一张进度卡改成红/橙，并带上
+`TurnFailureKind` 的稳定中文分类。
+
 ## 推荐测试
 
 - `tests/reply_projector.rs`：纯投影契约；

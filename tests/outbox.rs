@@ -30,7 +30,7 @@ use lark_codex_bridge::outbox::{
 use lark_codex_bridge::render::{ProjectedReply, card_markdown_element_wire_len};
 use lark_codex_bridge::runtime::intake::TenantNamespace;
 use lark_codex_bridge::runtime::scope::{
-    DurableReplySink, ReplySinkError, TurnFinalization, TurnProgress, TurnSource,
+    DurableReplySink, ReplySinkError, TurnFailureKind, TurnFinalization, TurnProgress, TurnSource,
 };
 use lark_codex_bridge::store::{
     InboundKey, InboundRejectionKind, NewOutboxRow, OutboxEnqueue, OutboxState, StoreHandle,
@@ -130,10 +130,24 @@ fn card_markdown(request: &RecordedRequest) -> String {
         .expect("card request should carry a content string");
     let card: serde_json::Value =
         serde_json::from_str(content).expect("card content should be JSON");
-    card["body"]["elements"][0]["content"]
-        .as_str()
+    card["body"]["elements"]
+        .as_array()
+        .expect("card should carry elements")
+        .iter()
+        .filter(|element| element["tag"] == "markdown")
+        .filter(|element| element["text_size"] != "notation")
+        .find_map(|element| element["content"].as_str())
         .expect("card should carry Markdown")
         .to_owned()
+}
+
+fn card_json(request: &RecordedRequest) -> serde_json::Value {
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&request.body).expect("card request should be JSON");
+    let content = envelope["content"]
+        .as_str()
+        .expect("card request should carry a content string");
+    serde_json::from_str(content).expect("card content should be JSON")
 }
 
 fn card_fences_are_balanced(markdown: &str) -> bool {
@@ -234,6 +248,7 @@ fn completed_finalization(turn_row_id: i64, text: &str) -> TurnFinalization {
             completed_items: vec![agent(text, Some(MessagePhase::FinalAnswer))],
             token_usage: None,
         }),
+        failure: None,
     }
 }
 
@@ -381,6 +396,19 @@ fn markdown_post_payload_roundtrips_without_losing_its_semantic_type() {
 }
 
 #[test]
+fn interactive_card_payload_roundtrips_the_durable_spec() {
+    let operation = OutboxOperation::ReplyInteractiveCard {
+        message_id: "om_parent".to_owned(),
+        thread_id: None,
+        spec: lark_codex_bridge::render::help_card(),
+    };
+    let json = operation.encode().expect("encode");
+    assert!(json.contains("\"op\":\"reply_interactive_card\""));
+    assert_eq!(OutboxOperation::decode(&json).expect("decode"), operation);
+    assert!(!format!("{operation:?}").contains("/new"));
+}
+
+#[test]
 fn payload_rejects_unknown_fields() {
     let json = r#"{"version":2,"op":"reply_text","message_id":"m","text":"t","bogus":1}"#;
     assert!(matches!(
@@ -466,6 +494,22 @@ fn payload_rejects_oversize_input() {
     assert!(matches!(
         operation.encode(),
         Err(OutboxError::PayloadTooLarge { .. })
+    ));
+}
+
+#[test]
+fn payload_rejects_running_progress_finalization() {
+    let operation = OutboxOperation::FinalizeProgressCard {
+        anchor_key: "11:progress".to_owned(),
+        message_id: "om_parent".to_owned(),
+        thread_id: None,
+        text: "still running".to_owned(),
+        fallback_markdown: "still running".to_owned(),
+        phase: lark_codex_bridge::render::RunCardPhase::Running,
+    };
+    assert!(matches!(
+        operation.encode(),
+        Err(OutboxError::Invalid { context }) if context.contains("running")
     ));
 }
 
@@ -723,34 +767,30 @@ async fn progress_cards_are_created_updated_and_finalized_through_the_outbox() {
         card_markdown(&requests[2]),
         "working\n```rust\nlet x = 1;\nlet y = 2;\n```"
     );
-    let initial_card = serde_json::to_string(&serde_json::json!({
-        "schema": "2.0",
-        "body": {"elements": [{
-            "tag": "markdown",
-            "content": "working\n```rust\nlet x = 1;\n```",
-        }]},
-    }))
-    .expect("initial Card2");
-    let final_card = serde_json::to_string(&serde_json::json!({
-        "schema": "2.0",
-        "body": {"elements": [{
-            "tag": "markdown",
-            "content": "working\n```rust\nlet x = 1;\nlet y = 2;\n```",
-        }]},
-    }))
-    .expect("final Card2");
-    let create_body: serde_json::Value =
-        serde_json::from_slice(&requests[0].body).expect("Card2 create body");
-    let update_body: serde_json::Value =
-        serde_json::from_slice(&requests[1].body).expect("Card2 update body");
-    let final_body: serde_json::Value =
-        serde_json::from_slice(&requests[2].body).expect("Card2 final body");
-    assert_eq!(
-        create_body,
-        serde_json::json!({"msg_type": "interactive", "content": initial_card})
+    let create_card = card_json(&requests[0]);
+    let update_card = card_json(&requests[1]);
+    let final_card = card_json(&requests[2]);
+    assert_eq!(create_card["header"]["title"]["content"], "Codex 正在回答");
+    assert_eq!(create_card["header"]["template"], "blue");
+    assert!(
+        create_card["body"]["elements"]
+            .as_array()
+            .expect("running card elements")
+            .iter()
+            .any(|element| element["tag"] == "button"
+                && element["behaviors"][0]["value"]["cmd"] == "stop")
     );
-    assert_eq!(update_body, serde_json::json!({"content": final_card}));
-    assert_eq!(final_body, serde_json::json!({"content": final_card}));
+    assert_eq!(update_card["header"]["title"]["content"], "Codex 正在回答");
+    assert_eq!(final_card["header"]["title"]["content"], "Codex 已完成");
+    assert_eq!(final_card["header"]["template"], "green");
+    assert!(
+        !final_card["body"]["elements"]
+            .as_array()
+            .expect("final card elements")
+            .iter()
+            .any(|element| element["tag"] == "button"),
+        "finished cards drop the stop button"
+    );
 
     pump.shutdown().await;
 }
@@ -1206,6 +1246,7 @@ async fn same_scope_cross_turn_progress_anchor_is_rejected_before_patch() {
         thread_id: None,
         text: "wrong turn final".to_owned(),
         fallback_markdown: "wrong turn final".to_owned(),
+        phase: lark_codex_bridge::render::RunCardPhase::Done,
     };
     let bad_final_id = match store
         .enqueue_outbox(NewOutboxRow {
@@ -1292,6 +1333,7 @@ async fn uncertain_finalization_enqueues_a_deterministic_notice() {
         sources: vec![source("evt_1", "om_parent")],
         resolution: TurnResolution::Uncertain,
         outcome: None,
+        failure: None,
     };
 
     sink.finalize(turn).await.expect("finalize");
@@ -1383,6 +1425,7 @@ async fn final_rows_reply_only_to_the_last_source_bounded_by_parts() {
             completed_items: vec![agent(&text, Some(MessagePhase::FinalAnswer))],
             token_usage: None,
         }),
+        failure: None,
     };
 
     sink.finalize(turn).await.expect("finalize");
@@ -1426,6 +1469,7 @@ async fn empty_sources_produce_no_rows() {
             completed_items: vec![agent("the answer", Some(MessagePhase::FinalAnswer))],
             token_usage: None,
         }),
+        failure: None,
     };
     sink.finalize(completed).await.expect("finalize");
     assert_eq!(store.outbox_depth().await.expect("depth").pending, 0);
@@ -1436,6 +1480,7 @@ async fn empty_sources_produce_no_rows() {
         sources: vec![],
         resolution: TurnResolution::Uncertain,
         outcome: None,
+        failure: None,
     };
     sink.finalize(uncertain).await.expect("finalize");
     assert_eq!(store.outbox_depth().await.expect("depth").pending, 0);
@@ -1451,6 +1496,7 @@ async fn notice_rows_reply_only_to_the_last_source() {
         sources: many_sources(64),
         resolution: TurnResolution::Uncertain,
         outcome: None,
+        failure: None,
     };
 
     sink.finalize(turn).await.expect("finalize");
@@ -1466,6 +1512,29 @@ async fn notice_rows_reply_only_to_the_last_source() {
             assert_eq!(message_id, "om_63", "the notice targets the last source");
         }
         _ => panic!("expected a text notice"),
+    }
+}
+
+#[tokio::test]
+async fn failed_notice_uses_stable_failure_category() {
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let sink = OutboxReplySink::new(store.clone());
+    let turn = TurnFinalization {
+        turn_row_id: 8,
+        scope_key: "im:oc_chat".to_owned(),
+        sources: vec![source("evt_1", "om_parent")],
+        resolution: TurnResolution::Failed,
+        outcome: None,
+        failure: Some(TurnFailureKind::TurnStartRejected),
+    };
+    sink.finalize(turn).await.expect("finalize");
+    let row = store.outbox_row(1).await.expect("row").expect("exists");
+    let decoded = OutboxOperation::decode(&row.payload_json).expect("decode");
+    match decoded {
+        OutboxOperation::ReplyText { text, .. } => {
+            assert_eq!(text, "任务未能启动（模型或请求被拒绝）");
+        }
+        _ => panic!("expected a categorized text notice"),
     }
 }
 

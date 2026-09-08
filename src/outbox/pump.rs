@@ -13,7 +13,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -28,7 +28,7 @@ use crate::limits::{
     OUTBOX_RETRY_MAX, OUTBOX_SWEEP_BATCH, OUTBOX_SWEEP_INTERVAL, OUTBOX_TERMINAL_RETENTION_MS,
     STORE_OUTBOX_CLAIM_MAX_BATCH, STORE_OUTBOX_MAX_ATTEMPTS, STORE_RECEIPT_WRITE_ATTEMPTS,
 };
-use crate::render::stabilize_streaming_markdown;
+use crate::render::{RunCardPhase, render_interactive_card, render_run_card};
 use crate::store::{OutboxDepth, OutboxRow, OutboxState, StoreError, StoreHandle, now_ms};
 
 /// How one failed send must be handled.
@@ -548,6 +548,7 @@ const fn operation_kind(operation: &OutboxOperation) -> &'static str {
     match operation {
         OutboxOperation::ReplyText { .. } => "reply_text",
         OutboxOperation::ReplyMarkdownPost { .. } => "reply_markdown_post",
+        OutboxOperation::ReplyInteractiveCard { .. } => "reply_interactive_card",
         OutboxOperation::ReplyProgressCard { .. } => "reply_progress_card",
         OutboxOperation::UpdateProgressCard { .. } => "update_progress_card",
         OutboxOperation::FinalizeProgressCard { .. } => "finalize_progress_card",
@@ -592,6 +593,21 @@ async fn send(
             )
             .await
         }
+        OutboxOperation::ReplyInteractiveCard {
+            message_id,
+            thread_id,
+            spec,
+        } => {
+            deliver(
+                delivery,
+                OutboundRequest::ReplyCard {
+                    message_id: message_id.clone(),
+                    in_thread: thread_id.is_some(),
+                    card: render_interactive_card(spec),
+                },
+            )
+            .await
+        }
         OutboxOperation::ReplyProgressCard {
             message_id,
             thread_id,
@@ -602,7 +618,7 @@ async fn send(
                 OutboundRequest::ReplyCard {
                     message_id: message_id.clone(),
                     in_thread: thread_id.is_some(),
-                    card: progress_card(text),
+                    card: progress_card(text, RunCardPhase::Running),
                 },
             )
             .await
@@ -616,7 +632,7 @@ async fn send(
                         delivery,
                         OutboundRequest::UpdateCard {
                             message_id,
-                            card: progress_card(text),
+                            card: progress_card(text, RunCardPhase::Running),
                         },
                     )
                     .await
@@ -632,6 +648,7 @@ async fn send(
             thread_id,
             text,
             fallback_markdown,
+            phase,
         } => {
             let anchor =
                 progress_anchor(store, row, anchor_key, ProgressDependency::Finalize).await?;
@@ -641,7 +658,7 @@ async fn send(
                         delivery,
                         OutboundRequest::UpdateCard {
                             message_id: receipt,
-                            card: progress_card(text),
+                            card: progress_card(text, *phase),
                         },
                     )
                     .await
@@ -762,17 +779,8 @@ fn valid_progress_dependency(
     }
 }
 
-fn progress_card(text: &str) -> Value {
-    let stable = stabilize_streaming_markdown(text);
-    json!({
-        "schema": "2.0",
-        "body": {
-            "elements": [{
-                "tag": "markdown",
-                "content": stable,
-            }],
-        },
-    })
+fn progress_card(text: &str, phase: RunCardPhase) -> Value {
+    render_run_card(text, phase)
 }
 
 async fn record_final_card_patch_failure(

@@ -368,24 +368,6 @@ impl AccessPolicy {
         Ok(authorized_lark_actor(&event.sender_id))
     }
 
-    /// Authorizes the sender of a directly quoted parent after Lark has
-    /// returned its identity. Parent messages do not need to mention the bot,
-    /// but they must independently satisfy the human sender/owner/group
-    /// policy; authorization of the quoting child is not transitive.
-    #[must_use]
-    pub(crate) fn allows_quoted_parent(
-        &self,
-        sender_id: &str,
-        sender_is_human: bool,
-        chat_id: &str,
-        chat_type: ChatMode,
-    ) -> bool {
-        sender_is_human
-            && (self.is_owner(sender_id)
-                || self.is_allowed_sender(sender_id)
-                || (chat_type != ChatMode::P2p && self.is_allowed_group(chat_id)))
-    }
-
     fn is_owner(&self, sender_id: &str) -> bool {
         self.owners.iter().any(|owner| owner.as_str() == sender_id)
     }
@@ -400,6 +382,35 @@ impl AccessPolicy {
         self.allowed_groups
             .iter()
             .any(|group| group.as_str() == chat_id)
+    }
+
+    #[must_use]
+    pub(crate) fn allowed_senders(&self) -> &[String] {
+        &self.allowed_senders
+    }
+
+    #[must_use]
+    pub(crate) fn allowed_groups(&self) -> &[String] {
+        &self.allowed_groups
+    }
+
+    #[must_use]
+    pub(crate) fn platform_roots(&self) -> &PlatformRoots {
+        &self.roots
+    }
+
+    pub(crate) fn replace_allowlists(&mut self, senders: Vec<String>, groups: Vec<String>) {
+        self.allowed_senders = senders;
+        self.allowed_groups = groups;
+    }
+
+    pub(crate) fn replace_codex_policy(
+        &mut self,
+        sandbox: SandboxMode,
+        approval_policy: ApprovalPolicy,
+    ) {
+        self.sandbox = sandbox;
+        self.approval_policy = approval_policy;
     }
 
     fn mention_gate(event: &InboundEvent) -> AccessDecision {

@@ -431,6 +431,122 @@ impl StoreHandle {
         .await
     }
 
+    /// Lists recent threads for one scope, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the writer task or SQLite fails.
+    pub async fn list_scope_threads(
+        &self,
+        scope: &ScopeKey,
+        limit: usize,
+    ) -> Result<Vec<ThreadRow>, StoreError> {
+        let scope_key = scope.to_string();
+        let limit = i64::try_from(limit.clamp(1, 20)).unwrap_or(5);
+        let request_size = request_bytes(&[&scope_key]);
+        self.run_sized(request_size, move |connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT scope_key, codex_thread_id, status, created_ms, archived_ms,
+                            context_tools_version, origin, adoption_generation
+                     FROM threads
+                     WHERE scope_key = ?1
+                     ORDER BY COALESCE(archived_ms, created_ms) DESC, created_ms DESC
+                     LIMIT ?2",
+                )
+                .map_err(|error| sqlite_error("listing scope threads", &error))?;
+            let rows = statement
+                .query_map(params![scope_key, limit], read_thread_row)
+                .map_err(|error| sqlite_error("listing scope threads", &error))?;
+            let mut threads = Vec::new();
+            for row in rows {
+                threads.push(row.map_err(|error| sqlite_error("reading a listed thread", &error))?);
+            }
+            Ok(threads)
+        })
+        .await
+    }
+
+    /// Archives the current active thread (when bridge-created) and reactivates
+    /// one archived bridge-created thread on the same scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the writer task or SQLite fails, or when the
+    /// selected thread cannot be reactivated.
+    pub async fn reactivate_archived_thread(
+        &self,
+        scope: &ScopeKey,
+        thread_id: &str,
+    ) -> Result<Option<ThreadRow>, StoreError> {
+        let scope_key = scope.to_string();
+        let thread_id = thread_id.to_owned();
+        let request_size = request_bytes(&[&scope_key, &thread_id]);
+        self.run_sized(request_size, move |connection| {
+            let now = now_ms();
+            let transaction = connection.transaction().map_err(|error| {
+                sqlite_error("starting a thread reactivation transaction", &error)
+            })?;
+            let selected = transaction.query_row(
+                "SELECT scope_key, codex_thread_id, status, created_ms, archived_ms,
+                        context_tools_version, origin, adoption_generation
+                 FROM threads
+                 WHERE scope_key = ?1 AND codex_thread_id = ?2",
+                params![scope_key, thread_id],
+                read_thread_row,
+            );
+            let Some(mut row) = query_optional(selected, "reading a thread to reactivate")? else {
+                return Ok(None);
+            };
+            if row.origin != ThreadOrigin::BridgeCreated {
+                return Err(StoreError::InvalidTransition {
+                    context: "reactivating an externally adopted thread outside adoption",
+                });
+            }
+            if row.status == ThreadStatus::Active {
+                return Ok(Some(row));
+            }
+            let active = transaction.query_row(
+                "SELECT scope_key, codex_thread_id, status, created_ms, archived_ms,
+                        context_tools_version, origin, adoption_generation
+                 FROM threads WHERE scope_key = ?1 AND status = 'active'",
+                params![scope_key],
+                read_thread_row,
+            );
+            if let Some(active) = query_optional(active, "reading the active thread before resume")?
+            {
+                if active.origin != ThreadOrigin::BridgeCreated {
+                    return Err(StoreError::InvalidTransition {
+                        context: "archiving an externally adopted thread outside release finish",
+                    });
+                }
+                transaction
+                    .execute(
+                        "UPDATE threads SET status = 'archived', archived_ms = ?3
+                         WHERE scope_key = ?1 AND codex_thread_id = ?2 AND status = 'active'",
+                        params![active.scope_key, active.codex_thread_id, now],
+                    )
+                    .map_err(|error| {
+                        sqlite_error("archiving the active thread for resume", &error)
+                    })?;
+            }
+            transaction
+                .execute(
+                    "UPDATE threads SET status = 'active', archived_ms = NULL
+                     WHERE scope_key = ?1 AND codex_thread_id = ?2",
+                    params![row.scope_key, row.codex_thread_id],
+                )
+                .map_err(|error| sqlite_error("reactivating an archived thread", &error))?;
+            transaction.commit().map_err(|error| {
+                sqlite_error("committing a thread reactivation transaction", &error)
+            })?;
+            row.status = ThreadStatus::Active;
+            row.archived_ms = None;
+            Ok(Some(row))
+        })
+        .await
+    }
+
     /// Records a new turn row, returning its row ID.
     ///
     /// # Errors

@@ -75,5 +75,6 @@ probe 与 auth check 都只输出单行 JSON：
 - 无显式配置的首次 `run` onboarding 会登记/复用凭证、写 owner 和安全默认 runtime config；
   已有配置或显式 `--config` 不会被覆盖。
 - 单 profile、单默认凭证文件。
-- 修改配置后必须重启。
-- chat 内命令只有 parser/metadata，尚未接入生产 handler。
+- 文件级配置变更（backend、路径、owners 等）仍需重启；`/config` 可热更新 model /
+  effort / sandbox / approval 和群/私聊白名单。
+- 第一阶段 chat 命令已接入生产 handler，见 [飞书命令与卡片](../guide/commands.md)。

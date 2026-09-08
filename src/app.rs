@@ -195,11 +195,22 @@ where
     F: OutboundFactory + ?Sized,
     S: Future<Output = ()>,
 {
-    let config = BridgeConfig::load(config_path).map_err(|_| AppError::Config)?;
+    let resolved = match config_path {
+        Some(path) => path.to_path_buf(),
+        None => crate::config::default_config_path().map_err(|_| AppError::Config)?,
+    };
+    let config = BridgeConfig::load(Some(&resolved)).map_err(|_| AppError::Config)?;
     let credentials = load_credentials()
         .map_err(|_| AppError::Credentials)?
         .ok_or(AppError::Credentials)?;
-    run_config_with_outbound_until(config, credentials, outbound_factory, shutdown).await
+    run_config_with_outbound_until(
+        Some(resolved),
+        config,
+        credentials,
+        outbound_factory,
+        shutdown,
+    )
+    .await
 }
 
 /// Runs the production bridge with the durable outbox until `shutdown`.
@@ -227,6 +238,7 @@ where
 /// stopped before the error is returned.
 #[allow(clippy::too_many_lines)]
 pub async fn run_config_with_outbound_until<F, S>(
+    config_path: Option<std::path::PathBuf>,
     config: BridgeConfig,
     credentials: LarkCredentials,
     outbound_factory: &F,
@@ -238,7 +250,7 @@ where
 {
     tracing::info!("bridge runtime starting");
     let policy = AccessPolicy::from_config(&config).map_err(|_| AppError::Config)?;
-    let router_settings = RouterSettings::from_config(&config);
+    let mut router_settings = RouterSettings::from_config(&config);
     // External observe-only transport exists, but this application path immediately constructs a
     // mutation-capable scope router. Until #30-#31 add reconciliation and shared-write fencing, an
     // explicitly external backend must fail closed and can never fall back to spawning.
@@ -254,6 +266,9 @@ where
     let http = LarkHttp::new(endpoints.clone()).map_err(|_| AppError::Lark)?;
     let tokens = TenantTokenProvider::new(http.clone(), credentials.clone());
     let api = LarkApi::new(http.clone(), tokens);
+    if let Ok(info) = api.bot_info().await {
+        router_settings.bot_open_id = info.open_id.filter(|open_id| !open_id.is_empty());
+    }
     let native = Arc::new(NativeChannel::new(api.clone()));
 
     let store = StoreHandle::open(&database_path)
@@ -300,6 +315,18 @@ where
     }
     let mut supervisor_state = supervisor.subscribe_state();
     let context_registry = Arc::new(ContextRegistry::default());
+    let live = match config_path {
+        Some(path) => crate::runtime::live::LiveBridgeConfig::persistent(
+            path,
+            config.clone(),
+            policy.clone(),
+            router_settings.clone(),
+        ),
+        None => crate::runtime::live::LiveBridgeConfig::from_runtime(
+            policy.clone(),
+            router_settings.clone(),
+        ),
+    };
     let quote_resolver = Arc::new(LarkQuoteResolver::new(api.clone(), policy.clone()));
     let inbound_runtime = supervise_assembly_step(
         &mut supervisor_state,
@@ -340,7 +367,7 @@ where
         stop_store_after_error(store).await;
         return Err(AppError::Outbound);
     };
-    let router_result = Router::start_with_contexts_and_quotes(
+    let router_result = Router::start_with_live(
         store.clone(),
         tenant,
         policy,
@@ -350,6 +377,7 @@ where
         Arc::clone(&attachment_cache),
         context_registry,
         quote_resolver,
+        Some(live),
     )
     .await;
     let router = match router_result {
@@ -937,6 +965,7 @@ mod tests {
         let error = timeout(
             Duration::from_secs(5),
             run_config_with_outbound_until(
+                None,
                 config,
                 credentials,
                 &ProductionOutboundFactory,

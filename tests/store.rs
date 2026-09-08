@@ -1961,6 +1961,50 @@ async fn archive_returns_the_thread_changed_by_this_call() {
 }
 
 #[tokio::test]
+async fn list_and_reactivate_scope_threads_round_trip() {
+    let store = StoreHandle::open_in_memory().await.expect("open");
+    let scope = ScopeKey::Chat("oc_resume".to_owned());
+    store
+        .record_active_thread(&scope, "thread-one")
+        .await
+        .expect("first");
+    store
+        .archive_active_thread(&scope)
+        .await
+        .expect("archive first");
+    store
+        .record_active_thread(&scope, "thread-two")
+        .await
+        .expect("second");
+    let listed = store.list_scope_threads(&scope, 8).await.expect("list");
+    assert_eq!(listed.len(), 2);
+    assert!(
+        listed
+            .iter()
+            .any(|row| row.codex_thread_id == "thread-one" && row.status == ThreadStatus::Archived)
+    );
+    assert!(
+        listed
+            .iter()
+            .any(|row| row.codex_thread_id == "thread-two" && row.status == ThreadStatus::Active)
+    );
+    let resumed = store
+        .reactivate_archived_thread(&scope, "thread-one")
+        .await
+        .expect("resume")
+        .expect("row");
+    assert_eq!(resumed.codex_thread_id, "thread-one");
+    assert_eq!(resumed.status, ThreadStatus::Active);
+    let active = store
+        .active_thread(&scope)
+        .await
+        .expect("active")
+        .expect("row");
+    assert_eq!(active.codex_thread_id, "thread-one");
+    store.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
 async fn scope_paths_are_redacted_and_non_utf8_paths_are_refused() {
     let store = StoreHandle::open_in_memory().await.expect("open");
     let scope = ScopeKey::Chat("oc_scope".to_owned());
