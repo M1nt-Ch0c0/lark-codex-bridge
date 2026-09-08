@@ -1361,7 +1361,7 @@ async fn execute_status_control(
         .ok()
         .flatten()
         .map(|row| row.codex_thread_id);
-    let active_run = active_turn.read().ok().is_some_and(|guard| guard.is_some());
+    let active_run = active_turn.read().is_ok_and(|guard| guard.is_some());
     let pending = pending_media.lock().map_or(0, |mut queue| queue.stats().0);
     let depth = store.outbox_depth().await.unwrap_or_default();
     let scope_state = state.read().map_or_else(

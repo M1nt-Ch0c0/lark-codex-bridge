@@ -1947,11 +1947,9 @@ fn mention_identity(mention: EventMention) -> MentionIdentity {
 }
 
 fn looks_like_card_action(payload: &[u8]) -> bool {
-    serde_json::from_slice::<Value>(payload)
-        .ok()
-        .is_some_and(|value| {
-            value.pointer("/action").is_some() || value.pointer("/event/action").is_some()
-        })
+    serde_json::from_slice::<Value>(payload).is_ok_and(|value| {
+        value.pointer("/action").is_some() || value.pointer("/event/action").is_some()
+    })
 }
 
 fn parse_card_action(value: &Value, bot_open_id: &str) -> Option<ParsedEvent> {
