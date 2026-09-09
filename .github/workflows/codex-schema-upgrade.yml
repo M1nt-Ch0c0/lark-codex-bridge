@@ -53,7 +53,7 @@ jobs:
           python3 tools/codex_schema.py sync --binary "$install_root/node_modules/.bin/codex"
           baseline="$(jq -r .establishedBaselineVersion protocol/codex/support-history.json)"
           python3 tools/codex_schema.py diff --baseline "$baseline" --candidate "$CANDIDATE_VERSION" --write-defaults --allow-breaking
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: steps.candidate.outputs.known != 'true'
         with:
           name: codex-schema-${{ steps.candidate.outputs.version }}
@@ -74,4 +74,5 @@ jobs:
           baseline="$(jq -r .establishedBaselineVersion protocol/codex/support-history.json)"
           summary="$(jq -c .summary "protocol/codex/reports/$baseline-to-$CANDIDATE_VERSION.json")"
           compatible="$(jq -r .compatible "protocol/codex/reports/$baseline-to-$CANDIDATE_VERSION.json")"
-          gh issue create --title "$title" --label enhancement --body "Automated schema discovery compared $baseline to $CANDIDATE_VERSION. Compatible: $compatible. Classified summary: $summary. Download the workflow artifact, add/review the complete contract fixture, and update support-policy.json only after the offline promotion gate passes. Breaking or contract failures must remain blocked."
+          body="Automated schema discovery compared $baseline to $CANDIDATE_VERSION. Compatible: $compatible. Classified summary: $summary. Native Rust wire still supports 0.146.0 and 0.149.0 only. Newer versions go through protocol_sidecar adapters (currently 0.149.0 / 0.151.0), not native schema promotion. If this version should be usable, add a reviewed sidecar adapter. Native contract promotion remains blocked on breaking or incomplete fixtures."
+          gh issue create --title "$title" --label enhancement --body "$body"

@@ -5,10 +5,12 @@ compatibility mapping, and contract fixture have been reviewed. The authoritativ
 policy is [`protocol/codex/support-policy.json`](../protocol/codex/support-policy.json).
 The established baseline and every promoted version are also pinned in the
 append-only [`protocol/codex/support-history.json`](../protocol/codex/support-history.json).
-At present 0.146.0 and 0.149.0 are supported. Version 0.146.0 remains the established
-baseline, while 0.149.0 is the first promoted shared-endpoint contract. Promotion is
-exact-version only; a later Codex release remains unsupported until it completes the
-same review and contract process.
+At present native Rust wire supports 0.146.0 and 0.149.0. Version 0.146.0 remains the
+established baseline, while 0.149.0 is the first promoted shared-endpoint contract.
+`protocol_sidecar` independently supports 0.149.0 and 0.151.0 through reviewed JS
+adapters; those versions do not need a native schema promotion to be usable. A later
+Codex release stays unsupported on native wire until it completes the same review and
+contract process, and stays unsupported on sidecar until a matching adapter lands.
 
 Normal Cargo builds are offline with respect to Codex. They compile committed Rust
 wire DTOs and never install, locate, or execute a `codex` binary. Only the explicit
@@ -113,5 +115,6 @@ domain types. Shared-endpoint profiles are exposed only by the exact promoted
 
 The scheduled `Codex Schema Upgrade Report` workflow discovers a newer npm release,
 generates the normalized candidate report as a workflow artifact, and opens an
-idempotent review issue. It never edits the supported range. Human contract review
-is therefore mandatory before a version can be promoted.
+idempotent review issue. It never edits the supported range. Treat that issue as a
+version radar: sidecar adapter work is the usual next step; native schema promotion
+is a separate, still-manual gate.

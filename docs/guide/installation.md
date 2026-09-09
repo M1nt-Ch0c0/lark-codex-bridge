@@ -1,117 +1,42 @@
-# Release 安装手册
+# 安装
 
-项目面向最终用户只推荐 GitHub Release 二进制，不要求本机安装 Rust 工具链。
-
-## 1. 选择产物
-
-打开 [Releases](https://github.com/M1nt-Ch0c0/lark-codex-bridge/releases)，选择最新的
-稳定版或明确标记的 prerelease，并下载与平台、CPU 架构匹配的压缩包。
-
-只从项目 Releases 页面下载。early alpha 阶段如果页面尚无可用产物，表示还没有可供普通
-用户安装的正式包，不要从第三方镜像获取未知二进制。
-
-## 2. 校验
-
-安装前必须完成完整性校验。Release 需要提供 SHA-256 校验和文件或发布签名；两者都没有时
-停止安装，不要执行该二进制。
-
-SHA-256 校验：
-
-Linux：
+目前没有 GitHub Release。从源码编译：
 
 ```bash
-sha256sum --check SHA256SUMS
+git clone https://github.com/M1nt-Ch0c0/lark-codex-bridge.git
+cd lark-codex-bridge
+cargo build --release --locked
 ```
 
-macOS：
+二进制在 `target/release/lark-codex-bridge`。日常开发直接 `cargo run --locked -- run` 即可。
+
+## 运行依赖
+
+- 默认 `spawned_stdio`：本机 `codex` 已登录，版本必须是 `codex-cli 0.146.0` 或 `0.149.0`
+- 可选 `protocol_sidecar`：Node 20+，以及 `codex-sidecar/`（先 `npm ci --ignore-scripts --prefix codex-sidecar`）。只接受精确 `0.149.0` / `0.151.0`
+- 能访问对应租户的飞书或 Lark OpenAPI 和 WebSocket
 
 ```bash
-shasum -a 256 -c SHA256SUMS
+cargo run --locked -- lark auth check
+cargo run --locked -- lark probe
+cargo run --locked -- codex probe
 ```
 
-Windows PowerShell：
-
-```powershell
-Get-FileHash .\lark-codex-bridge.exe -Algorithm SHA256
-```
-
-将输出与 Release 页面或校验和文件比较。无法匹配时不要执行二进制。
-
-## 3. 安装
-
-### Linux / macOS
+sidecar 模式把最后一条换成：
 
 ```bash
-install -d "$HOME/.local/bin"
-install -m 0755 ./lark-codex-bridge "$HOME/.local/bin/lark-codex-bridge"
-lark-codex-bridge --version
+cargo run --locked -- codex sidecar-probe --entrypoint "$PWD/codex-sidecar/index.cjs"
 ```
 
-如果 `$HOME/.local/bin` 不在 `PATH`，将它加入 shell 配置后重新打开终端。
+`external_endpoint` 不是普通 `run` 路径，没有 CLI probe。
 
-### Windows
+## 升级 / 卸载
 
-1. 创建例如 `%LOCALAPPDATA%\Programs\lark-codex-bridge` 的目录。
-2. 把 `lark-codex-bridge.exe` 移入该目录。
-3. 将目录加入当前用户的 `PATH`。
-4. 在新 PowerShell 窗口执行：
+停掉前台进程，重新 `git pull` 再编译。配置、SQLite 和附件缓存不会跟着二进制走。
 
-```powershell
-lark-codex-bridge.exe --version
-```
+不再用时删掉二进制即可。确认不需要恢复后再删：
 
-## 4. 运行依赖
-
-- 默认 `spawned_stdio`：Codex CLI 已安装并登录，精确版本为 0.146.0 或 0.149.0；
-- 可选 `protocol_sidecar`：部署产物还必须包含 Node 20+，以及与当前平台和 CPU 匹配的
-  `codex-sidecar/` 自包含目录；也可显式覆盖为已审核的精确 0.149.0/0.151.0 binary。该目录
-  必须同时包含源码、lockfile、生产 `node_modules`、Codex 0.151.0 原生包和
-  `artifact-manifest.json`，不能用仓库里的源代码目录代替。CI 会在 Linux、macOS、Windows
-  上用真实 lockfile 依赖完成完整协议 smoke，再上传、下载独立的平台目录 artifact，由
-  checkout 中的可信校验器先核对 workflow 保存的 manifest SHA-256 和逐文件清单，再按
-  已认证清单恢复 GitHub artifact 丢失的 Unix 执行位，并在无 npm、无安装和无 package
-  下载的路径中重复 smoke；
-- 能访问对应租户的飞书或 Lark OpenAPI 与 WebSocket endpoint；
-- 本地时钟和系统证书正常。
-
-安装后先执行 Lark 检查，并按普通 `run` 支持的本地 Codex backend 二选一：
-
-```bash
-lark-codex-bridge lark auth check
-lark-codex-bridge lark probe
-
-# spawned_stdio
-lark-codex-bridge codex probe
-
-# protocol_sidecar（使用成功 CI workflow artifact，或未来 Release 中与平台/CPU 匹配的目录）
-lark-codex-bridge codex sidecar-probe \
-  --entrypoint /absolute/path/to/codex-sidecar/index.cjs
-```
-
-`external_endpoint` 不在上述本地 backend 二选一中，也没有独立的 CLI probe。普通
-mutation-driven `run` 会对它 fail closed；开发或验收人员只能在仓库 checkout 中先
-运行 `cargo test --locked --test external_endpoint_gate`，再按
-[External Codex endpoint admission gate](../external-codex-endpoint-gate.md#verification) 以精确测试名
-显式运行真实 binary smoke。通过这些 admission 测试不会使普通 `run` 开放该模式。
-
-## 5. 升级
-
-1. 按 `Ctrl-C` 停止当前前台进程。
-2. 备份配置、SQLite 数据库和附件缓存目录。
-3. 下载并校验新 Release。
-4. 原子替换旧二进制，保留旧文件直到新版本完成 probe。
-5. 重新执行 Lark 检查和所选 backend 的 Codex probe，再启动 bridge。
-
-early alpha 期间不保证配置向后兼容。Release notes 如果要求迁移，应先按对应版本说明操作。
-
-## 6. 卸载
-
-停止 bridge 后删除二进制即可。配置和运行状态不会自动删除；确认不再需要恢复后，才手工
-删除以下数据：
-
-- 配置文件；
-- `credentials.toml`；
-- SQLite 数据库及 `-wal`、`-shm`；
-- 专用附件缓存目录。
-
-删除凭证和状态不可恢复。不要用宽泛递归命令指向 HOME、工作区根或不确定路径。
+- `config.toml`
+- `credentials.toml`
+- SQLite 以及同目录的 `-wal`、`-shm`
+- 附件缓存目录
