@@ -27,16 +27,11 @@ tenant token provider 负责缓存和刷新 token；永久认证错误与临时�
 
 ## Transport
 
-启动流程：
+入站事件始终走官方 Node SDK sidecar（`sidecar/`）。查询、媒体下载和出站仍走 Rust OpenAPI。
+没有 native WebSocket 开关，启动失败也不会回退。
 
-1. 使用 App ID/Secret 获取 WebSocket endpoint；
-2. 建立 TLS WebSocket；
-3. 解码 frame 和分片；
-4. 处理 ping/pong；
-5. 把完整事件交给 normalizer；
-6. 断线后按 server 配置和本地上限退避重连。
-
-frame、分片集合、队列和 payload 都有计数/字节上限。
+sidecar 完成协议配置并由 SDK 报告 `connected` 后才算启动成功。Rust 在 POSIX 上拥有整个
+sidecar 进程组、在 Windows 上拥有 Job object。协议见 [channel-wire-v1](../channel-wire-v1.md)。
 
 ## 事件归一化
 

@@ -240,10 +240,17 @@ impl BridgeConfig {
         {
             return Err(ConfigError::AllowRootsTooLarge);
         }
-        self.codex
-            .backend
-            .validate()
-            .map_err(|_| ConfigError::InvalidCodexBackend)?;
+        match &self.codex.backend {
+            CodexBackendConfig::ProtocolSidecar { .. } => self
+                .codex
+                .backend
+                .validate()
+                .map_err(|_| ConfigError::InvalidCodexBackend)?,
+            CodexBackendConfig::SpawnedStdio { .. }
+            | CodexBackendConfig::ExternalEndpoint { .. } => {
+                return Err(ConfigError::InvalidCodexBackend);
+            }
+        }
         if self
             .codex
             .effort
@@ -535,40 +542,23 @@ impl fmt::Debug for CodexSection {
     }
 }
 
-/// Inbound transport selected for production application assembly.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum ChannelTransport {
-    /// Native Rust WebSocket transport (default and fallback).
-    #[default]
-    Native,
-    /// Official Node SDK sidecar for inbound WebSocket events.
-    NodeSidecar,
-}
-
-/// Channel transport configuration. Queue/frame/time bounds are fixed in the
-/// binary and are intentionally not operator-tunable.
+/// Channel sidecar configuration. Queue/frame/time bounds are fixed in the
+/// binary. Inbound always uses the official Node SDK sidecar; there is no
+/// native transport switch.
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ChannelSection {
-    /// Explicit inbound implementation.
-    pub transport: ChannelTransport,
-    /// Node executable used only for `node-sidecar`.
+    /// Node executable used by the inbound sidecar.
     pub node_binary: PathBuf,
-    /// Checked-in/deployed sidecar entrypoint used only for `node-sidecar`.
+    /// Checked-in/deployed sidecar entrypoint.
     pub sidecar_entrypoint: PathBuf,
-    /// If sidecar bootstrap fails before the first SDK connection is live,
-    /// retain the native transport.
-    pub fallback_to_native: bool,
 }
 
 impl Default for ChannelSection {
     fn default() -> Self {
         Self {
-            transport: ChannelTransport::Native,
             node_binary: PathBuf::from("node"),
             sidecar_entrypoint: PathBuf::from("sidecar/index.cjs"),
-            fallback_to_native: true,
         }
     }
 }
@@ -606,10 +596,8 @@ impl fmt::Debug for ChannelSection {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ChannelSection")
-            .field("transport", &self.transport)
             .field("node_binary", &"[configured]")
             .field("sidecar_entrypoint", &"[configured]")
-            .field("fallback_to_native", &self.fallback_to_native)
             .finish()
     }
 }

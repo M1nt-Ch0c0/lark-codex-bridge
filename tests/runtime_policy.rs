@@ -6,8 +6,8 @@ use lark_codex_bridge::codex::{
     types::{ApprovalPolicy, GranularApprovalPolicy, SandboxMode},
 };
 use lark_codex_bridge::config::{
-    AsrSection, BridgeConfig, ChannelTransport, CodexSection, ConcurrencyConfig, ConfigError,
-    PathsSection, WorkspacePolicy,
+    AsrSection, BridgeConfig, CodexSection, ConcurrencyConfig, ConfigError, PathsSection,
+    WorkspacePolicy,
 };
 use lark_codex_bridge::lark::api::ChatMode;
 use lark_codex_bridge::lark::normalize::{InboundEvent, ScopeKey};
@@ -151,8 +151,10 @@ fn minimal_config_has_safe_defaults_and_resolves_relative_runtime_paths() {
     assert_eq!(config.concurrency.max_scope_actors, 256);
     assert_eq!(config.codex.sandbox, SandboxMode::WorkspaceWrite);
     assert!(config.codex.effort.is_none());
-    assert_eq!(config.channel.transport, ChannelTransport::Native);
-    assert!(config.channel.fallback_to_native);
+    assert!(matches!(
+        config.codex.backend,
+        CodexBackendConfig::ProtocolSidecar { .. }
+    ));
     assert_eq!(config.channel.node_binary, PathBuf::from("node"));
     assert_eq!(
         config.channel.sidecar_entrypoint,
@@ -200,9 +202,12 @@ fn full_config_round_trips_and_resolves_only_runtime_relative_paths() {
     );
     assert!(matches!(
         config.codex.backend,
-        CodexBackendConfig::SpawnedStdio { ref binary, ref codex_home }
-            if binary == &PathBuf::from("/opt/codex/bin/codex")
-                && codex_home.as_deref() == Some(Path::new("/opt/codex/home"))
+        CodexBackendConfig::ProtocolSidecar {
+            ref sidecar_entrypoint,
+            ref codex_home,
+            ..
+        } if sidecar_entrypoint == Path::new("/opt/lark-codex-bridge/codex-sidecar/index.cjs")
+            && codex_home.is_none()
     ));
     assert_eq!(
         config.asr.command.as_deref(),
@@ -358,7 +363,7 @@ fn config_rejects_unknown_keys_at_every_schema_level() {
 }
 
 #[test]
-fn node_sidecar_is_explicit_and_paths_are_resolved_without_expanding_node() {
+fn channel_sidecar_paths_are_resolved_without_expanding_node() {
     let temp = scratch();
     let config_path = temp.path().join("config.toml");
     fs::write(
@@ -367,28 +372,66 @@ fn node_sidecar_is_explicit_and_paths_are_resolved_without_expanding_node() {
 owners = ["ou_owner_123456"]
 
 [channel]
-transport = "node-sidecar"
 node_binary = "node"
 sidecar_entrypoint = "runtime/channel/index.cjs"
-fallback_to_native = false
 "#,
     )
     .expect("fixture should write");
 
     let config = BridgeConfig::load(Some(&config_path)).expect("sidecar config should load");
-    assert_eq!(config.channel.transport, ChannelTransport::NodeSidecar);
     assert_eq!(config.channel.node_binary, PathBuf::from("node"));
     assert_eq!(
         config.channel.sidecar_entrypoint,
         temp.path().join("runtime/channel/index.cjs")
     );
-    assert!(!config.channel.fallback_to_native);
     assert!(
         toml::from_str::<BridgeConfig>(
-            "owners = [\"ou_owner_123456\"]\n[channel]\ntransport = \"automatic\""
+            "owners = [\"ou_owner_123456\"]\n[channel]\ntransport = \"native\""
         )
         .is_err()
     );
+}
+
+#[test]
+fn config_rejects_spawned_stdio_and_external_endpoint_backends() {
+    let temp = scratch();
+    let config_path = temp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+owners = ["ou_owner_123456"]
+
+[codex.backend]
+mode = "spawned_stdio"
+"#,
+    )
+    .expect("stdio config should write");
+    assert!(matches!(
+        BridgeConfig::load(Some(&config_path)),
+        Err(ConfigError::InvalidCodexBackend)
+    ));
+
+    fs::write(
+        &config_path,
+        r#"
+owners = ["ou_owner_123456"]
+
+[codex.backend]
+mode = "external_endpoint"
+endpoint = "wss://127.0.0.1:9/app-server"
+expected_codex_version = "0.149.0"
+capability_profile = "observe_shared"
+
+[codex.backend.authentication]
+source = "bearer_token_file"
+path = "/tmp/token"
+"#,
+    )
+    .expect("external config should write");
+    assert!(matches!(
+        BridgeConfig::load(Some(&config_path)),
+        Err(ConfigError::InvalidCodexBackend)
+    ));
 }
 
 #[test]
@@ -1208,9 +1251,12 @@ fn debug_and_error_output_never_echo_sensitive_config_or_requested_paths() {
     fs::create_dir_all(&safe).expect("safe root should be created");
     let mut config = policy_config(safe.clone());
     config.owners = vec!["ou_extremely_sensitive_owner_123456".to_owned()];
-    config.codex.backend = CodexBackendConfig::SpawnedStdio {
-        binary: PathBuf::from("/outside/secret-codex"),
-        codex_home: Some(PathBuf::from("/outside/secret-home")),
+    config.codex.backend = CodexBackendConfig::ProtocolSidecar {
+        node_binary: PathBuf::from("/outside/secret-node"),
+        sidecar_entrypoint: PathBuf::from("/outside/secret-sidecar.cjs"),
+        codex_binary: Some(PathBuf::from("/outside/secret-codex")),
+        codex_home: None,
+        codex_arguments: Vec::new(),
     };
     config.paths.database = PathBuf::from("/outside/secret.sqlite");
     config.paths.attachment_cache = PathBuf::from("/outside/secret-cache");

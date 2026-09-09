@@ -17,9 +17,9 @@ sandbox = "read-only"
 approval_policy = "on-request"
 
 [codex.backend]
-mode = "spawned_stdio"
-binary = "/opt/codex/bin/codex"
-codex_home = "/opt/codex/home"
+mode = "protocol_sidecar"
+node_binary = "node"
+sidecar_entrypoint = "/opt/lark-codex-bridge/codex-sidecar/index.cjs"
 
 [paths]
 database = "state/bridge.sqlite3"

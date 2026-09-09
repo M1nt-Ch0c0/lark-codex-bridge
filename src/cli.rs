@@ -8,7 +8,6 @@ use tokio::time::{sleep, timeout};
 
 use crate::{
     codex::{
-        process::CodexProcessConfig,
         sidecar::CodexSidecarConfig,
         supervisor::{AppServerSupervisor, ProtocolInfo, SupervisorHandle, SupervisorState},
     },
@@ -102,14 +101,22 @@ impl fmt::Debug for Command {
 
 #[derive(Subcommand)]
 pub enum CodexCommand {
-    /// Spawn the app-server, run the initialize handshake, and print a
+    /// Start the Codex protocol sidecar, run initialize, and print a
     /// sanitized JSON summary of the supported installation.
     Probe {
-        #[arg(long, default_value = "codex")]
-        binary: PathBuf,
+        #[arg(long, default_value = "node")]
+        node_binary: PathBuf,
+        #[arg(long, default_value = "codex-sidecar/index.cjs")]
+        entrypoint: PathBuf,
+        /// Override the exact pinned Codex package used by the sidecar.
+        #[arg(long)]
+        codex_binary: Option<PathBuf>,
+        #[arg(long)]
+        codex_home: Option<PathBuf>,
+        #[arg(long = "codex-argument", action = ArgAction::Append)]
+        codex_arguments: Vec<String>,
     },
-    /// Start the stable local-wire adapter and print its negotiated upstream
-    /// version, protocol version, and capabilities without exposing paths.
+    /// Alias of `probe`.
     SidecarProbe {
         #[arg(long, default_value = "node")]
         node_binary: PathBuf,
@@ -130,9 +137,22 @@ pub enum CodexCommand {
 impl fmt::Debug for CodexCommand {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Probe { binary } => formatter
+            Self::Probe {
+                node_binary,
+                entrypoint,
+                codex_binary,
+                codex_home,
+                codex_arguments,
+            } => formatter
                 .debug_struct("Probe")
-                .field("binary_bytes", &binary.as_os_str().len())
+                .field("node_binary_bytes", &node_binary.as_os_str().len())
+                .field("entrypoint_bytes", &entrypoint.as_os_str().len())
+                .field(
+                    "codex_binary_bytes",
+                    &codex_binary.as_ref().map(|binary| binary.as_os_str().len()),
+                )
+                .field("codex_home_configured", &codex_home.is_some())
+                .field("codex_argument_count", &codex_arguments.len())
                 .finish(),
             Self::SidecarProbe {
                 node_binary,
@@ -247,11 +267,15 @@ pub async fn run_with(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Run { config } => run_bridge(config).await,
         Command::Codex {
-            command: CodexCommand::Probe { binary },
-        } => probe_codex(binary).await,
-        Command::Codex {
             command:
-                CodexCommand::SidecarProbe {
+                CodexCommand::Probe {
+                    node_binary,
+                    entrypoint,
+                    codex_binary,
+                    codex_home,
+                    codex_arguments,
+                }
+                | CodexCommand::SidecarProbe {
                     node_binary,
                     entrypoint,
                     codex_binary,
@@ -311,7 +335,7 @@ struct ThreadAdoptionReport {
     classification: ThreadAdoptionAvailability,
     guidance: &'static str,
     release_authority: Option<&'static str>,
-    managed_backends: [&'static str; 2],
+    managed_backends: [&'static str; 1],
     supported_platforms: &'static [&'static str],
     external_endpoint: ThreadAdoptionExternalEndpointReport,
     requires_explicit_handoff: bool,
@@ -327,17 +351,14 @@ struct ThreadAdoptionExternalEndpointReport {
 }
 
 fn report_thread_adoption_status() -> Result<()> {
-    let availability = ThreadAdoptionGate::managed_stdio().availability();
+    let availability = ThreadAdoptionGate::managed_sidecar().availability();
     let external = ThreadAdoptionGate::external_endpoint().availability();
     let report = ThreadAdoptionReport {
         available: availability.is_available(),
         classification: availability,
         guidance: availability.guidance(),
         release_authority: availability.release_authority(),
-        managed_backends: [
-            ThreadAdoptionBackend::ManagedStdio.code(),
-            ThreadAdoptionBackend::ManagedSidecar.code(),
-        ],
+        managed_backends: [ThreadAdoptionBackend::ManagedSidecar.code()],
         supported_platforms: THREAD_ADOPTION_SUPPORTED_PLATFORMS,
         external_endpoint: ThreadAdoptionExternalEndpointReport {
             available: external.is_available(),
@@ -380,17 +401,6 @@ struct ProbeReport {
     wire_protocol: String,
     wire_version: Option<u32>,
     capabilities: Vec<String>,
-}
-
-async fn probe_codex(binary: PathBuf) -> Result<()> {
-    let config = CodexProcessConfig {
-        binary,
-        codex_home: None,
-    };
-    let handle = AppServerSupervisor::start(config)
-        .await
-        .context("unable to start the Codex supervisor")?;
-    probe_supervisor(handle).await
 }
 
 async fn probe_codex_sidecar(

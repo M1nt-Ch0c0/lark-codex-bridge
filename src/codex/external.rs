@@ -92,9 +92,12 @@ fn default_codex_sidecar_entrypoint() -> PathBuf {
 
 impl Default for CodexBackendConfig {
     fn default() -> Self {
-        Self::SpawnedStdio {
-            binary: default_codex_binary(),
+        Self::ProtocolSidecar {
+            node_binary: default_node_binary(),
+            sidecar_entrypoint: default_codex_sidecar_entrypoint(),
+            codex_binary: None,
             codex_home: None,
+            codex_arguments: Vec::new(),
         }
     }
 }

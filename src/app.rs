@@ -9,13 +9,13 @@ use std::time::Duration;
 use futures_util::{FutureExt, future::BoxFuture};
 use tokio::sync::{mpsc, watch};
 
-use crate::channel::native::{NativeChannel, NativeInboundSource};
+use crate::channel::native::NativeChannel;
 use crate::channel::sidecar::{NodeSidecar, NodeSidecarConfig};
 use crate::channel::{
     ChatMessageQuery, ConnectionState, ControlledMediaResolver, InboundRuntime, InboundSource,
     OutboundDelivery,
 };
-use crate::config::{ChannelSection, ChannelTransport};
+use crate::config::ChannelSection;
 use crate::lark::api::LarkApi;
 use crate::lark::bridge::{BridgeConfig as LarkBridgeConfig, LarkBridge, QueuedInboundEvent};
 use crate::lark::config::LarkEndpoints;
@@ -251,14 +251,7 @@ where
     tracing::info!("bridge runtime starting");
     let policy = AccessPolicy::from_config(&config).map_err(|_| AppError::Config)?;
     let mut router_settings = RouterSettings::from_config(&config);
-    // External observe-only transport exists, but this application path immediately constructs a
-    // mutation-capable scope router. Until #30-#31 add reconciliation and shared-write fencing, an
-    // explicitly external backend must fail closed and can never fall back to spawning.
-    let process_config = config.codex.process_config();
-    let sidecar_config = config.codex.sidecar_config();
-    if process_config.is_none() && sidecar_config.is_none() {
-        return Err(AppError::Supervisor);
-    }
+    let sidecar_config = config.codex.sidecar_config().ok_or(AppError::Supervisor)?;
     let database_path = config.paths.database.clone();
     let attachment_cache_path = config.paths.attachment_cache.clone();
     let tenant = TenantNamespace::from_credentials(&credentials);
@@ -297,11 +290,7 @@ where
         stop_store_after_error(store).await;
         return Err(AppError::Attachments);
     }
-    let supervisor = match (process_config, sidecar_config) {
-        (Some(process), None) => AppServerSupervisor::start(process).await,
-        (None, Some(sidecar)) => AppServerSupervisor::start_sidecar(sidecar).await,
-        _ => Err(crate::codex::supervisor::SupervisorError::TaskFailed),
-    };
+    let supervisor = AppServerSupervisor::start_sidecar(sidecar_config).await;
     let Ok(supervisor) = supervisor else {
         drop(attachment_cache);
         stop_store_after_error(store).await;
@@ -333,7 +322,6 @@ where
         start_inbound(
             &config.channel,
             &credentials,
-            &http,
             &api,
             Arc::clone(&native),
             &store,
@@ -447,7 +435,6 @@ fn finish_run(
 async fn start_inbound(
     channel: &ChannelSection,
     credentials: &LarkCredentials,
-    http: &LarkHttp,
     api: &LarkApi,
     native: Arc<NativeChannel>,
     store: &StoreHandle,
@@ -471,42 +458,20 @@ async fn start_inbound(
     let (event_handler, events) =
         LarkBridge::prepare_durable(credentials, bridge_config, intake, normalizer)
             .map_err(|_| AppError::Lark)?;
-    let source: Box<dyn InboundSource> = match channel.transport {
-        ChannelTransport::Native => {
-            Box::new(NativeInboundSource::new(LarkBridge::start_prepared_native(
-                http.clone(),
-                credentials.clone(),
-                bridge_config,
-                event_handler,
-            )))
-        }
-        ChannelTransport::NodeSidecar => {
-            let sidecar_config = NodeSidecarConfig {
-                node_binary: channel.node_binary.clone(),
-                entrypoint: channel.sidecar_entrypoint.clone(),
-                ..NodeSidecarConfig::default()
-            };
-            match NodeSidecar::start(
-                sidecar_config,
-                credentials.clone(),
-                Arc::clone(&event_handler),
-            )
-            .await
-            {
-                Ok(sidecar) => Box::new(sidecar),
-                Err(_) if channel.fallback_to_native => {
-                    tracing::warn!("node sidecar startup failed; using configured native fallback");
-                    Box::new(NativeInboundSource::new(LarkBridge::start_prepared_native(
-                        http.clone(),
-                        credentials.clone(),
-                        bridge_config,
-                        event_handler,
-                    )))
-                }
-                Err(_) => return Err(AppError::Lark),
-            }
-        }
+    let sidecar_config = NodeSidecarConfig {
+        node_binary: channel.node_binary.clone(),
+        entrypoint: channel.sidecar_entrypoint.clone(),
+        ..NodeSidecarConfig::default()
     };
+    let source: Box<dyn InboundSource> = Box::new(
+        NodeSidecar::start(
+            sidecar_config,
+            credentials.clone(),
+            Arc::clone(&event_handler),
+        )
+        .await
+        .map_err(|_| AppError::Lark)?,
+    );
     Ok(InboundRuntime { source, events })
 }
 
@@ -693,6 +658,7 @@ where
 mod tests {
     use std::collections::VecDeque;
     use std::future::pending;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -713,7 +679,6 @@ mod tests {
     use crate::channel::native::NativeChannel;
     use crate::codex::external::CodexBackendConfig;
     use crate::codex::supervisor::SupervisorState;
-    use crate::codex::wire::SUPPORTED_CODEX_VERSIONS;
     use crate::config::{BridgeConfig, PathsSection, WorkspacePolicy};
     use crate::lark::api::{ChatMode, LarkApi};
     use crate::lark::bridge::QueuedInboundEvent;
@@ -890,10 +855,7 @@ mod tests {
             publish_gate.wait().await;
             state_tx
                 .send(SupervisorState::Degraded {
-                    reason: format!(
-                        "Codex 0.148.0 is unsupported; expected an exact reviewed version ({})",
-                        SUPPORTED_CODEX_VERSIONS.join(", ")
-                    ),
+                    reason: "configured Codex protocol sidecar is invalid".to_owned(),
                 })
                 .expect("assembly monitor remains subscribed");
         });
@@ -912,30 +874,16 @@ mod tests {
         let AppError::CodexUnavailable { reason } = error else {
             panic!("unexpected assembly error: {error:?}");
         };
-        assert_eq!(
-            reason,
-            format!(
-                "Codex 0.148.0 is unsupported; expected an exact reviewed version ({})",
-                SUPPORTED_CODEX_VERSIONS.join(", ")
-            )
-        );
+        assert_eq!(reason, "configured Codex protocol sidecar is invalid");
         publisher.await.expect("terminal publisher");
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn assembly_fails_closed_on_permanent_codex_degradation_before_lark_startup() {
-        use std::os::unix::fs::PermissionsExt;
-
         let temp = tempfile::Builder::new()
             .prefix("app-fail-closed-")
             .tempdir_in(env!("CARGO_MANIFEST_DIR"))
             .expect("temporary directory under the allowed checkout");
-        let binary = temp.path().join("unsupported-codex");
-        std::fs::write(&binary, b"#!/bin/sh\nprintf 'codex-cli 0.148.0\\n'\n")
-            .expect("write fake Codex");
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))
-            .expect("make fake Codex executable");
         let workspace = temp.path().join("workspace");
         std::fs::create_dir(&workspace).expect("workspace");
         let mut config = BridgeConfig {
@@ -951,9 +899,12 @@ mod tests {
             },
             ..BridgeConfig::default()
         };
-        config.codex.backend = CodexBackendConfig::SpawnedStdio {
-            binary,
+        config.codex.backend = CodexBackendConfig::ProtocolSidecar {
+            node_binary: PathBuf::from("node"),
+            sidecar_entrypoint: temp.path().join("missing-sidecar.cjs"),
+            codex_binary: None,
             codex_home: None,
+            codex_arguments: Vec::new(),
         };
         config.validate().expect("valid test config");
         let credentials = LarkCredentials::new(
@@ -974,18 +925,12 @@ mod tests {
         )
         .await
         .expect("assembly must fail before attempting Lark I/O")
-        .expect_err("unsupported Codex must stop assembly");
+        .expect_err("missing Codex sidecar must stop assembly");
         let AppError::CodexUnavailable { reason } = error else {
             panic!("unexpected static application error: {error:?}");
         };
 
-        assert_eq!(
-            reason,
-            format!(
-                "Codex 0.148.0 is unsupported; expected an exact reviewed version ({})",
-                SUPPORTED_CODEX_VERSIONS.join(", ")
-            )
-        );
+        assert_eq!(reason, "configured Codex protocol sidecar is invalid");
         let redacted_error = AppError::CodexUnavailable { reason };
         assert_eq!(format!("{redacted_error:?}"), "CodexUnavailable");
     }

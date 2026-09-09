@@ -494,7 +494,7 @@ pub struct ThreadAdoptionGate {
 
 impl Default for ThreadAdoptionGate {
     fn default() -> Self {
-        Self::managed_stdio()
+        Self::managed_sidecar()
     }
 }
 

@@ -16,7 +16,7 @@ CLI 是唯一的主机侧用户入口，负责解析命令、输出脱敏 probe 
 
 ```text
 lark-codex-bridge run [--config <path>]
-lark-codex-bridge codex probe [--binary <path>]
+lark-codex-bridge codex probe [--node-binary <path>] [--entrypoint <path>] [--codex-binary <path>]
 lark-codex-bridge codex sidecar-probe [--node-binary <path>] [--entrypoint <path>] [--codex-binary <path>]
 lark-codex-bridge codex adoption-status
 lark-codex-bridge lark auth register [--app-id <id> --tenant <feishu|lark>]
@@ -27,8 +27,7 @@ lark-codex-bridge lark probe
 `run` 启动前台常驻进程。当前没有 host service、profile、migrate 或日志导出子命令。
 
 `codex adoption-status` 是纯静态、脱敏的 capability matrix：Linux/macOS 构建把
-`spawned_stdio` 和 `protocol_sidecar` 标记为
-`available_dedicated_process_ownership`；Windows 构建因缺少 Job
+`protocol_sidecar` 标记为 `available_dedicated_process_ownership`；Windows 构建因缺少 Job
 `ACTIVE_PROCESS_ZERO` 证明而标记为 `unavailable_platform_process_tree_proof`。
 `external_endpoint` 始终标记为 `unavailable_shared_external_endpoint`。输出同时声明
 `supportedPlatforms: ["linux", "macos"]`。该命令不加载配置、不读取 `CODEX_HOME`、

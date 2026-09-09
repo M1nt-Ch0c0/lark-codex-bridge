@@ -34,10 +34,11 @@ max_scope_actors = 256
 sandbox = "workspace-write"
 approval_policy = "never"
 
-[codex.backend]
-mode = "spawned_stdio"
-binary = "codex"
-# codex_home = "/absolute/path/to/codex-home"
+# 可选；省略则用仓库默认 sidecar 路径
+# [codex.backend]
+# mode = "protocol_sidecar"
+# node_binary = "node"
+# sidecar_entrypoint = "codex-sidecar/index.cjs"
 
 [paths]
 database = "state/bridge.sqlite3"
@@ -100,16 +101,7 @@ allow root 只是 bridge 的 cwd 准入边界，不替代 Codex sandbox。
 
 默认值是 `workspace-write` + `never`。
 
-`[codex.backend]` 是带 `mode` 的严格表。默认/生成配置使用：
-
-```toml
-[codex.backend]
-mode = "spawned_stdio"
-binary = "codex"
-# codex_home = "/absolute/private/codex-home"
-```
-
-可选的本地协议 sidecar 使用：
+Codex 始终走 `protocol_sidecar`。生成配置不写 backend。若要覆盖路径：
 
 ```toml
 [codex.backend]
@@ -134,13 +126,12 @@ sidecar_entrypoint = "/opt/lark-codex-bridge/codex-sidecar/index.cjs"
 448 pending、15 秒 bootstrap 和 5 秒 process grace。启动前用与配置相同的路径检查：
 
 ```bash
-lark-codex-bridge codex sidecar-probe \
+lark-codex-bridge codex probe \
   --entrypoint /opt/lark-codex-bridge/codex-sidecar/index.cjs
 ```
 
-`external_endpoint` 是另一个显式模式，但普通 mutation-driven `run` 仍对它 fail closed；配置与
-边界见 [External Codex endpoint admission gate](../external-codex-endpoint-gate.md)。不同 mode
-的字段不能混用，未知字段会拒绝加载。
+`spawned_stdio` 和 `external_endpoint` 不再是 `run` 可选项，写进配置会拒绝加载。入站飞书
+事件始终走 `sidecar/`，`[channel] transport` 也不再接受。
 
 ## paths
 
@@ -171,10 +162,5 @@ lark-codex-bridge lark auth register
 
 1. 停止 bridge；
 2. 备份数据库和配置；
-3. 执行 `lark auth check`、`lark probe`，并按 backend 执行 `codex probe` 或
-   `codex sidecar-probe`。`external_endpoint` 没有对应的 CLI probe；普通
-   mutation-driven `run` 会对它 fail closed。要验证该 admission gate，必须在仓库
-   checkout 中运行 `cargo test --locked --test external_endpoint_gate`，然后按
-   [Verification](../external-codex-endpoint-gate.md#verification) 以精确测试名显式运行真实
-   binary smoke；
+3. 执行 `lark auth check`、`lark probe`、`codex probe`；
 4. 重新启动。

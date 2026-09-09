@@ -461,6 +461,9 @@ pub async fn spawn_codex_sidecar(
     config: &CodexSidecarConfig,
 ) -> Result<CodexSidecarProcess, ProcessError> {
     config.validate()?;
+    if !config.entrypoint.is_file() {
+        return Err(ProcessError::InvalidSidecarConfig);
+    }
     let mut command = Command::new(&config.node_binary);
     command
         .arg(&config.entrypoint)
