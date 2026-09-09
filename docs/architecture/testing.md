@@ -45,8 +45,7 @@ cargo build --release --locked
 git diff --check
 ```
 
-本页给开发者记录源码门禁，不是最终用户安装方式。根 README 和使用手册只使用 Release
-二进制命令。
+本页给开发者记录源码门禁。根 README 面向从仓库直接跑的人，使用 `cargo run --locked`。
 
 ## 文档门禁
 
@@ -56,9 +55,7 @@ git diff --check
 - 命令来自当前 `--help`；
 - 配置字段来自 `BridgeConfig`；
 - 当前限制没有被写成已实现；
-- 没有 secret、token、真实 open_id/chat_id 或敏感路径；
-- 根 README 不出现源码运行命令；
-- Release asset 名称没有在 workflow 未定义时被臆造。
+- 没有 secret、token、真实 open_id/chat_id 或敏感路径。
 
 ## 高风险变更
 

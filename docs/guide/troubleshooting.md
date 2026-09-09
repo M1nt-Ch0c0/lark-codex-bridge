@@ -25,9 +25,8 @@ lark-codex-bridge codex probe
 codex --version
 ```
 
-精确支持列表以源码中的 `SUPPORTED_CODEX_VERSIONS` 为准；当前是 `codex-cli 0.146.0` 和
-`0.149.0`。更高的 patch/minor 版本不会自动视为兼容。还应确认 Codex 已登录、
-`codex app-server` 可以启动、`CODEX_HOME` 可访问。
+`spawned_stdio` 只要精确 `codex-cli 0.146.0` 或 `0.149.0`。更高版本不会自动兼容。确认
+Codex 已登录、`codex app-server` 能启动、`CODEX_HOME` 可访问。
 
 probe 超时或 app-server 退出时，先单独修复 Codex 环境，不要同时排查 Lark。
 
