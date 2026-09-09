@@ -4,13 +4,19 @@
 
 飞书 / Lark 和本机 Codex app-server 之间的桥。Rust 写的常驻进程：消息进 Codex，回复打回飞书。还是 alpha，能日常用，别当生产机器人。
 
+入站飞书事件和 Codex 协议都只走 sidecar，没有 stdio / native WebSocket 开关。
+
 ## 环境
 
 - Rust 1.85+（见 `rust-toolchain.toml`）
-- 已登录的 Codex CLI。默认 `spawned_stdio` 只要精确 `codex-cli 0.146.0` 或 `0.149.0`
+- Node 20+
+- Codex 精确 `0.149.0` 或 `0.151.0`（默认用 `codex-sidecar` lockfile 里钉死的 0.151.0）
 - 一个飞书 / Lark 应用机器人，并已加入目标会话
 
-更高版本的 Codex（目前是 `0.149.0` / `0.151.0`）走可选的 `protocol_sidecar`，需要 Node 20+。
+```bash
+npm ci --ignore-scripts --prefix sidecar
+npm ci --ignore-scripts --prefix codex-sidecar
+```
 
 ## 跑起来
 
@@ -44,36 +50,18 @@ cargo run --locked -- lark probe
 cargo run --locked -- codex probe
 ```
 
-已有 App ID / Secret 时：
+`codex probe` 会拉起 `codex-sidecar/`。已有 App ID / Secret 时：
 
 ```bash
 cargo run --locked -- lark auth register --app-id <id> --tenant feishu
 # secret 从 LARK_APP_SECRET 读
 ```
 
-## Codex sidecar（可选）
-
-默认不用。要用 lockfile 里钉死的 0.151.0（或已审核的 0.149.0 binary）：
-
-```bash
-npm ci --ignore-scripts --prefix codex-sidecar
-cargo run --locked -- codex sidecar-probe --entrypoint "$PWD/codex-sidecar/index.cjs"
-```
-
-配置里显式打开，不要指望运行中回退到 stdio：
-
-```toml
-[codex.backend]
-mode = "protocol_sidecar"
-node_binary = "node"
-sidecar_entrypoint = "/absolute/path/to/codex-sidecar/index.cjs"
-```
-
-协议说明：[docs/codex-sidecar-wire-v1.md](docs/codex-sidecar-wire-v1.md)。
+协议说明：[docs/codex-sidecar-wire-v1.md](docs/codex-sidecar-wire-v1.md)、[docs/channel-wire-v1.md](docs/channel-wire-v1.md)。
 
 ## 配置要点
 
-完整字段见 [docs/guide/configuration.md](docs/guide/configuration.md)。最少要有 owner 和工作区。可选白名单：
+完整字段见 [docs/guide/configuration.md](docs/guide/configuration.md)。最少要有 owner 和工作区。不要再写 `[codex.backend]` 的 `spawned_stdio`，也不要写 `[channel] transport`。可选白名单：
 
 ```toml
 owners = ["ou_owner_open_id"]

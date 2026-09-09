@@ -166,6 +166,14 @@ impl FakeControl {
         }))
         .await;
     }
+
+    pub(crate) async fn respond_error(&self, request: &Value, code: i64, message: &str) {
+        self.send_json(json!({
+            "id": request.get("id").expect("request contains an id"),
+            "error": { "code": code, "message": message }
+        }))
+        .await;
+    }
 }
 
 impl FakeFactory {

@@ -41,7 +41,8 @@ use lark_codex_bridge::runtime::scope::{
 };
 use lark_codex_bridge::store::{
     BeginTurnOutcome, DedupOutcome, InboundEventState, InboundKey, InboundRejectionKind,
-    InboundTerminal, NewOutboxRow, NewTurnRow, StoreHandle, TurnResolution, TurnState,
+    InboundTerminal, NewOutboxRow, NewTurnRow, StoreHandle, ThreadStatus, TurnResolution,
+    TurnState,
 };
 use secrecy::SecretString;
 use semver::Version;
@@ -4095,6 +4096,211 @@ async fn message_while_running_waits_then_resumes_the_same_thread() {
     )
     .await;
     assert_eq!(sink.finalizations.lock().expect("finalizations").len(), 2);
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn missing_active_thread_is_archived_and_replaced_before_claim() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let inbound = event("event-stale-resume", "owner-runtime-scope");
+    let fingerprint = policy.fingerprint(&workspace).expect("policy fingerprint");
+    store
+        .upsert_scope(&inbound.scope, &workspace, fingerprint.as_str())
+        .await
+        .expect("seed scope");
+    store
+        .record_active_thread(&inbound.scope, "thread-archived")
+        .await
+        .expect("seed stale mapping");
+    let sink = Arc::new(RecordingSink::default());
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink.clone(),
+    )
+    .await
+    .expect("router");
+    router
+        .route(queued_registered(&store, &namespace, inbound.clone()).await)
+        .await
+        .expect("route inbound against stale mapping");
+
+    let resume = control.next_request().await;
+    assert_eq!(resume["method"], "thread/resume");
+    assert_eq!(resume["params"]["threadId"], "thread-archived");
+    control
+        .respond_error(&resume, -32602, "thread not found")
+        .await;
+
+    let start = control.next_request().await;
+    assert_eq!(start["method"], "thread/start");
+    control
+        .respond(&start, thread_result("thread-replacement", &workspace))
+        .await;
+    let started = control.next_request().await;
+    assert_eq!(started["method"], "turn/start");
+    assert_eq!(started["params"]["threadId"], "thread-replacement");
+    control
+        .respond(
+            &started,
+            json!({"turn": turn("turn-replacement", "inProgress")}),
+        )
+        .await;
+    control
+        .send_json(json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-replacement",
+                "turn": turn("turn-replacement", "completed")
+            }
+        }))
+        .await;
+
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-stale-resume"],
+        InboundEventState::Completed,
+    )
+    .await;
+    let active = store
+        .active_thread(&inbound.scope)
+        .await
+        .expect("active mapping")
+        .expect("replacement mapping");
+    assert_eq!(active.codex_thread_id, "thread-replacement");
+    assert_eq!(active.status, ThreadStatus::Active);
+    assert!(
+        sink.rejections.lock().expect("rejections").is_empty(),
+        "missing-thread replacement must not reject the inbound"
+    );
+    router.shutdown().await.expect("shutdown");
+    store.shutdown().await.expect("store shutdown");
+}
+
+#[tokio::test]
+async fn stale_running_turn_on_archived_thread_is_interrupted_when_mapping_is_replaced() {
+    let config = validated_config();
+    let workspace = config.default_workspace.clone().expect("workspace");
+    let policy = AccessPolicy::from_config(&config).expect("policy");
+    let settings = RouterSettings::from_config(&config);
+    let namespace = TenantNamespace::from_credentials(&credentials());
+    let store = StoreHandle::open_in_memory().await.expect("store");
+    let orphan = event("event-orphan-running", "owner-runtime-scope");
+    let inbound = event("event-after-orphan", "owner-runtime-scope");
+    let fingerprint = policy.fingerprint(&workspace).expect("policy fingerprint");
+    store
+        .upsert_scope(&orphan.scope, &workspace, fingerprint.as_str())
+        .await
+        .expect("seed scope");
+    store
+        .record_active_thread(&orphan.scope, "thread-archived")
+        .await
+        .expect("seed stale mapping");
+    let _ = queued_registered(&store, &namespace, orphan.clone()).await;
+    let seeded = store
+        .begin_turn_and_claim_inbound(
+            NewTurnRow {
+                scope_key: orphan.scope.to_string(),
+                client_message_id: "seeded-orphan-running".to_owned(),
+                codex_thread_id: Some("thread-archived".to_owned()),
+                state: TurnState::Starting,
+            },
+            &[InboundKey::new(
+                namespace.clone(),
+                "event-orphan-running".to_owned(),
+            )],
+        )
+        .await
+        .expect("seed orphaned turn");
+    let BeginTurnOutcome::Started {
+        turn_row_id: orphan_turn,
+        ..
+    } = seeded
+    else {
+        panic!("seeded orphan claim must create a turn");
+    };
+    store
+        .set_turn_state(orphan_turn, TurnState::Running, Some("turn-orphan"))
+        .await
+        .expect("mark orphaned turn running");
+
+    let sink = Arc::new(RecordingSink::default());
+    let (supervisor, control) = ready_supervisor().await;
+    let router = Router::start(
+        store.clone(),
+        namespace.clone(),
+        policy,
+        settings,
+        supervisor,
+        sink.clone(),
+    )
+    .await
+    .expect("router");
+    router
+        .route(queued_registered(&store, &namespace, inbound).await)
+        .await
+        .expect("route inbound after orphaned running turn");
+
+    let resume = control.next_request().await;
+    assert_eq!(resume["method"], "thread/resume");
+    assert_eq!(resume["params"]["threadId"], "thread-archived");
+    control
+        .respond_error(&resume, -32602, "thread not found")
+        .await;
+
+    let start = control.next_request().await;
+    assert_eq!(start["method"], "thread/start");
+    control
+        .respond(&start, thread_result("thread-replacement", &workspace))
+        .await;
+    let started = control.next_request().await;
+    assert_eq!(started["method"], "turn/start");
+    control
+        .respond(
+            &started,
+            json!({"turn": turn("turn-after-orphan", "inProgress")}),
+        )
+        .await;
+    control
+        .send_json(json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-replacement",
+                "turn": turn("turn-after-orphan", "completed")
+            }
+        }))
+        .await;
+
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-after-orphan"],
+        InboundEventState::Completed,
+    )
+    .await;
+    wait_for_inbound_states(
+        &store,
+        &namespace,
+        &["event-orphan-running"],
+        InboundEventState::Rejected,
+    )
+    .await;
+    let live = store.uncertain_turns().await.expect("live turns");
+    assert!(
+        live.iter().all(|row| row.id != orphan_turn),
+        "orphaned running turn must be terminalized"
+    );
     router.shutdown().await.expect("shutdown");
     store.shutdown().await.expect("store shutdown");
 }

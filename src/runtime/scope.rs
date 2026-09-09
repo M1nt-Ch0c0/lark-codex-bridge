@@ -2138,6 +2138,16 @@ async fn process_batch(
                 )
                 .await;
             }
+            Err(ThreadPreparationError::Client(error))
+                if error.turn_start_definitely_not_applied() =>
+            {
+                tracing::warn!(
+                    failure = "thread_prepare_rejected",
+                    "Codex thread preparation failed before claim; inbound was rejected"
+                );
+                reject_terminal_batch(store, sink.as_ref(), &batch).await?;
+                return Ok(());
+            }
             Err(error) => return Err(error.scope_kind()),
         };
         (turn_epoch, client, thread_id)
@@ -3255,25 +3265,37 @@ async fn ensure_thread(
             params.overrides.sandbox = Some(settings.sandbox);
             params.overrides.approval_policy = Some(settings.approval_policy.clone());
             params.overrides.model.clone_from(&settings.model);
-            let thread = client
-                .resume_thread(params)
-                .await
-                .map_err(ThreadPreparationError::Client)?;
-            if policy_changed {
-                store
-                    .upsert_scope(scope, cwd, fingerprint)
-                    .await
-                    .map_err(|_| ThreadPreparationError::Scope(ScopeFailureKind::Store))?;
+            match client.resume_thread(params).await {
+                Ok(thread) => {
+                    if policy_changed {
+                        store
+                            .upsert_scope(scope, cwd, fingerprint)
+                            .await
+                            .map_err(|_| ThreadPreparationError::Scope(ScopeFailureKind::Store))?;
+                    }
+                    return Ok(thread.id);
+                }
+                Err(error)
+                    if active.origin == ThreadOrigin::BridgeCreated
+                        && resume_failure_is_missing_thread(&error) =>
+                {
+                    tracing::warn!(
+                        failure = "stale_codex_thread",
+                        "active Codex thread could not be resumed; starting a replacement"
+                    );
+                    abandon_unusable_bridge_thread(store, scope, &active.codex_thread_id).await?;
+                }
+                Err(error) => return Err(ThreadPreparationError::Client(error)),
             }
-            return Ok(thread.id);
+        } else {
+            store
+                .archive_active_thread(scope)
+                .await
+                .map_err(|_| ThreadPreparationError::Scope(ScopeFailureKind::Store))?;
+            let _ = client
+                .release_thread(&ThreadId::from(active.codex_thread_id.as_str()))
+                .await;
         }
-        store
-            .archive_active_thread(scope)
-            .await
-            .map_err(|_| ThreadPreparationError::Scope(ScopeFailureKind::Store))?;
-        let _ = client
-            .release_thread(&ThreadId::from(active.codex_thread_id.as_str()))
-            .await;
     }
     let rpc_cwd =
         revalidate_workspace(policy, cwd, fingerprint).map_err(ThreadPreparationError::Scope)?;
@@ -3300,6 +3322,51 @@ async fn ensure_thread(
             .map_err(|_| ThreadPreparationError::Scope(ScopeFailureKind::Store))?;
     }
     Ok(thread.id)
+}
+
+fn resume_failure_is_missing_thread(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::Rpc(RpcError::Server {
+            method: "thread/resume",
+            ..
+        })
+    )
+}
+
+async fn abandon_unusable_bridge_thread(
+    store: &StoreHandle,
+    scope: &ScopeKey,
+    thread_id: &str,
+) -> Result<(), ThreadPreparationError> {
+    let scope_key = scope.to_string();
+    let live = store
+        .uncertain_turns()
+        .await
+        .map_err(|_| ThreadPreparationError::Scope(ScopeFailureKind::Store))?;
+    for turn in live {
+        if turn.scope_key == scope_key
+            && turn.codex_thread_id.as_deref() == Some(thread_id)
+            && matches!(
+                turn.state,
+                TurnState::Starting | TurnState::Running | TurnState::Uncertain
+            )
+        {
+            store
+                .resolve_turn_and_finish_inbound_batch(
+                    turn.id,
+                    TurnResolution::Interrupted,
+                    InboundTerminal::Rejected,
+                )
+                .await
+                .map_err(|_| ThreadPreparationError::Scope(ScopeFailureKind::Store))?;
+        }
+    }
+    store
+        .archive_active_thread(scope)
+        .await
+        .map_err(|_| ThreadPreparationError::Scope(ScopeFailureKind::Store))?;
+    Ok(())
 }
 
 fn revalidate_workspace(

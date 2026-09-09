@@ -7,20 +7,10 @@
 ```bash
 lark-codex-bridge lark auth check
 lark-codex-bridge lark probe
-```
-
-再按配置里的 Codex backend 选一个：
-
-```bash
-# [codex.backend].mode = "spawned_stdio"
 lark-codex-bridge codex probe
-
-# [codex.backend].mode = "protocol_sidecar"
-lark-codex-bridge codex sidecar-probe \
-  --entrypoint /absolute/path/to/codex-sidecar/index.cjs
 ```
 
-`sidecar-probe` 不读 `config.toml`，路径要和配置一致。`external_endpoint` 没有 CLI probe，普通 `run` 会直接拒绝。
+`codex probe` 默认用仓库里的 `codex-sidecar/index.cjs`。入站飞书事件始终走 `sidecar/`，没有 native 回退。
 
 ## 启动
 
@@ -91,3 +81,4 @@ RUST_LOG=lark_codex_bridge=debug lark-codex-bridge run --config /path/config.tom
 
 Debug 日志按设计只记录分类、计数和长度。发现 secret、token、用户正文或敏感绝对路径时，
 应按安全缺陷处理。
+

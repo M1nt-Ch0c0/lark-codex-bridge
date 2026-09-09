@@ -115,13 +115,9 @@ npm ci --ignore-scripts --prefix sidecar
 npm run check --prefix sidecar
 ```
 
-The Rust runtime never runs npm or downloads dependencies. `native` remains
-the default. `node-sidecar` is opt-in and may be configured to fall back to
-native when the initial executable, protocol, configuration, or SDK connection
-attempt fails.
-"Initial" includes reaching the first authoritative SDK `connected` state:
-mere configure success never suppresses fallback. Once the first process has
-connected, later crashes stay on the explicitly selected sidecar and are
+The Rust runtime never runs npm or downloads dependencies. Inbound production
+always uses this sidecar; there is no native WebSocket switch or fallback.
+Once the first process has connected, later crashes stay on the sidecar and are
 supervised with a fresh handshake on every process epoch; the bridge never
 switches live sources mid-run. Restart delay escalates through the existing
 bounded jittered schedule (30-second cap) and resets only after one process

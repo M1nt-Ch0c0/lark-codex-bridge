@@ -2,7 +2,6 @@ use assert_cmd::cargo::cargo_bin_cmd;
 use clap::Parser;
 use lark_codex_bridge::{
     cli::{Cli, CodexCommand, Command as CliCommand, LogFormat},
-    codex::wire::SUPPORTED_CODEX_VERSIONS,
     runtime::adoption::{THREAD_ADOPTION_SUPPORTED_PLATFORMS, ThreadAdoptionGate},
 };
 use predicates::prelude::*;
@@ -30,7 +29,7 @@ fn version_matches_the_package_version() {
 
 #[test]
 fn adoption_status_is_machine_readable_and_fail_closed() {
-    let availability = ThreadAdoptionGate::managed_stdio().availability();
+    let availability = ThreadAdoptionGate::managed_sidecar().availability();
     let external = ThreadAdoptionGate::external_endpoint().availability();
     let assertion = cargo_bin_cmd!("lark-codex-bridge")
         .args(["codex", "adoption-status"])
@@ -48,7 +47,7 @@ fn adoption_status_is_machine_readable_and_fail_closed() {
             "classification": availability.code(),
             "guidance": availability.guidance(),
             "releaseAuthority": availability.release_authority(),
-            "managedBackends": ["spawned_stdio", "protocol_sidecar"],
+            "managedBackends": ["protocol_sidecar"],
             "supportedPlatforms": THREAD_ADOPTION_SUPPORTED_PLATFORMS,
             "externalEndpoint": {
                 "available": external.is_available(),
@@ -85,7 +84,7 @@ fn adoption_status_does_not_spawn_codex_or_read_its_profile() {
             .success()
             .stdout(predicate::str::contains(format!(
                 "\"classification\":\"{}\"",
-                ThreadAdoptionGate::managed_stdio().availability().code()
+                ThreadAdoptionGate::managed_sidecar().availability().code()
             )))
             .stdout(predicate::str::contains(
                 "\"classification\":\"unavailable_shared_external_endpoint\"",
@@ -94,44 +93,36 @@ fn adoption_status_does_not_spawn_codex_or_read_its_profile() {
 }
 
 #[test]
-fn probe_reports_a_missing_codex_binary_without_panicking() {
+fn probe_reports_a_missing_sidecar_entrypoint_without_panicking() {
     let temp = tempfile::tempdir().expect("temporary directory");
-    let missing_binary = temp.path().join("missing-codex");
+    let missing_entrypoint = temp.path().join("missing-sidecar.cjs");
 
     cargo_bin_cmd!("lark-codex-bridge")
-        .args(["codex", "probe", "--binary"])
-        .arg(&missing_binary)
+        .args(["codex", "probe", "--entrypoint"])
+        .arg(&missing_entrypoint)
         .assert()
         .failure()
-        .stderr(predicate::str::contains("unable to run Codex binary"))
+        .stderr(predicate::str::contains(
+            "configured Codex protocol sidecar is invalid",
+        ))
         .stderr(predicate::str::contains("panicked").not());
 }
 
-#[cfg(unix)]
 #[test]
-fn run_and_probe_report_the_same_unsupported_version_reason_before_runtime_ready() {
-    use std::os::unix::fs::PermissionsExt;
-
+fn run_and_probe_report_the_same_sidecar_spawn_failure_before_runtime_ready() {
     let temp = tempfile::tempdir().expect("temporary directory");
-    let binary = temp.path().join("unsupported-codex");
-    std::fs::write(&binary, b"#!/bin/sh\nprintf 'codex-cli 0.148.0\\n'\n")
-        .expect("write fake Codex");
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))
-        .expect("make fake Codex executable");
-    let encoded_binary = serde_json::to_string(&binary.to_string_lossy())
-        .expect("encode fake Codex path as a TOML string");
+    let missing_entrypoint = temp.path().join("missing-sidecar.cjs");
+    let encoded_entrypoint = serde_json::to_string(&missing_entrypoint.to_string_lossy())
+        .expect("encode missing sidecar path as a TOML string");
     let config = temp.path().join("config.toml");
     std::fs::write(
         &config,
         format!(
-            "owners = [\"ou_owner_cli_fail_closed\"]\n\n[codex.backend]\nmode = \"spawned_stdio\"\nbinary = {encoded_binary}\n"
+            "owners = [\"ou_owner_cli_fail_closed\"]\n\n[codex.backend]\nmode = \"protocol_sidecar\"\nsidecar_entrypoint = {encoded_entrypoint}\n"
         ),
     )
     .expect("write runtime config");
-    let expected = format!(
-        "Codex 0.148.0 is unsupported; expected an exact reviewed version ({})",
-        SUPPORTED_CODEX_VERSIONS.join(", ")
-    );
+    let expected = "configured Codex protocol sidecar is invalid";
 
     let run = cargo_bin_cmd!("lark-codex-bridge")
         .env("LARK_APP_ID", "cli_app_fail_closed")
@@ -141,13 +132,13 @@ fn run_and_probe_report_the_same_unsupported_version_reason_before_runtime_ready
         .args(["-v", "run", "--config"])
         .arg(&config)
         .output()
-        .expect("run bridge with unsupported Codex");
+        .expect("run bridge with missing Codex sidecar");
     let probe = cargo_bin_cmd!("lark-codex-bridge")
         .env_remove("RUST_LOG")
-        .args(["-v", "codex", "probe", "--binary"])
-        .arg(&binary)
+        .args(["-v", "codex", "probe", "--entrypoint"])
+        .arg(&missing_entrypoint)
         .output()
-        .expect("probe unsupported Codex");
+        .expect("probe missing Codex sidecar");
     let run_stderr = String::from_utf8_lossy(&run.stderr);
     let probe_stderr = String::from_utf8_lossy(&probe.stderr);
 
@@ -155,10 +146,10 @@ fn run_and_probe_report_the_same_unsupported_version_reason_before_runtime_ready
     assert!(!probe.status.success());
     assert!(run.stdout.is_empty());
     assert!(probe.stdout.is_empty());
-    assert!(run_stderr.contains(&expected));
-    assert!(probe_stderr.contains(&expected));
+    assert!(run_stderr.contains(expected));
+    assert!(probe_stderr.contains(expected));
     assert!(!run_stderr.contains("bridge runtime ready"));
-    assert!(!run_stderr.contains(&*binary.to_string_lossy()));
+    assert!(!run_stderr.contains(&*missing_entrypoint.to_string_lossy()));
 }
 
 #[test]
@@ -183,7 +174,9 @@ fn parsed_cli_debug_redacts_secrets_ids_and_absolute_paths() {
         "lark-codex-bridge",
         "codex",
         "probe",
-        "--binary",
+        "--entrypoint",
+        "/sensitive/customer/sidecar.cjs",
+        "--codex-binary",
         "/sensitive/customer/codex",
     ])
     .expect("parse codex command");
@@ -223,8 +216,19 @@ fn parsed_cli_debug_redacts_secrets_ids_and_absolute_paths() {
 
 #[test]
 fn sidecar_probe_uses_the_pinned_package_unless_a_binary_is_explicit() {
-    let pinned = Cli::try_parse_from(["lark-codex-bridge", "codex", "sidecar-probe"])
+    let pinned = Cli::try_parse_from(["lark-codex-bridge", "codex", "probe"])
         .expect("parse pinned sidecar probe");
+    assert!(matches!(
+        pinned.command,
+        CliCommand::Codex {
+            command: CodexCommand::Probe {
+                codex_binary: None,
+                ..
+            }
+        }
+    ));
+    let pinned = Cli::try_parse_from(["lark-codex-bridge", "codex", "sidecar-probe"])
+        .expect("parse pinned sidecar probe alias");
     assert!(matches!(
         pinned.command,
         CliCommand::Codex {
@@ -288,7 +292,7 @@ fn verbose_diagnostics_use_stderr_and_redact_configured_paths() {
     let missing_binary = temp.path().join(secret_marker).join("missing-codex");
     let output = cargo_bin_cmd!("lark-codex-bridge")
         .env_remove("RUST_LOG")
-        .args(["-vv", "codex", "probe", "--binary"])
+        .args(["-vv", "codex", "probe", "--entrypoint"])
         .arg(&missing_binary)
         .output()
         .expect("run verbose probe");
@@ -298,7 +302,7 @@ fn verbose_diagnostics_use_stderr_and_redact_configured_paths() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Codex supervisor epoch starting"));
     assert!(stderr.contains("Codex supervisor degraded"));
-    assert!(stderr.contains("error: unable to run Codex binary"));
+    assert!(stderr.contains("error: configured Codex protocol sidecar is invalid"));
     assert!(!stderr.contains(secret_marker));
     assert!(!stderr.contains(&*missing_binary.to_string_lossy()));
 }
@@ -309,7 +313,7 @@ fn rust_log_overrides_verbose_defaults() {
     let missing_binary = temp.path().join("missing-codex");
     let output = cargo_bin_cmd!("lark-codex-bridge")
         .env("RUST_LOG", "error")
-        .args(["-vv", "codex", "probe", "--binary"])
+        .args(["-vv", "codex", "probe", "--entrypoint"])
         .arg(missing_binary)
         .output()
         .expect("run filtered probe");
@@ -317,7 +321,7 @@ fn rust_log_overrides_verbose_defaults() {
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("error: unable to run Codex binary"));
+    assert!(stderr.contains("error: configured Codex protocol sidecar is invalid"));
     assert!(!stderr.contains("terminal tracing initialized"));
     assert!(!stderr.contains("Codex supervisor epoch starting"));
     assert!(!stderr.contains("Codex supervisor degraded"));
@@ -328,7 +332,7 @@ fn invalid_rust_log_is_actionable_and_does_not_echo_its_value() {
     let secret_filter = "[SECRET_FILTER_CONTENT";
     let output = cargo_bin_cmd!("lark-codex-bridge")
         .env("RUST_LOG", secret_filter)
-        .args(["codex", "probe", "--binary", "missing-codex"])
+        .args(["codex", "probe", "--entrypoint", "missing-sidecar.cjs"])
         .output()
         .expect("run invalid filter probe");
 
@@ -346,7 +350,14 @@ fn json_log_format_is_structured_and_still_stderr_only() {
     let missing_binary = temp.path().join("missing-codex");
     let output = cargo_bin_cmd!("lark-codex-bridge")
         .env_remove("RUST_LOG")
-        .args(["-v", "--log-format", "json", "codex", "probe", "--binary"])
+        .args([
+            "-v",
+            "--log-format",
+            "json",
+            "codex",
+            "probe",
+            "--entrypoint",
+        ])
         .arg(missing_binary)
         .output()
         .expect("run JSON probe");

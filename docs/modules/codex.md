@@ -2,16 +2,14 @@
 
 ## 模块职责
 
-Codex 模块长期管理一个 `codex app-server --listen stdio://` 子进程，或管理一个再启动 Codex
-的本地协议 sidecar，完成 JSONL RPC、initialize、thread/turn 生命周期、事件订阅、中断和
-进程树重启。
+Codex 模块通过受监督的本地协议 sidecar 管理一个 `codex app-server` 子进程，完成 JSONL RPC、
+initialize、thread/turn 生命周期、事件订阅、中断和进程树重启。
 
 关联代码位于 `src/codex/`。
 
 ## 版本和启动
 
-默认 `spawned_stdio` 精确支持 `codex-cli 0.146.0` 和 `0.149.0`；显式
-`protocol_sidecar` 精确支持 `0.149.0` 和 `0.151.0`。启动前严格执行版本 probe，输出必须符合：
+`run` 只走 `protocol_sidecar`，精确支持 `0.149.0` 和 `0.151.0`。启动前严格执行版本 probe，输出必须符合：
 
 ```text
 codex-cli X.Y.Z
@@ -24,7 +22,6 @@ app-server 并执行 initialize。
 
 ```bash
 lark-codex-bridge codex probe
-lark-codex-bridge codex sidecar-probe --entrypoint /absolute/codex-sidecar/index.cjs
 ```
 
 sidecar 使用固定 v1 hello/configure 握手、33,554,432-byte frame、448 pending 和七个精确
@@ -70,9 +67,9 @@ runtime 不能把旧 epoch 的请求或事件误归入新连接。
 
 ## 当前限制
 
-- 普通 `run` 支持 owned `spawned_stdio` 和 `protocol_sidecar`；显式 shared external endpoint
-  仍在 mutation-driven 装配路径 fail closed。
-- persisted thread 只在 Linux/macOS 允许 managed stdio/sidecar 的显式顺序交接；Unix
+- 普通 `run` 只走 owned `protocol_sidecar`；`spawned_stdio` 和 shared external endpoint
+  都不是可配置的运行路径。
+- persisted thread 只在 Linux/macOS 允许 managed sidecar 的显式顺序交接；Unix
   lifecycle 用 `waitid(WNOWAIT)` 保留 leader PID/PGID 身份，所有破坏性 group signal 都必须
   发生在 exact leader wait/reap 之前；Unix 禁止调用 outer group wait，wait 后只允许以 signal-0
   得到 process-group `ESRCH`；`ECHILD` 会立即 poison 身份并禁止后续 signal/wait。Windows Job child
